@@ -128,7 +128,7 @@ pub(crate) async fn single_block_reads_answer_retained_heights_and_absence<H: Re
 }
 
 pub(crate) async fn compact_block_ranges_answer_their_ends<H: ReaderHarness>() -> eyre::Result<()> {
-    let chain = chain(RawBlobRetention::Transactions);
+    let chain = chain(RawBlobRetention::None);
     let reader = published::<H>(&CanonicalBaseline::new(&chain))?;
 
     let blocks = reader.compact_blocks_in_range(range(1, TIP)).await?;
@@ -156,7 +156,7 @@ pub(crate) async fn compact_block_ranges_answer_their_ends<H: ReaderHarness>() -
 
 pub(crate) async fn byte_bounded_ranges_keep_whole_blocks_from_the_first_end<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let chain = chain(RawBlobRetention::Transactions);
+    let chain = chain(RawBlobRetention::None);
     let reader = published::<H>(&CanonicalBaseline::new(&chain))?;
     let whole = range(1, TIP);
 
@@ -196,9 +196,9 @@ pub(crate) async fn block_blob_reads_follow_raw_blob_retention<H: ReaderHarness>
         assert_eq!(blob.as_ref(), Some(&expected), "height {height}");
     }
 
-    let unretained = chain(RawBlobRetention::Transactions);
+    let unretained = chain(RawBlobRetention::None);
     let reader = published::<H>(&CanonicalBaseline::new(&unretained))?;
-    assert_eq!(reader.raw_blob_retention(), RawBlobRetention::Transactions);
+    assert_eq!(reader.raw_blob_retention(), RawBlobRetention::None);
     assert_eq!(reader.block_blob_at(BlockHeight::new(1)).await?, None);
     assert!(
         reader
@@ -212,7 +212,7 @@ pub(crate) async fn block_blob_reads_follow_raw_blob_retention<H: ReaderHarness>
 
 pub(crate) async fn mined_transactions_are_found_or_proven_absent<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let (chain, mined) = chain_with_mined_transaction(RawBlobRetention::Transactions)?;
+    let (chain, mined) = chain_with_mined_transaction(RawBlobRetention::All)?;
     let reader = published::<H>(&CanonicalBaseline::new(&chain))?;
     let block = fixture_block(&chain, MINED_HEIGHT)?;
 
@@ -249,12 +249,19 @@ pub(crate) async fn mined_transactions_are_found_or_proven_absent<H: ReaderHarne
         .await?
         .ok_or_else(|| eyre!("an unretained transaction must still be found"))?;
     assert_eq!(transaction.transaction_blob, None);
+    let batched = reader
+        .mined_transactions(&[never_mined(), mined, mined])
+        .await?;
+    assert_eq!(
+        batched,
+        vec![None, Some(transaction.clone()), Some(transaction)]
+    );
     Ok(())
 }
 
 pub(crate) async fn transaction_bytes_name_the_missing_artifact<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let (chain, _) = chain_with_mined_transaction(RawBlobRetention::Transactions)?;
+    let (chain, _) = chain_with_mined_transaction(RawBlobRetention::All)?;
     let reader = published::<H>(&CanonicalBaseline::new(&chain))?;
     assert_transaction_unavailable(
         reader.transaction_blob_by_id(never_mined()).await,
@@ -273,7 +280,7 @@ pub(crate) async fn transaction_bytes_name_the_missing_artifact<H: ReaderHarness
 
 pub(crate) async fn a_checkpointed_store_cannot_prove_an_absence<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let chain = chain(RawBlobRetention::Transactions);
+    let chain = chain(RawBlobRetention::None);
     let floor = BlockHeight::new(2);
     let reader = published::<H>(&CanonicalBaseline::new(&chain).with_history_floor(floor))?;
 
@@ -302,7 +309,7 @@ pub(crate) async fn a_checkpointed_store_cannot_prove_an_absence<H: ReaderHarnes
 }
 
 pub(crate) async fn tree_states_are_stored_or_replayed<H: ReaderHarness>() -> eyre::Result<()> {
-    let chain = chain(RawBlobRetention::Transactions);
+    let chain = chain(RawBlobRetention::None);
     let reader = published::<H>(&CanonicalBaseline::new(&chain))?;
     let tip = block_id(&chain, TIP)?;
 
@@ -356,7 +363,7 @@ pub(crate) async fn tree_states_are_stored_or_replayed<H: ReaderHarness>() -> ey
 pub(crate) async fn a_replay_reads_its_own_seed_not_one_built_outside_it<H: ReaderHarness>()
 -> eyre::Result<()> {
     let activations = sample_regtest_upgrade_activations();
-    let chain = with_note_commitments(&chain(RawBlobRetention::Transactions), &activations)?;
+    let chain = with_note_commitments(&chain(RawBlobRetention::None), &activations)?;
     let floor = BlockHeight::new(2);
     let mut harness = H::publish(
         &CanonicalBaseline::new(&chain).with_history_floor(floor),
@@ -656,37 +663,60 @@ pub(crate) async fn chain_event_starts_resolve_to_a_resume_position<H: ReaderHar
     Ok(())
 }
 
-pub(crate) async fn the_settled_stream_carries_only_settled_commits<H: ReaderHarness>()
+pub(crate) async fn the_settled_stream_commits_each_newly_settled_range<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let (mut harness, _) = appended::<H>(1)?;
+    let chain = chain(RawBlobRetention::None).extend_blocks(2);
+    let mut harness = H::publish(
+        &CanonicalBaseline::new(&chain)
+            .with_history_floor(BlockHeight::new(1))
+            .through(BlockHeight::new(TIP))
+            .with_settled_tip(BlockHeight::new(3)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    harness.append_live_block(&chain, block_id(&chain, 3)?)?;
+    let tail = harness
+        .canonical_reader()?
+        .resolve_wallet_chain_event_stream_start(
+            EventStreamStartPosition::LiveTail,
+            ChainEventStreamFamily::Settled,
+        )
+        .await?;
+    assert!(tail.cursor.is_some());
+    assert_eq!(tail.family, ChainEventStreamFamily::Settled);
+    harness.append_live_block(&chain, block_id(&chain, TIP)?)?;
     let reader = harness.canonical_reader()?;
     let visible = reader
         .wallet_chain_event_history(None, ChainEventStreamFamily::Visible, MANY_EVENTS)
         .await?;
-    let unsettled = visible
-        .last()
-        .ok_or_else(|| eyre!("the history must not be empty"))?;
-    ensure!(
-        !is_settled_commit(unsettled),
-        "the appended block must leave the visible tip above the settled tip"
-    );
-
+    let [baseline, held, advanced] = visible.as_slice() else {
+        return Err(eyre!("expected the baseline and two visible appends"));
+    };
+    assert_eq!(committed_range(baseline)?, range(2, TIP));
+    assert_eq!(committed_range(held)?, range(TIP + 1, TIP + 1));
+    assert_eq!(committed_range(advanced)?, range(TIP + 2, TIP + 2));
     let settled = reader
         .wallet_chain_event_history(None, ChainEventStreamFamily::Settled, MANY_EVENTS)
         .await?;
-    ensure!(
-        !settled.is_empty(),
-        "the settled baseline commit must be in the settled stream"
-    );
-    assert_eq!(
-        event_sequences(&settled),
-        event_sequences(visible.iter().filter(|event| is_settled_commit(event))),
-        "the settled stream carries exactly the commits that leave the tip settled"
-    );
-    assert!(
-        settled.iter().all(is_settled_commit),
-        "every settled event must leave the visible tip at or below the settled tip"
-    );
+    let [prefix, extension] = settled.as_slice() else {
+        return Err(eyre!(
+            "expected the settled baseline and one settlement advance"
+        ));
+    };
+    for (event, transition, expected) in [
+        (prefix, baseline, range(2, 3)),
+        (extension, advanced, range(4, TIP)),
+    ] {
+        assert_eq!(committed_range(event)?, expected);
+        assert_eq!(event.event_sequence, transition.event_sequence);
+        assert_eq!(event.chain_epoch, transition.chain_epoch);
+        assert_eq!(event.settled_tip_height, expected.end);
+    }
+    harness.prune_chain_events_before(advanced.event_sequence)?;
+    let resumed = harness
+        .canonical_reader()?
+        .wallet_chain_event_history(tail.cursor, tail.family, NonZeroU32::MIN)
+        .await?;
+    assert_eq!(resumed.as_slice(), std::slice::from_ref(extension));
     Ok(())
 }
 
@@ -800,7 +830,7 @@ pub(crate) async fn pruned_and_malformed_chain_event_cursors_are_refused<H: Read
 
 pub(crate) async fn a_reader_keeps_its_fence_while_the_writer_appends<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let chain = chain(RawBlobRetention::Transactions).extend_blocks(1);
+    let chain = chain(RawBlobRetention::None).extend_blocks(1);
     let baseline_tip = BlockHeight::new(TIP);
     let mut harness = H::publish(
         &CanonicalBaseline::new(&chain).through(baseline_tip),
@@ -810,7 +840,7 @@ pub(crate) async fn a_reader_keeps_its_fence_while_the_writer_appends<H: ReaderH
     let pinned_fence = pinned.event_fence();
     let pinned_epoch = pinned.chain_epoch();
 
-    harness.append_live_block(&chain)?;
+    harness.append_live_block(&chain, block_id(&chain, TIP)?)?;
     let current = harness.canonical_reader()?;
     let appended = block_id(&chain, TIP + 1)?;
 
@@ -846,7 +876,7 @@ pub(crate) async fn a_reader_keeps_its_fence_while_the_writer_appends<H: ReaderH
 
 pub(crate) async fn a_reorg_replaces_blocks_only_for_readers_opened_after_it<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let (chain, mined) = chain_with_mined_transaction(RawBlobRetention::Transactions)?;
+    let (chain, mined) = chain_with_mined_transaction(RawBlobRetention::All)?;
     let replaced_height = BlockHeight::new(MINED_HEIGHT);
     // The writer archives each block a reorg displaces, which must start
     // with a coinbase.
@@ -946,7 +976,7 @@ async fn assert_hashes_resolve_on_their_own_chain(
 
 pub(crate) async fn a_reorg_is_served_as_a_visible_chain_event<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let (chain, _) = chain_with_mined_transaction(RawBlobRetention::Transactions)?;
+    let (chain, _) = chain_with_mined_transaction(RawBlobRetention::All)?;
     let replaced_height = BlockHeight::new(MINED_HEIGHT);
     let chain = with_coinbases(chain, MINED_HEIGHT + 1..=TIP)?;
     let replacement_chain = chain.fork_at(replaced_height)?.extend_blocks(1);
@@ -969,14 +999,13 @@ pub(crate) async fn a_reorg_is_served_as_a_visible_chain_event<H: ReaderHarness>
         "the replacement must be served as a reorg event, got {:?}",
         last.event
     );
-    assert!(
-        after
-            .wallet_chain_event_history(None, ChainEventStreamFamily::Settled, MANY_EVENTS)
-            .await?
-            .iter()
-            .all(is_settled_commit),
-        "the settled stream serves no reorg and no commit above the settled tip"
-    );
+    let settled = after
+        .wallet_chain_event_history(None, ChainEventStreamFamily::Settled, MANY_EVENTS)
+        .await?;
+    let [baseline] = settled.as_slice() else {
+        return Err(eyre!("only the baseline advanced settlement"));
+    };
+    assert_eq!(committed_range(baseline)?, range(1, MINED_HEIGHT - 1));
     Ok(())
 }
 
@@ -1043,31 +1072,24 @@ fn published<H: ReaderHarness>(baseline: &CanonicalBaseline<'_>) -> eyre::Result
 
 /// Publishes a [`TIP`]-block baseline and appends `appended` live blocks.
 fn appended<H: ReaderHarness>(appended: u32) -> eyre::Result<(H, ChainFixture)> {
-    let chain = chain(RawBlobRetention::Transactions).extend_blocks(appended);
+    let chain = chain(RawBlobRetention::None).extend_blocks(appended);
     let mut harness = H::publish(
         &CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP)),
         &sample_regtest_upgrade_activations(),
     )?;
+    let settled_tip = block_id(&chain, TIP)?;
     for _ in 0..appended {
-        harness.append_live_block(&chain)?;
+        harness.append_live_block(&chain, settled_tip)?;
     }
     Ok((harness, chain))
 }
 
-/// Reports whether `event` is a commit after which the visible tip is at or
-/// below the settled tip, the only events the settled stream carries.
-fn is_settled_commit(event: &ChainEventEnvelope) -> bool {
-    event.event.is_chain_committed()
-        && event.chain_epoch.visible_tip_height <= event.chain_epoch.settled_tip_height
-}
-
-fn event_sequences<'event>(
-    events: impl IntoIterator<Item = &'event ChainEventEnvelope>,
-) -> Vec<u64> {
-    events
-        .into_iter()
-        .map(|event| event.event_sequence)
-        .collect()
+fn committed_range(event: &ChainEventEnvelope) -> eyre::Result<BlockHeightRange> {
+    let ChainEvent::ChainCommitted { committed } = &event.event else {
+        return Err(eyre!("expected a commit, got {:?}", event.event));
+    };
+    assert_eq!(committed.chain_epoch, event.chain_epoch);
+    Ok(committed.block_range)
 }
 
 /// Frontiers of the sizes `frontiers` holds whose leaves are all the

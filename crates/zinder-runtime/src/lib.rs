@@ -12,12 +12,13 @@
 //! - The bounded HTTP/1 listener ([`serve_http`], [`HttpListenerLimits`]) that
 //!   serves every axum router, so header, body, idle, and connection limits
 //!   are applied in one place.
-//! - The shared configuration error type, fluent layered loader, and shared
-//!   schema/redacted-render mirrors ([`ConfigError`], [`ConfigLoader`],
-//!   [`NetworkSection`], [`NetworkToml`], [`NodeAuthToml`], [`NodeHealthToml`],
-//!   [`NodeIndexerTlsToml`], [`NodeToml`], [`NodeFallbacksToml`], [`zinder_environment_source`],
-//!   [`require_field`], [`duration_as_millis_u64`]) that every service binary
-//!   uses to honor the
+//! - The shared configuration error type, fluent layered loader, and unified
+//!   strict configuration schema ([`ZinderConfig`], [`ConfigError`],
+//!   [`ConfigLoader`], [`ConfigValue`], [`Toggle`], [`SecretInput`],
+//!   [`RedactedUrl`], [`NetworkSection`], [`zinder_source::NodeSection`],
+//!   [`zinder_source::NodeFallbackSections`], [`require_field`],
+//!   [`duration_as_millis_u64`]) that every service binary and the `zinder`
+//!   supervisor use to honor the
 //!   `defaults -> file -> ZINDER_* env -> CLI overrides` precedence.
 //! - Two thin lifecycle helpers used by every binary entry point:
 //!   [`cancel_on_terminating_signal`] and [`install_tracing_subscriber`],
@@ -50,10 +51,10 @@
 mod allocator;
 mod auth;
 mod bind_guard;
+mod browser_transport;
 mod canonical_fence_attestation;
 mod composed_readiness;
 mod config;
-mod env_diagnostics;
 mod env_var_docs;
 mod http_listener;
 mod logging;
@@ -63,6 +64,7 @@ mod ops_endpoint;
 mod ops_healthcheck;
 #[cfg(test)]
 mod perf;
+mod process;
 mod public_grpc_health;
 mod public_grpc_server;
 mod readiness;
@@ -81,6 +83,7 @@ pub use auth::{
 pub use bind_guard::{
     BindAddressClass, classify_bind_address, guard_optional_serving_bind, guard_serving_bind,
 };
+pub use browser_transport::{BrowserOrigins, is_grpc_web_request};
 pub use canonical_fence_attestation::{
     CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
     CanonicalFenceDivergence, CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation,
@@ -90,10 +93,10 @@ pub use canonical_fence_attestation::{
 };
 pub use composed_readiness::{ComposedReadiness, ReadinessInput};
 pub use config::{
-    ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeFallbacksToml,
-    NodeHealthToml, NodeIndexerTlsToml, NodeToml, ZinderEnvironmentSource, duration_as_millis_u64,
-    load_bearer_token, parse_socket_addr, require_field, zinder_environment_source,
-    zinder_environment_source_from_map,
+    ConfigError, ConfigLoader, ConfigValue, DISABLED_SENTINEL, NetworkSection,
+    REDACTED_PLACEHOLDER, RedactedCidrs, RedactedUrl, SecretInput, Toggle, ZinderConfig,
+    discover_schema_leaf_paths, duration_as_millis_u64, load_bearer_token, parse_socket_addr,
+    require_field, resolve_optional_bearer_token, validate_optional_path,
 };
 pub use env_var_docs::{
     ENVIRONMENT_VARIABLES, EnvVarDoc, Requirement as EnvVarRequirement,
@@ -104,35 +107,45 @@ pub use http_listener::{
     DEFAULT_HTTP_MAX_REQUEST_BODY_BYTES, DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
     DEFAULT_HTTP_WRITE_STALL_TIMEOUT, HttpListenerLimits, serve_http,
 };
-pub use logging::{TracingSubscriberError, install_tracing_subscriber};
+pub use logging::{
+    RuntimeTracing, TracingSubscriberError, install_runtime_tracing_subscriber,
+    install_tracing_subscriber, trace_ingest_control, trace_node_rpc,
+};
 pub use memory_budget::{
     canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
-    container_memory_budget_bytes,
+    wallet_build_outpoint_sort_memory_bytes, wallet_build_outpoint_sort_memory_bytes_for,
+    wallet_build_reorg_undo_memory_bytes, wallet_build_reorg_undo_memory_bytes_for,
+    wallet_build_secondary_sort_memory_bytes_per_sorter,
+    wallet_build_secondary_sort_memory_bytes_per_sorter_for,
 };
 pub use metrics::{
     MetricsHandle, MetricsInstallError, install_metrics_recorder,
     install_metrics_recorder_for_service,
 };
 pub use ops_endpoint::{
-    OpsEndpointHandle, OpsServer, OpsServerError, serve_ops_endpoint, spawn_ops_endpoint,
-    spawn_ops_endpoint_for,
+    OpsEndpointHandle, OpsServer, OpsServerError, OpsStatus, ServedChainStatus, serve_ops_endpoint,
+    spawn_ops_endpoint, spawn_ops_endpoint_for,
 };
 pub use ops_healthcheck::{
     DEFAULT_OPS_HEALTHCHECK_PATH, OPS_HEALTHCHECK_TIMEOUT, OPS_LISTEN_ADDR_ENV_VAR,
     OpsHealthcheckArgs, OpsHealthcheckError, config_file_ops_listen_addr, probe_ops_endpoint,
     resolve_ops_healthcheck_addr,
 };
+pub use process::ProcessMemory;
 pub use public_grpc_server::{
     ClientAddressSource, DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT,
-    DEFAULT_GRPC_SEND_STALL_TIMEOUT, GrpcCallTermination, GrpcCallTerminationLayer,
+    DEFAULT_GRPC_SEND_STALL_TIMEOUT, GrpcCallTermination, GrpcCallTerminationFuture,
+    GrpcCallTerminationLayer, GrpcDeadline, GrpcProxyProtocol, GrpcRangeAdmission,
     GrpcReceiveLimit, GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStall, GrpcSendStallLayer,
-    MAX_CONCURRENT_STREAMS_PER_CONNECTION, PROXY_CLIENT_ADDRESS_HEADER, PublicGrpcServer,
-    public_grpc_reflection, public_grpc_server, public_grpc_server_with,
+    HTTP2_MAX_LOCAL_ERROR_RESETS, MAX_CONCURRENT_STREAMS_PER_CONNECTION,
+    PROXY_CLIENT_ADDRESS_HEADER, PublicGrpcLayers, PublicGrpcRouter, PublicGrpcServer,
+    RangeClientKey, RetryPushback, WalletRpcMetrics, WalletRpcMetricsLayer, public_grpc_reflection,
+    public_grpc_server, public_grpc_server_with,
 };
 pub use readiness::{
-    ActiveNodeEndpoint, IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause,
-    ReadinessDependency, ReadinessReport, ReadinessState, TrafficReadinessInterceptor,
-    UpstreamHealth, UpstreamNotReadyDetail, not_ready_status,
+    ActiveNodeEndpoint, FollowWaitReason, IngestPhase, NodeUnavailableDetail, Readiness,
+    ReadinessCause, ReadinessDependency, ReadinessReport, ReadinessState,
+    TrafficReadinessInterceptor, UpstreamHealth, UpstreamNotReadyDetail, not_ready_status,
 };
 pub use repeated_field_limits::{
     MethodFieldLimits, RepeatedElementEncoding, RepeatedFieldGuard, RepeatedFieldLimit,
@@ -143,27 +156,36 @@ pub use runtime_supervision::{
     RuntimeTaskFailure, ShutdownRequest, SupervisedGrpcRouter, SupervisedRuntime, SupervisedTasks,
 };
 pub use sections::{
-    CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, DEFAULT_ALLOW_PUBLIC_BIND,
-    IngestControlReaderToml, IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml,
-    ProjectorControlSection, ProjectorControlToml, ResolvedCanonicalSecondaryStorage,
-    ResolvedIngestControlReader, ResolvedIngestControlWriter, ResolvedProjectorControl,
-    ResolvedRetention, ResolvedSecondaryStorage, RetentionSection, RetentionToml,
-    RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, RuntimeService,
-    SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
-    StorageRoleSection, StorageRoleToml, defaults as section_defaults, resolve_allow_public_bind,
-    resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
-    resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_reader,
-    resolve_ingest_control_writer, resolve_materialized_view_reader_rocksdb_budget,
+    CipherscanSection, CompatSection, CompatServing, DEFAULT_ALLOW_PUBLIC_BIND, DeploymentProfile,
+    DeploymentSection, ExplorerSection, IngestConstructionSection, IngestControlSection,
+    IngestCoverage, IngestFollowSection, IngestMempoolSection, IngestPhaseClassificationSection,
+    IngestRunOverridesSection, IngestSection, IngestTreeStateDensificationSection,
+    IngestTreeStateVerificationSection, ObservabilityConfig, OpsSection, ProjectorBuildSection,
+    ProjectorControlSection, ProjectorFollowSection, ProjectorSection, QuerySection,
+    ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, ResolvedIngestControlWriter,
+    ResolvedProjectorControl, ResolvedRetention, ResolvedSecondaryStorage, RetentionSection,
+    RocksDbResourceBudgetSection, RuntimeService, SecuritySection, StorageRoleSection,
+    StorageSection, TreeStateSelectionName, WalletSection, defaults as section_defaults,
+    derive_canonical_path, derive_canonical_secondary_path, derive_checkpoints_path,
+    derive_explorer_secondary_path, derive_wallet_path, derive_wallet_secondary_path,
+    resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
+    resolve_canonical_secondary_storage, resolve_canonical_writer_rocksdb_budget,
+    resolve_ingest_control_reader, resolve_ingest_control_writer,
+    resolve_ingest_control_writer_with_data_dir, resolve_manual_raw_blob_retention,
+    resolve_materialized_view_reader_rocksdb_budget,
     resolve_materialized_view_writer_rocksdb_budget, resolve_ops_listen_addr,
-    resolve_projector_control, resolve_retention, resolve_secondary_storage,
-    resolve_wallet_projection_reader_rocksdb_budget,
-    resolve_wallet_projection_writer_rocksdb_budget,
+    resolve_projector_control, resolve_projector_control_with_data_dir, resolve_retention,
+    resolve_secondary_storage, resolve_wallet_projection_reader_rocksdb_budget,
+    resolve_wallet_projection_writer_rocksdb_budget, validate_optional_data_dir,
 };
 pub use startup_phase::{StartupPhase, StartupPhaseGuard};
 pub use transport::{
     DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT, InvalidZinderGrpcEndpoint, LazyZinderGrpcChannel,
     connect_zinder_grpc, connect_zinder_grpc_at_startup, connect_zinder_grpc_with_timeout,
     validate_zinder_grpc_endpoint,
+};
+pub use zinder_store::{
+    CgroupMemorySnapshot, container_memory_budget_bytes, container_memory_snapshot,
 };
 
 use tokio::task::JoinHandle;
@@ -172,17 +194,16 @@ use tokio_util::sync::CancellationToken;
 /// Upper bound on the size of an incoming gRPC request message, applied to
 /// every serving Zinder gRPC server via `max_decoding_message_size`.
 ///
-/// tonic holds a request message in memory while it decodes it, so this
-/// bound times [`DEFAULT_GRPC_RECEIVE_SLOTS`] bounds the request bytes a
-/// public server decodes at once.
+/// The same cap applies to the decompressed payload and zstd window on
+/// public application services.
 ///
 /// The largest legitimate request is a broadcast transaction of
 /// [`zinder_core::MAX_RAW_TRANSACTION_BYTES`] (2,000,000 bytes), which
 /// encodes to at most 2,000,015 bytes as a lightwalletd `RawTransaction` and
 /// fits under 2 MiB with room to spare. A larger transaction that still fits
-/// is rejected by the broadcast guard with its typed error; one beyond this
-/// bound fails in the transport with `OUT_OF_RANGE`, before tonic buffers
-/// it.
+/// is rejected by the broadcast guard with its typed error. The transport
+/// rejects an oversized frame with `OUT_OF_RANGE` and an oversized
+/// decompressed payload with `RESOURCE_EXHAUSTED`.
 ///
 /// Setting it explicitly also keeps a future tonic default from silently
 /// widening the limit.
@@ -278,12 +299,21 @@ async fn await_terminating_signal() {
 ///
 /// Release images compile with `-C target-cpu=x86-64-v3`, which lets both the
 /// Rust code and the vendored `RocksDB` C++ emit AVX2/BMI2 instructions
-/// unconditionally. A host below that baseline dies with `SIGILL` deep inside
-/// storage code, so binaries call this before opening storage and exit with a
-/// readable error instead. Builds without the flag (tests, local dev, non-x86
-/// images) require nothing and always pass.
+/// unconditionally. The startup check reports missing features before opening
+/// storage. Deployments must meet the baseline even for code that runs before
+/// this check.
 #[must_use]
 pub fn host_cpu_meets_compiled_baseline() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if cfg!(target_feature = "avx2") && !host_has_avx_state() {
+        tracing::error!(
+            target: "zinder::runtime",
+            event = "host_cpu_below_compiled_baseline",
+            missing = "avx",
+            "AVX requires OS-enabled XMM and YMM state"
+        );
+        return false;
+    }
     let missing = missing_required_cpu_features();
     if missing.is_empty() {
         return true;
@@ -299,15 +329,42 @@ pub fn host_cpu_meets_compiled_baseline() -> bool {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn missing_required_cpu_features() -> Vec<&'static str> {
+    let cpu = raw_cpuid::CpuId::new();
+    let basic = cpu.get_feature_info();
+    let extended = host_extended_features();
     let required = [
-        ("avx2", std::arch::is_x86_feature_detected!("avx2")),
-        ("bmi1", std::arch::is_x86_feature_detected!("bmi1")),
-        ("bmi2", std::arch::is_x86_feature_detected!("bmi2")),
-        ("fma", std::arch::is_x86_feature_detected!("fma")),
-        ("lzcnt", std::arch::is_x86_feature_detected!("lzcnt")),
+        (
+            "avx2",
+            extended
+                .as_ref()
+                .is_some_and(raw_cpuid::ExtendedFeatures::has_avx2),
+        ),
+        (
+            "bmi1",
+            extended
+                .as_ref()
+                .is_some_and(raw_cpuid::ExtendedFeatures::has_bmi1),
+        ),
+        (
+            "bmi2",
+            extended
+                .as_ref()
+                .is_some_and(raw_cpuid::ExtendedFeatures::has_bmi2),
+        ),
+        (
+            "fma",
+            basic.as_ref().is_some_and(raw_cpuid::FeatureInfo::has_fma),
+        ),
+        (
+            "lzcnt",
+            cpu.get_extended_processor_and_feature_identifiers()
+                .is_some_and(|features| features.has_lzcnt()),
+        ),
         (
             "pclmulqdq",
-            std::arch::is_x86_feature_detected!("pclmulqdq"),
+            basic
+                .as_ref()
+                .is_some_and(raw_cpuid::FeatureInfo::has_pclmulqdq),
         ),
     ];
     required
@@ -317,7 +374,168 @@ fn missing_required_cpu_features() -> Vec<&'static str> {
         .collect()
 }
 
+#[cfg(target_arch = "x86_64")]
+fn host_has_avx_state() -> bool {
+    raw_cpuid::CpuId::new()
+        .get_feature_info()
+        .is_some_and(|features| {
+            host_avx_enabled(
+                features.has_avx() && features.has_xsave() && features.has_oxsave(),
+                x86_64::registers::xcontrol::XCr0::read,
+            )
+        })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn host_avx_enabled(
+    can_read_avx_state: bool,
+    read_xcr0: impl FnOnce() -> x86_64::registers::xcontrol::XCr0Flags,
+) -> bool {
+    use x86_64::registers::xcontrol::XCr0Flags;
+
+    // XGETBV is valid only after the CPU and OS have enabled XSAVE.
+    can_read_avx_state && read_xcr0().contains(XCr0Flags::SSE | XCr0Flags::AVX)
+}
+
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 fn missing_required_cpu_features() -> Vec<&'static str> {
     Vec::new()
+}
+
+/// The Pasta field-arithmetic backend compiled into this build, from
+/// `pasta_curves`: `"portable"`, `"x86-64"`, `"aarch64"`, or `"armv7em"`.
+///
+/// `pasta_curves` selects the backend at compile time from its `asm` feature
+/// and the target. Release images, binary archives, and Compose builds enable
+/// `pasta_curves/asm` by default (`ZINDER_PASTA_ASM=1`; set `0` for portable);
+/// logging this backend at startup makes any accidental portable fallback
+/// immediately visible.
+#[must_use]
+pub const fn pasta_backend() -> &'static str {
+    pasta_curves::BACKEND
+}
+
+/// Verifies the host CPU provides every instruction-set feature the compiled
+/// Pasta backend requires.
+///
+/// Logs the selected backend and returns `false` when the host falls short.
+/// The `pasta_curves` x86-64 assembly backend (enabled by default in release
+/// images and binary archives via `ZINDER_PASTA_ASM=1`) uses BMI2 and ADX
+/// instructions without runtime dispatch. Because ADX lies above the base
+/// `x86-64-v3` profile, the runtime fails closed before storage opens rather
+/// than crashing with `SIGILL` on pre-Broadwell/Haswell CPUs (rebuild with
+/// `ZINDER_PASTA_ASM=0` for such hosts). The portable backend and the `AArch64`
+/// and `ARMv7E-M` backends require nothing beyond their target. This is a
+/// separate check from [`host_cpu_meets_compiled_baseline`], which covers the
+/// base `x86-64-v3` features every release binary requires.
+#[must_use]
+pub fn host_cpu_meets_pasta_backend_baseline() -> bool {
+    tracing::info!(
+        target: "zinder::runtime",
+        event = "pasta_backend_selected",
+        backend = pasta_backend(),
+        "Pasta field-arithmetic backend compiled into this build"
+    );
+    let missing = missing_pasta_backend_cpu_features();
+    if missing.is_empty() {
+        return true;
+    }
+    tracing::error!(
+        target: "zinder::runtime",
+        event = "host_cpu_below_pasta_backend_baseline",
+        backend = pasta_backend(),
+        missing = missing.join(", "),
+        "this build compiled the Pasta x86-64 assembly backend, which requires these CPU features"
+    );
+    false
+}
+
+#[cfg(any(target_arch = "x86_64", test))]
+fn missing_pasta_features(backend: &str, bmi2: bool, adx: bool) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if backend == "x86-64" {
+        if !bmi2 {
+            missing.push("bmi2");
+        }
+        if !adx {
+            missing.push("adx");
+        }
+    }
+    missing
+}
+
+#[cfg(target_arch = "x86_64")]
+fn host_extended_features() -> Option<raw_cpuid::ExtendedFeatures> {
+    // Rust's detection macro folds features enabled by target-cpu to true.
+    raw_cpuid::CpuId::new().get_extended_feature_info()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn missing_pasta_backend_cpu_features() -> Vec<&'static str> {
+    let features = host_extended_features();
+    missing_pasta_features(
+        pasta_backend(),
+        features
+            .as_ref()
+            .is_some_and(raw_cpuid::ExtendedFeatures::has_bmi2),
+        features
+            .as_ref()
+            .is_some_and(raw_cpuid::ExtendedFeatures::has_adx),
+    )
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn missing_pasta_backend_cpu_features() -> Vec<&'static str> {
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{missing_pasta_features, pasta_backend};
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx_requires_os_enabled_xmm_and_ymm_state() {
+        use x86_64::registers::xcontrol::XCr0Flags;
+
+        let mut xcr0_read = false;
+        assert!(!super::host_avx_enabled(false, || {
+            xcr0_read = true;
+            XCr0Flags::all()
+        }));
+        assert!(!xcr0_read);
+        for state in [XCr0Flags::empty(), XCr0Flags::SSE, XCr0Flags::AVX] {
+            assert!(!super::host_avx_enabled(true, || state));
+        }
+        assert!(super::host_avx_enabled(true, || XCr0Flags::SSE | XCr0Flags::AVX));
+    }
+
+    #[test]
+    fn pasta_backend_names_a_known_backend() {
+        assert!(
+            ["portable", "x86-64", "aarch64", "armv7em"].contains(&pasta_backend()),
+            "unexpected Pasta backend: {}",
+            pasta_backend()
+        );
+    }
+
+    #[test]
+    fn pasta_guard_requires_both_x86_assembly_features() {
+        assert_eq!(
+            missing_pasta_features("x86-64", false, false),
+            ["bmi2", "adx"]
+        );
+        assert_eq!(missing_pasta_features("x86-64", true, false), ["adx"]);
+        assert_eq!(missing_pasta_features("x86-64", false, true), ["bmi2"]);
+        assert_eq!(
+            missing_pasta_features("x86-64", true, true),
+            [] as [&str; 0]
+        );
+        for backend in ["portable", "aarch64", "armv7em"] {
+            assert_eq!(
+                missing_pasta_features(backend, false, false),
+                [] as [&str; 0]
+            );
+        }
+    }
 }

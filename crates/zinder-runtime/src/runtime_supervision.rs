@@ -46,7 +46,7 @@ use crate::{
     ClientAddressSource, DEFAULT_GRPC_SEND_STALL_TIMEOUT, GrpcCallTerminationLayer,
     GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStallLayer, OpsEndpointHandle,
     OpsServerError, Readiness, RuntimeService, cancel_on_terminating_signal,
-    public_grpc_server::{OpenGrpcCalls, supervised_grpc_layers, supervised_wallet_router},
+    public_grpc_server::{OpenGrpcCalls, supervised_grpc_layers, supervised_router},
 };
 
 /// Longest a supervised gRPC server may drain after the runtime starts
@@ -68,9 +68,9 @@ pub const GRPC_SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// entrypoint's 20-second grace window.
 pub const GRPC_SERVER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The tonic router type that [`SupervisedRuntime::public_grpc_router`]
+/// The gRPC router type that [`SupervisedRuntime::public_grpc_router`]
 /// returns.
-pub type SupervisedGrpcRouter<L = Identity> = tonic::transport::server::Router<
+pub type SupervisedGrpcRouter<L = Identity, T = Identity> = crate::PublicGrpcRouter<
     Stack<
         Stack<
             GrpcSendStallLayer,
@@ -78,6 +78,7 @@ pub type SupervisedGrpcRouter<L = Identity> = tonic::transport::server::Router<
         >,
         L,
     >,
+    T,
 >;
 
 /// A runtime's public gRPC listener and background tasks, supervised so that
@@ -94,6 +95,7 @@ pub struct SupervisedRuntime {
     serving_drained: CancellationToken,
     open_calls: Arc<OpenGrpcCalls>,
     grpc_drain_timeout: Duration,
+    grpc_send_stall_timeout: Duration,
 }
 
 impl SupervisedRuntime {
@@ -108,6 +110,7 @@ impl SupervisedRuntime {
             serving_drained: CancellationToken::new(),
             open_calls: Arc::new(OpenGrpcCalls::default()),
             grpc_drain_timeout: GRPC_SERVER_DRAIN_TIMEOUT,
+            grpc_send_stall_timeout: DEFAULT_GRPC_SEND_STALL_TIMEOUT,
         }
     }
 
@@ -118,6 +121,16 @@ impl SupervisedRuntime {
     #[must_use]
     pub const fn with_grpc_drain_timeout(mut self, grpc_drain_timeout: Duration) -> Self {
         self.grpc_drain_timeout = grpc_drain_timeout;
+        self
+    }
+
+    /// Replaces the send stall timeout of the listener this runtime builds.
+    ///
+    /// Production runtimes keep [`DEFAULT_GRPC_SEND_STALL_TIMEOUT`]. This
+    /// form exists so tests can reach a stalled response's end quickly.
+    #[must_use]
+    pub const fn with_grpc_send_stall_timeout(mut self, grpc_send_stall_timeout: Duration) -> Self {
+        self.grpc_send_stall_timeout = grpc_send_stall_timeout;
         self
     }
 
@@ -153,21 +166,21 @@ impl SupervisedRuntime {
         self.serving_drained.clone()
     }
 
-    /// Assembles this runtime's public wallet listener, which serves
-    /// `wallet_service` and tells clients apart by `client_address`.
+    /// Assembles this runtime's public gRPC listener, which serves
+    /// `application_service` and tells clients apart by `client_address`.
     ///
     /// The router serves, on the transport policy of
     /// [`crate::public_grpc_server`]:
     ///
-    /// - `wallet_service`, behind a [`crate::TrafficReadinessInterceptor`]
+    /// - `application_service`, behind a [`crate::TrafficReadinessInterceptor`]
     ///   over `readiness`;
-    /// - gRPC reflection v1, describing `wallet_descriptor_set` and
-    ///   `grpc.health.v1`; and
+    /// - gRPC reflection v1, plus v1alpha for `CompactTxStreamer`, describing
+    ///   the application, health, and reflection services; and
     /// - `grpc.health.v1.Health`, `SERVING` exactly when `readiness` admits
     ///   traffic, as `/readyz` reports it.
     ///
     /// Reflection and health stay outside the traffic gate, so they answer
-    /// while the runtime refuses wallet calls. Every call first passes
+    /// while the runtime refuses application calls. Every call first passes
     /// through [`GrpcCallTerminationLayer`], so the supervisor can end the
     /// calls still open at the drain deadline.
     ///
@@ -179,67 +192,79 @@ impl SupervisedRuntime {
     /// # Errors
     ///
     /// Returns an error when reflection cannot describe
-    /// `wallet_descriptor_set`.
-    pub fn public_grpc_router<S>(
+    /// `descriptor_set`.
+    pub fn public_grpc_router<S, ResponseBody>(
         &self,
-        wallet_service: S,
-        wallet_descriptor_set: &'static [u8],
+        application_service: S,
+        descriptor_set: &'static [u8],
         client_address: ClientAddressSource,
         readiness: &Readiness,
     ) -> Result<SupervisedGrpcRouter, tonic_reflection::server::Error>
     where
-        S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
-            + NamedService
+        S: Service<
+                http::Request<Body>,
+                Response = http::Response<ResponseBody>,
+                Error = Infallible,
+            > + NamedService
             + Clone
             + Send
             + Sync
             + 'static,
         S::Future: Send + 'static,
+        ResponseBody:
+            http_body::Body<Data = bytes::Bytes, Error: Into<axum::BoxError>> + Send + 'static,
     {
         self.public_grpc_router_with_transport(
-            (wallet_service, wallet_descriptor_set),
+            (application_service, descriptor_set),
             client_address,
             readiness,
             std::convert::identity,
         )
     }
 
-    /// Builds the same supervised wallet router with an outer transport adapter.
-    /// Pass the wallet service with its reflection descriptor set.
+    /// Builds the same supervised router with an outer transport adapter.
+    /// Pass the application service with its reflection descriptor set.
     /// The adapter translates incoming requests before the supervisor and receive
-    /// limits inspect native gRPC frames.
+    /// limits inspect native gRPC frames. Register it with
+    /// [`crate::PublicGrpcServer::transport_layer`] so it can format deadline responses.
     ///
     /// # Errors
     ///
-    /// Returns an error when reflection cannot describe the wallet service.
-    pub fn public_grpc_router_with_transport<S, L>(
+    /// Returns an error when reflection cannot describe the application service.
+    pub fn public_grpc_router_with_transport<S, L, T, ResponseBody>(
         &self,
-        (wallet_service, descriptor_set): (S, &'static [u8]),
+        (application_service, descriptor_set): (S, &'static [u8]),
         client_address: ClientAddressSource,
         readiness: &Readiness,
-        transport: impl FnOnce(tonic::transport::Server) -> tonic::transport::Server<L>,
-    ) -> Result<SupervisedGrpcRouter<L>, tonic_reflection::server::Error>
+        transport: impl FnOnce(crate::PublicGrpcServer) -> crate::PublicGrpcServer<L, T>,
+    ) -> Result<SupervisedGrpcRouter<L, T>, tonic_reflection::server::Error>
     where
         L: Clone,
-        S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
-            + NamedService
+        S: Service<
+                http::Request<Body>,
+                Response = http::Response<ResponseBody>,
+                Error = Infallible,
+            > + NamedService
             + Clone
             + Send
             + Sync
             + 'static,
         S::Future: Send + 'static,
+        ResponseBody:
+            http_body::Body<Data = bytes::Bytes, Error: Into<axum::BoxError>> + Send + 'static,
     {
-        let server = transport(crate::public_grpc_server::public_grpc_transport()).layer(
-            supervised_grpc_layers(
-                Arc::clone(&self.open_calls),
-                GrpcReceiveLimits::default(),
-                DEFAULT_GRPC_SEND_STALL_TIMEOUT,
-                client_address,
-            ),
-        );
-        supervised_wallet_router(
+        let server = transport(crate::public_grpc_server::public_grpc_transport(
+            self.grpc_send_stall_timeout,
+        ))
+        .layer(supervised_grpc_layers(
+            Arc::clone(&self.open_calls),
+            GrpcReceiveLimits::default(),
+            self.grpc_send_stall_timeout,
+            client_address,
+        ));
+        supervised_router(
             server,
-            wallet_service,
+            application_service,
             descriptor_set,
             readiness,
             &self.stopping,
@@ -279,7 +304,7 @@ impl SupervisedRuntime {
         publish_shutting_down: impl FnOnce(),
     ) -> Result<(), RuntimeSupervisionError>
     where
-        Server: Future<Output = Result<(), tonic::transport::Error>>,
+        Server: Future<Output = Result<(), std::io::Error>>,
     {
         let service = self.service.binary_name();
         let mut running = tasks.start(&self.stopping);
@@ -338,9 +363,9 @@ impl SupervisedRuntime {
         &self,
         mut server: Pin<&mut Server>,
         server_stopped: bool,
-    ) -> Result<(), tonic::transport::Error>
+    ) -> Result<(), std::io::Error>
     where
-        Server: Future<Output = Result<(), tonic::transport::Error>>,
+        Server: Future<Output = Result<(), std::io::Error>>,
     {
         let drained = if server_stopped {
             Some(Ok(()))
@@ -370,9 +395,9 @@ impl SupervisedRuntime {
     async fn drain_grpc_server<Server>(
         &self,
         server: Pin<&mut Server>,
-    ) -> Option<Result<(), tonic::transport::Error>>
+    ) -> Option<Result<(), std::io::Error>>
     where
-        Server: Future<Output = Result<(), tonic::transport::Error>>,
+        Server: Future<Output = Result<(), std::io::Error>>,
     {
         if let Ok(server_outcome) = tokio::time::timeout(self.grpc_drain_timeout, server).await {
             return Some(server_outcome);
@@ -392,9 +417,9 @@ impl SupervisedRuntime {
     async fn close_grpc_server<Server>(
         &self,
         server: Pin<&mut Server>,
-    ) -> Result<(), tonic::transport::Error>
+    ) -> Result<(), std::io::Error>
     where
-        Server: Future<Output = Result<(), tonic::transport::Error>>,
+        Server: Future<Output = Result<(), std::io::Error>>,
     {
         if let Ok(server_outcome) = tokio::time::timeout(GRPC_SERVER_CLOSE_TIMEOUT, server).await {
             return server_outcome;
@@ -431,7 +456,7 @@ struct TaskExit {
 
 enum RuntimeExit {
     ShutdownRequested,
-    GrpcServer(Result<(), tonic::transport::Error>),
+    GrpcServer(Result<(), std::io::Error>),
     Task(TaskExit),
 }
 
@@ -456,7 +481,7 @@ fn log_task_exit(service: &'static str, task: &'static str, failure: Option<&Run
     }
 }
 
-fn log_server_drain_failure(service: &'static str, error: &tonic::transport::Error) {
+fn log_server_drain_failure(service: &'static str, error: &std::io::Error) {
     tracing::error!(
         target: "zinder::runtime",
         event = "runtime_grpc_drain_failed",
@@ -689,7 +714,7 @@ pub enum RuntimeSupervisionError {
     GrpcServer {
         /// The transport failure.
         #[source]
-        source: tonic::transport::Error,
+        source: std::io::Error,
     },
 }
 

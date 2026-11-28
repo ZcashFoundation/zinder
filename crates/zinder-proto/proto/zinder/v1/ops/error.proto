@@ -28,7 +28,8 @@ package zinder.v1.ops;
 // `WalletServerInfo.contract_revision`, reserve any removed name and scalar,
 // and cut controlled consumers over with the server.
 enum ErrorReason {
-  reserved "COMPACT_BLOCK_RANGE_TOO_LARGE";
+  reserved 11;
+  reserved "BROADCAST_DISABLED", "COMPACT_BLOCK_RANGE_TOO_LARGE";
 
   // Default scalar so unset fields do not silently match a real reason.
   ERROR_REASON_UNSPECIFIED = 0;
@@ -50,7 +51,6 @@ enum ErrorReason {
   SUBTREE_ROOT_RANGE_TOO_LARGE = 49;
 
   // FAILED_PRECONDITION family.
-  BROADCAST_DISABLED = 11;
   CHAIN_EVENT_CURSOR_EXPIRED = 12;
   MEMPOOL_EVENT_CURSOR_EXPIRED = 13;
   SNAPSHOT_PAGE_CURSOR_EXPIRED = 45;
@@ -152,4 +152,27 @@ enum ErrorReason {
   // serves its limit of open block-range streams. Retry with backoff; a slot
   // frees when an open stream ends.
   COMPACT_BLOCK_STREAM_LIMIT_REACHED = 56;
+
+  // UNAVAILABLE family.
+  // The upstream node refused a forwarded call with HTTP 429 because it
+  // already holds its JSON-RPC connection or request limit. The node is up;
+  // retry with backoff.
+  NODE_RATE_LIMITED = 57;
+
+  // RESOURCE_EXHAUSTED family.
+  // A wallet read the server forwards to its node was refused because every
+  // node-call or response slot of its kind stayed taken through the wait, or
+  // every waiting place was taken. Retry with backoff.
+  FORWARDED_READ_LIMIT_REACHED = 58;
+
+  // UNAVAILABLE family.
+  // A forwarded transparent UTXO or balance lookup answered at a different
+  // tip than the reader's served tip, or consecutive pages disagreed at that
+  // tip. The node is up; retry after the `grpc-retry-pushback-ms` delay.
+  SERVED_TIP_MISMATCH = 59;
+
+  // UNAVAILABLE family.
+  // The wallet listener refused a native block-range stream at admission.
+  // Retry on the existing connection after the grpc-retry-pushback-ms delay.
+  BLOCK_RANGE_ADMISSION_REFUSED = 60;
 }

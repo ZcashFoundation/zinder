@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ZcashFoundation/zinder/scripts/mainnet-fixture/fixture.schema.json",
+  "title": "Zinder benchmark fixture",
+  "description": "Identity of a frozen benchmark fixture: the chain fence it serves, the release and schemas that built it, the disk snapshots that hold each component, and the SHA-256 of every file a restore must reproduce.",
+  "type": "object",
+  "required": ["format_version", "fixture_id", "network", "chain", "schemas", "building_release", "components"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "const": 1 },
+    "fixture_id": {
+      "description": "Stable name, for example zinder-fx-m3593347-s7-v0.20.0.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]{0,62}$"
+    },
+    "network": { "enum": ["zcash-mainnet", "zcash-testnet", "zcash-regtest"] },
+    "chain": {
+      "type": "object",
+      "required": ["visible_height", "visible_block_hash", "settled_height", "settled_block_hash"],
+      "additionalProperties": false,
+      "properties": {
+        "visible_height": { "type": "integer", "minimum": 0 },
+        "visible_block_hash": { "$ref": "#/$defs/block_hash" },
+        "settled_height": { "type": "integer", "minimum": 0 },
+        "settled_block_hash": { "$ref": "#/$defs/block_hash" },
+        "reorg_window_blocks": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "schemas": {
+      "type": "object",
+      "required": ["canonical_store", "wallet_store", "artifact"],
+      "additionalProperties": false,
+      "properties": {
+        "canonical_store": { "type": "integer", "minimum": 1 },
+        "wallet_store": { "type": "integer", "minimum": 1 },
+        "artifact": { "type": "integer", "minimum": 1 },
+        "node_database_format": { "type": "string" },
+        "tree_state_layout": { "enum": ["sparse", "dense"] }
+      }
+    },
+    "building_release": { "$ref": "#/$defs/release" },
+    "verified_with_release": { "$ref": "#/$defs/release" },
+    "digests": {
+      "description": "Store digests read from a running deployment over this fixture.",
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/hex" }
+    },
+    "components": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/component" }
+    },
+    "wallet_sample": {
+      "description": "Digest of the fixed wallet response set that guest/wallet-sample.sh records.",
+      "type": "object",
+      "required": ["sha256sums_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "sha256sums_sha256": { "$ref": "#/$defs/sha256" },
+        "transparent_address": { "type": "string" },
+        "responses": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "stage_sha256": {
+      "description": "SHA-256 of the only stage tarball restore-fixture.sh accepts for this fixture.",
+      "$ref": "#/$defs/sha256"
+    },
+    "executables": {
+      "description": "Immutable object generation that holds the executables the fixture was built and verified with. It is a separate artifact from the restore stage; see stage_sha256.",
+      "type": "object",
+      "required": ["uri", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "uri": { "type": "string" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "listing": { "type": "string" }
+      }
+    },
+    "off_host_copies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "location", "manifest_sha256"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "enum": ["private-state-bundle", "node-state", "catalog-generation", "oracle"] },
+          "location": { "type": "string" },
+          "manifest_sha256": { "$ref": "#/$defs/sha256" },
+          "bytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "notes": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "hex": { "type": "string", "pattern": "^[0-9a-f]+$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "block_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "release": {
+      "type": "object",
+      "required": ["version", "commit"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "type": "string" },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "binaries": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    },
+    "component": {
+      "type": "object",
+      "required": ["name", "kind", "snapshot", "disk_size_gb", "filesystem", "mount_path"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "kind": { "enum": ["node-state", "stores", "catalog", "oracle"] },
+        "snapshot": {
+          "description": "GCP snapshot name in the fixture project.",
+          "type": "string"
+        },
+        "project": { "type": "string" },
+        "disk_size_gb": { "type": "integer", "minimum": 1 },
+        "filesystem": { "enum": ["ext4", "ext4-verity", "xfs"] },
+        "filesystem_label": { "type": "string" },
+        "mount_path": { "type": "string", "pattern": "^/" },
+        "paths": {
+          "description": "Role name to path relative to mount_path, such as canonical, wallet, or zebra_state.",
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "file_count": { "type": "integer", "minimum": 0 },
+        "apparent_bytes": { "type": "integer", "minimum": 0 },
+        "files_sha256": {
+          "description": "SHA-256 of the sorted `sha256sum` listing of every regular file under paths, excluding RocksDB LOCK files.",
+          "$ref": "#/$defs/sha256"
+        },
+        "files_listing": {
+          "description": "Relative path, inside the evidence or the component, of that sorted listing.",
+          "type": "string"
+        },
+        "signed_history": { "$ref": "#/$defs/signed_history" }
+      }
+    },
+    "signed_history": {
+      "description": "Signed history catalog on this component. A restored lightwalletd-compatible reader follows the publisher directory, trusts only the named key, and must serve historical block ranges from it. Requires fs-verity on every segment when the component's filesystem is ext4-verity. A fixture with signed_history must also set stage_sha256, and every component that names a catalog must carry this object.",
+      "type": "object",
+      "required": ["directory", "publisher_key", "manifest_sha256", "publisher_key_sha256", "segment_count", "first_height", "highest_height"],
+      "additionalProperties": false,
+      "properties": {
+        "directory": {
+          "description": "Publisher directory relative to mount_path, holding current.json, .publisher-head.json, and the segment files.",
+          "type": "string"
+        },
+        "publisher_key": {
+          "description": "Path relative to mount_path of the publisher's 32-byte raw Ed25519 public key.",
+          "type": "string"
+        },
+        "manifest_sha256": {
+          "description": "SHA-256 of the directory's current.json.",
+          "$ref": "#/$defs/sha256"
+        },
+        "publisher_key_sha256": { "$ref": "#/$defs/sha256" },
+        "segment_count": {
+          "description": "Segments the manifest lists. The restore compares it with the manifest.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "first_height": {
+          "description": "First height the catalog covers, which the restore compares with the manifest.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "highest_height": {
+          "description": "Last height the catalog covers, which the restore compares with the manifest. It must be below the chain's visible height so the height above it can be probed.",
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

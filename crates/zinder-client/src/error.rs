@@ -58,6 +58,9 @@ pub enum RetryPolicy {
     /// Restart the chain-event stream from the earliest retained event and
     /// rebuild derived state from that replay boundary.
     RestartFromEarliestRetained,
+    /// Discard the expired cursor and any partial mempool snapshot. Read a new
+    /// snapshot from its first page, then subscribe from its events resume cursor.
+    RefreshMempoolSnapshot,
     /// Retry with exponential backoff. The remote service or upstream node
     /// is transiently unavailable; the request shape is correct.
     RetryWithBackoff,
@@ -451,10 +454,10 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::TransparentOutpointCountOutOfRange
         | ErrorReason::SnapshotPageCursorInvalid
         | ErrorReason::BroadcastTransactionTooLarge => RetryPolicy::ClientError,
-        ErrorReason::BroadcastDisabled
-        | ErrorReason::MempoolEventCursorExpired
-        | ErrorReason::SnapshotPageCursorExpired
-        | ErrorReason::SchemaMismatch
+        ErrorReason::MempoolEventCursorExpired | ErrorReason::SnapshotPageCursorExpired => {
+            RetryPolicy::RefreshMempoolSnapshot
+        }
+        ErrorReason::SchemaMismatch
         | ErrorReason::SchemaTooNew
         | ErrorReason::ReorgWindowExceeded
         | ErrorReason::ChainEpochConflict
@@ -479,6 +482,8 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::UnsupportedTransactionStatus
         | ErrorReason::BlockingTaskFailed
         | ErrorReason::NodeUnavailable
+        | ErrorReason::NodeRateLimited
+        | ErrorReason::ServedTipMismatch
         | ErrorReason::StorageUnavailable
         | ErrorReason::UnsupportedWalletEncoding
         | ErrorReason::NoVisibleChainEpoch
@@ -487,6 +492,8 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::TransactionNotFound
         | ErrorReason::TreeStateReplayLimitReached
         | ErrorReason::CompactBlockStreamLimitReached
+        | ErrorReason::BlockRangeAdmissionRefused
+        | ErrorReason::ForwardedReadLimitReached
         | ErrorReason::BroadcastBudgetExhausted => RetryPolicy::RetryWithBackoff,
         ErrorReason::Unknown(_) => retry_policy_for_status(code),
     }
@@ -690,6 +697,21 @@ mod tests {
     }
 
     #[test]
+    fn retired_broadcast_reason_from_older_servers_preserves_its_name() {
+        let status = tonic::Status::with_error_details(
+            Code::FailedPrecondition,
+            "broadcast disabled",
+            ErrorDetails::with_error_info("BROADCAST_DISABLED", ZINDER_ERROR_DOMAIN, []),
+        );
+        let error = IndexerError::from_status(status);
+        assert_eq!(
+            error.reason(),
+            Some(ErrorReason::Unknown("BROADCAST_DISABLED".to_owned()))
+        );
+        assert_eq!(error.retry_policy(), RetryPolicy::OperatorActionRequired);
+    }
+
+    #[test]
     fn unknown_remote_reason_is_preserved_with_status_retry_policy() {
         let status = tonic::Status::with_error_details(
             Code::Unavailable,
@@ -705,6 +727,60 @@ mod tests {
         );
         assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
         assert!(matches!(error, IndexerError::RemoteFailure { .. }));
+    }
+
+    #[test]
+    fn node_rate_limited_refusal_is_retried_with_backoff() {
+        let status = tonic::Status::with_error_details(
+            Code::Unavailable,
+            "node rate-limited the call",
+            ErrorDetails::with_error_info(
+                ErrorReason::NodeRateLimited.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                [],
+            ),
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert_eq!(error.reason(), Some(ErrorReason::NodeRateLimited));
+        assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
+    }
+
+    #[test]
+    fn served_tip_mismatch_refusal_is_retried_with_backoff() {
+        let status = tonic::Status::with_error_details(
+            Code::Unavailable,
+            "node answered at another tip than the served tip; retry shortly",
+            ErrorDetails::with_error_info(
+                ErrorReason::ServedTipMismatch.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                [],
+            ),
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert_eq!(error.reason(), Some(ErrorReason::ServedTipMismatch));
+        assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
+    }
+
+    #[test]
+    fn forwarded_read_limit_refusal_is_retried_with_backoff() {
+        let status = tonic::Status::with_error_details(
+            Code::ResourceExhausted,
+            "forwarded transaction reads are at their limit",
+            ErrorDetails::with_error_info(
+                ErrorReason::ForwardedReadLimitReached.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                [],
+            ),
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert_eq!(error.reason(), Some(ErrorReason::ForwardedReadLimitReached));
+        assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
     }
 
     #[test]

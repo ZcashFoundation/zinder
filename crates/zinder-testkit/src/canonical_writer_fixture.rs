@@ -31,8 +31,8 @@ use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalBuildSubtreeRoot,
     CanonicalEventFence, CanonicalEventRetentionReport, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreBuildPlan, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
-    RocksDbCanonicalStore, RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE,
+    CanonicalStoreBuildPlan, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+    TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
 };
 
 use crate::{ChainFixture, FixtureBlock, FixtureTransactionRows, WalletServingStoreFixture};
@@ -51,6 +51,7 @@ pub struct CanonicalBaseline<'chain> {
     history_floor: Option<BlockHeight>,
     settled_tip_height: Option<BlockHeight>,
     subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
+    tree_state_checkpoint_selection: Option<TreeStateCheckpointSelection>,
 }
 
 impl<'chain> CanonicalBaseline<'chain> {
@@ -63,6 +64,7 @@ impl<'chain> CanonicalBaseline<'chain> {
             history_floor: None,
             settled_tip_height: None,
             subtree_roots: Vec::new(),
+            tree_state_checkpoint_selection: None,
         }
     }
 
@@ -100,6 +102,23 @@ impl<'chain> CanonicalBaseline<'chain> {
     #[must_use]
     pub fn with_subtree_root(mut self, subtree_root: CanonicalBuildSubtreeRoot) -> Self {
         self.subtree_roots.push(subtree_root);
+        self
+    }
+
+    /// Publishes a tree-state checkpoint for every constructed block instead
+    /// of only on the global cadence and at the build tip.
+    #[must_use]
+    pub const fn with_every_block_tree_state_checkpoints(self) -> Self {
+        self.with_tree_state_checkpoint_selection(TreeStateCheckpointSelection::EveryBlock)
+    }
+
+    /// Adds construction checkpoints under `selection` alongside the cadence and tip.
+    #[must_use]
+    pub const fn with_tree_state_checkpoint_selection(
+        mut self,
+        selection: TreeStateCheckpointSelection,
+    ) -> Self {
+        self.tree_state_checkpoint_selection = Some(selection);
         self
     }
 
@@ -186,12 +205,16 @@ impl CanonicalWriterFixture {
         let temporary_directory =
             TempDir::new().wrap_err("create canonical writer fixture directory")?;
         let canonical_primary_path = temporary_directory.path().join("canonical-primary");
-        let mut builder = RocksDbCanonicalBuilder::create_fresh(
+        let builder = RocksDbCanonicalBuilder::create_fresh(
             &canonical_primary_path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
+        let mut builder = if let Some(selection) = baseline.tree_state_checkpoint_selection {
+            builder.with_tree_state_checkpoint_selection(selection)?
+        } else {
+            builder
+        };
         let blocks = baseline_blocks(
             &artifacts,
             &mut trees,
@@ -199,6 +222,7 @@ impl CanonicalWriterFixture {
                 first_height: first_retained_height,
                 tip_height,
             },
+            baseline.tree_state_checkpoint_selection,
         )?;
         let tip_checkpoint = blocks
             .last()
@@ -280,6 +304,48 @@ impl CanonicalWriterFixture {
     /// compact block does not advance the persisted commitment trees to its
     /// declared sizes, or the store rejects the append.
     pub fn append_live_block(&mut self, chain: &ChainFixture) -> eyre::Result<CanonicalEventFence> {
+        let settled_tip = self.canonical_primary()?.sequence_checkpoint().through();
+        self.append_live_block_with_settled_tip(chain, settled_tip)
+    }
+
+    /// Appends the next block and publishes the supplied settled tip in the same epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the next block cannot be built or the writer rejects
+    /// the block or settlement transition.
+    pub fn append_live_block_with_settled_tip(
+        &mut self,
+        chain: &ChainFixture,
+        settled_tip: BlockId,
+    ) -> eyre::Result<CanonicalEventFence> {
+        self.append_fixture_block(&FixtureChainArtifacts::new(chain), settled_tip)
+    }
+
+    /// Appends each remaining block as a separate event, settling it at commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer rejects an append or a block cannot be built.
+    pub fn append_settled_blocks(&mut self, chain: &ChainFixture) -> eyre::Result<()> {
+        let artifacts = FixtureChainArtifacts::new(chain);
+        let tip = self.canonical_primary()?.event_fence().visible_tip();
+        for block in artifacts
+            .chain
+            .blocks()
+            .iter()
+            .filter(|block| block.height > tip.height)
+        {
+            self.append_fixture_block(&artifacts, BlockId::new(block.height, block.hash))?;
+        }
+        Ok(())
+    }
+
+    fn append_fixture_block(
+        &mut self,
+        artifacts: &FixtureChainArtifacts,
+        settled_tip: BlockId,
+    ) -> eyre::Result<CanonicalEventFence> {
         let canonical_primary = self.take_canonical_primary()?;
         let anchor = canonical_primary.append_anchor()?;
         let height = anchor
@@ -288,7 +354,6 @@ impl CanonicalWriterFixture {
             .height
             .next()
             .ok_or_else(|| eyre!("the visible tip height cannot advance"))?;
-        let artifacts = FixtureChainArtifacts::new(chain);
         let mut trees = FixtureCommitmentTrees::after(
             anchor.tip_checkpoint().block_id.height,
             &anchor.tip_checkpoint().frontiers,
@@ -301,7 +366,7 @@ impl CanonicalWriterFixture {
                 anchor.event_fence(),
                 block,
                 Vec::new(),
-                anchor.settled_tip(),
+                settled_tip,
                 created_at,
             ),
             &self.network_upgrade_activations,
@@ -416,7 +481,13 @@ impl CanonicalWriterFixture {
         )
     }
 
-    fn take_canonical_primary(&mut self) -> eyre::Result<RocksDbCanonicalStore> {
+    /// Transfers the primary to a writer loop. Keep the fixture alive while
+    /// the loop uses its temporary directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fixture no longer owns the primary.
+    pub fn take_canonical_primary(&mut self) -> eyre::Result<RocksDbCanonicalStore> {
         self.canonical_primary
             .take()
             .ok_or_else(|| eyre!("an earlier canonical transition failed and closed the primary"))
@@ -483,15 +554,23 @@ fn baseline_blocks(
     artifacts: &FixtureChainArtifacts,
     trees: &mut FixtureCommitmentTrees<'_>,
     range: BaselineRange,
+    tree_state_checkpoint_selection: Option<TreeStateCheckpointSelection>,
 ) -> eyre::Result<Vec<CanonicalBuildBlock>> {
     let mut blocks = Vec::new();
+    let mut checkpoint_tree_sizes = trees.accumulator.tip_metadata();
     for height in range.first_height.value()..=range.tip_height.value() {
         let height = BlockHeight::new(height);
         let tip_metadata =
             trees.apply_cold(&artifacts.chain, height, artifacts.compact_block(height)?)?;
         let checkpoint_required = height == range.tip_height
-            || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
+            || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE)
+            || tree_state_checkpoint_selection.is_some_and(|selection| {
+                selection.requires_checkpoint_since(checkpoint_tree_sizes, tip_metadata)
+            });
         let checkpoint_frontiers = checkpoint_required.then(|| trees.frontiers()).transpose()?;
+        if checkpoint_required {
+            checkpoint_tree_sizes = tip_metadata;
+        }
         blocks.push(artifacts.build_block(height, tip_metadata, checkpoint_frontiers)?);
     }
     Ok(blocks)
@@ -576,7 +655,7 @@ impl FixtureChainArtifacts {
             })?
             .into_facts();
         let raw_blob_retention = self.chain.raw_blob_retention();
-        let transaction_blobs = if raw_blob_retention.retains_transaction_blobs() {
+        let transaction_blobs = if raw_blob_retention.full_blocks() {
             self.block_transaction_blobs(fixture_block)?
         } else {
             Vec::new()
@@ -594,10 +673,9 @@ impl FixtureChainArtifacts {
                     frontiers,
                 )
             }),
-            block_final_note_commitment_roots: None,
             transaction_blobs,
             block_blob: raw_blob_retention
-                .retains_block_blobs()
+                .full_blocks()
                 .then(|| fixture_block.block_blob_artifact()),
         })
     }

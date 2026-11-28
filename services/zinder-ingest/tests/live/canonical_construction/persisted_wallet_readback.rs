@@ -1,20 +1,26 @@
-use std::{path::Path, time::Instant};
+use std::{fs, path::Path, time::Instant};
 
 use eyre::{Result, eyre};
 use rust_rocksdb::{DB, LiveFile, Options, ReadOptions};
+use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use zinder_core::{
-    BlockHeaderArtifact, BlockHeight, SerializedBytesDigest, decode_canonical_block_replay,
-    wire::encode_height_key_ascending,
+    BlockHeight,
+    wire::{decode_internal_block_hash, encode_height_key_ascending},
 };
-use zinder_store::CanonicalBlockLoadEvidence;
+use zinder_store::{CanonicalBlockLoadEvidence, SEGMENTS_MANIFEST_FILE_NAME};
 
 const BLOCK_HEADER_COLUMN_FAMILY: &str = "block_header";
 const BLOCK_HASH_INDEX_COLUMN_FAMILY: &str = "block_hash_index";
-const BLOCK_REPLAY_COLUMN_FAMILY: &str = "block_replay";
-const COMPACT_BLOCK_COLUMN_FAMILY: &str = "compact_block";
+const SETTLED_SEGMENT_INDEX_COLUMN_FAMILY: &str = "settled_segment_index";
+const LIVE_TAIL_BLOCK_COLUMN_FAMILY: &str = "live_tail_block";
 const TRANSACTION_LOCATION_COLUMN_FAMILY: &str = "transaction_location";
-const TRANSACTION_BLOB_COLUMN_FAMILY: &str = "transaction_blob";
-const BLOCK_BLOB_COLUMN_FAMILY: &str = "block_blob";
+
+const BLOCK_HEADER_VALUE_LEN: usize = 184;
+const LIVE_TAIL_MAGIC: &[u8; 8] = b"ZSLVTL01";
+const LIVE_TAIL_FORMAT_VERSION_V1: u16 = 1;
+const LIVE_TAIL_HEADER_MIN_LEN: usize = 123;
+const LIVE_TAIL_TRAILER_LEN: usize = 32;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PersistedFamilyEvidence {
@@ -28,11 +34,9 @@ pub(super) struct PersistedFamilyEvidence {
 pub(super) struct PersistedCanonicalEvidence {
     pub(super) block_header: PersistedFamilyEvidence,
     pub(super) block_hash_index: PersistedFamilyEvidence,
-    pub(super) block_replay: PersistedFamilyEvidence,
-    pub(super) compact_block: PersistedFamilyEvidence,
+    pub(super) settled_segment_index: PersistedFamilyEvidence,
+    pub(super) live_tail_block: PersistedFamilyEvidence,
     pub(super) transaction_location: PersistedFamilyEvidence,
-    pub(super) transaction_blob: PersistedFamilyEvidence,
-    pub(super) block_blob: PersistedFamilyEvidence,
     pub(super) readback_milliseconds: u64,
 }
 
@@ -56,24 +60,26 @@ pub(super) fn validate_persisted_wallet_families(
         expected.block_hash_index_count
     );
     assert_eq!(
-        persisted.block_replay.row_count,
-        expected.block_replay_count
+        persisted.settled_segment_index.row_count,
+        expected.settled_segment_index_count
     );
     assert_eq!(
-        persisted.compact_block.row_count,
-        expected.compact_block_count
+        persisted.live_tail_block.row_count,
+        expected.live_tail_block_count
     );
     assert_eq!(
         persisted.transaction_location.row_count,
         expected.transaction_location_count
     );
-    assert_eq!(
-        persisted.transaction_blob.row_count,
-        expected.transaction_blob_count
-    );
-    assert_eq!(persisted.block_blob.row_count, expected.block_blob_count);
+    let manifest_json = load_segments_manifest_if_needed(store_path, expected)?;
     for height in sample_heights(expected) {
-        validate_sampled_block_families(&database, height, expected)?;
+        validate_sampled_block_families(
+            store_path,
+            &database,
+            height,
+            expected,
+            manifest_json.as_ref(),
+        )?;
     }
     persisted.readback_milliseconds = u64::try_from(readback_started_at.elapsed().as_millis())
         .unwrap_or(u64::MAX)
@@ -101,18 +107,18 @@ fn inspect_wallet_families(
             expected.block_hash_index_logical_bytes,
             32,
         )?,
-        block_replay: inspect_family(
+        settled_segment_index: inspect_family(
             database,
             live_files,
-            BLOCK_REPLAY_COLUMN_FAMILY,
-            expected.block_replay_logical_bytes,
+            SETTLED_SEGMENT_INDEX_COLUMN_FAMILY,
+            expected.settled_segment_index_logical_bytes,
             4,
         )?,
-        compact_block: inspect_family(
+        live_tail_block: inspect_family(
             database,
             live_files,
-            COMPACT_BLOCK_COLUMN_FAMILY,
-            expected.compact_block_logical_bytes,
+            LIVE_TAIL_BLOCK_COLUMN_FAMILY,
+            expected.live_tail_block_logical_bytes,
             4,
         )?,
         transaction_location: inspect_family(
@@ -121,20 +127,6 @@ fn inspect_wallet_families(
             TRANSACTION_LOCATION_COLUMN_FAMILY,
             expected.transaction_location_logical_bytes,
             32,
-        )?,
-        transaction_blob: inspect_family(
-            database,
-            live_files,
-            TRANSACTION_BLOB_COLUMN_FAMILY,
-            expected.transaction_blob_logical_bytes,
-            8,
-        )?,
-        block_blob: inspect_family(
-            database,
-            live_files,
-            BLOCK_BLOB_COLUMN_FAMILY,
-            expected.block_blob_logical_bytes,
-            4,
         )?,
         readback_milliseconds: 0,
     })
@@ -233,110 +225,202 @@ fn sample_heights(expected: &CanonicalBlockLoadEvidence) -> Vec<BlockHeight> {
     heights
 }
 
+fn load_segments_manifest_if_needed(
+    store_path: &Path,
+    expected: &CanonicalBlockLoadEvidence,
+) -> Result<Option<Value>> {
+    let manifest_path = store_path.join(SEGMENTS_MANIFEST_FILE_NAME);
+    if !manifest_path.exists() {
+        if expected.settled_segment_index_count > 0 {
+            return Err(eyre!(
+                "missing {SEGMENTS_MANIFEST_FILE_NAME} with {} settled segments",
+                expected.settled_segment_index_count
+            ));
+        }
+        return Ok(None);
+    }
+    let manifest_bytes = fs::read(&manifest_path)?;
+    let parsed: Value = serde_json::from_slice(&manifest_bytes)?;
+    assert_eq!(
+        parsed.get("schema_version").and_then(Value::as_u64),
+        Some(2)
+    );
+    Ok(Some(parsed))
+}
+
 fn validate_sampled_block_families(
+    store_path: &Path,
     database: &DB,
     height: BlockHeight,
     expected: &CanonicalBlockLoadEvidence,
+    manifest_json: Option<&Value>,
 ) -> Result<()> {
     let height_key = encode_height_key_ascending(height);
-    let replay_bytes = read_uncached(database, BLOCK_REPLAY_COLUMN_FAMILY, &height_key)?;
-    let replay = decode_canonical_block_replay(&replay_bytes)?;
-    let facts = replay.facts();
-    let header = &facts.block_header;
-    assert_eq!(header.height, height);
+    let persisted_header = read_uncached(database, BLOCK_HEADER_COLUMN_FAMILY, &height_key)?;
+    if persisted_header.len() != BLOCK_HEADER_VALUE_LEN {
+        return Err(eyre!(
+            "sampled block {} header has unexpected byte length {}",
+            height.value(),
+            persisted_header.len()
+        ));
+    }
+    let block_hash_wire = persisted_header
+        .get(..32)
+        .ok_or_else(|| eyre!("sampled block {} header is truncated", height.value()))?;
+    let parent_hash_wire = persisted_header
+        .get(32..64)
+        .ok_or_else(|| eyre!("sampled block {} header is truncated", height.value()))?;
+    let block_hash = decode_internal_block_hash(block_hash_wire)?;
+    let parent_hash = decode_internal_block_hash(parent_hash_wire)?;
     if height == expected.first_height {
-        assert_eq!(header.block_hash, expected.first_hash);
-        assert_eq!(header.parent_hash, expected.first_parent_hash);
+        assert_eq!(block_hash, expected.first_hash);
+        assert_eq!(parent_hash, expected.first_parent_hash);
     }
     if height == expected.tip_height {
-        assert_eq!(header.block_hash, expected.tip_hash);
+        assert_eq!(block_hash, expected.tip_hash);
     }
 
-    let persisted_header = read_uncached(database, BLOCK_HEADER_COLUMN_FAMILY, &height_key)?;
-    assert_eq!(persisted_header, encode_block_header_v1(header));
-    let persisted_height = read_uncached(
-        database,
-        BLOCK_HASH_INDEX_COLUMN_FAMILY,
-        &header.block_hash.as_bytes(),
-    )?;
+    let persisted_height =
+        read_uncached(database, BLOCK_HASH_INDEX_COLUMN_FAMILY, block_hash_wire)?;
     assert_eq!(persisted_height, height_key);
 
-    let compact_bytes = read_uncached(database, COMPACT_BLOCK_COLUMN_FAMILY, &height_key)?;
-    assert_ne!(compact_bytes, [] as [u8; 0]);
-
-    let last_transaction_index = facts.transactions.len().saturating_sub(1);
-    for transaction_index in [0, last_transaction_index] {
-        let transaction = facts
-            .transactions
-            .get(transaction_index)
-            .ok_or_else(|| eyre!("sampled block {} has no transactions", height.value()))?;
-        let transaction_index = u32::try_from(transaction_index)?;
-        let transaction_id = transaction.public_facts.transaction_id;
-        let persisted_location = read_uncached(
-            database,
-            TRANSACTION_LOCATION_COLUMN_FAMILY,
-            &transaction_id.as_bytes(),
-        )?;
-        assert_eq!(
-            persisted_location,
-            encode_transaction_location_v1(
-                height,
-                &header.block_hash.as_bytes(),
-                transaction_index,
-            )
-        );
-        let transaction_key = encode_transaction_position_v1(height, transaction_index);
-        let transaction_bytes =
-            read_uncached(database, TRANSACTION_BLOB_COLUMN_FAMILY, &transaction_key)?;
-        assert_eq!(
-            SerializedBytesDigest::from_serialized_bytes(&transaction_bytes),
-            transaction.serialized_bytes_digest
-        );
+    if let Some(live_tail_bytes) =
+        read_optional_uncached(database, LIVE_TAIL_BLOCK_COLUMN_FAMILY, &height_key)?
+    {
+        validate_sampled_live_tail_bytes(&live_tail_bytes, height, block_hash_wire)?;
+    } else {
+        validate_sampled_settled_segment(store_path, database, height, manifest_json)?;
     }
     Ok(())
 }
 
-fn read_uncached(database: &DB, family_name: &'static str, key: &[u8]) -> Result<Vec<u8>> {
+fn validate_sampled_live_tail_bytes(
+    live_tail_bytes: &[u8],
+    height: BlockHeight,
+    expected_block_hash_wire: &[u8],
+) -> Result<()> {
+    let min_len = LIVE_TAIL_HEADER_MIN_LEN + LIVE_TAIL_TRAILER_LEN;
+    if live_tail_bytes.len() < min_len {
+        return Err(eyre!(
+            "sampled live-tail row at {} is truncated ({} bytes)",
+            height.value(),
+            live_tail_bytes.len()
+        ));
+    }
+    let magic = live_tail_bytes
+        .get(..8)
+        .ok_or_else(|| eyre!("missing live-tail magic"))?;
+    assert_eq!(magic, LIVE_TAIL_MAGIC);
+    let version_bytes: [u8; 2] = live_tail_bytes
+        .get(8..10)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| eyre!("missing live-tail version"))?;
+    assert_eq!(
+        u16::from_be_bytes(version_bytes),
+        LIVE_TAIL_FORMAT_VERSION_V1
+    );
+    let row_height_bytes: [u8; 4] = live_tail_bytes
+        .get(12..16)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| eyre!("missing live-tail height"))?;
+    assert_eq!(u32::from_be_bytes(row_height_bytes), height.value());
+    let row_hash_wire = live_tail_bytes
+        .get(16..48)
+        .ok_or_else(|| eyre!("missing live-tail hash"))?;
+    assert_eq!(row_hash_wire, expected_block_hash_wire);
+    let split = live_tail_bytes
+        .len()
+        .checked_sub(LIVE_TAIL_TRAILER_LEN)
+        .ok_or_else(|| eyre!("live-tail row missing SHA-256 trailer"))?;
+    let body = live_tail_bytes
+        .get(..split)
+        .ok_or_else(|| eyre!("live-tail body slice out of bounds"))?;
+    let trailer = live_tail_bytes
+        .get(split..)
+        .ok_or_else(|| eyre!("live-tail trailer slice out of bounds"))?;
+    let computed: [u8; 32] = Sha256::digest(body).into();
+    assert_eq!(computed.as_slice(), trailer);
+    Ok(())
+}
+
+fn validate_sampled_settled_segment(
+    store_path: &Path,
+    database: &DB,
+    height: BlockHeight,
+    manifest_json: Option<&Value>,
+) -> Result<()> {
+    let manifest_root = manifest_json.ok_or_else(|| {
+        eyre!(
+            "sampled block {} is absent from live_tail_block without {SEGMENTS_MANIFEST_FILE_NAME}",
+            height.value()
+        )
+    })?;
+    let entries = manifest_root
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| eyre!("{SEGMENTS_MANIFEST_FILE_NAME} has no entries array"))?;
+    let covering = entries
+        .iter()
+        .find(|entry_json| {
+            let start = entry_json.get("start_height").and_then(Value::as_u64);
+            let end = entry_json
+                .get("end_block")
+                .and_then(|block| block.get("height"))
+                .and_then(Value::as_u64);
+            matches!(
+                (start, end),
+                (Some(low), Some(high))
+                    if u64::from(height.value()) >= low && u64::from(height.value()) <= high
+            )
+        })
+        .ok_or_else(|| {
+            eyre!(
+                "sampled block {} is covered by neither live_tail_block nor settled segments",
+                height.value()
+            )
+        })?;
+    let start_height = covering
+        .get("start_height")
+        .and_then(Value::as_u64)
+        .and_then(|num| u32::try_from(num).ok())
+        .ok_or_else(|| eyre!("segment entry missing start_height"))?;
+    let end_height = covering
+        .get("end_block")
+        .and_then(|block| block.get("height"))
+        .and_then(Value::as_u64)
+        .and_then(|num| u32::try_from(num).ok())
+        .ok_or_else(|| eyre!("segment entry missing end_block.height"))?;
+    let start_key = encode_height_key_ascending(BlockHeight::new(start_height));
+    let index_row = read_uncached(database, SETTLED_SEGMENT_INDEX_COLUMN_FAMILY, &start_key)?;
+    assert_ne!(index_row, [] as [u8; 0]);
+    let shielded_file = store_path
+        .join("segments")
+        .join("shielded")
+        .join(format!("{start_height:010}-{end_height:010}.zshrng02"));
+    if !shielded_file.is_file() {
+        return Err(eyre!(
+            "missing settled shielded segment {}",
+            shielded_file.display()
+        ));
+    }
+    Ok(())
+}
+
+fn read_optional_uncached(
+    database: &DB,
+    family_name: &'static str,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>> {
     let column_family = database
         .cf_handle(family_name)
         .ok_or_else(|| eyre!("fresh canonical store is missing {family_name}"))?;
     let mut read_options = ReadOptions::default();
     read_options.fill_cache(false);
     read_options.set_verify_checksums(true);
-    database
-        .get_cf_opt(&column_family, key, &read_options)?
+    Ok(database.get_cf_opt(&column_family, key, &read_options)?)
+}
+
+fn read_uncached(database: &DB, family_name: &'static str, key: &[u8]) -> Result<Vec<u8>> {
+    read_optional_uncached(database, family_name, key)?
         .ok_or_else(|| eyre!("{family_name} is missing sampled key {}", hex::encode(key)))
-}
-
-fn encode_block_header_v1(header: &BlockHeaderArtifact) -> [u8; 184] {
-    let mut encoded = [0_u8; 184];
-    encoded[..32].copy_from_slice(&header.block_hash.as_bytes());
-    encoded[32..64].copy_from_slice(&header.parent_hash.as_bytes());
-    encoded[64..96].copy_from_slice(&header.merkle_root_hash);
-    encoded[96..128].copy_from_slice(&header.commitment_bytes);
-    encoded[128..136].copy_from_slice(&header.block_time.to_le_bytes());
-    encoded[136..140].copy_from_slice(&header.bits.to_le_bytes());
-    encoded[140..172].copy_from_slice(&header.nonce);
-    encoded[172..176].copy_from_slice(&header.version.to_le_bytes());
-    encoded[176..184].copy_from_slice(&header.block_size_bytes.to_le_bytes());
-    encoded
-}
-
-fn encode_transaction_location_v1(
-    height: BlockHeight,
-    block_hash: &[u8; 32],
-    transaction_index: u32,
-) -> [u8; 40] {
-    let mut encoded = [0_u8; 40];
-    encoded[..4].copy_from_slice(&encode_height_key_ascending(height));
-    encoded[4..36].copy_from_slice(block_hash);
-    encoded[36..].copy_from_slice(&transaction_index.to_be_bytes());
-    encoded
-}
-
-fn encode_transaction_position_v1(height: BlockHeight, transaction_index: u32) -> [u8; 8] {
-    let mut encoded = [0_u8; 8];
-    encoded[..4].copy_from_slice(&encode_height_key_ascending(height));
-    encoded[4..].copy_from_slice(&transaction_index.to_be_bytes());
-    encoded
 }

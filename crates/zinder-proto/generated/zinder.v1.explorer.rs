@@ -1586,26 +1586,18 @@ pub struct TransparentAddressDeltasResponse {
 /// `(address_script_hash, ascending_height, in_block_position, kind, index)`.
 /// The handler projects this onto `TransparentAddressDeltasEntry`, pulling
 /// the height from the key.
-///
-/// A row carries its transaction id in exactly one of `transaction_id` and
-/// `internal_transaction_id`. Rows written before `internal_transaction_id`
-/// existed set `transaction_id`; newer rows set `internal_transaction_id`.
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressDeltasRecord {
-    /// Canonical transaction id in RPC byte order (64 lowercase hex
-    /// characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-    #[prost(string, tag = "1")]
-    pub transaction_id: ::prost::alloc::string::String,
+    /// Canonical transaction ID as 32 bytes in internal byte order.
+    #[prost(bytes = "vec", tag = "1")]
+    pub transaction_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(int64, tag = "2")]
     pub block_time_unix_seconds: i64,
     /// Signed value the event moved for the address; positive for a received
     /// output, negative for a spent prevout.
     #[prost(sint64, tag = "3")]
     pub value_zat: i64,
-    /// Canonical transaction id as 32 bytes in internal byte order.
-    #[prost(bytes = "vec", tag = "4")]
-    pub internal_transaction_id: ::prost::alloc::vec::Vec<u8>,
 }
 /// `ExplorerQuery.FeeSummary` request.
 ///
@@ -2618,17 +2610,12 @@ pub struct NetworkUpgradeStatusResponse {
 /// carries `(address_script_hash, reverse_height, in_block_position)`.
 /// The handler projects this onto the wire `TransparentAddressActivityEntry`
 /// shape and pulls the height + timestamp it already knows from the key.
-///
-/// A row carries its transaction id in exactly one of `transaction_id` and
-/// `internal_transaction_id`. Rows written before `internal_transaction_id`
-/// existed set `transaction_id`; newer rows set `internal_transaction_id`.
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressActivityRecord {
-    /// Canonical transaction id in RPC byte order (64 lowercase hex
-    /// characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-    #[prost(string, tag = "1")]
-    pub transaction_id: ::prost::alloc::string::String,
+    /// Canonical transaction ID as 32 bytes in internal byte order.
+    #[prost(bytes = "vec", tag = "1")]
+    pub transaction_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(int64, tag = "2")]
     pub block_time_unix_seconds: i64,
     /// Net transparent value the transaction moved for this address
@@ -2649,9 +2636,6 @@ pub struct TransparentAddressActivityRecord {
     /// explaining why `net_value_zat` is unset rather than guessing.
     #[prost(enumeration = "PrevoutResolutionStatus", tag = "6")]
     pub prevout_resolution_status: i32,
-    /// Canonical transaction id as 32 bytes in internal byte order.
-    #[prost(bytes = "vec", tag = "7")]
-    pub internal_transaction_id: ::prost::alloc::vec::Vec<u8>,
 }
 /// Per-transaction record materialized by `TransactionFeesConsumer`.
 ///
@@ -3171,26 +3155,14 @@ pub struct DisplacedBlockDetailResponse {
     #[prost(message, optional, tag = "5")]
     pub coverage: ::core::option::Option<DisplacedBlockArchiveCoverage>,
 }
-/// Typed error returned when a materialized-view RPC cursor has expired.
-///
-/// Per the explorer-plane cursor contract (see
-/// `docs/architecture/explorer-plane.md`): cursors are valid for the
-/// lifetime of the column-family snapshot at issue time. The server
-/// rejects a cursor that references a height range no longer in the store
-/// (reorged out, or rolled off retention) with this typed error attached
-/// to the gRPC status's `details`. Consumers re-issue from the start of
-/// the range or jump to `recommended_resume_height`.
+/// Reserved for cursor expiry. ExplorerQuery does not currently emit this detail.
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CursorExpiredError {
-    /// Recommended restart height for a fresh
-    /// cursor. Set to the canonical tip when the consumer should restart at
-    /// the head of the materialized view; set to the lowest still-indexed height
-    /// when the consumer should restart earlier.
+    /// Recommended restart height for a fresh cursor.
     #[prost(uint32, tag = "1")]
     pub recommended_resume_height: u32,
-    /// Short reason hint a UI can render verbatim. The canonical sentences
-    /// live in `crates/zinder-core/src/explorer_reasons.rs`.
+    /// Short reason a UI can display.
     #[prost(string, tag = "2")]
     pub hint: ::prost::alloc::string::String,
 }
@@ -3229,7 +3201,7 @@ pub struct OverviewSnapshotRequest {
 ///
 /// All present sub-fields are read against the snapshot identified by
 /// `freshness.chain_view.chain_epoch`; the bundle never spans two tips. Optional
-/// fields whose wallet capability is structurally unavailable are identified in
+/// fields without an index or a supported wallet capability are identified in
 /// `freshness.unavailable`. The handler reads the wallet tip once and every
 /// materialized-view field once, in one pass, then assembles the single
 /// freshness envelope. Consumers compare the chain epoch's `chain_epoch_id` and
@@ -3254,7 +3226,8 @@ pub struct OverviewSnapshotResponse {
     #[prost(message, optional, tag = "3")]
     pub mempool: ::core::option::Option<OverviewMempool>,
     /// Rolling counts of mempool events over a sliding window ending at the
-    /// bundle's observation instant.
+    /// bundle's observation instant. Absent when the window has no indexed counts. In that
+    /// case, `freshness.unavailable` lists `mempool_events`.
     #[prost(message, optional, tag = "4")]
     pub mempool_events: ::core::option::Option<OverviewMempoolEvents>,
     /// Fee summary over the last `fee_summary_block_count` blocks ending at
@@ -5030,7 +5003,8 @@ pub mod explorer_query_client {
             self.inner.unary(req, path, codec).await
         }
         /// Returns rolling counts of mempool events from the durable per-second
-        /// counter column family.
+        /// counter column family. A window with no indexed counts fails with
+        /// ARTIFACT_UNAVAILABLE.
         /// Capability: `explorer.mempool.event_counts_v1`.
         pub async fn mempool_event_counts(
             &mut self,
@@ -5587,7 +5561,8 @@ pub mod explorer_query_server {
             tonic::Status,
         >;
         /// Returns rolling counts of mempool events from the durable per-second
-        /// counter column family.
+        /// counter column family. A window with no indexed counts fails with
+        /// ARTIFACT_UNAVAILABLE.
         /// Capability: `explorer.mempool.event_counts_v1`.
         async fn mempool_event_counts(
             &self,

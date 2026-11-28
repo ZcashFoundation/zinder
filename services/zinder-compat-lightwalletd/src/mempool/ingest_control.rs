@@ -31,20 +31,25 @@
 //! restart from driving a tight reconnect loop.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::watch;
+use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request};
+use tonic_types::StatusExt as _;
 use zinder_core::{
     BlockHeight, BlockId, ChainEpochId, TransactionId, wire::encode_rpc_transaction_id_hex,
 };
 use zinder_proto::{
+    ZINDER_ERROR_DOMAIN,
     v1::{
         ingest::{MempoolTransactionRequest, ingest_control_client::IngestControlClient},
+        ops::ErrorReason,
         wallet,
     },
     wire::TransactionAbsence,
@@ -149,7 +154,7 @@ impl IngestControlMempoolSurface {
             .await
             .map_err(|_| MempoolSurfaceError::Unavailable {
                 reason: format!(
-                    "ingest-control {operation_name} timed out after {:?}",
+                    "live mempool {operation_name} timed out after {:?}",
                     self.request_timeout
                 ),
             })?
@@ -164,7 +169,7 @@ impl MempoolSurface for IngestControlMempoolSurface {
         from_cursor: Option<Vec<u8>>,
     ) -> Result<MempoolSnapshotPage, MempoolSurfaceError> {
         let response = self
-            .bounded("mempool_snapshot", async {
+            .bounded("snapshot", async {
                 let mut client = self.ingest_control_client().await?;
                 client
                     .mempool_snapshot(wallet_ingest_control_request(
@@ -174,9 +179,7 @@ impl MempoolSurface for IngestControlMempoolSurface {
                         },
                     ))
                     .await
-                    .map_err(|status| MempoolSurfaceError::Unavailable {
-                        reason: format!("ingest-control mempool_snapshot failed: {status}"),
-                    })
+                    .map_err(|status| mempool_surface_error_from_status("snapshot", &status))
             })
             .await?
             .into_inner();
@@ -200,33 +203,32 @@ impl MempoolSurface for IngestControlMempoolSurface {
             .chain_view
             .and_then(|chain_view| chain_view.chain_epoch)
             .ok_or_else(|| MempoolSurfaceError::Unavailable {
-                reason: "ingest-control mempool_snapshot omitted chain_view.chain_epoch".to_owned(),
+                reason: "upstream mempool snapshot omitted chain epoch".to_owned(),
             })?;
         let visible_tip =
             chain_epoch
                 .visible_tip
                 .ok_or_else(|| MempoolSurfaceError::Unavailable {
-                    reason: "ingest-control mempool_snapshot omitted chain_view visible tip"
-                        .to_owned(),
+                    reason: "upstream mempool snapshot omitted visible tip".to_owned(),
                 })?;
         let source_tip = response
             .source_tip
             .ok_or_else(|| MempoolSurfaceError::Unavailable {
-                reason: "ingest-control mempool_snapshot omitted source_tip".to_owned(),
+                reason: "upstream mempool snapshot omitted source tip".to_owned(),
             })?;
         let visible_tip_hash = zinder_core::wire::decode_rpc_block_hash_hex(&visible_tip.hash)
             .map_err(|error| MempoolSurfaceError::Unavailable {
-                reason: format!("ingest-control mempool_snapshot visible tip is invalid: {error}"),
+                reason: format!("upstream mempool snapshot visible tip is invalid: {error}"),
             })?;
         let source_tip_hash = zinder_core::wire::decode_rpc_block_hash_hex(&source_tip.hash)
             .map_err(|error| MempoolSurfaceError::Unavailable {
-                reason: format!("ingest-control mempool_snapshot source tip is invalid: {error}"),
+                reason: format!("upstream mempool snapshot source tip is invalid: {error}"),
             })?;
         if BlockId::new(BlockHeight::new(visible_tip.height), visible_tip_hash)
             != BlockId::new(BlockHeight::new(source_tip.height), source_tip_hash)
         {
             return Err(MempoolSurfaceError::Unavailable {
-                reason: "ingest-control mempool_snapshot source tip differs from its chain view"
+                reason: "upstream mempool snapshot source tip differs from its chain view"
                     .to_owned(),
             });
         }
@@ -249,54 +251,22 @@ impl MempoolSurface for IngestControlMempoolSurface {
             EventStreamStartPosition::AfterCursor,
         );
         let response = self
-            .bounded("mempool_events", async {
+            .bounded("event stream", async {
                 let mut client = self.ingest_control_client().await?;
                 client
-                    .mempool_events(wallet::MempoolEventsRequest {
-                        start: Some(event_stream_start_message(&start)),
-                    })
+                    .mempool_events(zinder_query::wallet_mempool_events_request(
+                        wallet::MempoolEventsRequest {
+                            start: Some(event_stream_start_message(&start)),
+                        },
+                    ))
                     .await
-                    .map_err(|status| MempoolSurfaceError::Unavailable {
-                        reason: format!("ingest-control mempool_events failed: {status}"),
-                    })
+                    .map_err(|status| mempool_surface_error_from_status("event stream", &status))
             })
             .await?;
 
-        let (output_sender, output_receiver) = mpsc::channel(16);
-        let mut response_stream = response.into_inner();
-        tokio::spawn(async move {
-            loop {
-                match tokio_stream::StreamExt::next(&mut response_stream).await {
-                    Some(Ok(message)) => {
-                        match mempool_event_envelope_from_message(message).map_err(|error| {
-                            MempoolSurfaceError::Unavailable {
-                                reason: error.to_string(),
-                            }
-                        }) {
-                            Ok(envelope) => {
-                                if output_sender.send(Ok(envelope)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Err(error) => {
-                                let _ = output_sender.send(Err(error)).await;
-                                return;
-                            }
-                        }
-                    }
-                    Some(Err(status)) => {
-                        let _ = output_sender
-                            .send(Err(MempoolSurfaceError::Unavailable {
-                                reason: format!("ingest-control mempool_events errored: {status}"),
-                            }))
-                            .await;
-                        return;
-                    }
-                    None => return,
-                }
-            }
-        });
-        Ok(Box::pin(ReceiverStream::new(output_receiver)))
+        Ok(Box::pin(IngestControlMempoolEventStream {
+            response_stream: Some(response.into_inner()),
+        }))
     }
 
     async fn mempool_transaction(
@@ -304,7 +274,7 @@ impl MempoolSurface for IngestControlMempoolSurface {
         transaction_id: TransactionId,
     ) -> Result<MempoolTransactionLookup, MempoolSurfaceError> {
         let rpc_outcome = self
-            .bounded("mempool_transaction", async {
+            .bounded("transaction lookup", async {
                 let mut client = self.ingest_control_client().await?;
                 Ok(client
                     .mempool_transaction(wallet_ingest_control_request(MempoolTransactionRequest {
@@ -321,8 +291,7 @@ impl MempoolSurface for IngestControlMempoolSurface {
             response.location.and_then(|location| location.location)
         else {
             return Err(MempoolSurfaceError::Unavailable {
-                reason: "ingest-control mempool_transaction did not return a mempool entry"
-                    .to_owned(),
+                reason: "upstream mempool lookup did not return a mempool entry".to_owned(),
             });
         };
         let entry = mempool_entry_from_message(entry).map_err(|error| {
@@ -332,11 +301,85 @@ impl MempoolSurface for IngestControlMempoolSurface {
         })?;
         if entry.transaction_id() != transaction_id {
             return Err(MempoolSurfaceError::Unavailable {
-                reason: "ingest-control mempool_transaction returned another transaction"
-                    .to_owned(),
+                reason: "upstream mempool lookup returned a mismatched transaction".to_owned(),
             });
         }
         Ok(MempoolTransactionLookup::Pending(Box::new(entry)))
+    }
+}
+
+struct IngestControlMempoolEventStream {
+    response_stream: Option<tonic::codec::Streaming<wallet::MempoolEventEnvelope>>,
+}
+
+impl Stream for IngestControlMempoolEventStream {
+    type Item = Result<zinder_store::MempoolEventEnvelope, MempoolSurfaceError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let Some(response_stream) = self.response_stream.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match Pin::new(response_stream).poll_next(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                self.response_stream = None;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Ok(message))) => {
+                match mempool_event_envelope_from_message(message).map_err(|error| {
+                    MempoolSurfaceError::Unavailable {
+                        reason: error.to_string(),
+                    }
+                }) {
+                    Ok(envelope) => Poll::Ready(Some(Ok(envelope))),
+                    Err(error) => {
+                        self.response_stream = None;
+                        Poll::Ready(Some(Err(error)))
+                    }
+                }
+            }
+            Poll::Ready(Some(Err(status))) => {
+                self.response_stream = None;
+                Poll::Ready(Some(Err(mempool_surface_error_from_status(
+                    "event stream",
+                    &status,
+                ))))
+            }
+        }
+    }
+}
+
+/// Translates an upstream `IngestControl` gRPC failure without leaking raw
+/// `tonic::Status` `Display` output (`MetadataMap` headers) or private RPC
+/// names onto public compatibility responses.
+fn mempool_surface_error_from_status(
+    operation: &'static str,
+    status: &tonic::Status,
+) -> MempoolSurfaceError {
+    let details = status.get_error_details();
+    if let Some(error_detail) = details.error_info()
+        && error_detail.domain == ZINDER_ERROR_DOMAIN
+        && ErrorReason::from_str_name(&error_detail.reason)
+            == Some(ErrorReason::UnsupportedWalletEncoding)
+    {
+        let message = status.message();
+        let reason = if message.is_empty() {
+            "mempool entry cannot be encoded within the gRPC response budget".to_owned()
+        } else {
+            message.to_owned()
+        };
+        return MempoolSurfaceError::UnsupportedEncoding { reason };
+    }
+    tracing::debug!(
+        target: "zinder::compat_lightwalletd",
+        event = "mempool_surface_rpc_failed",
+        operation,
+        code = ?status.code(),
+        message = status.message(),
+        "upstream mempool RPC failed"
+    );
+    MempoolSurfaceError::Unavailable {
+        reason: format!("live mempool {operation} is unavailable"),
     }
 }
 
@@ -353,19 +396,26 @@ fn mempool_transaction_miss(
             chain_epoch_id: absence.chain_epoch_id,
         }),
         Ok(None) if status.code() == Code::NotFound => Err(MempoolSurfaceError::Unavailable {
-            reason: "ingest-control mempool_transaction answered without a typed absence; \
+            reason: "upstream mempool lookup answered without a typed absence; \
                      transaction absence cannot be proven"
                 .to_owned(),
         }),
-        Ok(None) => Err(MempoolSurfaceError::Unavailable {
-            reason: format!("ingest-control mempool_transaction failed: {status}"),
-        }),
-        Err(metadata_error) => Err(MempoolSurfaceError::Unavailable {
-            reason: format!(
-                "ingest-control mempool_transaction returned a malformed transaction absence: \
-                 {metadata_error}"
-            ),
-        }),
+        Ok(None) => Err(mempool_surface_error_from_status(
+            "transaction lookup",
+            status,
+        )),
+        Err(metadata_error) => {
+            tracing::debug!(
+                target: "zinder::compat_lightwalletd",
+                event = "mempool_transaction_absence_invalid",
+                error = %metadata_error,
+                "upstream mempool lookup returned malformed transaction absence metadata"
+            );
+            Err(MempoolSurfaceError::Unavailable {
+                reason: "upstream mempool lookup returned malformed transaction absence metadata"
+                    .to_owned(),
+            })
+        }
     }
 }
 
@@ -621,5 +671,183 @@ mod tests {
         );
         drop(listener);
         Ok(())
+    }
+
+    struct IdleMempoolEventsServer {
+        closed_sender: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    struct DropSignalStream {
+        closed_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl tokio_stream::Stream for DropSignalStream {
+        type Item = Result<wallet::MempoolEventEnvelope, tonic::Status>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for DropSignalStream {
+        fn drop(&mut self) {
+            if let Some(sender) = self.closed_sender.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl zinder_proto::v1::ingest::ingest_control_server::IngestControl for IdleMempoolEventsServer {
+        type VisibleChainEventsStream = std::pin::Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = Result<wallet::ChainEventEnvelope, tonic::Status>>
+                    + Send,
+            >,
+        >;
+        type MempoolEventsStream = std::pin::Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = Result<wallet::MempoolEventEnvelope, tonic::Status>>
+                    + Send,
+            >,
+        >;
+
+        async fn server_info(
+            &self,
+            _request: Request<zinder_proto::v1::ingest::ServerInfoRequest>,
+        ) -> Result<tonic::Response<zinder_proto::v1::ingest::ServerInfoResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("unused in unit test"))
+        }
+
+        async fn writer_status(
+            &self,
+            _request: Request<zinder_proto::v1::ingest::WriterStatusRequest>,
+        ) -> Result<tonic::Response<zinder_proto::v1::ingest::WriterStatusResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("unused in unit test"))
+        }
+
+        async fn visible_chain_events(
+            &self,
+            _request: Request<wallet::EventStreamStart>,
+        ) -> Result<tonic::Response<Self::VisibleChainEventsStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in unit test"))
+        }
+
+        async fn mempool_snapshot(
+            &self,
+            _request: Request<wallet::MempoolSnapshotRequest>,
+        ) -> Result<tonic::Response<wallet::MempoolSnapshotResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in unit test"))
+        }
+
+        async fn mempool_transaction(
+            &self,
+            _request: Request<MempoolTransactionRequest>,
+        ) -> Result<tonic::Response<wallet::TransactionStatusResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in unit test"))
+        }
+
+        async fn mempool_events(
+            &self,
+            _request: Request<wallet::MempoolEventsRequest>,
+        ) -> Result<tonic::Response<Self::MempoolEventsStream>, tonic::Status> {
+            let closed_sender = self.closed_sender.lock().take();
+            Ok(tonic::Response::new(Box::pin(DropSignalStream {
+                closed_sender,
+            })))
+        }
+
+        async fn chain_value_pools_at_tip(
+            &self,
+            _request: Request<wallet::ChainValuePoolsAtTipRequest>,
+        ) -> Result<tonic::Response<wallet::ChainValuePoolsAtTipResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in unit test"))
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_mempool_events_stream_releases_idle_ingest_control_subscription()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        let service = IdleMempoolEventsServer {
+            closed_sender: parking_lot::Mutex::new(Some(closed_sender)),
+        };
+        let server_cancel = CancellationToken::new();
+        let shutdown_signal = server_cancel.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    zinder_proto::v1::ingest::ingest_control_server::IngestControlServer::new(
+                        service,
+                    ),
+                )
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    shutdown_signal.cancelled_owned(),
+                )
+                .await
+        });
+
+        let surface = IngestControlMempoolSurface::new(endpoint);
+        let mut events = surface.mempool_events(None).await?;
+        let pending_poll = tokio::time::timeout(
+            Duration::from_millis(50),
+            tokio_stream::StreamExt::next(&mut events),
+        )
+        .await;
+        assert!(pending_poll.is_err(), "idle stream must stay pending");
+
+        drop(events);
+
+        let release_outcome =
+            tokio::time::timeout(Duration::from_millis(500), closed_receiver).await;
+        server_cancel.cancel();
+        let _ = server.await;
+        release_outcome??;
+        Ok(())
+    }
+
+    #[test]
+    fn status_translation_preserves_unsupported_encoding_and_strips_metadata_dumps() {
+        let mut upstream_failure =
+            tonic::Status::unavailable("ingest-control internal transport reset");
+        upstream_failure.metadata_mut().insert(
+            "x-private-header",
+            tonic::metadata::MetadataValue::from_static("internal-token-hint"),
+        );
+        let mapped = mempool_surface_error_from_status("snapshot", &upstream_failure);
+        assert!(
+            matches!(
+                &mapped,
+                MempoolSurfaceError::Unavailable { reason }
+                    if reason == "live mempool snapshot is unavailable"
+                        && !reason.contains("ingest-control")
+                        && !reason.contains("MetadataMap")
+                        && !reason.contains("internal-token-hint")
+            ),
+            "unexpected mapped error: {mapped:?}"
+        );
+
+        let typed_encoding_failure = zinder_proto::status_for_reason(
+            ErrorReason::UnsupportedWalletEncoding,
+            "mempool entry exceeds gRPC response budget",
+        );
+        let mapped_encoding =
+            mempool_surface_error_from_status("snapshot", &typed_encoding_failure);
+        assert!(
+            matches!(
+                &mapped_encoding,
+                MempoolSurfaceError::UnsupportedEncoding { reason }
+                    if reason == "mempool entry exceeds gRPC response budget"
+            ),
+            "unexpected encoding error: {mapped_encoding:?}"
+        );
     }
 }

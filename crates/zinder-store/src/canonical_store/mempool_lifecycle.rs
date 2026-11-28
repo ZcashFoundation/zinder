@@ -5,9 +5,13 @@
 //! publishes the matching in-memory index transition, so a writer restart can
 //! always recover the event cursor history without reopening the canonical primary.
 
-use std::collections::HashMap;
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use rust_rocksdb::{DB, Direction, IteratorMode, WriteBatch, WriteOptions};
+use tokio::sync::watch;
 use zinder_core::{Network, TransactionId, UnixTimestampMillis};
 
 use crate::{
@@ -28,6 +32,156 @@ pub(super) const MEMPOOL_EVENT_SEQUENCE_KEY: &[u8] = b"mempool_event_sequence_v1
 /// Durable inclusive retention floor for the canonical mempool-event log.
 pub(super) const MEMPOOL_EVENT_RETENTION_FLOOR_KEY: &[u8] = b"mempool_event_retention_floor_v1";
 
+/// Tracks the latest unmatched `Added` sequence per transaction while
+/// maintaining the earliest active addition sequence in `O(log N)`.
+#[derive(Debug, Default)]
+pub(super) struct ActiveAddSequences {
+    by_transaction_id: HashMap<TransactionId, u64>,
+    by_sequence: BTreeSet<(u64, TransactionId)>,
+}
+
+impl ActiveAddSequences {
+    pub(super) fn record_added(&mut self, transaction_id: TransactionId, event_sequence: u64) {
+        if let Some(previous_sequence) = self
+            .by_transaction_id
+            .insert(transaction_id, event_sequence)
+        {
+            self.by_sequence
+                .remove(&(previous_sequence, transaction_id));
+        }
+        self.by_sequence.insert((event_sequence, transaction_id));
+    }
+
+    pub(super) fn record_removed(&mut self, transaction_id: TransactionId) {
+        if let Some(previous_sequence) = self.by_transaction_id.remove(&transaction_id) {
+            self.by_sequence
+                .remove(&(previous_sequence, transaction_id));
+        }
+    }
+
+    pub(super) fn earliest_sequence(&self) -> Option<u64> {
+        self.by_sequence.first().map(|&(sequence, _)| sequence)
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.by_transaction_id.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.by_transaction_id.is_empty()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct MempoolEventReadCounters {
+    event_row_reads: AtomicU64,
+    envelope_decodes: AtomicU64,
+}
+
+impl MempoolEventReadCounters {
+    fn record_event_row_read(&self) {
+        self.event_row_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_envelope_decode(&self) {
+        self.envelope_decodes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> MempoolEventReadCounts {
+        MempoolEventReadCounts {
+            event_row_reads: self.event_row_reads.load(Ordering::Relaxed),
+            envelope_decodes: self.envelope_decodes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Cumulative durable mempool-event row reads and envelope decodes observed
+/// through a [`RocksDbCanonicalStore`] handle.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MempoolEventReadCounts {
+    /// Number of `mempool_event` column-family rows read.
+    pub event_row_reads: u64,
+    /// Number of durable mempool-event envelopes decoded.
+    pub envelope_decodes: u64,
+}
+
+/// Live subscription to monotonic advances of the durable mempool-event head
+/// sequence.
+#[derive(Clone, Debug)]
+pub struct MempoolEventHeadSubscription {
+    head_sequence: watch::Receiver<u64>,
+}
+
+impl MempoolEventHeadSubscription {
+    /// Returns the latest durable mempool-event head sequence observed by this
+    /// subscription, marking it seen.
+    pub fn current_head_sequence(&mut self) -> u64 {
+        *self.head_sequence.borrow_and_update()
+    }
+
+    /// Waits until the durable mempool-event head sequence strictly exceeds
+    /// `sequence`, or returns `None` if the owning store was dropped.
+    pub async fn wait_for_advance_past(&mut self, sequence: u64) -> Option<u64> {
+        self.head_sequence
+            .wait_for(|head| *head > sequence)
+            .await
+            .ok()
+            .map(|head| *head)
+    }
+}
+
+/// Resolved start of a durable mempool-event stream paired with a live
+/// head-advance subscription captured under the same lifecycle lock.
+#[derive(Debug)]
+pub struct CanonicalMempoolEventStreamStart {
+    after_cursor: Option<StreamCursorTokenV1>,
+    after_sequence: u64,
+    head_sequence: u64,
+    head_subscription: MempoolEventHeadSubscription,
+}
+
+impl CanonicalMempoolEventStreamStart {
+    /// Returns the cursor that page reads must resume strictly after.
+    #[must_use]
+    pub const fn after_cursor(&self) -> Option<&StreamCursorTokenV1> {
+        self.after_cursor.as_ref()
+    }
+
+    /// Returns the event sequence matching [`Self::after_cursor`], or `0` when
+    /// resuming from the earliest retained event.
+    #[must_use]
+    pub const fn after_sequence(&self) -> u64 {
+        self.after_sequence
+    }
+
+    /// Returns the durable head sequence observed when the stream opened.
+    #[must_use]
+    pub const fn head_sequence(&self) -> u64 {
+        self.head_sequence
+    }
+
+    /// Unpacks the resume cursor, starting sequence, initial durable head
+    /// sequence, and live head-advance subscription.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        Option<StreamCursorTokenV1>,
+        u64,
+        u64,
+        MempoolEventHeadSubscription,
+    ) {
+        (
+            self.after_cursor,
+            self.after_sequence,
+            self.head_sequence,
+            self.head_subscription,
+        )
+    }
+}
+
 /// Process-local progress for one resumable bounded retention scan.
 ///
 /// Losing this state on restart is safe: the durable floor remains the source
@@ -37,11 +191,22 @@ pub(super) struct MempoolEventRetentionProgress {
     expected_floor: u64,
     captured_head: u64,
     next_sequence: u64,
-    active_add_sequences: HashMap<TransactionId, u64>,
+    active_add_sequences: ActiveAddSequences,
     observed_at: UnixTimestampMillis,
     retention: MempoolEventRetentionConfig,
     prunable_through: u64,
     terminal_stop: Option<MempoolEventRetentionStepStop>,
+}
+
+/// Reads the persisted mempool-event head sequence when opening a READY store.
+pub(super) fn read_initial_mempool_event_sequence(db: &DB) -> Result<u64, CanonicalStoreError> {
+    match read_admission_control_sequence(db, MEMPOOL_EVENT_SEQUENCE_KEY, "head")? {
+        None => Ok(0),
+        Some(0) => Err(CanonicalStoreError::MempoolEventLogInvalid {
+            reason: "mempool event sequence pointer must be absent or nonzero".to_owned(),
+        }),
+        Some(sequence) => Ok(sequence),
+    }
 }
 
 /// Validates the bounded durable mempool-log admission invariant.
@@ -207,7 +372,15 @@ impl RocksDbCanonicalStore {
             batch.put(MEMPOOL_EVENT_RETENTION_FLOOR_KEY, 1_u64.to_be_bytes());
         }
         write_mempool_lifecycle_batch(self, &batch, "mempool event batch append")?;
+        self.mempool_event_head.send_replace(event_sequence);
         Ok(envelopes)
+    }
+
+    /// Returns cumulative durable mempool-event row reads and envelope decodes
+    /// observed through this canonical store handle.
+    #[must_use]
+    pub fn mempool_event_read_counts(&self) -> MempoolEventReadCounts {
+        self.mempool_event_read_counters.snapshot()
     }
 
     /// Reads a bounded page of durable mempool events strictly after its
@@ -257,6 +430,7 @@ impl RocksDbCanonicalStore {
                     operation: "mempool event history scan",
                     source,
                 })?;
+            self.mempool_event_read_counters.record_event_row_read();
             let event_sequence = event_sequence_from_key(&key)?;
             if event_sequence > current_event_sequence || events.len() >= max_events {
                 break;
@@ -294,10 +468,25 @@ impl RocksDbCanonicalStore {
         &self,
         start: &EventStreamStartPosition,
     ) -> Result<Option<StreamCursorTokenV1>, CanonicalStoreError> {
+        Ok(self.open_mempool_event_stream(start)?.after_cursor)
+    }
+
+    /// Resolves a public mempool-event subscription start and captures a
+    /// head-advance subscription under the same lifecycle lock.
+    pub fn open_mempool_event_stream(
+        &self,
+        start: &EventStreamStartPosition,
+    ) -> Result<CanonicalMempoolEventStreamStart, CanonicalStoreError> {
         let _lifecycle_guard = self.lifecycle_lock.lock();
         let current_event_sequence = current_mempool_event_sequence(self)?;
-        match start {
-            EventStreamStartPosition::EarliestRetained => Ok(None),
+        if *self.mempool_event_head.borrow() < current_event_sequence {
+            self.mempool_event_head.send_replace(current_event_sequence);
+        }
+        let head_subscription = MempoolEventHeadSubscription {
+            head_sequence: self.mempool_event_head.subscribe(),
+        };
+        let (after_cursor, after_sequence) = match start {
+            EventStreamStartPosition::EarliestRetained => (None, 0),
             EventStreamStartPosition::AfterCursor(cursor) => {
                 if current_event_sequence == 0 {
                     return Err(CanonicalStoreError::MempoolEventCursorInvalid {
@@ -306,22 +495,29 @@ impl RocksDbCanonicalStore {
                 }
                 let oldest_retained_sequence =
                     mempool_event_retention_floor(self, current_event_sequence)?;
-                let _next = validate_mempool_resume_cursor(
+                let next_sequence = validate_mempool_resume_cursor(
                     self,
                     cursor,
                     current_event_sequence,
                     oldest_retained_sequence,
                 )?;
-                Ok(Some(cursor.clone()))
+                (Some(cursor.clone()), next_sequence.saturating_sub(1))
             }
             EventStreamStartPosition::LiveTail => {
                 if current_event_sequence == 0 {
-                    return Ok(None);
+                    (None, 0)
+                } else {
+                    let envelope = read_mempool_event(self, current_event_sequence)?;
+                    (Some(envelope.cursor), current_event_sequence)
                 }
-                let envelope = read_mempool_event(self, current_event_sequence)?;
-                Ok(Some(envelope.cursor))
             }
-        }
+        };
+        Ok(CanonicalMempoolEventStreamStart {
+            after_cursor,
+            after_sequence,
+            head_sequence: current_event_sequence,
+            head_subscription,
+        })
     }
 
     /// Decodes a snapshot paging cursor or captures the current durable
@@ -446,7 +642,7 @@ impl RocksDbCanonicalStore {
             expected_floor: oldest_retained_sequence,
             captured_head: current_event_sequence,
             next_sequence: oldest_retained_sequence,
-            active_add_sequences: HashMap::new(),
+            active_add_sequences: ActiveAddSequences::default(),
             observed_at: now,
             retention,
             prunable_through: oldest_retained_sequence.saturating_sub(1),
@@ -645,17 +841,17 @@ fn scan_expired_mempool_events(
     reason = "MempoolEvent is non-exhaustive; unrecognized variants must not silently change replay retention."
 )]
 fn update_active_add_sequences(
-    active_add_sequences: &mut HashMap<TransactionId, u64>,
+    active_add_sequences: &mut ActiveAddSequences,
     event_sequence: u64,
     event: &MempoolEvent,
 ) -> Result<(), CanonicalStoreError> {
     match event {
         MempoolEvent::Added { entry } => {
-            active_add_sequences.insert(entry.transaction_id(), event_sequence);
+            active_add_sequences.record_added(entry.transaction_id(), event_sequence);
         }
         MempoolEvent::Invalidated { transaction_id, .. }
         | MempoolEvent::Mined { transaction_id, .. } => {
-            active_add_sequences.remove(transaction_id);
+            active_add_sequences.record_removed(*transaction_id);
         }
         _ => {
             return Err(CanonicalStoreError::MempoolEventLogInvalid {
@@ -669,13 +865,11 @@ fn update_active_add_sequences(
 fn prunable_through(
     latest_inspected_sequence: u64,
     captured_head: u64,
-    active_add_sequences: &HashMap<TransactionId, u64>,
+    active_add_sequences: &ActiveAddSequences,
 ) -> u64 {
     let before_head = latest_inspected_sequence.min(captured_head.saturating_sub(1));
     active_add_sequences
-        .values()
-        .copied()
-        .min()
+        .earliest_sequence()
         .map_or(before_head, |earliest_active_add| {
             before_head.min(earliest_active_add.saturating_sub(1))
         })
@@ -811,14 +1005,16 @@ fn read_encoded_mempool_event(
     event_sequence: u64,
 ) -> Result<Option<Vec<u8>>, CanonicalStoreError> {
     let event_family = column_family(&store.bounded_open.db, MEMPOOL_EVENT_COLUMN_FAMILY)?;
-    store
+    let encoded_event = store
         .bounded_open
         .db
         .get_cf(&event_family, event_sequence.to_be_bytes())
         .map_err(|source| CanonicalStoreError::RocksDbOperation {
             operation: "mempool event read",
             source,
-        })
+        })?;
+    store.mempool_event_read_counters.record_event_row_read();
+    Ok(encoded_event)
 }
 
 fn decode_mempool_event(
@@ -826,6 +1022,7 @@ fn decode_mempool_event(
     event_sequence: u64,
     encoded_event: &[u8],
 ) -> Result<MempoolEventEnvelope, CanonicalStoreError> {
+    store.mempool_event_read_counters.record_envelope_decode();
     let envelope = decode_mempool_event_envelope(
         &StoreKey::mempool_event(event_sequence),
         encoded_event,

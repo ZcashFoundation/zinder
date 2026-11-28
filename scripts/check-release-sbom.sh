@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -s "$sbom" && -s "$archive" && -n "$version" && "$commit" =~ ^[0-9a-f]{40}$ ]] || usage
 case "$platform" in
-  x86_64-v3-unknown-linux-gnu|aarch64-unknown-linux-gnu) ;;
+  x86_64-v3-unknown-linux-gnu|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin) ;;
   *) usage ;;
 esac
 expected_sbom_name="zinder-${version}-${platform}.spdx.json"
@@ -76,23 +76,15 @@ jq -e \
       and any(.externalRefs[]?; .referenceType == "zinder:source-commit" and .referenceLocator == $commit)
     )
     and ([.packages[] | select(.SPDXID | startswith("SPDXRef-Binary-")) | .name] | sort) == [
-      "zinder-compat-lightwalletd",
-      "zinder-explorer",
-      "zinder-ingest",
-      "zinder-projector",
-      "zinder-query"
+      "zinder"
     ]
     and ([.files[].fileName] | sort) == [
-      "./bin/zinder-compat-lightwalletd",
-      "./bin/zinder-explorer",
-      "./bin/zinder-ingest",
-      "./bin/zinder-projector",
-      "./bin/zinder-query"
+      "./bin/zinder"
     ]
     and any(.packages[]; .name == "rust-librocksdb-sys" and .versionInfo == $rocksdb_version)
     and any(.packages[]; any(.externalRefs[]?; .referenceType == "purl" and (.referenceLocator | startswith("pkg:cargo/"))))
     and all(.packages[];
-      (.name | test("^zinder-(bench|testkit|proto-codegen|compat-cipherscan)$"; "i") | not)
+      (.name | test("^zinder-(bench|testkit|proto-codegen)$"; "i") | not)
     )
   ' "$sbom" >/dev/null
 

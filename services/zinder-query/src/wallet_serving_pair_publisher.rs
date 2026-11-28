@@ -3,12 +3,17 @@
 //! Each reader runtime owns no canonical or wallet primary handle. It catches
 //! up only an inactive generation, authenticates that generation against the
 //! canonical writer control plane, and atomically publishes it as one
-//! immutable canonical/wallet pair. A replaced pair keeps answering reads
-//! pinned to its chain epoch for one retention window, however fast later
-//! blocks arrive: while every spare generation still holds such a pair, the
+//! immutable canonical/wallet pair. A replaced pair that a request observed,
+//! because a response could expose its chain epoch, keeps answering reads
+//! pinned to that epoch for one retention window, however fast later blocks
+//! arrive: while every spare generation still holds such a pair, the
 //! publisher publishes nothing and then publishes the writer's latest fence,
-//! so blocks in a burst share one publication. Each generation stays
-//! frozen until every in-flight request has dropped its captured pair `Arc`;
+//! so blocks in a burst share one publication. A replaced pair that no
+//! request observed is released at once, so a burst of blocks that no request
+//! observes does not wait on the retention window. Requests still holding
+//! such a pair can delay reuse of its generation until they drop it. Each
+//! generation stays frozen until every in-flight request has dropped its
+//! captured pair `Arc`;
 //! the publisher then catches that same open generation up for a later
 //! publication, so a slot is opened cold only on its first use or after a
 //! failed catch-up. A request that holds an old pair for a long time pins
@@ -51,7 +56,7 @@ use tokio::{
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
-use zinder_core::{ChainEpochId, Network, UnixTimestampMillis};
+use zinder_core::{ChainEpochId, Network};
 use zinder_proto::{
     v1::{
         ingest::{
@@ -76,21 +81,61 @@ use zinder_source::{
     UpstreamHealthSnapshot,
 };
 use zinder_store::{
-    CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
-    RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbInstanceMemory,
-    RocksDbOpenResources, RocksDbResourceBudget, SharedBlockCache, StoreRole,
-    record_instance_memory_gauges, record_shared_block_cache_gauges,
+    CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError,
+    CanonicalStoreRequirements, CanonicalStoredSet, ResourceGaugeThrottle,
+    RocksDbCanonicalSecondary, RocksDbInstanceMemory, RocksDbOpenResources, RocksDbResourceBudget,
+    SharedSecondaryResources, StoreRole, record_instance_memory_gauges,
 };
 use zinder_wallet_projection::WalletCanonicalSourceIdentity;
 use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
 
-/// How long a replaced pair keeps answering reads pinned to its epoch.
+/// How long a replaced pair that a request observed keeps answering reads
+/// pinned to its epoch.
 ///
 /// The window is a guarantee as well as a bound. Publication never releases
-/// a replaced pair before its window ends, so a pin on its epoch is answered
-/// for exactly this long after the pair was replaced, however many blocks
-/// arrive meanwhile.
-const RETAINED_PAIR_WINDOW: Duration = Duration::from_mins(1);
+/// an observed replaced pair before its window ends, so a pin on its epoch is
+/// answered for exactly this long after the pair was replaced, however many
+/// blocks arrive meanwhile. A pair no request observed has no pin to answer,
+/// so publication releases it at once.
+#[cfg(test)]
+const RETAINED_PAIR_WINDOW: Duration = Duration::from_secs(EpochPinRetention::MIN_SECONDS);
+
+/// Duration for which a replaced serving pair remains available to epoch pins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EpochPinRetention(u64);
+
+impl EpochPinRetention {
+    /// Minimum retention, in seconds.
+    pub const MIN_SECONDS: u64 = 60;
+    /// Maximum retention, in seconds.
+    pub const MAX_SECONDS: u64 = 300;
+
+    /// Accepts an epoch pin window within the supported bounds.
+    #[must_use]
+    pub const fn from_seconds(seconds: u64) -> Option<Self> {
+        if seconds >= Self::MIN_SECONDS && seconds <= Self::MAX_SECONDS {
+            Some(Self(seconds))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the retention window in seconds.
+    #[must_use]
+    pub const fn seconds(self) -> u64 {
+        self.0
+    }
+
+    const fn duration(self) -> Duration {
+        Duration::from_secs(self.0)
+    }
+}
+
+impl Default for EpochPinRetention {
+    fn default() -> Self {
+        Self(Self::MIN_SECONDS)
+    }
+}
 /// Longest a request may keep reading a pair after the publisher released it.
 ///
 /// Past this bound the publisher revokes reads on the pair, so a slow or
@@ -115,6 +160,7 @@ const SECONDARY_GENERATION_COUNT: usize = 4;
 /// the read then fails, retryably, and later reads use the replacement.
 const MISSING_TABLE_FILE_REPLACEMENT_WAIT: Duration = Duration::from_secs(5);
 const CONVERGENCE_RETRY_DELAY_CAP: Duration = Duration::from_millis(100);
+const STORED_SET_RETRY_DELAY: Duration = Duration::from_secs(30);
 const READINESS_REASON_MAX_BYTES: usize = 256;
 
 /// Immutable configuration for the bounded secondary-pair lifecycle.
@@ -132,8 +178,8 @@ pub struct WalletServingPairConfig {
     /// generation adopts the network-upgrade schedule the canonical writer
     /// admitted for this network.
     pub network: Network,
-    /// Persisted raw-blob retention every published canonical pair must attest.
-    pub expected_raw_blob_retention: RawBlobRetention,
+    /// Minimum persisted data and historical coverage for each canonical secondary.
+    pub canonical_requirements: CanonicalStoreRequirements,
     /// Canonical replacement-depth identity expected from the writer.
     pub canonical_reorg_policy: CanonicalReorgPolicy,
     /// `RocksDB` budget for each canonical secondary generation. Its
@@ -146,11 +192,9 @@ pub struct WalletServingPairConfig {
     pub wallet_resource_budget: RocksDbResourceBudget,
     /// Delay between refresh attempts after initial publication.
     pub catchup_interval: Duration,
-    /// Maximum wall time allowed for pair convergence. Bootstrap also waits up
-    /// to this long for the canonical writer's first schedule admission.
+    /// Maximum wall time allowed for pair convergence.
     pub convergence_timeout: Duration,
-    /// Maximum catch-up attempts allowed for pair convergence. Rounds that
-    /// wait for the writer's first schedule admission do not count.
+    /// Maximum catch-up attempts allowed for pair convergence.
     pub convergence_attempts: NonZeroU8,
     /// Writer lag tolerated before readiness fails.
     pub replica_lag_threshold_chain_epochs: u64,
@@ -158,6 +202,8 @@ pub struct WalletServingPairConfig {
     /// attestation. Past it the transient warning gives way to the fail-closed
     /// cause the failure would otherwise have raised.
     pub serving_pair_staleness_ceiling: Duration,
+    /// Retention after an observed epoch is replaced.
+    pub epoch_pin_retention: EpochPinRetention,
 }
 
 /// Read-only handle to the currently published wallet-serving pair.
@@ -167,12 +213,20 @@ pub struct WalletServingPairConfig {
 /// the storage evidence used to derive endpoint capabilities stable for the
 /// lifetime of a composed query.
 ///
-/// Each replaced pair keeps answering reads pinned to its chain epoch for one
-/// minute after it was replaced, however many pairs are published meanwhile.
+/// Each replaced pair that a request may have exposed to a client keeps
+/// answering reads pinned to its chain epoch for the configured retention
+/// window after replacement, however many pairs are published meanwhile. A replaced pair that
+/// no request exposed is released at once, because no pin can name it.
 #[derive(Clone)]
 pub struct WalletServingPairSlot {
     published: Arc<ArcSwap<PublishedPairs>>,
+    epoch_pin_retention: EpochPinRetention,
     signals: Arc<SlotSignals>,
+    /// Orders the first observation of a pair against its replacement.
+    ///
+    /// Held only for the once-per-pair observation and for a publication, so
+    /// a request that finds its pair already observed never takes it.
+    observation: Arc<Mutex<()>>,
 }
 
 /// Wake-ups exchanged between the requests reading a slot and its publisher.
@@ -199,8 +253,40 @@ struct RetainedPair {
 }
 
 impl RetainedPair {
-    fn is_within_window(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.replaced_at) < RETAINED_PAIR_WINDOW
+    fn is_within_window(&self, now: Instant, retention: EpochPinRetention) -> bool {
+        now.saturating_duration_since(self.replaced_at) < retention.duration()
+    }
+}
+
+impl PublishedPairs {
+    /// Reports whether the current pair answers `chain_epoch_id`.
+    fn serves(&self, chain_epoch_id: ChainEpochId) -> bool {
+        self.current.canonical_fence().chain_epoch_id() == chain_epoch_id
+    }
+
+    /// Returns the pair that answers a pin on `chain_epoch_id` at `now`: the
+    /// current pair, else a retained pair inside its window without a missing
+    /// table file, else the current pair at another epoch.
+    fn pinned_pair(
+        &self,
+        chain_epoch_id: ChainEpochId,
+        now: Instant,
+        retention: EpochPinRetention,
+    ) -> Arc<WalletServingReadPair> {
+        if self.serves(chain_epoch_id) {
+            return Arc::clone(&self.current);
+        }
+        self.retained
+            .iter()
+            .find(|retained| {
+                retained.is_within_window(now, retention)
+                    && !retained.pair.has_missing_table_file()
+                    && retained.pair.canonical_fence().chain_epoch_id() == chain_epoch_id
+            })
+            .map_or_else(
+                || Arc::clone(&self.current),
+                |retained| Arc::clone(&retained.pair),
+            )
     }
 }
 
@@ -223,7 +309,15 @@ impl WalletServingPairSlot {
     /// [`WalletServingPairPublisher`].
     #[must_use]
     pub fn new(initial_pair: Arc<WalletServingReadPair>) -> Self {
+        Self::with_retention(initial_pair, EpochPinRetention::default())
+    }
+
+    fn with_retention(
+        initial_pair: Arc<WalletServingReadPair>,
+        epoch_pin_retention: EpochPinRetention,
+    ) -> Self {
         Self {
+            epoch_pin_retention,
             published: Arc::new(ArcSwap::from_pointee(PublishedPairs {
                 current: initial_pair,
                 retained: Vec::new(),
@@ -232,47 +326,108 @@ impl WalletServingPairSlot {
                 missing_table_file: Notify::new(),
                 publication: watch::Sender::new(()),
             }),
+            observation: Arc::new(Mutex::new(())),
         }
     }
 
-    /// Captures the exact pair to retain for one request.
+    /// Captures the exact pair to retain for one request, and keeps that pair
+    /// readable for pins after it is replaced.
+    ///
+    /// Use this when the response can expose the pair's chain epoch, or the
+    /// request reads the pair again by that epoch. A request that only needs
+    /// the current pair's data captures it with [`Self::capture_ephemeral`].
     #[must_use]
     pub fn capture(&self) -> Arc<WalletServingReadPair> {
+        let published = self.published.load();
+        if published.current.is_observed_for_epoch_pin() {
+            return Arc::clone(&published.current);
+        }
+        drop(published);
+        // Under the lock no publication runs, so the pair marked here is the
+        // current pair at that moment and its replacement sees the mark.
+        let _observation = self.observation.lock();
+        let published = self.published.load();
+        published.current.mark_observed_for_epoch_pin();
+        Arc::clone(&published.current)
+    }
+
+    /// Captures the current pair for a read whose response exposes no chain
+    /// epoch and which no later read continues by epoch.
+    ///
+    /// The pair is not kept readable for pins once it is replaced, unless
+    /// another request captured it with [`Self::capture`], so such reads never
+    /// hold a generation through the retention window. Taking it never waits
+    /// for a publication.
+    #[must_use]
+    pub fn capture_ephemeral(&self) -> Arc<WalletServingReadPair> {
         Arc::clone(&self.published.load().current)
+    }
+
+    /// Runs a synchronous, non-pinning read against the currently published
+    /// pair without cloning or dropping its `Arc` reference count.
+    pub(crate) fn with_ephemeral<Output>(
+        &self,
+        read: impl FnOnce(&Arc<WalletServingReadPair>) -> Output,
+    ) -> Output {
+        let published = self.published.load();
+        read(&published.current)
+    }
+
+    /// Subscribes to the slot's publications.
+    ///
+    /// The receiver reports a change for every pair published after this
+    /// call, so a caller that subscribes before it reads the current pair
+    /// cannot miss the publication that replaces it. Holding the receiver
+    /// holds no pair.
+    #[must_use]
+    pub fn subscribe_publications(&self) -> watch::Receiver<()> {
+        self.signals.publication.subscribe()
+    }
+
+    /// Reports whether `candidate` still names the currently published pair.
+    #[must_use]
+    pub(crate) fn is_current_weak(&self, candidate: &Weak<WalletServingReadPair>) -> bool {
+        std::ptr::eq(
+            candidate.as_ptr(),
+            Arc::as_ptr(&self.published.load().current),
+        )
     }
 
     /// Captures the pair that answers a read pinned to `chain_epoch_id`.
     ///
     /// A retained pair answers a pin that names its epoch until its retention
     /// window ends, even before the publisher releases it, unless a read
-    /// found one of its table files missing. Every other pin, and an absent
-    /// one, captures the current pair, so the caller's epoch check still
-    /// reports a pin that no pair serves.
+    /// found one of its table files missing. Every other pin captures the
+    /// current pair, so the caller's epoch check still reports a pin that no
+    /// pair serves.
+    ///
+    /// An absent pin captures as [`Self::capture`] does, because the response
+    /// exposes the epoch of the pair it answers. A pin that the current pair
+    /// answers observes that pair too, because the caller holds its epoch
+    /// from some response, perhaps one of another replica, and may pin it
+    /// again after the pair is replaced.
     #[must_use]
     pub(crate) fn capture_at(
         &self,
         chain_epoch_id: Option<ChainEpochId>,
     ) -> Arc<WalletServingReadPair> {
-        let published = self.published.load();
-        let serves = |pair: &WalletServingReadPair| {
-            chain_epoch_id.is_some_and(|id| pair.canonical_fence().chain_epoch_id() == id)
+        let Some(chain_epoch_id) = chain_epoch_id else {
+            return self.capture();
         };
-        if serves(&published.current) {
-            return Arc::clone(&published.current);
+        let published = self.published.load();
+        if !published.serves(chain_epoch_id) || published.current.is_observed_for_epoch_pin() {
+            return published.pinned_pair(chain_epoch_id, Instant::now(), self.epoch_pin_retention);
         }
-        let now = Instant::now();
-        published
-            .retained
-            .iter()
-            .find(|retained| {
-                retained.is_within_window(now)
-                    && !retained.pair.has_missing_table_file()
-                    && serves(&retained.pair)
-            })
-            .map_or_else(
-                || Arc::clone(&published.current),
-                |retained| Arc::clone(&retained.pair),
-            )
+        drop(published);
+        // A publication may have replaced the pair before the lock was taken,
+        // so the pin is selected again from the pairs published under it.
+        let _observation = self.observation.lock();
+        let published = self.published.load();
+        let pair = published.pinned_pair(chain_epoch_id, Instant::now(), self.epoch_pin_retention);
+        if Arc::ptr_eq(&pair, &published.current) && published.serves(chain_epoch_id) {
+            pair.mark_observed_for_epoch_pin();
+        }
+        pair
     }
 
     /// Makes `pair` current as the publisher would, for tests outside this
@@ -286,20 +441,25 @@ impl WalletServingPairSlot {
         self.published.load().retained.len()
     }
 
-    /// Makes `pair` current and retains the pair it replaces.
+    /// Makes `pair` current and retains the pair it replaces if a request
+    /// observed it.
     ///
-    /// Returns the pairs that leave the slot: retained pairs at `pair`'s
-    /// epoch, which `pair` now answers, and pairs missing a table file. A
-    /// schedule revision or a replacement for a pair missing a table file
-    /// republishes the current epoch, so the pair it replaces leaves at once
-    /// instead of keeping a generation that no pin can reach. Every other
-    /// retained pair stays until its window ends. Only the publisher writes
-    /// the slot, so the load and store below cannot race another publication.
+    /// Returns the pairs that leave the slot: the replaced pair when no
+    /// request observed it, retained pairs at `pair`'s epoch, which `pair` now
+    /// answers, and pairs missing a table file. A schedule revision or a
+    /// replacement for a pair missing a table file republishes the current
+    /// epoch, so the pair it replaces leaves at once instead of keeping a
+    /// generation that no pin can reach. The republished pair inherits the
+    /// observation of the pairs it replaces, because a client that received
+    /// the epoch may still pin it. Every other observed pair stays until its
+    /// window ends. Only the publisher writes the slot, so the load and store
+    /// below cannot race another publication.
     fn publish(
         &self,
         pair: Arc<WalletServingReadPair>,
         replaced_at: Instant,
     ) -> Vec<Arc<WalletServingReadPair>> {
+        let observation = self.observation.lock();
         let previous = self.published.load_full();
         let chain_epoch_id = pair.canonical_fence().chain_epoch_id();
         let (released, retained): (Vec<_>, Vec<_>) = std::iter::once(RetainedPair {
@@ -310,22 +470,30 @@ impl WalletServingPairSlot {
         .partition(|retained| {
             retained.pair.canonical_fence().chain_epoch_id() == chain_epoch_id
                 || retained.pair.has_missing_table_file()
+                || !retained.pair.is_observed_for_epoch_pin()
         });
+        if released.iter().any(|released| {
+            released.pair.canonical_fence().chain_epoch_id() == chain_epoch_id
+                && released.pair.is_observed_for_epoch_pin()
+        }) {
+            pair.mark_observed_for_epoch_pin();
+        }
         self.published.store(Arc::new(PublishedPairs {
             current: pair,
             retained,
         }));
+        drop(observation);
         self.signals.publication.send_replace(());
         released.into_iter().map(|released| released.pair).collect()
     }
 
-    /// Releases the retained pairs replaced at least [`RETAINED_PAIR_WINDOW`]
-    /// before `now`, and those missing a table file, returning them.
+    /// Releases retained pairs whose window has ended and those missing a table file.
     fn release_expired(&self, now: Instant) -> Vec<Arc<WalletServingReadPair>> {
         let previous = self.published.load_full();
         let (retained, expired): (Vec<_>, Vec<_>) =
             previous.retained.iter().cloned().partition(|retained| {
-                retained.is_within_window(now) && !retained.pair.has_missing_table_file()
+                retained.is_within_window(now, self.epoch_pin_retention)
+                    && !retained.pair.has_missing_table_file()
             });
         if expired.is_empty() {
             return Vec::new();
@@ -367,24 +535,28 @@ impl WalletServingPairSlot {
     }
 
     /// Reports `pair` as missing a table file and waits, for at most
-    /// [`MISSING_TABLE_FILE_REPLACEMENT_WAIT`], for a pair that answers
-    /// `chain_epoch_id` without that mark.
+    /// [`MISSING_TABLE_FILE_REPLACEMENT_WAIT`], for `capture` to return a pair
+    /// without that mark.
     ///
-    /// Returns `None` when no such pair is published in time. A pin whose
-    /// epoch only the marked pair served gets the current pair, at another
-    /// epoch, so the caller's epoch check refuses it.
+    /// `capture` selects the replacement the way the read selected `pair`,
+    /// with [`Self::capture_at`] for a read that observes its pair and
+    /// [`Self::capture_ephemeral`] for one that does not, so recovery never
+    /// changes whether the replacement is retained. Returns `None` when no
+    /// unmarked pair is published in time. A pin whose epoch only the marked
+    /// pair served gets the current pair, at another epoch, so the caller's
+    /// epoch check refuses it.
     pub(crate) async fn replace_missing_table_file_pair(
         &self,
         pair: Arc<WalletServingReadPair>,
         error: &crate::QueryError,
-        chain_epoch_id: Option<ChainEpochId>,
+        capture: impl Fn() -> Arc<WalletServingReadPair>,
     ) -> Option<Arc<WalletServingReadPair>> {
         let mut publications = self.signals.publication.subscribe();
         self.report_missing_table_file(&pair, error);
         drop(pair);
         let deadline = Instant::now() + MISSING_TABLE_FILE_REPLACEMENT_WAIT;
         loop {
-            let replacement = self.capture_at(chain_epoch_id);
+            let replacement = capture();
             if !replacement.has_missing_table_file() {
                 return Some(replacement);
             }
@@ -426,6 +598,7 @@ pub struct WalletServingReadiness {
 struct IngestControlInput {
     observed: ReadinessCause,
     unadopted_halt: Option<ReorgWindowExceededDetail>,
+    awaiting_writer_attestation: bool,
 }
 
 impl IngestControlInput {
@@ -463,7 +636,40 @@ impl WalletServingReadiness {
             ingest_control: Arc::new(Mutex::new(IngestControlInput {
                 observed: ReadinessCause::Starting,
                 unadopted_halt: None,
+                awaiting_writer_attestation: false,
             })),
+        }
+    }
+
+    /// Returns the shared admission for the storage publisher and its stale deadline.
+    #[must_use]
+    pub const fn canonical_admission(&self) -> &ComposedReadiness {
+        &self.composed
+    }
+
+    /// Hands a latched ingest halt to the canonical publisher before its writer-status read.
+    pub fn begin_canonical_refresh(&self, writer: &mut WriterAttestation, height: u32) {
+        let mut input = self.ingest_control.lock();
+        if let Some(halt) = input.unadopted_halt {
+            input.awaiting_writer_attestation = true;
+            drop(input);
+            writer.remember_halt(halt, Some(height));
+        }
+    }
+
+    /// Releases the halt observed before this refresh once the writer attests the served fence.
+    /// A new halt observed during the refresh must wait for the next attestation.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the latest observation and its publication must stay ordered"
+    )]
+    pub fn confirm_canonical_attestation(&self) {
+        let mut input = self.ingest_control.lock();
+        if input.awaiting_writer_attestation {
+            input.unadopted_halt = None;
+            input.awaiting_writer_attestation = false;
+            self.composed
+                .publish_input(ReadinessInput::IngestControl, input.observed.clone());
         }
     }
 
@@ -482,10 +688,10 @@ impl WalletServingReadiness {
         self.composed.publish_admission(pair_state);
     }
 
-    fn publish_served_epoch(&self, committed_at: UnixTimestampMillis) {
+    fn publish_served_epoch(&self, epoch: &zinder_core::ChainEpoch) {
         self.composed
             .runtime_readiness()
-            .set_served_epoch_committed_at(committed_at);
+            .set_served_chain_epoch(epoch);
     }
 
     fn publish_node_source_cause(&self, node_source_cause: ReadinessCause) {
@@ -505,6 +711,9 @@ impl WalletServingReadiness {
         let mut input = self.ingest_control.lock();
         if let Some(halt) = ingest_control_cause.reorg_window_exceeded_detail() {
             input.unadopted_halt = Some(halt);
+            {
+                input.awaiting_writer_attestation = false;
+            }
         }
         input.observed = ingest_control_cause;
         self.composed
@@ -663,7 +872,20 @@ pub fn spawn_wallet_node_readiness_probe<Source>(
 where
     Source: NodeSource + BroadcastNodeProbe,
 {
-    let Some(nodes) = nodes else {
+    let probe =
+        nodes.map(|nodes| WalletNodeProbe::new(nodes, serving_pair_slot, poll_interval, false));
+    spawn_wallet_node_probe(probe, readiness, cancel)
+}
+
+pub(crate) fn spawn_wallet_node_probe<Source>(
+    probe: Option<WalletNodeProbe<Source>>,
+    readiness: WalletServingReadiness,
+    cancel: CancellationToken,
+) -> JoinHandle<()>
+where
+    Source: NodeSource + BroadcastNodeProbe,
+{
+    let Some(probe) = probe else {
         readiness.publish_node_source_cause(ReadinessCause::Ready);
         return tokio::spawn(async move {
             cancel.cancelled().await;
@@ -671,12 +893,6 @@ where
     };
 
     tokio::spawn(async move {
-        let probe = WalletNodeProbe {
-            outcomes: watch::Sender::new(vec![None; nodes.endpoint_count()]),
-            nodes,
-            serving_pair_slot,
-            poll_interval,
-        };
         let verification = futures_util::future::join_all(
             (0..probe.nodes.endpoint_count()).map(|position| probe.keep_verified(position)),
         );
@@ -688,7 +904,8 @@ where
 }
 
 /// The node endpoints one readiness probe verifies and observes.
-struct WalletNodeProbe<Source> {
+pub(crate) struct WalletNodeProbe<Source> {
+    primary_required: bool,
     nodes: OrderedBroadcaster<Source>,
     serving_pair_slot: WalletServingPairSlot,
     poll_interval: Duration,
@@ -701,12 +918,27 @@ impl<Source> WalletNodeProbe<Source>
 where
     Source: NodeSource + BroadcastNodeProbe,
 {
+    pub(crate) fn new(
+        nodes: OrderedBroadcaster<Source>,
+        serving_pair_slot: WalletServingPairSlot,
+        poll_interval: Duration,
+        primary_required: bool,
+    ) -> Self {
+        Self {
+            outcomes: watch::Sender::new(vec![None; nodes.endpoint_count()]),
+            nodes,
+            serving_pair_slot,
+            poll_interval,
+            primary_required,
+        }
+    }
+
     /// Verifies the endpoint at `position` whenever its verification is
     /// due, without waiting on any other endpoint.
     async fn keep_verified(&self, position: usize) {
         let mut publications = self.serving_pair_slot.signals.publication.subscribe();
         loop {
-            let basis = VerificationBasis::of(&self.serving_pair_slot.capture());
+            let basis = VerificationBasis::of(&self.serving_pair_slot.capture_ephemeral());
             let outcome = self
                 .nodes
                 .verify_endpoint(position, &self.serving_pair_slot)
@@ -741,7 +973,7 @@ where
         publications: &mut watch::Receiver<()>,
     ) {
         while publications.changed().await.is_ok() {
-            let pair = self.serving_pair_slot.capture();
+            let pair = self.serving_pair_slot.capture_ephemeral();
             if self.nodes.verification_ended_by(position, basis, &pair) {
                 return;
             }
@@ -766,16 +998,24 @@ where
     }
 
     /// Observes the liveness of the first verified endpoint in broadcast
-    /// preference order that is reachable, or reports why none is verified.
+    /// preference order that is reachable. A query that also needs the
+    /// primary for cold transaction reads observes that endpoint directly.
     ///
     /// Returns `None` while no endpoint is verified and no verification has
     /// ended yet.
     async fn observe(&self) -> Option<Result<UpstreamHealthSnapshot, NodeFailure>> {
         let mut unreachable = None;
-        for (position, source) in self.nodes.verified_endpoints() {
+        for (position, source) in self
+            .nodes
+            .verified_endpoints()
+            .filter(|(position, _)| !self.primary_required || *position == 0)
+        {
             match probe_wallet_node_readiness(source).await {
                 Err(error)
-                    if error.upstream_classification() == SourceFailureClass::NodeUnreachable =>
+                    if matches!(
+                        error.upstream_classification(),
+                        SourceFailureClass::NodeUnreachable | SourceFailureClass::NodeRateLimited
+                    ) =>
                 {
                     unreachable = Some(error);
                 }
@@ -798,12 +1038,18 @@ where
     /// verification ends.
     fn verification_failure(&self) -> Option<NodeFailure> {
         let outcomes = self.outcomes.borrow();
-        if outcomes.iter().all(Option::is_none) {
+        let observed = if self.primary_required {
+            outcomes.first()?.is_some()
+        } else {
+            outcomes.iter().any(Option::is_some)
+        };
+        if !observed {
             return None;
         }
         let failure = self
             .nodes
             .preference_order()
+            .filter(|position| !self.primary_required || *position == 0)
             .find_map(|position| outcomes.get(position)?.as_ref()?.as_ref().err().cloned());
         drop(outcomes);
         Some(failure.unwrap_or_else(|| {
@@ -841,22 +1087,27 @@ fn publish_wallet_node_observation(
     observation: Result<UpstreamHealthSnapshot, NodeFailure>,
     outage: &mut Option<WalletNodeOutage>,
 ) {
+    readiness.publish_node_source_cause(node_observation_cause(observation, outage));
+}
+
+fn node_observation_cause(
+    observation: Result<UpstreamHealthSnapshot, NodeFailure>,
+    outage: &mut Option<WalletNodeOutage>,
+) -> ReadinessCause {
     match observation {
         Ok(snapshot) if snapshot.ready_for_queries => {
             *outage = None;
-            readiness.publish_node_source_cause(ReadinessCause::Ready);
+            ReadinessCause::Ready
         }
         Ok(snapshot) => {
             *outage = None;
-            readiness.publish_node_source_cause(ReadinessCause::UpstreamNotReady(
-                upstream_not_ready_detail(snapshot),
-            ));
+            ReadinessCause::UpstreamNotReady(upstream_not_ready_detail(snapshot))
         }
         Err(NodeFailure::CapabilityMissing(capability)) => {
             *outage = None;
-            readiness.publish_node_source_cause(ReadinessCause::NodeCapabilityMissing {
+            ReadinessCause::NodeCapabilityMissing {
                 capability: capability.name(),
-            });
+            }
         }
         Err(NodeFailure::Unavailable {
             failure_class,
@@ -864,18 +1115,50 @@ fn publish_wallet_node_observation(
         }) => {
             let continued =
                 WalletNodeOutage::continue_with(outage.as_ref(), failure_class, &reason);
-            readiness.publish_node_source_cause(ReadinessCause::NodeUnavailable(
-                continued.detail.clone(),
-            ));
+            let cause = ReadinessCause::NodeUnavailable(continued.detail.clone());
             *outage = Some(continued);
+            cause
         }
+    }
+}
+
+impl crate::LightWalletNodeQuery {
+    /// Probes this endpoint's forwarding admission and health for the node-source dependency.
+    #[must_use]
+    pub fn spawn_node_readiness_probe(
+        self,
+        readiness: WalletServingReadiness,
+        interval: Duration,
+        cancel: CancellationToken,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut outage = None;
+            // Verification and observation use the readiness-probe slot, so
+            // forwarded calls holding every shared slot cannot fail readiness.
+            let probe_node = self.readiness_probe_node();
+            loop {
+                let probe = async {
+                    let node = self.verify_current(&probe_node).await?;
+                    probe_wallet_node_readiness(node).await
+                };
+                let observation = tokio::select! {
+                    () = cancel.cancelled() => break,
+                    observation = probe => observation.map_err(|error| NodeFailure::from(&error)),
+                };
+                publish_wallet_node_observation(&readiness, observation, &mut outage);
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {}
+                }
+            }
+        })
     }
 }
 
 async fn probe_wallet_node_readiness(
     source: &impl NodeSource,
 ) -> Result<UpstreamHealthSnapshot, SourceError> {
-    source.tip_id().await?;
+    source.probe_tip_id().await?;
     source.poll_upstream_health().await
 }
 
@@ -1021,9 +1304,6 @@ pub enum WalletServingConvergence {
     ProjectionBehind,
     /// The admitted networks, canonical fence, or local schema evidence is invalid.
     SchemaOrFenceMismatch,
-    /// The canonical store is READY, but its writer has not admitted a
-    /// network-upgrade schedule for the reader to adopt yet.
-    WriterScheduleNotAdmitted,
 }
 
 impl WalletServingConvergence {
@@ -1032,9 +1312,13 @@ impl WalletServingConvergence {
             Self::ReplicaBehind => "replica_behind",
             Self::ProjectionBehind => "projection_behind",
             Self::SchemaOrFenceMismatch => "schema_or_fence_mismatch",
-            Self::WriterScheduleNotAdmitted => "writer_schedule_not_admitted",
         }
     }
+}
+
+struct GenerationWait {
+    reason: &'static str,
+    since: Instant,
 }
 
 /// Owns the bounded reader generations and their publication slot.
@@ -1043,15 +1327,17 @@ pub struct WalletServingPairPublisher {
     writer_status: CanonicalWriterStatusClient,
     readiness: WalletServingReadiness,
     serving_pair_slot: Option<WalletServingPairSlot>,
+    admitted_stored_set: Option<CanonicalStoredSet>,
+    stored_set_retry_at: Option<Instant>,
     generations: [SecondaryGeneration; SECONDARY_GENERATION_COUNT],
-    /// The block caches every generation opens on. They outlive any one
-    /// generation, so a generation that closes leaves its cached blocks to
-    /// the others and to the next cold open.
-    block_caches: ServingBlockCaches,
+    /// Closing a generation preserves both its cached blocks and its contribution
+    /// to the store's cumulative tickers.
+    store_resources: ServingStoreResources,
     /// Gates the memory sample of the open generations, whose table-cache
     /// lookups are too costly to repeat on every refresh.
     instance_memory_throttle: ResourceGaugeThrottle,
     published_generation: Option<usize>,
+    generation_wait: Option<GenerationWait>,
     /// Trailing references to the pairs released from the slot.
     ///
     /// Holding them makes the publisher the last owner of every released
@@ -1069,6 +1355,8 @@ pub struct WalletServingPairPublisher {
     observed_lag_chain_epochs: u64,
     #[cfg(test)]
     candidate_preparations: CandidatePreparationCounts,
+    #[cfg(test)]
+    metrics_recorder: Option<Arc<metrics_exporter_prometheus::PrometheusRecorder>>,
 }
 
 impl WalletServingPairPublisher {
@@ -1110,9 +1398,9 @@ impl WalletServingPairPublisher {
     ) -> Result<(Self, WalletServingPairSlot), WalletServingPairError> {
         let generations =
             std::array::from_fn(|generation| SecondaryGeneration::new(&config, generation));
-        let block_caches = ServingBlockCaches {
-            canonical: SharedBlockCache::new(config.canonical_resource_budget.block_cache_bytes),
-            wallet: SharedBlockCache::new(config.wallet_resource_budget.block_cache_bytes),
+        let store_resources = ServingStoreResources {
+            canonical: SharedSecondaryResources::new(config.canonical_resource_budget),
+            wallet: SharedSecondaryResources::new(config.wallet_resource_budget),
         };
         let writer_attestation =
             WriterAttestation::new(config.network, config.serving_pair_staleness_ceiling);
@@ -1121,17 +1409,22 @@ impl WalletServingPairPublisher {
             writer_status,
             readiness,
             serving_pair_slot: None,
+            admitted_stored_set: None,
+            stored_set_retry_at: None,
             generations,
-            block_caches,
+            store_resources,
             instance_memory_throttle: ResourceGaugeThrottle::for_instance_memory(),
             published_generation: None,
+            generation_wait: None,
             retired_pairs: Vec::with_capacity(SECONDARY_GENERATION_COUNT),
             writer_attestation,
             observed_lag_chain_epochs: 0,
             #[cfg(test)]
             candidate_preparations: CandidatePreparationCounts::default(),
+            #[cfg(test)]
+            metrics_recorder: None,
         };
-        publisher.prepare_candidate_awaiting_schedule(0).await?;
+        publisher.prepare_candidate(0).await?;
         publisher.converge_and_publish(0).await?;
         publisher.record_resource_gauges().await;
         let Some(serving_pair_slot) = publisher.serving_pair_slot.clone() else {
@@ -1181,6 +1474,7 @@ impl WalletServingPairPublisher {
                 }
                 self.refresh_within_staleness_ceiling().await;
             }
+            self.end_generation_wait("interrupted");
             serving_runtime_drained.cancelled().await;
             tear_down_on_blocking_thread(self).await
         })
@@ -1197,8 +1491,17 @@ impl WalletServingPairPublisher {
 
     async fn refresh_and_record(&mut self) {
         let refreshed = self.refresh_once().await;
+        if refreshed.is_err() {
+            self.end_generation_wait("interrupted");
+        }
         self.record_resource_gauges().await;
         let Err(error) = refreshed else {
+            metrics::counter!(
+                "zinder_wallet_serving_pair_publisher_refresh_total",
+                "status" => "ok",
+                "error_class" => "none"
+            )
+            .increment(1);
             return;
         };
         let still_admitted = self.record_refresh_failure(&error);
@@ -1234,7 +1537,7 @@ impl WalletServingPairPublisher {
             .serving_pair_slot
             .as_ref()
             .ok_or(WalletServingPairError::PairSlotUnavailable)?;
-        let active_pair = serving_pair_slot.capture();
+        let active_pair = serving_pair_slot.capture_ephemeral();
         self.adopt_ingest_control_halt(&active_pair);
         let writer_status = self.writer_status.fetch().await?;
         let relation = self.update_active_readiness(&active_pair, &writer_status)?;
@@ -1242,32 +1545,58 @@ impl WalletServingPairPublisher {
         // when that fence has not moved.
         let replaces_active_pair = active_pair.has_missing_table_file();
         drop(active_pair);
-        match relation {
-            ActiveWriterRelation::Exact if !replaces_active_pair => return Ok(()),
-            ActiveWriterRelation::Refusing => return Ok(()),
-            ActiveWriterRelation::Exact | ActiveWriterRelation::Behind => {}
+        let needs_generation = match relation {
+            ActiveWriterRelation::Exact => replaces_active_pair,
+            ActiveWriterRelation::Refusing => false,
+            ActiveWriterRelation::Behind => true,
+        };
+        if !needs_generation {
+            self.end_generation_wait("interrupted");
+            return Ok(());
+        }
+        if self
+            .stored_set_retry_at
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
+            return Ok(());
         }
 
         // Waiting keeps every retained pair pinnable for its whole window. A
         // later refresh publishes the writer's fence at that time, so the
         // blocks that arrive meanwhile share one publication.
+        let fence = writer_status
+            .fence
+            .as_ref()
+            .ok_or_else(|| writer_fence_divergence_error(CanonicalFenceDivergence::MissingFence))?;
         let Some(generation) = self.inactive_generation() else {
-            self.record_generation_wait();
+            self.record_generation_wait(fence);
             return Ok(());
         };
+        self.end_generation_wait("available");
+        tracing::info!(
+            target: "zinder::wallet_serving",
+            event = "wallet_serving_pair_publisher_generation_selected",
+            process_id = std::process::id(),
+            generation,
+            chain_epoch = fence.chain_epoch_id,
+            event_sequence = fence.event_sequence,
+            "selected a secondary generation for the observed writer fence"
+        );
         self.prepare_candidate(generation).await?;
         self.converge_and_publish(generation).await
     }
 
-    /// Publishes the two shared block caches and the number of open
-    /// generations, and once per throttle interval the memory the open
-    /// generations hold outside the caches.
+    /// Publishes shared cache usage, cumulative tickers, and the number of open
+    /// generations, and once per throttle interval the cache composition,
+    /// per-column-family properties of the newest published pair, and the
+    /// memory the open generations hold outside the caches.
     async fn record_resource_gauges(&mut self) {
-        record_shared_block_cache_gauges(
-            StoreRole::CanonicalSecondary,
-            &self.block_caches.canonical,
-        );
-        record_shared_block_cache_gauges(StoreRole::WalletSecondary, &self.block_caches.wallet);
+        self.store_resources
+            .canonical
+            .record_resource_gauges(StoreRole::CanonicalSecondary);
+        self.store_resources
+            .wallet
+            .record_resource_gauges(StoreRole::WalletSecondary);
         let open_generations = self
             .generations
             .iter()
@@ -1281,14 +1610,23 @@ impl WalletServingPairPublisher {
         }
     }
 
-    /// Publishes the memtable and table-reader memory of every open
-    /// generation, summed for each store.
+    /// Publishes cache composition and per-column-family properties for the
+    /// newest published pair, plus the memtable and table-reader memory of
+    /// every open generation summed for each store.
     ///
     /// The sample looks up every table file's reader, so it runs on the
     /// blocking pool. Published readers are shared with that task, and a
     /// candidate moves to it and back as it does for catch-up. A task that
     /// fails drops the candidate, and a later refresh opens its slot cold.
     async fn record_instance_memory(&mut self) {
+        let newest_published = self.published_generation.and_then(|generation| {
+            let SecondaryGenerationState::Published { readers, .. } =
+                &self.generations[generation].state
+            else {
+                return None;
+            };
+            Some((Arc::clone(&readers.canonical), Arc::clone(&readers.wallet)))
+        });
         let published =
             self.generations
                 .iter()
@@ -1309,7 +1647,27 @@ impl WalletServingPairPublisher {
                     .map(|candidate| (generation, candidate))
             })
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        let metrics_recorder = self.metrics_recorder.clone();
         let sampled = tokio::task::spawn_blocking(move || {
+            if let Some((canonical, wallet)) =
+                newest_published.as_ref().or_else(|| published.first())
+            {
+                let record = || {
+                    canonical.record_block_cache_entry_gauges();
+                    canonical.record_column_family_property_gauges();
+                    wallet.record_block_cache_entry_gauges();
+                    wallet.record_column_family_property_gauges();
+                };
+                #[cfg(test)]
+                if let Some(recorder) = metrics_recorder {
+                    metrics::with_local_recorder(recorder.as_ref(), record);
+                } else {
+                    record();
+                }
+                #[cfg(not(test))]
+                record();
+            }
             let canonical = published
                 .iter()
                 .map(|(canonical, _)| canonical.instance_memory())
@@ -1348,7 +1706,7 @@ impl WalletServingPairPublisher {
     /// not ended, so the wait ends by the time that window does at the latest.
     /// `in_flight_requests` means only released pairs that requests still
     /// hold take the slots.
-    fn record_generation_wait(&self) {
+    fn record_generation_wait(&mut self, fence: &CanonicalWriterFence) {
         let reason = if self
             .serving_pair_slot
             .as_ref()
@@ -1363,6 +1721,48 @@ impl WalletServingPairPublisher {
             "reason" => reason
         )
         .increment(1);
+        if self
+            .generation_wait
+            .as_ref()
+            .is_some_and(|wait| wait.reason == reason)
+        {
+            return;
+        }
+        self.end_generation_wait("reason_changed");
+        self.generation_wait = Some(GenerationWait {
+            reason,
+            since: Instant::now(),
+        });
+        tracing::info!(
+            target: "zinder::wallet_serving",
+            event = "wallet_serving_pair_publisher_generation_wait_started",
+            process_id = std::process::id(),
+            reason,
+            chain_epoch = fence.chain_epoch_id,
+            event_sequence = fence.event_sequence,
+            "observed every inactive generation occupied"
+        );
+    }
+
+    fn end_generation_wait(&mut self, outcome: &'static str) {
+        if let Some(wait) = self.generation_wait.take() {
+            let elapsed = wait.since.elapsed();
+            metrics::histogram!(
+                "zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds",
+                "reason" => wait.reason,
+                "outcome" => outcome
+            )
+            .record(elapsed);
+            tracing::info!(
+                target: "zinder::wallet_serving",
+                event = "wallet_serving_pair_publisher_generation_wait_ended",
+                process_id = std::process::id(),
+                reason = wait.reason,
+                outcome,
+                elapsed_seconds = elapsed.as_secs_f64(),
+                "finished observing a generation wait"
+            );
+        }
     }
 
     /// Stops serving pins on retained pairs replaced longer ago than the
@@ -1534,49 +1934,6 @@ impl WalletServingPairPublisher {
         Ok(())
     }
 
-    /// Prepares `generation` as [`Self::prepare_candidate`] does, retrying
-    /// until `convergence_timeout` passes while the canonical writer has not
-    /// admitted its first network-upgrade schedule.
-    ///
-    /// The writer admits that schedule when it first opens the store, which
-    /// can take longer than the convergence attempts allow, so this wait is
-    /// bounded by time alone.
-    async fn prepare_candidate_awaiting_schedule(
-        &mut self,
-        generation: usize,
-    ) -> Result<(), WalletServingPairError> {
-        let deadline = Instant::now() + self.config.convergence_timeout;
-        let retry_delay = self
-            .config
-            .catchup_interval
-            .min(CONVERGENCE_RETRY_DELAY_CAP);
-        let mut waiting_logged = false;
-        loop {
-            match self.prepare_candidate(generation).await {
-                Err(WalletServingPairError::Canonical(
-                    CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
-                )) => {
-                    record_pair_convergence(WalletServingConvergence::WriterScheduleNotAdmitted);
-                    if Instant::now() >= deadline {
-                        return Err(WalletServingPairError::ConvergenceTimedOut {
-                            last_outcome: WalletServingConvergence::WriterScheduleNotAdmitted,
-                        });
-                    }
-                    if !waiting_logged {
-                        tracing::info!(
-                            target: "zinder::wallet_serving",
-                            event = "canonical_schedule_admission_pending",
-                            "waiting for the canonical writer to admit a network-upgrade schedule"
-                        );
-                        waiting_logged = true;
-                    }
-                    tokio::time::sleep(retry_delay).await;
-                }
-                outcome => return outcome,
-            }
-        }
-    }
-
     /// Opens both secondaries of `generation` and runs their full cold
     /// admission against the primaries.
     ///
@@ -1595,15 +1952,9 @@ impl WalletServingPairPublisher {
         let wallet_generation_path = secondary_generation.wallet_generation_path.clone();
         let wallet_secondary_path = secondary_generation.wallet_secondary_path.clone();
         let canonical_reorg_policy = self.config.canonical_reorg_policy;
-        let expected_raw_blob_retention = self.config.expected_raw_blob_retention;
-        let canonical_resources = RocksDbOpenResources::with_shared_block_cache(
-            self.config.canonical_resource_budget,
-            &self.block_caches.canonical,
-        );
-        let wallet_resources = RocksDbOpenResources::with_shared_block_cache(
-            self.config.wallet_resource_budget,
-            &self.block_caches.wallet,
-        );
+        let requirements = self.config.canonical_requirements.clone();
+        let canonical_resources = RocksDbOpenResources::from(&self.store_resources.canonical);
+        let wallet_resources = RocksDbOpenResources::from(&self.store_resources.wallet);
         let network = self.config.network;
         let started_at = Instant::now();
         let opened = tokio::task::spawn_blocking(move || {
@@ -1623,8 +1974,7 @@ impl WalletServingPairPublisher {
                 canonical_primary_path,
                 canonical_secondary_path,
                 network,
-                CanonicalStoreWorkload::Wallet,
-                expected_raw_blob_retention,
+                requirements,
                 canonical_reorg_policy,
                 canonical_resources,
             )?;
@@ -1777,7 +2127,16 @@ impl WalletServingPairPublisher {
         let SecondaryGenerationState::Candidate { candidate } = state else {
             return Err(WalletServingPairError::CandidateUnavailable { generation });
         };
+        let admitted_stored_set = self.admitted_stored_set;
+        if admitted_stored_set.is_some_and(|expected| candidate.canonical.stored_set() != expected)
+        {
+            self.writer_attestation.withdraw_allowance();
+            self.stored_set_retry_at = Some(Instant::now() + STORED_SET_RETRY_DELAY);
+        }
         let (pair, readers) = tokio::task::spawn_blocking(move || {
+            if let Some(expected) = admitted_stored_set {
+                candidate.canonical.require_stored_set(expected)?;
+            }
             let readers = PublishedReaders::new(*candidate);
             let canonical =
                 RocksDbCanonicalReader::new(Arc::clone(&readers.canonical)).map_err(|error| {
@@ -1792,13 +2151,18 @@ impl WalletServingPairPublisher {
         })
         .await
         .map_err(WalletServingPairError::CandidateTask)??;
+        self.stored_set_retry_at = None;
         if let Some(slot) = &self.serving_pair_slot {
             let now = Instant::now();
             let released = slot.publish(Arc::clone(&pair), now);
             record_retained_pair_count(slot);
             self.retire_pairs(released, now);
         } else {
-            self.serving_pair_slot = Some(WalletServingPairSlot::new(Arc::clone(&pair)));
+            self.admitted_stored_set = Some(readers.canonical.stored_set());
+            self.serving_pair_slot = Some(WalletServingPairSlot::with_retention(
+                Arc::clone(&pair),
+                self.config.epoch_pin_retention,
+            ));
         }
         self.generations[generation].state = SecondaryGenerationState::Published {
             lease: GenerationLease::new(&pair),
@@ -1813,8 +2177,7 @@ impl WalletServingPairPublisher {
         if refusal.is_none() {
             self.writer_attestation.attest();
         }
-        self.readiness
-            .publish_served_epoch(pair.chain_epoch().created_at);
+        self.readiness.publish_served_epoch(&pair.chain_epoch());
         self.readiness
             .publish_pair_state(refusal.unwrap_or_else(|| ReadinessState::ready(visible_height)));
         metrics::counter!("zinder_wallet_serving_pair_publisher_publications_total").increment(1);
@@ -1825,6 +2188,9 @@ impl WalletServingPairPublisher {
             chain_epoch = pair.canonical_fence().chain_epoch_id().value(),
             event_sequence = pair.canonical_fence().chain_event_sequence(),
             visible_height = pair.canonical_fence().visible_tip().height.value(),
+            visible_tip_hash = ?pair.canonical_fence().visible_tip().hash,
+            sequence_digest = ?pair.canonical_fence().sequence_digest().as_bytes(),
+            process_id = std::process::id(),
             "published exact immutable canonical and wallet secondary pair"
         );
         Ok(())
@@ -1886,10 +2252,17 @@ impl WalletServingPairPublisher {
                 ) =>
             {
                 record_replica_lag(0);
-                self.writer_attestation.attest();
                 self.observed_lag_chain_epochs = 0;
-                self.readiness
-                    .publish_pair_state(ReadinessState::ready(visible_height));
+                if self.stored_set_retry_at.is_some() && active_pair.has_missing_table_file() {
+                    self.readiness.publish_pair_state(ReadinessState::not_ready(
+                        ReadinessCause::StorageUnavailable,
+                    ));
+                } else {
+                    self.stored_set_retry_at = None;
+                    self.writer_attestation.attest();
+                    self.readiness
+                        .publish_pair_state(ReadinessState::ready(visible_height));
+                }
                 return Ok(ActiveWriterRelation::Exact);
             }
             // A writer restart can admit a new schedule revision without moving
@@ -1905,7 +2278,11 @@ impl WalletServingPairPublisher {
         let lag = behind.lag_chain_epochs;
         record_replica_lag(lag);
         self.observed_lag_chain_epochs = lag;
-        if lag > self.config.replica_lag_threshold_chain_epochs {
+        if self.stored_set_retry_at.is_some() {
+            self.readiness.publish_pair_state(ReadinessState::not_ready(
+                ReadinessCause::StorageUnavailable,
+            ));
+        } else if lag > self.config.replica_lag_threshold_chain_epochs {
             self.readiness.publish_pair_state(
                 self.stale_serving_pair_readiness(visible_height)
                     .unwrap_or_else(|| ReadinessState::replica_lagging(lag, visible_height)),
@@ -1939,7 +2316,7 @@ impl WalletServingPairPublisher {
     fn published_visible_height(&self) -> Option<u32> {
         self.serving_pair_slot.as_ref().map(|serving_pair_slot| {
             serving_pair_slot
-                .capture()
+                .capture_ephemeral()
                 .canonical_fence()
                 .visible_tip()
                 .height
@@ -2029,11 +2406,10 @@ enum ActiveWriterRelation {
     Refusing,
 }
 
-/// The block cache of each store that every generation of one publisher
-/// reads through.
-struct ServingBlockCaches {
-    canonical: SharedBlockCache,
-    wallet: SharedBlockCache,
+/// The cache and statistics of each store shared by all serving generations.
+struct ServingStoreResources {
+    canonical: SharedSecondaryResources,
+    wallet: SharedSecondaryResources,
 }
 
 struct SecondaryGeneration {
@@ -2313,19 +2689,7 @@ impl CanonicalFenceProbe for CandidatePairFenceProbe<'_> {
     type Error = WalletServingPairError;
 
     async fn catch_up(&mut self) -> Result<Option<CanonicalWriterFence>, WalletServingPairError> {
-        // Bootstrap waits for the first schedule before it converges, so a
-        // generation reopened here finds the store's admitted schedule.
-        match self.publisher.prepare_candidate(self.generation).await {
-            Ok(()) => {}
-            Err(WalletServingPairError::Canonical(
-                CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
-            )) => {
-                self.last_outcome = WalletServingConvergence::WriterScheduleNotAdmitted;
-                record_pair_convergence(self.last_outcome);
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        }
+        self.publisher.prepare_candidate(self.generation).await?;
         match self.publisher.catch_up_candidate(self.generation).await? {
             Ok(()) => {
                 self.last_outcome = WalletServingConvergence::ReplicaBehind;
@@ -2474,9 +2838,6 @@ fn refresh_failure_not_ready_cause(error: &WalletServingPairError) -> Option<Rea
             last_outcome: WalletServingConvergence::SchemaOrFenceMismatch,
         } => Some(ReadinessCause::SchemaMismatch),
         WalletServingPairError::ConvergenceTimedOut {
-            last_outcome: WalletServingConvergence::WriterScheduleNotAdmitted,
-        } => Some(ReadinessCause::StorageUnavailable),
-        WalletServingPairError::ConvergenceTimedOut {
             last_outcome:
                 WalletServingConvergence::ReplicaBehind | WalletServingConvergence::ProjectionBehind,
         } => None,
@@ -2515,9 +2876,6 @@ fn wallet_serving_pair_error_class(error: &WalletServingPairError) -> &'static s
         WalletServingPairError::ConvergenceTimedOut {
             last_outcome: WalletServingConvergence::SchemaOrFenceMismatch,
         } => "schema_or_fence_mismatch",
-        WalletServingPairError::ConvergenceTimedOut {
-            last_outcome: WalletServingConvergence::WriterScheduleNotAdmitted,
-        } => "writer_schedule_not_admitted",
         WalletServingPairError::PairPublication(_) => "pair_publication",
     }
 }
@@ -2596,7 +2954,7 @@ mod tests {
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
         CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
-        CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
+        CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreRequirements,
         EventStreamStartPosition, RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalBuilder,
         RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
         StreamCursorTokenV1, event_stream_start_message,
@@ -2837,6 +3195,50 @@ mod tests {
 
     /// A query without a configured node serves storage only, so its node
     /// dependency reports ready and never degrades.
+    #[tokio::test]
+    async fn primary_outage_degrades_cold_reads_while_the_fallback_broadcasts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let primary = MutableHealthSource::new()?;
+        let fallback = MutableHealthSource::new()?;
+        let (slot, _store) = regtest_serving_pair_slot()?;
+        let nodes = crate::OrderedBroadcaster::new(primary.clone(), [fallback.clone()]);
+        nodes.verify(&slot).await?;
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
+        let cancel = CancellationToken::new();
+        let probe = super::WalletNodeProbe::new(nodes, slot, Duration::from_millis(5), true);
+        let handle = super::spawn_wallet_node_probe(Some(probe), readiness, cancel.clone());
+
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+        primary.available.store(false, Ordering::SeqCst);
+        query
+            .broadcast_transaction(zinder_core::RawTransactionBytes::new(vec![0x05; 32]))
+            .await?;
+        assert_eq!(fallback.broadcast_attempts.load(Ordering::SeqCst), 1);
+        wait_for_report(&runtime, |report| {
+            matches!(
+                report.degraded.as_slice(),
+                [zinder_runtime::ReadinessDependency {
+                    input: zinder_runtime::ReadinessInput::NodeSource,
+                    cause: zinder_runtime::ReadinessCause::NodeUnavailable(_),
+                }]
+            )
+        })
+        .await?;
+        let mut gate = zinder_runtime::TrafficReadinessInterceptor::new(runtime.clone());
+        assert!(gate.call(Request::new(())).is_ok());
+
+        primary.available.store(true, Ordering::SeqCst);
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+        cancel.cancel();
+        handle.await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn wallet_node_probe_reports_ready_without_a_configured_node()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3694,7 +4096,7 @@ mod tests {
             AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
                 .await?;
         let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             &admitted_ingest_control,
         );
         let admitted_capabilities = capabilities.clone();
@@ -3832,7 +4234,7 @@ mod tests {
         ])?);
         let activations = Arc::new(sample_regtest_upgrade_activations());
         let chain = ChainFixture::new(Network::ZcashRegtest)
-            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .with_raw_blob_retention(RawBlobRetention::None)
             .extend_blocks(1);
         let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
         let (canonical, wallet) = store.take_readers()?;
@@ -4268,20 +4670,14 @@ mod tests {
         }
     }
 
-    /// A reader brings no activation table of its own: bootstrap waits for
-    /// the writer to admit the store's first schedule and then serves exactly
-    /// that schedule.
-    ///
-    /// The wait is bounded by the convergence timeout, however many attempts
-    /// it takes.
     #[tokio::test(flavor = "multi_thread")]
-    async fn bootstrap_waits_for_the_writers_first_schedule_admission()
+    async fn bootstrap_adopts_the_schedule_from_ready_publication()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let activations = lifecycle_upgrade_activations()?;
         let canonical_primary_path = temporary.path().join("canonical-primary");
         let wallet_primary_path = temporary.path().join("wallet-primary");
-        let mut canonical_primary = build_unadmitted_lifecycle_canonical_primary(
+        let canonical_primary = build_lifecycle_canonical_primary_through(
             &canonical_primary_path,
             &activations,
             BlockHeight::new(1),
@@ -4317,13 +4713,6 @@ mod tests {
             .await
         });
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !bootstrap.is_finished(),
-            "bootstrap must wait for the schedule"
-        );
-        canonical_primary.admit_network_upgrade_schedule(&activations)?;
-        control.set_writer_status(writer_status_for_store(&canonical_primary));
         let (_publisher, slot) = bootstrap.await??;
 
         let pair = slot.capture();
@@ -4335,62 +4724,6 @@ mod tests {
         );
         assert_eq!(pair.network_upgrade_activations(), &activations);
         drop(pair);
-        cancel.cancel();
-        server_task.await??;
-        Ok(())
-    }
-
-    /// A writer that never admits a schedule leaves bootstrap with a typed,
-    /// retryable outcome instead of a reader-supplied table.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn bootstrap_reports_a_store_whose_writer_admitted_no_schedule()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = TempDir::new()?;
-        let activations = lifecycle_upgrade_activations()?;
-        let canonical_primary_path = temporary.path().join("canonical-primary");
-        let wallet_primary_path = temporary.path().join("wallet-primary");
-        let canonical_primary = build_unadmitted_lifecycle_canonical_primary(
-            &canonical_primary_path,
-            &activations,
-            BlockHeight::new(1),
-        )?;
-        build_wallet_from_canonical(
-            &canonical_primary,
-            &wallet_primary_path,
-            RocksDbWalletBuildOptions {
-                supported_reorg_depth: 100,
-                ..RocksDbWalletBuildOptions::for_local_tests()
-            },
-        )?;
-        let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
-        let (endpoint, cancel, server_task) = serve_canonical_control(control).await?;
-
-        let outcome = WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
-            WalletServingPairConfig {
-                convergence_timeout: Duration::from_millis(300),
-                ..wallet_serving_pair_config(
-                    canonical_primary_path.clone(),
-                    temporary.path().join("canonical-secondaries"),
-                    wallet_primary_path.clone(),
-                    temporary.path().join("wallet-secondaries"),
-                )?
-            },
-            WalletServingReadiness::pair_only(zinder_runtime::Readiness::default()),
-            &endpoint,
-            None,
-        )
-        .await;
-
-        assert!(
-            matches!(
-                outcome,
-                Err(WalletServingPairError::ConvergenceTimedOut {
-                    last_outcome: WalletServingConvergence::WriterScheduleNotAdmitted,
-                })
-            ),
-            "unexpected bootstrap outcome: {:?}",
-            outcome.err()
-        );
         cancel.cancel();
         server_task.await??;
         Ok(())
@@ -4696,7 +5029,9 @@ mod tests {
             }
         });
         let config = WalletServingPairConfig {
-            expected_raw_blob_retention: writer.canonical_primary()?.raw_blob_retention(),
+            canonical_requirements: CanonicalStoreRequirements::for_blob_retention(
+                writer.canonical_primary()?.raw_blob_retention(),
+            ),
             ..wallet_serving_pair_config(
                 writer.canonical_primary_path().to_path_buf(),
                 temporary.path().join("canonical-secondaries"),
@@ -5001,8 +5336,7 @@ mod tests {
                 .path()
                 .join("wallet-reconcile-canonical-secondary"),
             &upgraded,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -6212,6 +6546,7 @@ mod tests {
                 start_height: visible_tip.height.value(),
                 end_height: visible_tip.height.value(),
                 at_epoch_id: Some(visible_tip.chain_epoch.id.value()),
+                pool_types: Vec::new(),
             })
             .await?
             .into_inner();
@@ -6293,6 +6628,7 @@ mod tests {
             WALLET_READ_VISIBLE_TIP_BLOCK_V1,
             WALLET_READ_SETTLED_TIP_BLOCK_V1,
             WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
+            WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
             WALLET_READ_COMPACT_BLOCK_AT_V2,
             WALLET_READ_COMPACT_BLOCK_RANGE_V2,
             WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
@@ -6313,14 +6649,6 @@ mod tests {
                 "admitted serving-pair query omitted structural capability {required}"
             );
         }
-        let partially_implemented = WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1;
-        assert!(
-            !advertised
-                .iter()
-                .any(|capability| capability == partially_implemented),
-            "serving-pair query advertised an operation that is not production-admitted: \
-             {partially_implemented}"
-        );
         let (healthy_status, healthy_healthz) = fetch_operations_json(ops_address, "/healthz")?;
         assert_eq!(healthy_status, 200);
         let (ready_status, readyz) = fetch_operations_json(ops_address, "/readyz")?;
@@ -6543,8 +6871,7 @@ mod tests {
                 .path()
                 .join("wallet-reconcile-canonical-secondary"),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -6724,6 +7051,7 @@ mod tests {
                 recycled: 0
             }
         );
+        observe(&slot);
         // Each replaced pair keeps its generation for a minute, so the first
         // blocks open the remaining slots before any pair drains.
         let warm_up_blocks = SECONDARY_GENERATION_COUNT - 1;
@@ -6731,6 +7059,7 @@ mod tests {
             age_out_retained_pairs(&mut publisher, 2);
             let fence = primaries.append_block()?;
             publisher.refresh_once().await?;
+            observe(&slot);
             assert_eq!(
                 slot.capture().canonical_fence(),
                 fence,
@@ -6804,6 +7133,113 @@ mod tests {
         primaries.shutdown().await
     }
 
+    #[tokio::test]
+    async fn cold_pair_replacement_refuses_a_different_admitted_stored_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_proto::capabilities::WALLET_READ_FULL_BLOCK_AT_V1;
+        use zinder_runtime::ReadinessCause;
+
+        let activations = sample_regtest_upgrade_activations();
+        let first_height = BlockHeight::new(1);
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+        let all = chain.clone().with_raw_blob_retention(RawBlobRetention::All);
+        let unretained = chain.with_raw_blob_retention(RawBlobRetention::None);
+        let baseline = |chain| CanonicalBaseline::new(chain).through(first_height);
+        let bootstrap = CanonicalWriterFixture::publish(&baseline(&all), &activations)?;
+        let mut replacement =
+            CanonicalWriterFixture::publish(&baseline(&unretained), &activations)?;
+        let replacement_fence = replacement.append_live_block(&unretained)?;
+
+        let paths = TempDir::new()?;
+        let original_wallet = paths.path().join("original-wallet");
+        let replacement_wallet = paths.path().join("replacement-wallet");
+        let primary = bootstrap.canonical_primary()?;
+        let replacement_primary = replacement.canonical_primary()?;
+        let reorg = primary.reorg_policy();
+        let options = RocksDbWalletBuildOptions {
+            supported_reorg_depth: reorg.reorg_window_blocks(),
+            ..RocksDbWalletBuildOptions::for_local_tests()
+        };
+        for (primary, path) in [
+            (primary, &original_wallet),
+            (replacement_primary, &replacement_wallet),
+        ] {
+            drop(build_wallet_from_canonical(primary, path, options)?.store);
+        }
+
+        let control = MutableCanonicalControl::new(writer_status_for_store(primary));
+        let writer_control = WriterControlFixture::spawn(
+            IngestControlFixtureService::new(Network::ZcashRegtest),
+            control.clone(),
+        )
+        .await?;
+        let mut config = wallet_serving_pair_config(
+            bootstrap.canonical_primary_path().to_owned(),
+            paths.path().join("canonical-secondaries"),
+            original_wallet,
+            paths.path().join("wallet-secondaries"),
+        )?;
+        config.canonical_reorg_policy = reorg;
+        // A lag within the normal allowance must not reopen the refused pair.
+        config.replica_lag_threshold_chain_epochs = u64::MAX;
+        let readiness = zinder_runtime::Readiness::default();
+        let (mut publisher, slot) =
+            WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                config,
+                WalletServingReadiness::pair_only(readiness.clone()),
+                &writer_control.endpoint,
+                None,
+            )
+            .await?;
+        let original = slot.capture();
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        assert!(
+            query
+                .native_endpoint_capabilities()
+                .contains(WALLET_READ_FULL_BLOCK_AT_V1)
+        );
+        query.full_block_at(first_height, None).await?;
+
+        assert!(
+            replacement_fence.chain_event_sequence()
+                > original.canonical_fence().chain_event_sequence()
+        );
+        publisher.config.canonical_primary_path = replacement.canonical_primary_path().to_owned();
+        publisher.config.wallet_primary_path = replacement_wallet;
+        control.set_writer_status(writer_status_for_store(replacement_primary));
+        publisher.refresh_and_record().await;
+        assert_eq!(readiness.report().cause, ReadinessCause::StorageUnavailable);
+        assert!(Arc::ptr_eq(&original, &slot.capture()));
+        assert_eq!(publisher.candidate_preparations.cold, 2);
+
+        assert_stored_set_backoff(&mut publisher, &readiness).await;
+        assert!(Arc::ptr_eq(&original, &slot.capture()));
+        query.full_block_at(first_height, None).await?;
+        writer_control.shutdown().await
+    }
+
+    /// Refreshes inside the stored-set backoff open no candidate, and the
+    /// first refresh after it opens one that is refused again.
+    async fn assert_stored_set_backoff(
+        publisher: &mut WalletServingPairPublisher,
+        readiness: &zinder_runtime::Readiness,
+    ) {
+        use zinder_runtime::ReadinessCause;
+
+        let cold = publisher.candidate_preparations.cold;
+        for _ in 0..3 {
+            publisher.refresh_and_record().await;
+            assert_eq!(readiness.report().cause, ReadinessCause::StorageUnavailable);
+            assert_eq!(publisher.candidate_preparations.cold, cold);
+        }
+        tokio::time::pause();
+        tokio::time::advance(super::STORED_SET_RETRY_DELAY).await;
+        tokio::time::resume();
+        publisher.refresh_and_record().await;
+        assert_eq!(readiness.report().cause, ReadinessCause::StorageUnavailable);
+        assert_eq!(publisher.candidate_preparations.cold, cold + 1);
+    }
+
     /// A burst of blocks keeps an epoch pinned before it answering until its
     /// retention window ends.
     ///
@@ -6840,6 +7276,7 @@ mod tests {
             );
         }
         let last_published = slot.capture();
+        let mut wait_start = None;
         let mut coalesced = Vec::new();
         for block in 1..=2 {
             coalesced.push(primaries.append_block()?);
@@ -6848,6 +7285,11 @@ mod tests {
                 Arc::ptr_eq(&slot.capture(), &last_published),
                 "coalesced block {block} must wait for a slot"
             );
+            let wait = publisher
+                .generation_wait
+                .as_ref()
+                .ok_or("missing slot wait")?;
+            assert_eq!(*wait_start.get_or_insert(wait.since), wait.since);
             assert!(readiness.report().is_ready);
             assert_eq!(
                 query.visible_tip_block(Some(pinned.id)).await?.chain_epoch,
@@ -6865,6 +7307,12 @@ mod tests {
             generation_waits(&rendered_metrics.render(), "retention_window"),
             2
         );
+
+        primaries.control.set_available(false);
+        publisher.refresh_and_record().await;
+        assert!(publisher.generation_wait.is_none());
+        primaries.control.set_available(true);
+        publisher.refresh_once().await?;
 
         let replaced_at = slot
             .published
@@ -6885,6 +7333,16 @@ mod tests {
         ));
 
         publisher.refresh_once().await?;
+        assert!(publisher.generation_wait.is_none());
+        let elapsed = rendered_metrics.render();
+        for outcome in ["interrupted", "available"] {
+            let sample = elapsed.lines().find(|line| {
+                line.starts_with("zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds_count{")
+                    && line.contains("reason=\"retention_window\"")
+                    && line.contains(&format!("outcome=\"{outcome}\""))
+            }).ok_or("missing retention wait")?;
+            assert_eq!(sample.split_whitespace().last(), Some("1"));
+        }
         let latest = *coalesced.last().ok_or("the burst must coalesce blocks")?;
         assert_eq!(slot.capture().canonical_fence(), latest);
         assert_eq!(
@@ -6934,8 +7392,8 @@ mod tests {
         let (mut publisher, slot) = primaries
             .bootstrap_publisher(zinder_runtime::Readiness::default())
             .await?;
-        let canonical_cache = publisher.block_caches.canonical.clone();
-        let wallet_cache = publisher.block_caches.wallet.clone();
+        let canonical_cache = publisher.store_resources.canonical.block_cache().clone();
+        let wallet_cache = publisher.store_resources.wallet.block_cache().clone();
         assert_eq!(
             gauge_sample(
                 &rendered_metrics.render(),
@@ -7017,6 +7475,13 @@ mod tests {
         store_role: &str,
         block_cache: &zinder_store::SharedBlockCache,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            exposition
+                .lines()
+                .any(|line| line.starts_with("zinder_store_rocksdb_ticker{")
+                    && line.contains(&format!("store_role=\"{store_role}\""))
+                    && line.contains("ticker=\"rocksdb.bytes.read\""))
+        );
         let budget = RocksDbResourceBudget::for_local_tests();
         let open_generations = u32::try_from(SECONDARY_GENERATION_COUNT)?;
         let gauge = |name: &str| {
@@ -7051,6 +7516,200 @@ mod tests {
         Ok(())
     }
 
+    /// Exports `rocksdb.live-sst-files-size` from the single newest published pair.
+    ///
+    /// Flushes additional SST bytes on both primaries before refreshing so the
+    /// retained and newest generations report distinct live SST sizes, propagates
+    /// a fixture-scoped recorder into the blocking sampler so parallel `cargo test`
+    /// runs never cross-contaminate, and compares both exported gauges strictly
+    /// against the newest pair without per-file estimates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publisher_exports_live_sst_size_for_newest_published_pair_without_per_file_properties()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = Arc::new(PrometheusBuilder::new().build_recorder());
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(recorder.as_ref());
+        let mut primaries = UnspentOutputPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher_every(Duration::from_millis(1))
+            .await?;
+        publisher.metrics_recorder = Some(Arc::clone(&recorder));
+        let first = slot.capture();
+        let retained_generation = publisher
+            .published_generation
+            .ok_or("bootstrap must record its published generation")?;
+        let retained_sizes = generation_live_sst_bytes(&publisher, retained_generation)?;
+        assert!(retained_sizes.live_tail_block > 0.0);
+        assert!(retained_sizes.wallet_utxo > 0.0);
+
+        primaries.append_block()?;
+        flush_serving_pair_primaries_for_distinct_sst_sizes(&mut primaries)?;
+        publisher.instance_memory_throttle = ResourceGaugeThrottle::new(Duration::ZERO);
+        publisher.refresh_and_record().await;
+        let second = slot.capture();
+        assert!(!Arc::ptr_eq(&first, &second));
+        let newest_generation = publisher
+            .published_generation
+            .ok_or("refresh must record its newest published generation")?;
+        assert_ne!(newest_generation, retained_generation);
+        let newest_sizes = generation_live_sst_bytes(&publisher, newest_generation)?;
+        assert!(newest_sizes.live_tail_block > retained_sizes.live_tail_block);
+        assert!(newest_sizes.wallet_utxo > retained_sizes.wallet_utxo);
+        assert!(newest_sizes.wallet_reorg_undo > retained_sizes.wallet_reorg_undo);
+
+        let exposition = rendered_metrics.render();
+        assert_serving_live_sst_gauges(&exposition, retained_sizes, newest_sizes);
+
+        drop((first, second, slot, publisher));
+        primaries.shutdown().await
+    }
+
+    #[derive(Clone, Copy)]
+    struct GenerationLiveSstBytes {
+        live_tail_block: f64,
+        wallet_utxo: f64,
+        wallet_reorg_undo: f64,
+    }
+
+    fn generation_live_sst_bytes(
+        publisher: &WalletServingPairPublisher,
+        generation: usize,
+    ) -> Result<GenerationLiveSstBytes, Box<dyn std::error::Error>> {
+        let SecondaryGenerationState::Published { readers, .. } =
+            &publisher.generations[generation].state
+        else {
+            return Err("selected generation must be published".into());
+        };
+        let live_tail_block = readers
+            .canonical
+            .rocksdb_property_value_cf("live_tail_block", "rocksdb.live-sst-files-size")?
+            .ok_or("canonical secondary must report live_tail_block live SST size")?
+            .parse::<f64>()?;
+        let wallet_utxo = readers
+            .wallet
+            .rocksdb_property_value_cf("transparent_unspent_output", "rocksdb.live-sst-files-size")?
+            .ok_or("wallet secondary must report transparent_unspent_output live SST size")?
+            .parse::<f64>()?;
+        let wallet_reorg_undo = readers
+            .wallet
+            .rocksdb_property_value_cf("reorg_undo", "rocksdb.live-sst-files-size")?
+            .ok_or("wallet secondary must report reorg_undo live SST size")?
+            .parse::<f64>()?;
+        Ok(GenerationLiveSstBytes {
+            live_tail_block,
+            wallet_utxo,
+            wallet_reorg_undo,
+        })
+    }
+
+    fn flush_serving_pair_primaries_for_distinct_sst_sizes(
+        primaries: &mut UnspentOutputPrimaries,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        drop(primaries.writer.take_canonical_primary()?);
+        {
+            let (canonical_db, _) = open_raw_primary(primaries.writer.canonical_primary_path())?;
+            let live_tail_cf = canonical_db
+                .cf_handle("live_tail_block")
+                .ok_or("live_tail_block family must open")?;
+            canonical_db.flush_cf(&live_tail_cf)?;
+        }
+        let (wallet_db, _) = open_raw_primary(&primaries.wallet_primary_path)?;
+        let undo_cf = wallet_db
+            .cf_handle("reorg_undo")
+            .ok_or("reorg_undo family must open")?;
+        wallet_db.flush_cf(&undo_cf)?;
+        split_family_rows(&wallet_db, "transparent_unspent_output")
+    }
+
+    /// Verifies serving secondaries export newest-pair `rocksdb.live-sst-files-size`.
+    ///
+    /// Also confirms no per-file estimates are emitted and shared cache capacity
+    /// series are not duplicated.
+    fn assert_serving_live_sst_gauges(
+        exposition: &str,
+        retained: GenerationLiveSstBytes,
+        newest: GenerationLiveSstBytes,
+    ) {
+        for (store_role, cf, retained_bytes, newest_bytes) in [
+            (
+                "canonical_secondary",
+                "live_tail_block",
+                retained.live_tail_block,
+                newest.live_tail_block,
+            ),
+            (
+                "wallet_secondary",
+                "transparent_unspent_output",
+                retained.wallet_utxo,
+                newest.wallet_utxo,
+            ),
+            (
+                "wallet_secondary",
+                "reorg_undo",
+                retained.wallet_reorg_undo,
+                newest.wallet_reorg_undo,
+            ),
+        ] {
+            let exported =
+                cf_property_sample(exposition, store_role, cf, "rocksdb.live-sst-files-size");
+            assert_eq!(
+                exported,
+                Some(newest_bytes),
+                "{store_role} {cf} must report the single newest generation's live SST size"
+            );
+            assert_ne!(
+                exported,
+                Some(retained_bytes),
+                "{store_role} {cf} must not report the retained generation's stale live SST size"
+            );
+        }
+        assert!(exposition.contains("zinder_store_block_cache_entries{"));
+        for store_role in ["canonical_secondary", "wallet_secondary"] {
+            let capacity_prefix =
+                format!("zinder_store_block_cache_capacity_bytes{{store_role=\"{store_role}\"}} ");
+            assert_eq!(
+                exposition
+                    .lines()
+                    .filter(|line| line.starts_with(&capacity_prefix))
+                    .count(),
+                1
+            );
+        }
+        for expensive_property in [
+            "rocksdb.estimate-live-data-size",
+            "rocksdb.total-sst-files-size",
+            "rocksdb.estimate-table-readers-mem",
+        ] {
+            assert!(
+                !exposition.contains(expensive_property),
+                "serving secondaries must not export per-file property {expensive_property}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_counter_includes_unchanged_fences_and_failed_attempts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, _slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        publisher.refresh_and_record().await;
+        primaries.control.set_available(false);
+        publisher.refresh_and_record().await;
+        let exposition = rendered_metrics.render();
+        for (status, class) in [("ok", "none"), ("error", "writer_status_rpc")] {
+            let series = format!(
+                "zinder_wallet_serving_pair_publisher_refresh_total{{status=\"{status}\",error_class=\"{class}\"}}"
+            );
+            assert_eq!(gauge_sample(&exposition, &series), Some(1.0));
+        }
+        primaries.shutdown().await
+    }
+
     /// Reads one unlabelled or fully labelled gauge series from a Prometheus
     /// exposition.
     fn gauge_sample(exposition: &str, series: &str) -> Option<f64> {
@@ -7063,6 +7722,26 @@ mod tests {
         })
     }
 
+    /// Reads one `zinder_store_rocksdb_property` gauge sample by store role,
+    /// column family, and property name.
+    fn cf_property_sample(
+        exposition: &str,
+        store_role: &str,
+        cf: &str,
+        property: &str,
+    ) -> Option<f64> {
+        let role_label = format!("store_role=\"{store_role}\"");
+        let cf_label = format!("cf=\"{cf}\"");
+        let property_label = format!("property=\"{property}\"");
+        let line = exposition.lines().find(|line| {
+            line.starts_with("zinder_store_rocksdb_property{")
+                && line.contains(&role_label)
+                && line.contains(&cf_label)
+                && line.contains(&property_label)
+        })?;
+        line.rsplit_once(' ')?.1.trim().parse().ok()
+    }
+
     /// Reads one `generation_wait_total` series from a Prometheus exposition.
     fn generation_waits(exposition: &str, reason: &str) -> u64 {
         let series = format!(
@@ -7073,6 +7752,145 @@ mod tests {
             .find_map(|line| line.strip_prefix(series.as_str()))
             .and_then(|count| count.trim().parse().ok())
             .unwrap_or(0)
+    }
+
+    /// A burst no request observes publishes every block at once.
+    ///
+    /// No pin can name a pair that no response exposed, so the publisher
+    /// releases each replaced pair and reuses its generation instead of
+    /// waiting out the retention window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unobserved_burst_publishes_every_block_without_a_retention_wait()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+
+        for block in 1..=3 * SECONDARY_GENERATION_COUNT {
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            assert_eq!(
+                slot.capture_ephemeral().canonical_fence(),
+                fence,
+                "burst block {block} must be published"
+            );
+            assert!(publisher.generation_wait.is_none());
+            assert_eq!(slot.retained_pair_count(), 0);
+        }
+        assert_eq!(
+            generation_waits(&rendered_metrics.render(), "retention_window"),
+            0
+        );
+
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// Tip polling between blocks, as `GetLatestBlock` and `GetLightdInfo`
+    /// do, observes no pair: the burst still publishes every block at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ephemeral_tip_poll_between_blocks_holds_no_retention_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        assert_eq!(
+            query.served_tip_snapshot().await?.chain_epoch,
+            slot.capture_ephemeral().chain_epoch()
+        );
+
+        for block in 1..=3 * SECONDARY_GENERATION_COUNT {
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            let snapshot = query.served_tip_snapshot().await?;
+            assert_eq!(
+                snapshot.chain_epoch.id,
+                fence.chain_epoch_id(),
+                "burst block {block} must be published"
+            );
+            query.network_upgrade_activations().await?;
+            assert!(publisher.generation_wait.is_none());
+            assert_eq!(slot.retained_pair_count(), 0);
+        }
+        assert_eq!(
+            generation_waits(&rendered_metrics.render(), "retention_window"),
+            0
+        );
+        let snapshot = query.served_tip_snapshot().await?;
+        let header = query
+            .block_header_by_selector(
+                crate::BlockSelector::Height(snapshot.chain_epoch.visible_tip_height),
+                Some(snapshot.chain_epoch.id),
+            )
+            .await?;
+        assert_eq!(
+            snapshot.block_time_unix_seconds,
+            header.block_header.block_time
+        );
+
+        drop(query);
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// A burst whose every pair a request observed keeps each replaced pair
+    /// for the whole window, so the block after the spare slots fill waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_observed_burst_waits_for_the_retention_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        observe(&slot);
+        for _ in 1..SECONDARY_GENERATION_COUNT {
+            primaries.append_block()?;
+            publisher.refresh_once().await?;
+            observe(&slot);
+        }
+        assert_eq!(slot.retained_pair_count(), SECONDARY_GENERATION_COUNT - 1);
+        let last_published = slot.capture_ephemeral();
+
+        primaries.append_block()?;
+        publisher.refresh_once().await?;
+        assert!(Arc::ptr_eq(&slot.capture_ephemeral(), &last_published));
+        assert!(publisher.generation_wait.is_some());
+        assert_eq!(
+            generation_waits(&rendered_metrics.render(), "retention_window"),
+            1
+        );
+
+        let oldest_replaced_at = slot
+            .published
+            .load()
+            .retained
+            .iter()
+            .map(|retained| retained.replaced_at)
+            .min()
+            .ok_or("the burst must retain its replaced pairs")?;
+        publisher.release_expired_pairs(oldest_replaced_at + RETAINED_PAIR_WINDOW);
+        publisher.refresh_once().await?;
+        assert!(!Arc::ptr_eq(&slot.capture_ephemeral(), &last_published));
+        assert!(publisher.generation_wait.is_none());
+
+        drop(last_published);
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
     }
 
     /// The publisher opens a slot it has not used only when every opened slot
@@ -7146,9 +7964,11 @@ mod tests {
         let (mut publisher, slot) = primaries
             .bootstrap_publisher(zinder_runtime::Readiness::default())
             .await?;
+        observe(&slot);
         for _ in 1..SECONDARY_GENERATION_COUNT {
             primaries.append_block()?;
             publisher.refresh_once().await?;
+            observe(&slot);
         }
         assert_eq!(
             publisher.candidate_preparations.cold,
@@ -7160,6 +7980,7 @@ mod tests {
             publisher.release_expired_pairs(tokio::time::Instant::now() + RETAINED_PAIR_WINDOW);
             let fence = primaries.append_block()?;
             publisher.refresh_once().await?;
+            observe(&slot);
             assert_eq!(
                 slot.capture().canonical_fence(),
                 fence,
@@ -7277,10 +8098,12 @@ mod tests {
         let mut primaries = AdvancingPrimaries::start().await?;
         let readiness = zinder_runtime::Readiness::default();
         let (mut publisher, slot) = primaries.bootstrap_publisher(readiness.clone()).await?;
+        observe(&slot);
         for _ in 0..SECONDARY_GENERATION_COUNT {
             age_out_retained_pairs(&mut publisher, 2);
             primaries.append_block()?;
             publisher.refresh_once().await?;
+            observe(&slot);
         }
         let warmed = publisher.candidate_preparations;
         assert_eq!(
@@ -7375,11 +8198,13 @@ mod tests {
         };
         let shared_canonical = Arc::clone(&readers.canonical);
         let bootstrap_fence = shared_canonical.event_fence();
+        observe(&slot);
         // These blocks fill the other slots. The bootstrap pair's window then
         // ends, which releases generation 0's pair.
         for _ in 1..SECONDARY_GENERATION_COUNT {
             primaries.append_block()?;
             publisher.refresh_once().await?;
+            observe(&slot);
         }
         age_out_retained_pairs(&mut publisher, 2);
 
@@ -7418,8 +8243,8 @@ mod tests {
     /// Canonical blocks the table-file tests build before giving each
     /// canonical row a table file of its own.
     ///
-    /// With the test budget's 64 open files, a secondary keeps at most 77
-    /// table files open: a 54-entry table cache over 64 one-entry shards, plus
+    /// With the test budget's 64 open files, a secondary keeps at most 69
+    /// table files open: a 54-entry table cache over 4 fourteen-entry shards, plus
     /// up to 13 handles pinned at open. A range read over these blocks looks
     /// up only the compact-block row of each block, which sits in a level-0
     /// file of its own, so the read needs 96 files and must reopen one
@@ -7501,6 +8326,70 @@ mod tests {
         cancel.cancel();
         serving_runtime_drained.cancel();
         publisher_task.await??;
+        primaries.shutdown().await
+    }
+
+    /// A tip poll that finds a table file of its pair deleted recovers on an
+    /// ephemeral replacement, so tip polling alone still holds no retention
+    /// window when the next block arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tip_snapshot_recovering_from_a_missing_table_file_retains_no_pair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let mut primaries =
+            AdvancingPrimaries::start_through(BlockHeight::new(SPLIT_TIP_HEIGHT)).await?;
+        let canonical_primary_path = primaries.close_canonical_primary()?;
+        compact_away_table_files(&canonical_primary_path)?;
+        split_rows_into_table_files(&canonical_primary_path)?;
+        saturate_initial_open_pins(&canonical_primary_path)?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher_every(
+                zinder_runtime::Readiness::default(),
+                Duration::from_hours(1),
+            )
+            .await?;
+        let stale_pair = slot.capture_ephemeral();
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        evict_tip_header_from_table_cache(stale_pair.canonical()).await?;
+        compact_away_table_files(&canonical_primary_path)?;
+
+        let replace_the_marked_pair = async {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !slot.capture_ephemeral().has_missing_table_file() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(|_| "the tip read never found a missing table file")?;
+            publisher.refresh_once().await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+        let (snapshot, replaced) =
+            tokio::join!(query.served_tip_snapshot(), replace_the_marked_pair);
+        replaced?;
+        assert_eq!(snapshot?.chain_epoch, stale_pair.chain_epoch());
+        let replacement = slot.capture_ephemeral();
+        assert!(!Arc::ptr_eq(&replacement, &stale_pair));
+        assert!(
+            !replacement.is_observed_for_epoch_pin(),
+            "recovery must not observe the replacement"
+        );
+
+        primaries.reopen_canonical_primary()?;
+        let moved = primaries.append_block()?;
+        publisher.refresh_once().await?;
+        assert_eq!(slot.capture_ephemeral().canonical_fence(), moved);
+        assert_eq!(slot.retained_pair_count(), 0);
+        assert!(publisher.generation_wait.is_none());
+        assert_eq!(
+            generation_waits(&rendered_metrics.render(), "retention_window"),
+            0
+        );
+
+        drop((stale_pair, replacement, query, slot));
+        drop(publisher);
         primaries.shutdown().await
     }
 
@@ -7682,8 +8571,7 @@ mod tests {
             &canonical_primary_path,
             temporary.path().join("canonical-secondary"),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -7884,12 +8772,56 @@ mod tests {
         path: &Path,
     ) -> Result<(rust_rocksdb::DB, Vec<String>), Box<dyn std::error::Error>> {
         let families = rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), path)?;
-        let db = rust_rocksdb::DB::open_cf(&rust_rocksdb::Options::default(), path, &families)?;
-        for family in &families {
-            let handle = db.cf_handle(family).ok_or("a listed family must open")?;
-            db.set_options_cf(&handle, &[("disable_auto_compactions", "true")])?;
-        }
+        let descriptors: Vec<_> = families
+            .iter()
+            .map(|family| {
+                let mut options = rust_rocksdb::Options::default();
+                options.set_disable_auto_compactions(true);
+                rust_rocksdb::ColumnFamilyDescriptor::new(family, options)
+            })
+            .collect();
+        let db = rust_rocksdb::DB::open_cf_descriptors(
+            &rust_rocksdb::Options::default(),
+            path,
+            descriptors,
+        )?;
         Ok((db, families))
+    }
+
+    /// Consumes `RocksDB`'s `min(16, table_cache_capacity / 4)` open-time
+    /// `table_reader_handle` pins on `default` (`CF 0`) so `block_header` (`CF 1`)
+    /// receives none when `CheckIterationResult` finishes manifest recovery.
+    fn saturate_initial_open_pins(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let (db, _families) = open_raw_primary(path)?;
+        let default_cf = db
+            .cf_handle(rust_rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+            .ok_or("default family must exist")?;
+        let (control_key, control_row) = db
+            .iterator_cf(&default_cf, rust_rocksdb::IteratorMode::Start)
+            .next()
+            .ok_or("default family must hold store control")??;
+        for _ in 0..16 {
+            db.put_cf(&default_cf, &control_key, &control_row)?;
+            db.flush_cf(&default_cf)?;
+        }
+        Ok(())
+    }
+
+    /// Evicts the tip `block_header` reader from the 4-shard table cache.
+    async fn evict_tip_header_from_table_cache(
+        canonical: &dyn crate::CanonicalReader,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        canonical
+            .compact_blocks_in_range(split_block_range())
+            .await?;
+        for height in 1..SPLIT_TIP_HEIGHT {
+            if let Some(header) = canonical.block_header_at(BlockHeight::new(height)).await? {
+                canonical
+                    .block_hash_lookup(header.into_header().block_id.hash)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Rewrites every row of a closed canonical or wallet primary unchanged,
@@ -8060,7 +8992,7 @@ mod tests {
         Box<dyn std::error::Error>,
     > {
         let chain = ChainFixture::new(Network::ZcashRegtest)
-            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .with_raw_blob_retention(RawBlobRetention::None)
             .extend_blocks(block_count);
         let mut store =
             WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
@@ -8132,7 +9064,9 @@ mod tests {
             wallet_primary_path,
             wallet_secondary_root,
             network: Network::ZcashRegtest,
-            expected_raw_blob_retention: RawBlobRetention::Transactions,
+            canonical_requirements: CanonicalStoreRequirements::for_blob_retention(
+                RawBlobRetention::None,
+            ),
             canonical_reorg_policy: CanonicalReorgPolicy::new(100)?,
             canonical_resource_budget: RocksDbResourceBudget::for_local_tests(),
             wallet_resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -8144,6 +9078,7 @@ mod tests {
                 .ok_or("wallet-serving pair convergence attempts must be non-zero")?,
             replica_lag_threshold_chain_epochs: 4,
             serving_pair_staleness_ceiling: Duration::from_mins(5),
+            epoch_pin_retention: crate::EpochPinRetention::default(),
         })
     }
 
@@ -8165,23 +9100,6 @@ mod tests {
     /// later blocks, and the admission is the one the canonical writer makes
     /// when it first opens the store.
     fn build_lifecycle_canonical_primary_through(
-        canonical_primary_path: &Path,
-        activations: &NetworkUpgradeActivations,
-        tip_height: BlockHeight,
-    ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
-        let mut store = build_unadmitted_lifecycle_canonical_primary(
-            canonical_primary_path,
-            activations,
-            tip_height,
-        )?;
-        store.admit_network_upgrade_schedule(activations)?;
-        Ok(store)
-    }
-
-    /// Builds the READY primary of
-    /// [`build_lifecycle_canonical_primary_through`] before its writer's
-    /// first schedule admission.
-    fn build_unadmitted_lifecycle_canonical_primary(
         canonical_primary_path: &Path,
         activations: &NetworkUpgradeActivations,
         tip_height: BlockHeight,
@@ -8210,12 +9128,11 @@ mod tests {
         let tip = BlockId::new(tip_height, parent_hash);
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             canonical_primary_path,
-            CanonicalStoreWorkload::Wallet,
             CanonicalStoreBuildPlan::complete(
                 activations,
                 0,
                 tip,
-                RawBlobRetention::Transactions,
+                RawBlobRetention::None,
                 CanonicalReorgPolicy::new(100)?,
             )?,
             RocksDbResourceBudget::for_local_tests(),
@@ -8280,7 +9197,6 @@ mod tests {
                 height.value(),
                 CommitmentTreeFrontiers::default(),
             )),
-            block_final_note_commitment_roots: None,
             transaction_blobs: Vec::new(),
             block_blob: None,
             facts,
@@ -8363,6 +9279,12 @@ mod tests {
             SecondaryGenerationState::Published { lease, .. } => Some(lease.is_reusable()),
             SecondaryGenerationState::Vacant | SecondaryGenerationState::Candidate { .. } => None,
         }
+    }
+
+    /// Observes the published pair, as a request that exposes its chain epoch
+    /// does, so the slot retains it once it is replaced.
+    fn observe(slot: &WalletServingPairSlot) {
+        drop(slot.capture());
     }
 
     /// Ends the retention window of every retained pair except the `kept`
@@ -8456,8 +9378,9 @@ mod tests {
                 &canonical_primary_path,
                 temporary.path().join("projector-canonical-secondary"),
                 &activations,
-                CanonicalStoreWorkload::Wallet,
-                RawBlobRetention::Transactions,
+                zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                    RawBlobRetention::None,
+                ),
                 CanonicalReorgPolicy::new(100)?,
                 RocksDbResourceBudget::for_local_tests(),
             )?;
@@ -8542,8 +9465,7 @@ mod tests {
             self.canonical_primary = Some(RocksDbCanonicalStore::open_ready(
                 self.temporary.path().join("canonical-primary"),
                 &self.activations,
-                CanonicalStoreWorkload::Wallet,
-                RawBlobRetention::Transactions,
+                RawBlobRetention::None,
                 CanonicalReorgPolicy::new(100)?,
                 RocksDbResourceBudget::for_local_tests(),
             )?);
@@ -8712,7 +9634,9 @@ mod tests {
         {
             let config = WalletServingPairConfig {
                 catchup_interval,
-                expected_raw_blob_retention: self.writer.canonical_primary()?.raw_blob_retention(),
+                canonical_requirements: CanonicalStoreRequirements::for_blob_retention(
+                    self.writer.canonical_primary()?.raw_blob_retention(),
+                ),
                 ..wallet_serving_pair_config(
                     self.writer.canonical_primary_path().to_path_buf(),
                     self.temporary.path().join("canonical-secondaries"),
@@ -8764,8 +9688,9 @@ mod tests {
                 self.writer.canonical_primary_path(),
                 self.temporary.path().join("projector-canonical-secondary"),
                 &self.activations,
-                CanonicalStoreWorkload::Wallet,
-                self.writer.canonical_primary()?.raw_blob_retention(),
+                zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                    self.writer.canonical_primary()?.raw_blob_retention(),
+                ),
                 CanonicalReorgPolicy::new(100)?,
                 RocksDbResourceBudget::for_local_tests(),
             )?;
@@ -9004,6 +9929,7 @@ mod retention_tests {
         let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
         let first_replaced_at = Instant::now();
 
+        drop(slot.capture());
         assert!(
             slot.publish(Arc::clone(&pairs[1]), first_replaced_at)
                 .is_empty()
@@ -9022,6 +9948,7 @@ mod retention_tests {
         // Later publications retain every replaced pair instead of releasing
         // the oldest one.
         for (offset_seconds, pair) in [(1, &pairs[2]), (2, &pairs[3])] {
+            drop(slot.capture());
             assert!(
                 slot.publish(
                     Arc::clone(pair),
@@ -9114,9 +10041,37 @@ mod retention_tests {
             .checked_sub(RETAINED_PAIR_WINDOW)
             .ok_or("the monotonic clock must reach back one retention window")?;
 
+        drop(slot.capture());
         assert!(slot.publish(Arc::clone(&pairs[1]), replaced_at).is_empty());
         assert_eq!(slot.retained_pair_count(), 1);
         assert_pin_unavailable(&query, &history, replaced_epoch).await?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_retention_extends_the_pin() -> Result<(), Box<dyn Error>> {
+        let history = address_history()?;
+        let pairs = serving_pairs_through_live_appends(&history.chain, 1)?;
+        let replaced_epoch = pairs[0].canonical_fence().chain_epoch_id();
+        let retention =
+            super::EpochPinRetention::from_seconds(180).ok_or("retention must be valid")?;
+        let slot = WalletServingPairSlot::with_retention(Arc::clone(&pairs[0]), retention);
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        drop(slot.capture());
+        let replaced_at = Instant::now();
+        assert!(slot.publish(Arc::clone(&pairs[1]), replaced_at).is_empty());
+
+        tokio::time::advance(Duration::from_secs(179)).await;
+        assert!(slot.release_expired(Instant::now()).is_empty());
+        assert_eq!(
+            unspent_outpoints(&query, &history, Some(replaced_epoch))
+                .await?
+                .0,
+            replaced_epoch,
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_pin_unavailable(&query, &history, replaced_epoch).await?;
+        assert_eq!(slot.release_expired(Instant::now()).len(), 1);
         Ok(())
     }
 
@@ -9136,6 +10091,7 @@ mod retention_tests {
         let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
         let replaced_at = Instant::now();
         for pair in &pairs[1..] {
+            drop(slot.capture());
             assert!(slot.publish(Arc::clone(pair), Instant::now()).is_empty());
             tokio::time::advance(BLOCK_INTERVAL).await;
         }
@@ -9163,6 +10119,155 @@ mod retention_tests {
         Ok(())
     }
 
+    /// A pair captured before its replacement is retained for the window.
+    #[test]
+    fn a_capture_before_a_publication_keeps_its_pair_pinnable() -> Result<(), Box<dyn Error>> {
+        let history = address_history()?;
+        let pairs = serving_pairs_through_live_appends(&history.chain, 1)?;
+        let epoch = pairs[0].canonical_fence().chain_epoch_id();
+        let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
+
+        assert!(Arc::ptr_eq(&slot.capture(), &pairs[0]));
+        assert!(
+            slot.publish(Arc::clone(&pairs[1]), Instant::now())
+                .is_empty()
+        );
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(epoch)), &pairs[0]));
+        Ok(())
+    }
+
+    /// A capture after the publication observes the replacement, and the
+    /// next publication retains it.
+    #[test]
+    fn a_capture_after_a_publication_observes_the_replacement() -> Result<(), Box<dyn Error>> {
+        let history = address_history()?;
+        let pairs = serving_pairs_through_live_appends(&history.chain, 2)?;
+        let epoch = pairs[1].canonical_fence().chain_epoch_id();
+        let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
+
+        let released = slot.publish(Arc::clone(&pairs[1]), Instant::now());
+        assert!(released.iter().all(|pair| Arc::ptr_eq(pair, &pairs[0])));
+        assert_eq!(released.len(), 1);
+        assert!(Arc::ptr_eq(&slot.capture(), &pairs[1]));
+        assert!(
+            slot.publish(Arc::clone(&pairs[2]), Instant::now())
+                .is_empty()
+        );
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(epoch)), &pairs[1]));
+        Ok(())
+    }
+
+    /// A pin that the current pair answers observes it, because the caller
+    /// holds an epoch that came from some response.
+    #[test]
+    fn an_explicit_pin_on_the_current_pair_keeps_it_pinnable() -> Result<(), Box<dyn Error>> {
+        let history = address_history()?;
+        let pairs = serving_pairs_through_live_appends(&history.chain, 1)?;
+        let epoch = pairs[0].canonical_fence().chain_epoch_id();
+        let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
+
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(epoch)), &pairs[0]));
+        assert!(
+            slot.publish(Arc::clone(&pairs[1]), Instant::now())
+                .is_empty()
+        );
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(epoch)), &pairs[0]));
+        assert_eq!(slot.retained_pair_count(), 1);
+        Ok(())
+    }
+
+    /// A pin that no pair answers, and an ephemeral capture, observe nothing.
+    #[test]
+    fn a_pin_no_pair_answers_and_an_ephemeral_capture_observe_nothing() -> Result<(), Box<dyn Error>>
+    {
+        let history = address_history()?;
+        let pairs = serving_pairs_through_live_appends(&history.chain, 1)?;
+        let unserved = pairs[1].canonical_fence().chain_epoch_id();
+        let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
+
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(unserved)), &pairs[0]));
+        assert!(Arc::ptr_eq(&slot.capture_ephemeral(), &pairs[0]));
+        let released = slot.publish(Arc::clone(&pairs[1]), Instant::now());
+        assert_eq!(released.len(), 1);
+        assert!(released.iter().all(|pair| Arc::ptr_eq(pair, &pairs[0])));
+        assert_eq!(slot.retained_pair_count(), 0);
+        Ok(())
+    }
+
+    /// Captures and publications racing on shared threads never lose a pin.
+    ///
+    /// Each round replays one race on a fresh slot, with a capture that
+    /// observes by absence of a pin on even rounds and by an explicit pin on
+    /// odd rounds. Whichever order the scheduler picks, the pair a capture
+    /// returned still answers its epoch inside the window. The test counts no
+    /// outcomes, so no scheduling frequency can fail it, and it records
+    /// failures instead of asserting inside a round, so a failure cannot leave
+    /// a thread waiting at the barrier.
+    #[test]
+    fn concurrent_captures_and_publications_never_lose_a_pin() -> Result<(), Box<dyn Error>> {
+        const ROUNDS: usize = 20_000;
+        let history = address_history()?;
+        let pairs = serving_pairs_through_live_appends(&history.chain, 1)?;
+        let first_epoch = pairs[0].canonical_fence().chain_epoch_id();
+        let start = std::sync::Barrier::new(3);
+        let finish = std::sync::Barrier::new(3);
+        let slot_of_round = parking_lot::Mutex::new(None::<WalletServingPairSlot>);
+        let captured_in_round = parking_lot::Mutex::new(None::<Arc<WalletServingReadPair>>);
+        let mut failures = Vec::new();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for round in 0..ROUNDS {
+                    start.wait();
+                    let slot = slot_of_round.lock().clone();
+                    *captured_in_round.lock() = slot.map(|slot| {
+                        if round % 2 == 0 {
+                            slot.capture()
+                        } else {
+                            slot.capture_at(Some(first_epoch))
+                        }
+                    });
+                    finish.wait();
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..ROUNDS {
+                    start.wait();
+                    let slot = slot_of_round.lock().clone();
+                    if let Some(slot) = slot {
+                        drop(slot.publish(Arc::clone(&pairs[1]), Instant::now()));
+                    }
+                    finish.wait();
+                }
+            });
+            for round in 0..ROUNDS {
+                for pair in &pairs {
+                    pair.clear_observation_for_test();
+                }
+                let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
+                *slot_of_round.lock() = Some(slot.clone());
+                start.wait();
+                finish.wait();
+                let captured = captured_in_round.lock().take();
+                if let Some(captured) = captured {
+                    let epoch = captured.canonical_fence().chain_epoch_id();
+                    if !Arc::ptr_eq(&slot.capture_at(Some(epoch)), &captured) {
+                        failures.push(round);
+                    }
+                }
+            }
+        });
+
+        assert!(
+            failures.is_empty(),
+            "rounds {failures:?} lost the pin of the pair they captured"
+        );
+        Ok(())
+    }
+
+    /// A pair republished at its own epoch leaves no retained duplicate, and
+    /// keeps the observation of the pair it replaces, so a client that holds
+    /// the epoch can still pin it when the next block arrives.
     #[test]
     fn a_pair_republished_at_its_own_epoch_leaves_the_slot_at_once() -> Result<(), Box<dyn Error>> {
         let history = address_history()?;
@@ -9175,12 +10280,12 @@ mod retention_tests {
         let epoch = first.canonical_fence().chain_epoch_id();
         assert_eq!(republished.canonical_fence().chain_epoch_id(), epoch);
         let slot = WalletServingPairSlot::new(Arc::clone(&first));
+        drop(slot.capture());
 
         let released = slot.publish(Arc::clone(&republished), Instant::now());
         assert_eq!(released.len(), 1);
         assert!(released.iter().all(|pair| Arc::ptr_eq(pair, &first)));
         assert_eq!(slot.retained_pair_count(), 0);
-        assert!(Arc::ptr_eq(&slot.capture_at(Some(epoch)), &republished));
 
         writer.append_live_block(&history.chain)?;
         assert!(
@@ -9194,6 +10299,31 @@ mod retention_tests {
         Ok(())
     }
 
+    /// A republished pair whose predecessor no request observed leaves with
+    /// the next publication, because no client holds its epoch.
+    #[test]
+    fn an_unobserved_republished_pair_is_released_when_replaced() -> Result<(), Box<dyn Error>> {
+        let history = address_history()?;
+        let mut writer = CanonicalWriterFixture::publish(
+            &CanonicalBaseline::new(&history.chain).through(BlockHeight::new(1)),
+            &sample_regtest_upgrade_activations(),
+        )?;
+        let first = serving_pair(&mut writer)?;
+        let republished = serving_pair(&mut writer)?;
+        let slot = WalletServingPairSlot::new(Arc::clone(&first));
+
+        assert_eq!(
+            slot.publish(Arc::clone(&republished), Instant::now()).len(),
+            1
+        );
+        writer.append_live_block(&history.chain)?;
+        let released = slot.publish(serving_pair(&mut writer)?, Instant::now());
+        assert_eq!(released.len(), 1);
+        assert!(released.iter().all(|pair| Arc::ptr_eq(pair, &republished)));
+        assert_eq!(slot.retained_pair_count(), 0);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn pinned_first_history_page_answers_from_the_retained_pair() -> Result<(), Box<dyn Error>>
     {
@@ -9204,6 +10334,7 @@ mod retention_tests {
         let slot = WalletServingPairSlot::new(Arc::clone(&pairs[1]));
         let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
 
+        drop(slot.capture());
         assert!(
             slot.publish(Arc::clone(&pairs[2]), Instant::now())
                 .is_empty()

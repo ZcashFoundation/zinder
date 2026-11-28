@@ -1,39 +1,32 @@
-//! Keeps `zinder_runtime::ENVIRONMENT_VARIABLES` aligned with the variables
-//! the `zinder-ingest` loader accepts.
+//! Binary smoke checks for unified `ZinderConfig` environment parsing on `zinder-ingest`.
 
-use zinder_runtime::ENVIRONMENT_VARIABLES;
-use zinder_testkit::EnvVarContractProbe;
+use std::process::Command;
 
-const BINARY: &str = "zinder-ingest";
-
-// `[ingest_control]` is shared with the reader processes; the writer reads
-// only the listen, token, and staging fields.
-const ACCEPTED_BUT_UNCONSUMED: &[&str] = &["ZINDER_INGEST_CONTROL__ADDR"];
-
-fn documented_variables() -> impl Iterator<Item = &'static str> {
-    ENVIRONMENT_VARIABLES
-        .iter()
-        .filter(|env_var| env_var.is_used_by(BINARY))
-        .map(|env_var| env_var.name)
+fn print_config_with_env(pairs: &[(&str, &str)]) -> eyre::Result<std::process::Output> {
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-ingest"));
+    command.env_clear().arg("--print-config");
+    command
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:8232");
+    for (name, env_val) in pairs {
+        command.env(name, env_val);
+    }
+    Ok(command.output()?)
 }
 
 #[test]
-fn every_documented_variable_is_accepted_by_the_loader() -> eyre::Result<()> {
-    EnvVarContractProbe::new(zinder_testkit::bin_exe!("zinder-ingest"))
-        .check_documented_variables_are_accepted(documented_variables())
-}
+fn shared_schema_env_vars_are_accepted_and_empty_or_unknown_keys_are_rejected() -> eyre::Result<()>
+{
+    let ok = print_config_with_env(&[("ZINDER_QUERY__LISTEN_ADDR", "127.0.0.1:9102")])?;
+    assert!(ok.status.success(), "{ok:?}");
 
-#[test]
-fn every_variable_the_loader_accepts_is_documented() -> eyre::Result<()> {
-    EnvVarContractProbe::new(zinder_testkit::bin_exe!("zinder-ingest"))
-        .check_accepted_variables_are_documented(documented_variables(), ACCEPTED_BUT_UNCONSUMED)
-}
+    let unknown = print_config_with_env(&[("ZINDER_UNKNOWN_SECTION__PATH", "x")])?;
+    assert!(!unknown.status.success(), "{unknown:?}");
 
-#[test]
-fn wallet_serving_entrypoint_routes_exactly_the_accepted_variables() -> eyre::Result<()> {
-    EnvVarContractProbe::new(zinder_testkit::bin_exe!("zinder-ingest"))
-        .check_wallet_serving_routing(
-            "ingest",
-            ENVIRONMENT_VARIABLES.iter().map(|env_var| env_var.name),
-        )
+    let nested = print_config_with_env(&[("ZINDER_OPS__LISTEN_ADDR__PORT", "9105")])?;
+    assert!(!nested.status.success(), "{nested:?}");
+
+    let empty = print_config_with_env(&[("ZINDER_OPS__LISTEN_ADDR", "")])?;
+    assert!(!empty.status.success(), "{empty:?}");
+    Ok(())
 }

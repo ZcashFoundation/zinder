@@ -80,6 +80,7 @@ pub async fn capture_fixed_range(config: CaptureConfig) -> Result<FixtureManifes
             request_timeout: config.request_timeout,
             max_response_bytes: config.max_response_bytes,
             broadcast_timeout: None,
+            ..ZebraJsonRpcSourceOptions::default()
         },
     )?;
 

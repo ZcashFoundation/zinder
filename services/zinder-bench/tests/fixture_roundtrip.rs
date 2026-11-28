@@ -12,6 +12,10 @@ use eyre::{Result, eyre};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tempfile::tempdir;
+use zebra_chain::{
+    block::{Block as ZebraBlock, Height as ZebraHeight},
+    serialization::{ZcashDeserializeInto, ZcashSerialize},
+};
 use zinder_bench::fixture::{
     ActivationRecord, CanonicalBlockFactsDigestEvidence, CapturedBlockId, CapturedSubtreeRoot,
     FIXTURE_CONTRACT_IDENTITY, FIXTURE_FORMAT_VERSION, FixtureManifest, FixtureNodeSource,
@@ -21,7 +25,8 @@ use zinder_bench::{
     canonical_fixture_replay::{
         CanonicalFixtureNodeSource, CanonicalFixtureReplayPlan,
         CanonicalFixtureRocksDbReplayConfig, CanonicalFixtureRocksDbReplayOutcome,
-        capture_canonical_fixture_replay_plan, replay_canonical_fixture_into_rocksdb,
+        TreeStateCheckpointCoverage, capture_canonical_fixture_replay_plan,
+        replay_canonical_fixture_into_rocksdb,
     },
     capture::measure_fixture_blocks,
 };
@@ -37,9 +42,8 @@ use zinder_source::{
     SourceChainSegmentLimits, SourceError,
 };
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
-    CanonicalSubtreeRootLoadCoverage, RawBlobRetention, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreError, CanonicalSubtreeRootLoadCoverage, RawBlobRetention,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget, TreeStateLookup,
 };
 use zinder_testkit::{completed_sapling_subtree_frontier, sample_regtest_upgrade_activations};
 
@@ -359,9 +363,11 @@ fn canonical_fixture_rocksdb_replay_config(
         request_timeout: construction.request_timeout,
         pipeline_limits: construction.pipeline_limits,
         resource_budget: RocksDbResourceBudget::for_local_tests(),
-        raw_blob_retention: RawBlobRetention::Transactions,
+        raw_blob_retention: RawBlobRetention::None,
         supported_reorg_depth: 1,
         source_segment_delay: Duration::ZERO,
+        tree_state_checkpoint_coverage: TreeStateCheckpointCoverage::EveryBlock,
+        tree_state_commitment_budget: None,
     }
 }
 
@@ -371,6 +377,10 @@ fn assert_canonical_fixture_load_evidence(
     predecessor: &CommitmentTreeCheckpoint,
     fixed_tip: &CommitmentTreeCheckpoint,
 ) {
+    assert_eq!(
+        outcome.tree_state_checkpoint_coverage,
+        TreeStateCheckpointCoverage::EveryBlock
+    );
     assert_eq!(
         outcome.block_load_evidence.first_height,
         fixture.block.height
@@ -397,6 +407,32 @@ fn assert_canonical_fixture_load_evidence(
     assert_eq!(outcome.subtree_root_load_evidence.subtree_root_count, 0);
     assert!(outcome.source_tip_checkpoint_authenticated);
     assert_eq!(outcome.settled_tip, fixed_tip.block_id);
+    assert_eq!(outcome.block_load_evidence.settled_segment_index_count, 0);
+    assert_eq!(
+        outcome.block_load_evidence.live_tail_block_count,
+        outcome.block_load_evidence.block_count
+    );
+    assert!(outcome.block_load_evidence.logical_replay_bytes > 0);
+    assert_eq!(
+        outcome
+            .block_load_evidence
+            .settled_segment_index_logical_bytes,
+        0
+    );
+    assert!(outcome.block_load_evidence.live_tail_block_logical_bytes > 0);
+    assert_eq!(outcome.block_load_evidence.transaction_blob_count, 0);
+    assert_eq!(
+        outcome.block_load_evidence.transaction_blob_logical_bytes,
+        0
+    );
+    assert_eq!(outcome.block_load_evidence.block_blob_count, 0);
+    assert_eq!(outcome.block_load_evidence.block_blob_logical_bytes, 0);
+    assert_eq!(
+        outcome
+            .block_load_evidence
+            .live_tail_raw_block_logical_bytes,
+        0
+    );
 }
 
 fn assert_canonical_fixture_ready_evidence(
@@ -468,55 +504,32 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
         report["contract_identity"],
         "rocksdb-raw-blob-retention-comparison"
     );
-    assert_eq!(report["report_format_version"], 2);
+    assert_eq!(report["report_format_version"], 1);
     assert_eq!(
         report["arm_execution_order"],
-        serde_json::json!(["transactions", "all"])
+        serde_json::json!(["none", "all"])
     );
-    assert_eq!(report["transactions"]["raw_blob_retention"], "transactions");
+    assert_eq!(report["none"]["raw_blob_retention"], "none");
     assert_eq!(report["all"]["raw_blob_retention"], "all");
     assert_eq!(
-        report["transactions"]["fixture_manifest_digest_sha256"],
+        report["none"]["fixture_manifest_digest_sha256"],
         report["all"]["fixture_manifest_digest_sha256"]
     );
     assert_eq!(
-        report["transactions"]["replay_plan_digest_sha256"],
+        report["none"]["replay_plan_digest_sha256"],
         report["all"]["replay_plan_digest_sha256"]
     );
     assert_eq!(
-        report["transactions"]["effective_limits"],
+        report["none"]["effective_limits"],
         report["all"]["effective_limits"]
     );
     assert_eq!(
-        report["transactions"]["logical_replay_identity"],
+        report["none"]["logical_replay_identity"],
         report["all"]["logical_replay_identity"]
     );
+    assert_raw_blob_retention_counts_and_v2_identity(report, fixture);
     assert_eq!(
-        report["transactions"]["logical_replay_identity"]["subtree_root_count"],
-        1
-    );
-    assert_eq!(
-        report["transactions"]["logical_replay_identity"]["subtree_root_coverage"],
-        "complete-prefix"
-    );
-    assert_eq!(
-        report["transactions"]["logical_replay_identity"]["subtree_root_sequence_digest_version"],
-        2
-    );
-    assert_eq!(
-        report["transactions"]["raw_blob_counts"]["transaction_blob_count"],
-        report["all"]["raw_blob_counts"]["transaction_blob_count"]
-    );
-    assert_eq!(
-        report["transactions"]["raw_blob_counts"]["block_blob_count"],
-        0
-    );
-    assert_eq!(
-        report["all"]["raw_blob_counts"]["block_blob_count"],
-        fixture.block_count
-    );
-    assert_eq!(
-        report["transactions"]["secondary_ready_matches_reopened_primary"].as_bool(),
+        report["none"]["secondary_ready_matches_reopened_primary"].as_bool(),
         Some(true)
     );
     assert_eq!(
@@ -524,7 +537,7 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
         Some(true)
     );
     assert!(
-        report["transactions"]["authenticated_replay_lifecycle_seconds"]
+        report["none"]["authenticated_replay_lifecycle_seconds"]
             .as_f64()
             .is_some_and(|seconds| seconds > 0.0)
     );
@@ -534,7 +547,7 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
             .is_some_and(|seconds| seconds > 0.0)
     );
     assert!(
-        report["transactions"]["authenticated_replay_lifecycle_blocks_per_second"]
+        report["none"]["authenticated_replay_lifecycle_blocks_per_second"]
             .as_f64()
             .is_some_and(|blocks_per_second| blocks_per_second > 0.0)
     );
@@ -542,6 +555,65 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
         report["all"]["authenticated_replay_lifecycle_blocks_per_second"]
             .as_f64()
             .is_some_and(|blocks_per_second| blocks_per_second > 0.0)
+    );
+}
+
+fn assert_raw_blob_retention_counts_and_v2_identity(report: &Value, fixture: &FixtureManifest) {
+    let none_identity = &report["none"]["logical_replay_identity"];
+    let none_layout = &report["none"]["storage_layout_evidence"];
+    let all_layout = &report["all"]["storage_layout_evidence"];
+    assert_eq!(none_layout["settled_segment_index_count"], 0);
+    assert_eq!(none_layout["live_tail_block_count"], fixture.block_count);
+    assert_eq!(none_layout["settled_segment_index_logical_bytes"], 0);
+    assert!(
+        none_layout["live_tail_block_logical_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(all_layout["settled_segment_index_count"], 0);
+    assert_eq!(all_layout["live_tail_block_count"], fixture.block_count);
+    assert_eq!(all_layout["settled_segment_index_logical_bytes"], 0);
+    assert!(
+        all_layout["live_tail_block_logical_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert!(
+        none_identity["logical_replay_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(none_identity["subtree_root_count"], 1);
+    assert_eq!(none_identity["subtree_root_coverage"], "complete-prefix");
+    assert_eq!(none_identity["subtree_root_sequence_digest_version"], 1);
+
+    let none_blobs = &report["none"]["raw_blob_counts"];
+    let all_blobs = &report["all"]["raw_blob_counts"];
+    assert_eq!(none_blobs["transaction_blob_count"], 0);
+    assert_eq!(none_blobs["transaction_blob_logical_bytes"], 0);
+    assert_eq!(none_blobs["block_blob_count"], 0);
+    assert_eq!(none_blobs["block_blob_logical_bytes"], 0);
+    assert_eq!(none_blobs["live_tail_raw_block_logical_bytes"], 0);
+    assert!(
+        all_blobs["transaction_blob_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(
+        all_blobs["transaction_blob_logical_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(all_blobs["block_blob_count"], fixture.block_count);
+    assert!(
+        all_blobs["block_blob_logical_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert!(
+        all_blobs["live_tail_raw_block_logical_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
     );
 }
 
@@ -730,7 +802,7 @@ async fn canonical_fixture_replay_preserves_historical_subtree_prefix_after_cold
     );
     assert_eq!(
         outcome.subtree_root_load_evidence.sequence_digest_version,
-        2
+        1
     );
     assert_eq!(outcome.subtree_root_load_evidence.subtree_root_count, 1);
     let subtree_range = SubtreeRootRange::new(
@@ -741,8 +813,7 @@ async fn canonical_fixture_replay_preserves_historical_subtree_prefix_after_cold
     let primary = RocksDbCanonicalStore::open_ready(
         &canonical_store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(1)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -756,8 +827,7 @@ async fn canonical_fixture_replay_preserves_historical_subtree_prefix_after_cold
         &canonical_store_path,
         &secondary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(1)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -808,6 +878,7 @@ async fn canonical_fixture_replay_cli_emits_self_validating_zero_prohibited_read
         report["measurement_kind"],
         "rocksdb-canonical-fixture-replay"
     );
+    assert_cli_report_v2_coverage(&report, "cadence-and-tip", 2, 1);
     assert_eq!(
         report["prohibited_reads"]["historical_prevout_read_count"],
         0
@@ -816,6 +887,317 @@ async fn canonical_fixture_replay_cli_emits_self_validating_zero_prohibited_read
         report["prohibited_reads"]["cross_block_wallet_read_count"],
         0
     );
+    Ok(())
+}
+
+fn assert_unsealed_v2_source_load(source_load: &Value, expected_blocks: u64) {
+    assert_eq!(source_load["block_count"], expected_blocks);
+    assert_eq!(source_load["settled_segment_index_count"], 0);
+    assert_eq!(source_load["live_tail_block_count"], expected_blocks);
+    assert!(
+        source_load["logical_replay_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(source_load["settled_segment_index_logical_bytes"], 0);
+    assert!(
+        source_load["live_tail_block_logical_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(source_load["live_tail_raw_block_logical_bytes"], 0);
+}
+
+fn assert_cli_report_v2_coverage(
+    report: &Value,
+    expected_coverage: &str,
+    expected_checkpoints: u64,
+    expected_blocks: u64,
+) {
+    assert_eq!(report["report_format_version"], 1);
+    assert_eq!(
+        report["resource_limits"]["tree_state_checkpoint_coverage"],
+        expected_coverage
+    );
+    assert_eq!(
+        report["source_load"]["tree_state_checkpoint_count"],
+        expected_checkpoints
+    );
+    assert_unsealed_v2_source_load(&report["source_load"], expected_blocks);
+}
+
+fn coinbase_only_linked_block(
+    template: &SourceBlock,
+    target_height: u32,
+    parent_hash: BlockHash,
+    block_time_seconds: u32,
+) -> Result<SourceBlock> {
+    let mut parsed: ZebraBlock = template
+        .raw_block_bytes
+        .as_slice()
+        .zcash_deserialize_into()?;
+    let coinbase = parsed
+        .transactions
+        .first()
+        .ok_or_else(|| eyre!("missing template coinbase"))?;
+    let mut bytes = coinbase.zcash_serialize_to_vec()?;
+    // ZIP 244 excludes the coinbase input script from the transaction ID.
+    // Give each synthetic coinbase a distinct lock time as well as a height.
+    let lock_height = target_height
+        .checked_sub(1)
+        .ok_or_else(|| eyre!("missing predecessor"))?;
+    bytes
+        .get_mut(12..16)
+        .ok_or_else(|| eyre!("missing lock time in fixture transaction"))?
+        .copy_from_slice(&lock_height.to_le_bytes());
+    parsed.transactions = vec![std::sync::Arc::new(
+        bytes.as_slice().zcash_deserialize_into()?,
+    )];
+    let mut raw_bytes = parsed.zcash_serialize_to_vec()?;
+    raw_bytes
+        .get_mut(4..36)
+        .ok_or_else(|| eyre!("template block is too short for parent hash"))?
+        .copy_from_slice(&parent_hash.as_bytes());
+    raw_bytes
+        .get_mut(100..104)
+        .ok_or_else(|| eyre!("template block is too short for header timestamp"))?
+        .copy_from_slice(&block_time_seconds.to_le_bytes());
+    let old_prefix = [0xff_u8, 0xff, 0xff, 0xff, 0x2a, 0x02, 0x5b, 0x02];
+    let target_le = u16::try_from(target_height)?.to_le_bytes();
+    let new_prefix = [
+        0xff_u8,
+        0xff,
+        0xff,
+        0xff,
+        0x2a,
+        0x02,
+        target_le[0],
+        target_le[1],
+    ];
+    let offset = raw_bytes
+        .windows(old_prefix.len())
+        .position(|window| window == old_prefix)
+        .ok_or_else(|| eyre!("template coinbase height prefix not found"))?;
+    raw_bytes[offset..offset + old_prefix.len()].copy_from_slice(&new_prefix);
+    let reparsed: ZebraBlock = raw_bytes.as_slice().zcash_deserialize_into()?;
+    if reparsed.coinbase_height() != Some(ZebraHeight(target_height)) {
+        return Err(eyre!(
+            "relinked block coinbase height {:?} != {target_height}",
+            reparsed.coinbase_height()
+        ));
+    }
+    Ok(SourceBlock::from_raw_block_bytes(
+        Network::ZcashRegtest,
+        BlockHeight::new(target_height),
+        raw_bytes,
+    )?)
+}
+
+fn write_multi_block_regtest_fixture() -> Result<(tempfile::TempDir, Vec<SourceBlock>)> {
+    let block_603 = load_regtest_block(REGTEST_BLOCK_603)?;
+    let block_604 = coinbase_only_linked_block(
+        &block_603,
+        604,
+        block_603.hash,
+        block_603.block_time_seconds.saturating_add(10),
+    )?;
+    let block_605 = coinbase_only_linked_block(
+        &block_603,
+        605,
+        block_604.hash,
+        block_603.block_time_seconds.saturating_add(20),
+    )?;
+    let block_606 = coinbase_only_linked_block(
+        &block_603,
+        606,
+        block_605.hash,
+        block_603.block_time_seconds.saturating_add(30),
+    )?;
+    let blocks = vec![block_603, block_604, block_605, block_606];
+    let activations = sample_regtest_upgrade_activations();
+    let directory = tempdir()?;
+    let descriptor = write_segment(directory.path(), 0, &blocks)?;
+    let measurements = measure_fixture_blocks(&blocks, &activations)?;
+    let tip = blocks
+        .last()
+        .ok_or_else(|| eyre!("multi-block fixture must contain blocks"))?;
+    let manifest = FixtureManifest {
+        contract_identity: FIXTURE_CONTRACT_IDENTITY.to_owned(),
+        fixture_format_version: FIXTURE_FORMAT_VERSION,
+        network: encode_zinder_native_chain_name(Network::ZcashRegtest).to_owned(),
+        from_height: 603,
+        to_height: 606,
+        block_count: 4,
+        workload_density: measurements.workload_density,
+        canonical_artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        canonical_block_facts_digest_evidence: measurements
+            .canonical_block_facts_digest_evidence()?,
+        tip_hash_hex: hex::encode(tip.hash.as_bytes()),
+        network_upgrade_activations: regtest_activation_records(),
+        segments: vec![descriptor],
+        subtree_roots: SubtreeRootSet::default(),
+    };
+    manifest.write(directory.path())?;
+    Ok((directory, blocks))
+}
+
+fn multi_block_checkpoint_source(blocks: &[SourceBlock]) -> Result<CheckpointSource> {
+    let activations = sample_regtest_upgrade_activations();
+    let first = blocks
+        .first()
+        .ok_or_else(|| eyre!("multi-block fixture must have a first block"))?;
+    let predecessor_height = BlockHeight::new(first.height.value() - 1);
+    let predecessor = CommitmentTreeCheckpoint::new(
+        BlockId::new(predecessor_height, first.parent_hash),
+        first.block_time_seconds.saturating_sub(1),
+        checkpoint_frontiers_at(predecessor_height)?,
+    );
+    let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+        predecessor.block_id.height,
+        &predecessor.frontiers,
+        &activations,
+    )?;
+    for block in blocks {
+        let prepared = prepare_canonical_block(block, &activations, RawBlobPolicy::None)?;
+        let mut sapling = Vec::new();
+        let mut orchard = Vec::new();
+        let mut ironwood = Vec::new();
+        for transaction in prepared.partial_compact_block.transactions() {
+            sapling.extend(
+                transaction
+                    .data
+                    .sapling_outputs
+                    .iter()
+                    .map(|output| output.commitment),
+            );
+            orchard.extend(
+                transaction
+                    .data
+                    .orchard_actions
+                    .iter()
+                    .map(|action| action.commitment),
+            );
+            ironwood.extend(
+                transaction
+                    .data
+                    .ironwood_actions
+                    .iter()
+                    .map(|action| action.commitment),
+            );
+        }
+        accumulator.append_block_commitments(block.height, &sapling, &orchard, &ironwood)?;
+    }
+    let tip = blocks
+        .last()
+        .ok_or_else(|| eyre!("multi-block fixture must have a tip block"))?;
+    let fixed_tip = CommitmentTreeCheckpoint::new(
+        BlockId::new(tip.height, tip.hash),
+        tip.block_time_seconds,
+        accumulator.validated_frontiers()?,
+    );
+    Ok(CheckpointSource::new(vec![predecessor, fixed_tip]))
+}
+
+fn run_canonical_fixture_replay_cli(
+    fixture_directory: &std::path::Path,
+    canonical_store_path: &std::path::Path,
+    report_path: &std::path::Path,
+    coverage_flag: Option<&str>,
+) -> Result<Value> {
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-bench"));
+    command
+        .arg("rocksdb-canonical-fixture-replay")
+        .arg("--fixture")
+        .arg(fixture_directory)
+        .arg("--canonical-store")
+        .arg(canonical_store_path)
+        .arg("--request-timeout-secs")
+        .arg("5")
+        .arg("--supported-reorg-depth")
+        .arg("1")
+        .arg("--report")
+        .arg(report_path);
+    if let Some(coverage) = coverage_flag {
+        command
+            .arg("--tree-state-checkpoint-coverage")
+            .arg(coverage);
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "canonical fixture replay CLI failed:\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(serde_json::from_slice(&std::fs::read(report_path)?)?)
+}
+
+#[tokio::test]
+async fn canonical_fixture_replay_cli_defaults_to_cadence_and_tip_and_supports_every_block()
+-> Result<()> {
+    let (fixture_directory, blocks) = write_multi_block_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let checkpoint_source = multi_block_checkpoint_source(&blocks)?;
+    capture_canonical_fixture_replay_plan(
+        fixture_directory.path(),
+        &checkpoint_source,
+        &activations,
+    )
+    .await?;
+
+    let output_directory = tempdir()?;
+    let dense_store_path = output_directory.path().join("canonical-dense");
+    let dense_report = run_canonical_fixture_replay_cli(
+        fixture_directory.path(),
+        &dense_store_path,
+        &output_directory.path().join("dense-report.json"),
+        Some("every-block"),
+    )?;
+    assert_cli_report_v2_coverage(&dense_report, "every-block", 5, 4);
+    let reopen = |path: &std::path::Path| -> Result<RocksDbCanonicalStore> {
+        Ok(RocksDbCanonicalStore::open_ready(
+            path,
+            &activations,
+            RawBlobRetention::None,
+            CanonicalReorgPolicy::new(1)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?)
+    };
+    let dense_store = reopen(&dense_store_path)?;
+    for height in 602_u32..=606 {
+        assert!(
+            matches!(
+                dense_store.tree_state_lookup(BlockHeight::new(height), &activations)?,
+                Some(TreeStateLookup::Stored(_))
+            ),
+            "every-block fixture replay must store checkpoint at height {height}"
+        );
+    }
+
+    let sparse_store_path = output_directory.path().join("canonical-sparse");
+    let sparse_report = run_canonical_fixture_replay_cli(
+        fixture_directory.path(),
+        &sparse_store_path,
+        &output_directory.path().join("sparse-report.json"),
+        None,
+    )?;
+    assert_cli_report_v2_coverage(&sparse_report, "cadence-and-tip", 2, 4);
+    let sparse_store = reopen(&sparse_store_path)?;
+    for height in [602_u32, 606] {
+        assert!(matches!(
+            sparse_store.tree_state_lookup(BlockHeight::new(height), &activations)?,
+            Some(TreeStateLookup::Stored(_))
+        ));
+    }
+    for height in 603_u32..=605 {
+        assert!(
+            matches!(
+                sparse_store.tree_state_lookup(BlockHeight::new(height), &activations)?,
+                Some(TreeStateLookup::Replay(_))
+            ),
+            "cadence-and-tip fixture replay must keep off-cadence height {height} unstored"
+        );
+    }
     Ok(())
 }
 
@@ -834,8 +1216,8 @@ async fn raw_blob_retention_comparison_replays_both_arms_and_admits_fresh_second
     )
     .await?;
     let output_directory = tempdir()?;
-    let transactions_canonical = output_directory.path().join("transactions-canonical");
-    let transactions_secondary = output_directory.path().join("transactions-secondary");
+    let none_canonical = output_directory.path().join("none-canonical");
+    let none_secondary = output_directory.path().join("none-secondary");
     let all_canonical = output_directory.path().join("all-canonical");
     let all_secondary = output_directory.path().join("all-secondary");
     let report_path = output_directory.path().join("comparison.json");
@@ -844,10 +1226,10 @@ async fn raw_blob_retention_comparison_replays_both_arms_and_admits_fresh_second
         .arg("rocksdb-raw-blob-retention-comparison")
         .arg("--fixture")
         .arg(fixture.directory.path())
-        .arg("--transactions-canonical-store")
-        .arg(&transactions_canonical)
-        .arg("--transactions-secondary-root")
-        .arg(&transactions_secondary)
+        .arg("--none-canonical-store")
+        .arg(&none_canonical)
+        .arg("--none-secondary-root")
+        .arg(&none_secondary)
         .arg("--all-canonical-store")
         .arg(&all_canonical)
         .arg("--all-secondary-root")
@@ -869,8 +1251,12 @@ async fn raw_blob_retention_comparison_replays_both_arms_and_admits_fresh_second
 
     let report: Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
     assert_raw_blob_retention_comparison_report(&report, &fixture.manifest);
-    assert!(transactions_canonical.is_dir());
-    assert!(transactions_secondary.is_dir());
+    assert_eq!(
+        report["none"]["effective_limits"]["tree_state_checkpoint_coverage"],
+        "cadence-and-tip"
+    );
+    assert!(none_canonical.is_dir());
+    assert!(none_secondary.is_dir());
     assert!(all_canonical.is_dir());
     assert!(all_secondary.is_dir());
     Ok(())
@@ -934,8 +1320,7 @@ async fn canonical_fixture_rocksdb_replay_leaves_a_mismatched_tip_checkpoint_unp
     let open_error = RocksDbCanonicalStore::open_ready(
         &canonical_store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(1)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -1020,8 +1405,7 @@ async fn canonical_fixture_rocksdb_replay_leaves_manifest_digest_drift_unpublish
     let open_error = RocksDbCanonicalStore::open_ready(
         &canonical_store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(1)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -1247,7 +1631,7 @@ async fn canonical_fixture_checkpoint_capture_rejects_disconnected_segment_bound
 }
 
 #[test]
-fn fixture_v3_requires_exact_contract_identity() -> Result<()> {
+fn fixture_v1_requires_exact_contract_identity() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut missing_identity = serde_json::to_value(&fixture.manifest)?;
     missing_identity
@@ -1279,7 +1663,7 @@ fn fixture_v3_requires_exact_contract_identity() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_unknown_manifest_fields() -> Result<()> {
+fn fixture_v1_rejects_unknown_manifest_fields() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut unknown_field = serde_json::to_value(&fixture.manifest)?;
     unknown_field
@@ -1301,7 +1685,7 @@ fn fixture_v3_rejects_unknown_manifest_fields() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_format_v2_without_compatibility_decoding() -> Result<()> {
+fn fixture_v1_rejects_format_v2_without_compatibility_decoding() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut encoded = serde_json::to_value(&fixture.manifest)?;
     encoded["fixture_format_version"] = serde_json::json!(2);
@@ -1323,7 +1707,7 @@ fn fixture_v3_rejects_format_v2_without_compatibility_decoding() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_requires_an_exact_completing_block_hash() -> Result<()> {
+fn fixture_v1_requires_an_exact_completing_block_hash() -> Result<()> {
     let mut fixture = write_regtest_fixture()?;
     let completing_block = BlockId::new(fixture.block.height, fixture.block.hash);
     fixture.manifest.subtree_roots.sapling = vec![subtree_root_record(0, 0x51, completing_block)];
@@ -1364,7 +1748,7 @@ fn fixture_source_rejects_an_in_range_completing_block_hash_mismatch() -> Result
 }
 
 #[test]
-fn fixture_v3_rejects_invalid_subtree_root_prefix_shape() -> Result<()> {
+fn fixture_v1_rejects_invalid_subtree_root_prefix_shape() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let completing_block = BlockId::new(fixture.block.height, fixture.block.hash);
     let root = subtree_root_record(0, 0x51, completing_block);
@@ -1675,7 +2059,7 @@ async fn fixture_source_rejects_short_missing_or_disconnected_exact_subtree_rang
 }
 
 #[test]
-fn fixture_v3_requires_digest_evidence() -> Result<()> {
+fn fixture_v1_requires_digest_evidence() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut missing_digest_evidence = serde_json::to_value(&fixture.manifest)?;
     missing_digest_evidence
@@ -1698,7 +2082,7 @@ fn fixture_v3_requires_digest_evidence() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_inconsistent_counts() -> Result<()> {
+fn fixture_v1_rejects_inconsistent_counts() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut inconsistent_digest_count = fixture.manifest.clone();
     inconsistent_digest_count
@@ -1729,7 +2113,7 @@ fn fixture_v3_rejects_inconsistent_counts() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_unknown_digest_version() -> Result<()> {
+fn fixture_v1_rejects_unknown_digest_version() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut unknown_digest_version = fixture.manifest;
     unknown_digest_version
@@ -1754,7 +2138,7 @@ fn fixture_v3_rejects_unknown_digest_version() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_uppercase_sequence_digest_hex() -> Result<()> {
+fn fixture_v1_rejects_uppercase_sequence_digest_hex() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut uppercase_sequence_digest = fixture.manifest;
     uppercase_sequence_digest
@@ -1771,5 +2155,56 @@ fn fixture_v3_rejects_uppercase_sequence_digest_hex() -> Result<()> {
         ));
     };
     assert!(error.to_string().contains("lowercase hexadecimal"));
+    Ok(())
+}
+
+#[test]
+fn checkpoint_policy_comparison_measures_off_cadence_checkpoints() -> Result<()> {
+    let fixture = zinder_testkit::manifest_dir!().join("fixtures/checkpoint-policy");
+    let scratch = tempdir()?;
+    let output = Command::new(zinder_testkit::bin_exe!("zinder-bench"))
+        .env("TOKIO_WORKER_THREADS", "2")
+        .arg("rocksdb-checkpoint-policy-comparison")
+        .arg("--fixture")
+        .arg(fixture)
+        .arg("--scratch-directory")
+        .arg(scratch.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "comparison failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["byte_equivalent"], true);
+    assert_eq!(
+        report["sampled_heights"],
+        serde_json::json!([603, 604, 605, 606])
+    );
+    let arms = report["arms"]
+        .as_array()
+        .ok_or_else(|| eyre!("comparison arms missing"))?;
+    assert_eq!(arms.len(), 4);
+    assert_eq!(arms[0]["coverage"], "cadence-and-tip");
+    assert_eq!(arms[1]["commitment_budget"], 1);
+    assert_eq!(arms[2]["commitment_budget"], 3);
+    assert_eq!(arms[3]["coverage"], "every-block");
+    for (arm, (rows, misses, max_blocks, max_commitments)) in
+        arms.iter()
+            .zip([(2, 3, 3, 2), (3, 2, 2, 0), (2, 3, 3, 2), (5, 0, 0, 0)])
+    {
+        assert_eq!(arm["checkpoint_rows"], rows);
+        assert_eq!(arm["miss_samples"], misses);
+        assert_eq!(arm["max_replayed_blocks"], max_blocks);
+        assert_eq!(arm["max_replayed_commitments"], max_commitments);
+        assert_eq!(arm["miss_latency_seconds"].is_null(), misses == 0);
+        for bytes in ["checkpoint_logical_bytes", "checkpoint_sst_bytes"] {
+            assert!(arm[bytes].as_u64().is_some_and(|count| count > 0));
+        }
+        for phase in ["ready_seconds", "reopen_seconds"] {
+            assert!(arm[phase].as_f64().is_some_and(|seconds| seconds > 0.0));
+        }
+    }
+    assert_eq!(std::fs::read_dir(scratch.path())?.count(), 0);
     Ok(())
 }

@@ -221,6 +221,20 @@ pub enum SourceError {
         reason: String,
     },
 
+    /// The upstream node refused a JSON-RPC request with HTTP 429.
+    ///
+    /// Zebra answers HTTP 429 (`Too many connections`) when its JSON-RPC
+    /// server already holds its configured connection limit, and a rate
+    /// limiter in front of the node answers the same way. The node is up, so
+    /// the request is retryable after a brief backoff, and the HTTP transport
+    /// itself is healthy: callers must not rebuild their connection pool,
+    /// because new connections add to the load the node refused.
+    #[error("upstream node rate-limited {operation}: HTTP 429 Too Many Requests")]
+    NodeRateLimited {
+        /// Node method the node refused.
+        operation: &'static str,
+    },
+
     /// A JSON-RPC response exceeded the configured adapter response limit.
     ///
     /// Batched source adapters should split bounded segments before surfacing
@@ -540,6 +554,10 @@ pub enum SourceFailureClass {
     /// The node itself cannot answer; retry the same call after a brief
     /// backoff.
     NodeUnreachable,
+    /// The node is up but refused the request with HTTP 429 because it is
+    /// at its connection or request limit. Retry after a brief backoff, or
+    /// fail over to another node; do not rebuild the transport.
+    NodeRateLimited,
     /// The upstream answered, but the request targeted a view that is no
     /// longer current (best-chain race, height not in best chain, txid
     /// dropped between observation and lookup). Re-observe the upstream's
@@ -576,6 +594,7 @@ impl SourceFailureClass {
     /// so adding a new variant without extending this slice fails CI.
     pub const ALL_LABELS: &'static [&'static str] = &[
         "node_unreachable",
+        "node_rate_limited",
         "upstream_view_changed",
         "stream_disconnected",
         "capability_missing",
@@ -591,6 +610,7 @@ impl SourceFailureClass {
     pub const fn label(self) -> &'static str {
         match self {
             Self::NodeUnreachable => "node_unreachable",
+            Self::NodeRateLimited => "node_rate_limited",
             Self::UpstreamViewChanged => "upstream_view_changed",
             Self::StreamDisconnected => "stream_disconnected",
             Self::CapabilityMissing => "capability_missing",
@@ -626,6 +646,7 @@ impl SourceError {
     pub const fn upstream_classification(&self) -> SourceFailureClass {
         match self {
             Self::NodeUnavailable { .. } => SourceFailureClass::NodeUnreachable,
+            Self::NodeRateLimited { .. } => SourceFailureClass::NodeRateLimited,
             Self::SourceResponseTooLarge { .. }
             | Self::NodeResponseTooLarge { .. }
             | Self::MempoolTransactionCountLimitExceeded { .. }
@@ -687,6 +708,7 @@ mod source_failure_class_tests {
     fn label_appears_in_all_labels() {
         for class in [
             SourceFailureClass::NodeUnreachable,
+            SourceFailureClass::NodeRateLimited,
             SourceFailureClass::UpstreamViewChanged,
             SourceFailureClass::StreamDisconnected,
             SourceFailureClass::CapabilityMissing,
@@ -700,6 +722,6 @@ mod source_failure_class_tests {
                 class.label(),
             );
         }
-        assert_eq!(SourceFailureClass::ALL_LABELS.len(), 7);
+        assert_eq!(SourceFailureClass::ALL_LABELS.len(), 8);
     }
 }

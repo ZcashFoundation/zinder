@@ -53,7 +53,19 @@ impl NativeWalletEndpointCapabilities {
     /// first contact; until then each broadcast fails on its own.
     pub(crate) fn with_node_broadcast(&self) -> Self {
         Self::from_predicate(|capability| {
-            capability == capabilities::WALLET_BROADCAST_TRANSACTION_V1 || self.contains(capability)
+            matches!(
+                capability,
+                capabilities::WALLET_BROADCAST_TRANSACTION_V1
+                    | capabilities::WALLET_READ_STANDARD_FEE_V1
+            ) || self.contains(capability)
+        })
+    }
+
+    pub(crate) fn with_cold_transaction_bytes(&self) -> Self {
+        Self::from_predicate(|capability| {
+            self.contains(capability)
+                || (capability == capabilities::WALLET_READ_TRANSACTION_BYTES_V1
+                    && self.contains(capabilities::WALLET_READ_TRANSACTION_BY_ID_V2))
         })
     }
 
@@ -90,8 +102,11 @@ impl NativeWalletEndpointCapabilities {
             capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1
                 | capabilities::WALLET_READ_SETTLED_TIP_BLOCK_V1
                 | capabilities::WALLET_READ_BLOCK_ID_BY_SELECTOR_V1
+                | capabilities::WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1
                 | capabilities::WALLET_READ_COMPACT_BLOCK_AT_V2
                 | capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V2
+                | capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V3
+                | capabilities::WALLET_READ_COMPACT_NULLIFIER_RANGE_V1
                 | capabilities::WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2
                 | capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2
                 | capabilities::WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2
@@ -101,6 +116,8 @@ impl NativeWalletEndpointCapabilities {
                 | capabilities::WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1
                 | capabilities::WALLET_EVENTS_CHAIN_V1
                 | capabilities::WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1
+                | capabilities::WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1
+                | capabilities::WALLET_ADDRESS_TRANSPARENT_BALANCES_V1
                 | capabilities::WALLET_ADDRESS_TRANSPARENT_HISTORY_V1
                 | capabilities::WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1
         );

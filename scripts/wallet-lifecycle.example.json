@@ -1,0 +1,188 @@
+{
+  "schema_version": 2,
+  "timeout_seconds": 180,
+  "cases": {
+    "zkool-internal": {
+      "wallet": "zkool",
+      "version": "6.37.0",
+      "variant": "internal-enabled",
+      "network": "zcash-regtest",
+      "implementation": "engine",
+      "interface": "lightwalletd",
+      "endpoint": "http://127.0.0.1:32367",
+      "require_no_fallback": true,
+      "client": {
+        "path": "/absolute/path/to/wallet-client",
+        "sha256": "REPLACE_WITH_SHA256"
+      },
+      "inputs": {
+        "/absolute/path/to/wallet-client": "REPLACE_WITH_SHA256",
+        "/absolute/path/to/lifecycle-adapter": "REPLACE_WITH_SHA256",
+        "/absolute/path/to/fixture-manifest.json": "REPLACE_WITH_SHA256"
+      },
+      "steps": {
+        "bootstrap": {
+          "command": [
+            "/absolute/path/to/lifecycle-adapter",
+            "--step",
+            "bootstrap",
+            "--scratch",
+            "{scratch}",
+            "--report",
+            "{report}",
+            "--endpoint",
+            "{endpoint}"
+          ],
+          "expect": {
+            "/assertions/bootstrap": true
+          }
+        },
+        "restore": {
+          "command": [
+            "/absolute/path/to/lifecycle-adapter",
+            "--step",
+            "restore",
+            "--scratch",
+            "{scratch}",
+            "--report",
+            "{report}",
+            "--endpoint",
+            "{endpoint}"
+          ],
+          "expect": {
+            "/assertions/restore": true
+          }
+        },
+        "transparent-discovery": {
+          "command": [
+            "/absolute/path/to/lifecycle-adapter",
+            "--step",
+            "transparent-discovery",
+            "--scratch",
+            "{scratch}",
+            "--report",
+            "{report}",
+            "--endpoint",
+            "{endpoint}"
+          ],
+          "expect": {
+            "/assertions/transparent-discovery": true
+          }
+        },
+        "shielded-discovery": {
+          "command": [
+            "/absolute/path/to/lifecycle-adapter",
+            "--step",
+            "shielded-discovery",
+            "--scratch",
+            "{scratch}",
+            "--report",
+            "{report}",
+            "--endpoint",
+            "{endpoint}"
+          ],
+          "expect": {
+            "/assertions/shielded-discovery": true
+          }
+        },
+        "send": {
+          "command": [
+            "/absolute/path/to/lifecycle-adapter",
+            "--step",
+            "send",
+            "--scratch",
+            "{scratch}",
+            "--report",
+            "{report}",
+            "--endpoint",
+            "{endpoint}"
+          ],
+          "expect": {
+            "/assertions/send": true
+          }
+        },
+        "pending": {
+          "command": [
+            "/absolute/path/to/lifecycle-adapter",
+            "--step",
+            "pending",
+            "--scratch",
+            "{scratch}",
+            "--report",
+            "{report}",
+            "--endpoint",
+            "{endpoint}"
+          ],
+          "expect": {
+            "/assertions/pending": true
+          }
+        },
+        "mined": {
+          "command": [
+            "/absolute/path/to/lifecycle-adapter",
+            "--step",
+            "mined",
+            "--scratch",
+            "{scratch}",
+            "--report",
+            "{report}",
+            "--endpoint",
+            "{endpoint}"
+          ],
+          "expect": {
+            "/assertions/mined": true
+          }
+        },
+        "scanned": {
+          "command": [
+            "/absolute/path/to/lifecycle-adapter",
+            "--step",
+            "scanned",
+            "--scratch",
+            "{scratch}",
+            "--report",
+            "{report}",
+            "--endpoint",
+            "{endpoint}"
+          ],
+          "expect": {
+            "/assertions/scanned": true
+          }
+        },
+        "restart": {
+          "command": [
+            "/absolute/path/to/lifecycle-adapter",
+            "--step",
+            "restart",
+            "--scratch",
+            "{scratch}",
+            "--report",
+            "{report}",
+            "--endpoint",
+            "{endpoint}"
+          ],
+          "expect": {
+            "/assertions/restart": true
+          }
+        },
+        "resume": {
+          "command": [
+            "/absolute/path/to/lifecycle-adapter",
+            "--step",
+            "resume",
+            "--scratch",
+            "{scratch}",
+            "--report",
+            "{report}",
+            "--endpoint",
+            "{endpoint}"
+          ],
+          "expect": {
+            "/assertions/resume": true
+          }
+        }
+      },
+      "restart_scope": "process-restart"
+    }
+  }
+}

@@ -1,0 +1,164 @@
+name: buildkit-cargo-cache
+description: >-
+  Restore or save the Cargo registry, git, and target cache mounts that
+  deploy/Dockerfile compiles release binaries in, through the GitHub Actions
+  cache. Run docker/setup-buildx-action first, because the mounts live in the
+  active Buildx builder.
+
+inputs:
+  mode:
+    description: >-
+      `restore` seeds the BuildKit cache mounts before a release build, from an
+      exact or prefix key match. `save` exports them after the build and saves
+      them, only on `refs/heads/main` and only when the exact key is new.
+    required: true
+  arch:
+    description: Docker architecture of the build, `amd64` or `arm64`.
+    required: true
+  cache-scope:
+    description: The `RELEASE_CACHE_SCOPE` build argument the release build uses.
+    required: false
+    default: shared
+
+outputs:
+  cache-matched-key:
+    description: The key a restore seeded the mounts from, or empty on a miss.
+    value: ${{ steps.restore.outputs.cache-matched-key }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the BuildKit Cargo cache key
+      id: key
+      shell: bash
+      env:
+        CACHE_ARCH: ${{ inputs.arch }}
+        CACHE_MODE: ${{ inputs.mode }}
+      run: |
+        set -euo pipefail
+        case "${CACHE_MODE}" in
+          restore|save) ;;
+          *) echo "::error::mode must be restore or save, got '${CACHE_MODE}'"; exit 1 ;;
+        esac
+        case "${CACHE_ARCH}" in
+          amd64|arm64) ;;
+          *) echo "::error::arch must be amd64 or arm64, got '${CACHE_ARCH}'"; exit 1 ;;
+        esac
+        dockerfile_arg() {
+          local value
+          value="$(sed -n "s/^ARG $1=//p" deploy/Dockerfile)"
+          if [[ -z "${value}" ]]; then
+            echo "::error::deploy/Dockerfile has no default for ARG $1"
+            exit 1
+          fi
+          printf '%s' "${value}"
+        }
+        rust_version="$(dockerfile_arg RUST_VERSION)"
+        debian_release="$(dockerfile_arg DEBIAN_RELEASE)"
+        debian_digest="$(dockerfile_arg DEBIAN_IMAGE_DIGEST)"
+        {
+          python3 -I "${GITHUB_ACTION_PATH}/cache_key.py" "${CACHE_ARCH}" "${rust_version}"
+          echo "rust-version=${rust_version}"
+          echo "base-image=debian:${debian_release}-slim@${debian_digest}"
+          echo "directory=${RUNNER_TEMP}/buildkit-cargo-cache-${CACHE_ARCH}"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Restore the BuildKit Cargo cache
+      id: restore
+      if: inputs.mode == 'restore'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.key.outputs.directory }}
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: ${{ steps.key.outputs.restore-key }}
+
+    # A prefix match from restore-keys is still worth seeding: Cargo rebuilds
+    # only the third-party crates whose versions changed.
+    - name: Seed the BuildKit cache mounts
+      if: inputs.mode == 'restore' && steps.restore.outputs.cache-matched-key != ''
+      shell: bash
+      env:
+        CACHE_ARCH: ${{ inputs.arch }}
+        CACHE_SCOPE: ${{ inputs.cache-scope }}
+        CACHE_DIRECTORY: ${{ steps.key.outputs.directory }}
+        BASE_IMAGE: ${{ steps.key.outputs.base-image }}
+        RUST_VERSION: ${{ steps.key.outputs.rust-version }}
+      run: |
+        set -euo pipefail
+        context="$(mktemp -d)"
+        # A cached seed layer would skip the extraction into the mounts, so
+        # every run passes a unique CACHE_BUST (see the Dockerfile for why not --no-cache).
+        docker buildx build \
+          --progress plain \
+          --platform "linux/${CACHE_ARCH}" \
+          --target seed \
+          --build-context "cargo-seed=${CACHE_DIRECTORY}" \
+          --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+          --build-arg "RUST_VERSION=${RUST_VERSION}" \
+          --build-arg "RELEASE_CACHE_SCOPE=${CACHE_SCOPE}" \
+          --build-arg "CACHE_BUST=${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$(date +%s%N)" \
+          --file "${GITHUB_ACTION_PATH}/Dockerfile" \
+          "${context}"
+        rm -rf "${CACHE_DIRECTORY}" "${context}"
+        # The builder keeps its own copy of the transferred seed archive.
+        # The cache mounts hold the data now, so drop that copy before the
+        # release build needs the disk.
+        docker buildx prune --force --filter type=source.local
+        df -h "${RUNNER_TEMP}" /var/lib/docker || true
+
+    - name: Look up the BuildKit Cargo cache
+      id: lookup
+      if: inputs.mode == 'save' && github.ref == 'refs/heads/main'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.key.outputs.directory }}
+        key: ${{ steps.key.outputs.key }}
+        lookup-only: true
+
+    - name: Export the BuildKit cache mounts
+      id: export
+      if: inputs.mode == 'save' && github.ref == 'refs/heads/main' && steps.lookup.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        CACHE_ARCH: ${{ inputs.arch }}
+        CACHE_SCOPE: ${{ inputs.cache-scope }}
+        CACHE_DIRECTORY: ${{ steps.key.outputs.directory }}
+        BASE_IMAGE: ${{ steps.key.outputs.base-image }}
+        RUST_VERSION: ${{ steps.key.outputs.rust-version }}
+        WORKSPACE_PACKAGES: ${{ steps.key.outputs.workspace-packages }}
+      run: |
+        set -euo pipefail
+        context="$(mktemp -d)"
+        rm -rf "${CACHE_DIRECTORY}"
+        mkdir -p "${CACHE_DIRECTORY}"
+        # A cached collect layer would export stale mount contents, so every run
+        # passes a unique CACHE_BUST (see the Dockerfile for why not --no-cache).
+        # Export a single tar stream instead of `type=local` to avoid the
+        # `fsutil`/HTTP/2 flow-control deadlock (moby/buildkit#2950) and keep the
+        # cache and seed boundary to a single file.
+        docker buildx build \
+          --progress plain \
+          --platform "linux/${CACHE_ARCH}" \
+          --target export \
+          --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+          --build-arg "RUST_VERSION=${RUST_VERSION}" \
+          --build-arg "RELEASE_CACHE_SCOPE=${CACHE_SCOPE}" \
+          --build-arg "WORKSPACE_PACKAGES=${WORKSPACE_PACKAGES}" \
+          --build-arg "CACHE_BUST=${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$(date +%s%N)" \
+          --output "type=tar,dest=${CACHE_DIRECTORY}/cache.tar" \
+          --file "${GITHUB_ACTION_PATH}/Dockerfile" \
+          "${context}"
+        rm -rf "${context}"
+        test -s "${CACHE_DIRECTORY}/cache.tar"
+        du -sh "${CACHE_DIRECTORY}/cache.tar"
+        df -h "${RUNNER_TEMP}" /var/lib/docker || true
+
+    # Another main run may save the same key first. The build this step
+    # follows has already passed, so a lost race only warns.
+    - name: Save the BuildKit Cargo cache
+      if: steps.export.outcome == 'success'
+      continue-on-error: true
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.key.outputs.directory }}
+        key: ${{ steps.key.outputs.key }}

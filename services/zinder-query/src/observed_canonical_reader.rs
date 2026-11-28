@@ -6,7 +6,7 @@ use std::{
     num::NonZeroU32,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -19,18 +19,24 @@ use zinder_core::{
 };
 use zinder_store::{
     BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, ChainEventEnvelope,
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, HeightOrder,
-    RawBlobRetention, ServedTreeState, StreamCursorTokenV1, TreeStateLookup, TreeStateReplay,
-    TreeStateReplayOutcome,
+    ChainEventStreamFamily, ChainEventStreamResume, CompactBlockSpliceSelection,
+    EncodedCompactBlockRange, EncodedCompactBlockRangeRequest, EventStreamStartPosition,
+    HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1, TreeStateLookup,
+    TreeStateReplay, TreeStateReplayOutcome,
 };
 
-use crate::{CanonicalReader, IndexedTransaction, RocksDbCanonicalReader, StorageReadError};
+use crate::{
+    CanonicalReader, EncodedCompactBlockLookup, IndexedTransaction, RocksDbCanonicalReader,
+    StorageReadError,
+};
 
 /// A [`CanonicalReader`] that counts its storage reads and can hold replays.
 pub(crate) struct ObservedCanonicalReader {
     inner: RocksDbCanonicalReader,
     reads: AtomicUsize,
+    fail_latest_checkpoint: AtomicBool,
     replays: Arc<ReplayGate>,
+    encoded_ranges: bool,
 }
 
 /// Holds every tree-state replay of an [`ObservedCanonicalReader`] until
@@ -38,6 +44,8 @@ pub(crate) struct ObservedCanonicalReader {
 pub(crate) struct ReplayGate {
     open: Semaphore,
     started: Notify,
+    pub(crate) runs: AtomicUsize,
+    pub(crate) seed_lookups: AtomicUsize,
 }
 
 impl ReplayGate {
@@ -58,12 +66,16 @@ impl ObservedCanonicalReader {
         let replays = ReplayGate {
             open: Semaphore::new(0),
             started: Notify::new(),
+            runs: AtomicUsize::new(0),
+            seed_lookups: AtomicUsize::new(0),
         };
         replays.release();
         Self {
             inner,
             reads: AtomicUsize::new(0),
+            fail_latest_checkpoint: AtomicBool::new(false),
             replays: Arc::new(replays),
+            encoded_ranges: true,
         }
     }
 
@@ -73,15 +85,31 @@ impl ObservedCanonicalReader {
         let replays = Arc::new(ReplayGate {
             open: Semaphore::new(0),
             started: Notify::new(),
+            runs: AtomicUsize::new(0),
+            seed_lookups: AtomicUsize::new(0),
         });
         (
             Self {
                 inner,
                 reads: AtomicUsize::new(0),
+                fail_latest_checkpoint: AtomicBool::new(false),
                 replays: Arc::clone(&replays),
+                encoded_ranges: true,
             },
             replays,
         )
+    }
+
+    /// Exercises structured range reads by making the wire projection unavailable.
+    pub(crate) fn without_encoded_ranges(mut self) -> Self {
+        self.encoded_ranges = false;
+        self
+    }
+
+    /// Forces the next `tree_state_checkpoint_at_or_before` call to fail with
+    /// [`StorageReadError::ReaderInvalidated`].
+    pub(crate) fn fail_next_latest_checkpoint(&self) {
+        self.fail_latest_checkpoint.store(true, Ordering::Release);
     }
 
     /// Returns how many storage reads were made through this reader.
@@ -121,6 +149,10 @@ impl CanonicalReader for ObservedCanonicalReader {
         self.inner.history_bounds()
     }
 
+    fn history_predecessor_digest(&self) -> Option<[u8; 32]> {
+        self.inner.history_predecessor_digest()
+    }
+
     async fn block_header_at(
         &self,
         height: BlockHeight,
@@ -156,6 +188,26 @@ impl CanonicalReader for ObservedCanonicalReader {
         self.count().compact_block_at(height).await
     }
 
+    async fn encoded_compact_block_at(
+        &self,
+        height: BlockHeight,
+        selection: CompactBlockSpliceSelection,
+    ) -> Result<EncodedCompactBlockLookup, StorageReadError> {
+        self.count()
+            .encoded_compact_block_at(height, selection)
+            .await
+    }
+
+    async fn encoded_compact_block_by_hash(
+        &self,
+        block_hash: BlockHash,
+        selection: CompactBlockSpliceSelection,
+    ) -> Result<EncodedCompactBlockLookup, StorageReadError> {
+        self.count()
+            .encoded_compact_block_by_hash(block_hash, selection)
+            .await
+    }
+
     async fn compact_blocks_in_range(
         &self,
         range: BlockHeightRange,
@@ -172,6 +224,20 @@ impl CanonicalReader for ObservedCanonicalReader {
         self.count()
             .compact_blocks_in_range_up_to(range, order, max_bytes)
             .await
+    }
+
+    async fn encoded_compact_block_range_up_to(
+        &self,
+        request: EncodedCompactBlockRangeRequest,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<EncodedCompactBlockRange>, StorageReadError> {
+        if self.encoded_ranges {
+            self.count()
+                .encoded_compact_block_range_up_to(request, cancel)
+                .await
+        } else {
+            Ok(None)
+        }
     }
 
     async fn block_blob_at(
@@ -195,6 +261,13 @@ impl CanonicalReader for ObservedCanonicalReader {
         self.count().mined_transaction(transaction_id).await
     }
 
+    async fn mined_transactions(
+        &self,
+        transaction_ids: &[TransactionId],
+    ) -> Result<Vec<Option<IndexedTransaction>>, StorageReadError> {
+        self.count().mined_transactions(transaction_ids).await
+    }
+
     async fn transaction_blob_by_id(
         &self,
         transaction_id: TransactionId,
@@ -206,15 +279,29 @@ impl CanonicalReader for ObservedCanonicalReader {
         &self,
         height: BlockHeight,
     ) -> Result<Option<ServedTreeState>, StorageReadError> {
+        if self.fail_latest_checkpoint.swap(false, Ordering::AcqRel) {
+            self.reads.fetch_add(1, Ordering::AcqRel);
+            return Err(StorageReadError::ReaderInvalidated {
+                source: Box::new(std::io::Error::other("simulated missing table file")),
+            });
+        }
         self.count()
             .tree_state_checkpoint_at_or_before(height)
             .await
+    }
+
+    async fn stored_tree_state_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ServedTreeState>, StorageReadError> {
+        self.count().stored_tree_state_at(height).await
     }
 
     async fn tree_state_lookup(
         &self,
         height: BlockHeight,
     ) -> Result<Option<TreeStateLookup>, StorageReadError> {
+        self.replays.seed_lookups.fetch_add(1, Ordering::Relaxed);
         self.count().tree_state_lookup(height).await
     }
 
@@ -226,6 +313,21 @@ impl CanonicalReader for ObservedCanonicalReader {
         // A released gate is closed, so it refuses the permit at once.
         let _released = self.replays.open.acquire().await;
         self.count().replay_tree_state(replay).await
+    }
+
+    async fn replay_tree_state_until_cancelled(
+        &self,
+        replay: TreeStateReplay,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateReplayOutcome>, StorageReadError> {
+        self.replays.runs.fetch_add(1, Ordering::Relaxed);
+        self.replays.started.notify_one();
+        while !self.replays.open.is_closed() && !cancelled.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        self.count()
+            .replay_tree_state_until_cancelled(replay, cancelled)
+            .await
     }
 
     async fn subtree_roots(

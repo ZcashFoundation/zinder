@@ -1,0 +1,159 @@
+name: release-wallet-roundtrip
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Complete release tag the candidate names
+        required: true
+        type: string
+      commit:
+        description: Full release commit the candidate names
+        required: true
+        type: string
+      version:
+        description: Product version without the v prefix
+        required: true
+        type: string
+      candidate-artifact:
+        description: Release build artifact containing the candidate archive
+        required: true
+        type: string
+      candidate-run-id:
+        description: Workflow run that owns the candidate artifact; empty uses this run
+        required: false
+        default: ""
+        type: string
+      archive-sha256:
+        description: Optional pinned SHA-256 of the candidate archive
+        required: false
+        default: ""
+        type: string
+      client-bundle-url:
+        description: Immutable URL of the checksummed pinned wallet client bundle
+        required: false
+        default: ""
+        type: string
+      client-bundle-sha256:
+        description: SHA-256 of the pinned wallet client bundle
+        required: false
+        default: ""
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Complete release tag the candidate names
+        required: true
+        type: string
+      commit:
+        description: Full release commit the candidate names
+        required: true
+        type: string
+      version:
+        description: Product version without the v prefix
+        required: true
+        type: string
+      candidate-artifact:
+        description: Release build artifact containing the candidate archive
+        required: true
+        type: string
+      candidate-run-id:
+        description: Workflow run that owns the candidate artifact
+        required: true
+        type: string
+      archive-sha256:
+        description: Optional pinned SHA-256 of the candidate archive
+        required: false
+        default: ""
+        type: string
+      client-bundle-url:
+        description: Immutable URL of the checksummed pinned wallet client bundle
+        required: true
+        type: string
+      client-bundle-sha256:
+        description: SHA-256 of the pinned wallet client bundle
+        required: true
+        type: string
+      operator-confirmation:
+        description: Type run-two-chain-gate to confirm this is a real candidate qualification
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  qualify:
+    name: two-chain wallet round-trip gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Require the explicit operator confirmation
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CONFIRMATION: ${{ inputs.operator-confirmation }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONFIRMATION" != "run-two-chain-gate" ]]; then
+            echo "::error::Operator gate: repeat the dispatch with operator-confirmation=run-two-chain-gate."
+            exit 1
+          fi
+
+      - name: Checkout the candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Require the gate harness at the candidate commit
+        env:
+          COMMIT: ${{ inputs.commit }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ inputs.version }}
+          RUN_ID: ${{ inputs.candidate-run-id || github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ && "$RUN_ID" =~ ^[0-9]+$ && "$TAG" == "v$VERSION" ]]
+          [[ "$(git rev-parse HEAD)" == "$COMMIT" && "$(git rev-parse "refs/tags/${TAG}^{commit}")" == "$COMMIT" ]]
+          git merge-base --is-ancestor "$COMMIT" origin/main
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" |
+            jq -e --arg sha "$COMMIT" --arg repo "$GITHUB_REPOSITORY" --arg tag "$TAG" '
+              .head_sha == $sha and .head_repository.full_name == $repo and
+              .event == "push" and .head_branch == $tag and .path == ".github/workflows/release.yml"'
+          if [[ ! -f scripts/release-wallet-action/action.yml ]]; then
+            echo "::error::The selected release predates the wallet gate."
+            exit 1
+          fi
+
+      - name: Download the candidate release build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.candidate-artifact }}
+          run-id: ${{ inputs.candidate-run-id || github.run_id }}
+          github-token: ${{ github.token }}
+          path: candidate
+
+      - name: Qualify the candidate
+        uses: ./scripts/release-wallet-action
+        with:
+          tag: ${{ inputs.tag }}
+          commit: ${{ inputs.commit }}
+          version: ${{ inputs.version }}
+          archive: candidate/zinder-${{ inputs.version }}-x86_64-v3-unknown-linux-gnu.tar.gz
+          archive-sha256: ${{ inputs.archive-sha256 }}
+          client-bundle-url: ${{ inputs.client-bundle-url }}
+          client-bundle-sha256: ${{ inputs.client-bundle-sha256 }}
+          state: ${{ runner.temp }}/release-wallet-state
+          evidence: evidence
+
+      - name: Upload allowlisted aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-wallet-roundtrip-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30

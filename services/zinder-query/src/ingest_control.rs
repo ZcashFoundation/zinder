@@ -152,6 +152,10 @@ impl AdmittedIngestControl {
                     &status,
                     Code::FailedPrecondition,
                     ErrorReason::ChainEpochPinUnavailable,
+                ) || is_writer_refusal(
+                    &status,
+                    zinder_proto::reason_policy(ErrorReason::UnsupportedWalletEncoding).code,
+                    ErrorReason::UnsupportedWalletEncoding,
                 ) =>
             {
                 return Ok(());
@@ -178,6 +182,22 @@ impl AdmittedIngestControl {
 pub fn wallet_ingest_control_request<T>(message: T) -> Request<T> {
     let mut request = Request::new(message);
     request.set_timeout(WALLET_INGEST_CONTROL_REQUEST_TIMEOUT);
+    request
+}
+
+/// Requests a wallet mempool event stream with a bounded wait for response
+/// headers and an unrestricted subscription lifetime.
+#[must_use]
+pub fn wallet_mempool_events_request(
+    message: wallet::MempoolEventsRequest,
+) -> Request<wallet::MempoolEventsRequest> {
+    let mut request = Request::new(message);
+    let millis =
+        u64::try_from(WALLET_INGEST_CONTROL_REQUEST_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+    request.metadata_mut().insert(
+        zinder_proto::MEMPOOL_EVENTS_OPEN_TIMEOUT_MS_HEADER,
+        millis.into(),
+    );
     request
 }
 
@@ -291,7 +311,9 @@ pub(crate) fn typed_ingest_control_status(status: tonic::Status) -> tonic::Statu
 /// `reason`, rather than a failure of the call or of another server.
 ///
 /// A `MempoolSnapshot` that is not yet coherent at a new tip returns
-/// `CHAIN_EPOCH_PIN_UNAVAILABLE`, which leaves ingest control healthy. A live
+/// `CHAIN_EPOCH_PIN_UNAVAILABLE`, and one whose first entry exceeds the unary
+/// response budget returns `UNSUPPORTED_WALLET_ENCODING`; both leave ingest
+/// control healthy while individual snapshot reads see the refusal. A live
 /// mempool that is hydrating or rebuilding from the node returns
 /// `NODE_UNAVAILABLE`, which the probe relays as the writer's node outage
 /// rather than an ingest-control failure.
@@ -748,6 +770,54 @@ mod tests {
             outcome,
             Err(IngestControlHealthError::WriterStatusRpc(_))
         ));
+        fixture.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_health_remains_ready_when_first_mempool_entry_exceeds_response_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_proto::v1::ops::ErrorReason;
+
+        let fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+        let admitted =
+            AdmittedIngestControl::connect(fixture.endpoint(), None, Network::ZcashRegtest).await?;
+
+        fixture.set_mempool_snapshot_error(Some(status_for_reason(
+            ErrorReason::UnsupportedWalletEncoding,
+            "mempool entry exceeds unary snapshot response budget",
+        )));
+        admitted.probe_health().await?;
+
+        for untyped_or_mismatch in [
+            Status::unavailable("untyped control failure"),
+            Status::failed_precondition("untyped precondition failure"),
+            Status::with_error_details(
+                Code::FailedPrecondition,
+                "mismatched outer code",
+                ErrorDetails::with_error_info(
+                    ErrorReason::UnsupportedWalletEncoding.as_str_name(),
+                    ZINDER_ERROR_DOMAIN,
+                    [],
+                ),
+            ),
+        ] {
+            fixture.set_mempool_snapshot_error(Some(untyped_or_mismatch));
+            let err = admitted
+                .probe_health()
+                .await
+                .err()
+                .ok_or("untyped or mismatched snapshot failure must fail probe_health")?;
+            assert!(matches!(
+                err,
+                IngestControlHealthError::MempoolSnapshotRpc(_)
+            ));
+            assert!(matches!(
+                err.readiness_cause(),
+                zinder_runtime::ReadinessCause::IngestControlUnavailable
+            ));
+        }
+
         fixture.shutdown().await?;
         Ok(())
     }

@@ -320,6 +320,50 @@ impl MempoolIndex {
             last_applied_event,
         }
     }
+
+    /// Captures the current index membership as an immutable sorted slice
+    /// alongside its last-applied event position.
+    #[must_use]
+    pub(crate) fn pinned_entries(
+        &self,
+    ) -> (Arc<[Arc<MempoolEntry>]>, Option<MempoolEventPosition>) {
+        let state = self.state.read();
+        let entries: Arc<[Arc<MempoolEntry>]> =
+            state.entries.values().cloned().collect::<Vec<_>>().into();
+        let last_applied_event = state.last_applied_event;
+        drop(state);
+        (entries, last_applied_event)
+    }
+}
+
+/// Slices one deterministic page after `after_transaction_id` from a sorted
+/// point-in-time entry slice.
+#[must_use]
+pub(crate) fn snapshot_page_from_pinned_entries(
+    pinned: &[Arc<MempoolEntry>],
+    last_applied_event: Option<MempoolEventPosition>,
+    max_entries: u32,
+    after_transaction_id: Option<TransactionId>,
+) -> MempoolSnapshotPage {
+    let start_index = after_transaction_id.map_or(0, |after_id| {
+        pinned.partition_point(|entry| entry.transaction_id() <= after_id)
+    });
+    let remaining = pinned.get(start_index..).unwrap_or_default();
+    let bound = u32_to_usize(max_entries);
+    let page_len = remaining.len().min(bound);
+    let entries = remaining.get(..page_len).unwrap_or_default().to_vec();
+    let has_more = remaining.len() > bound;
+    let next_after_transaction_id = if has_more {
+        entries.last().map(|entry| entry.transaction_id())
+    } else {
+        None
+    };
+
+    MempoolSnapshotPage {
+        entries,
+        next_after_transaction_id,
+        last_applied_event,
+    }
 }
 
 #[allow(

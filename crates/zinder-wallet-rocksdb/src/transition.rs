@@ -24,19 +24,19 @@ use zinder_store::{
     CanonicalStoreError, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
 };
 use zinder_wallet_projection::{
-    WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
-    WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity, WalletOutpointKey,
-    WalletProjectionBuildState, WalletProjectionDigestBuilder, WalletProjectionEventCursor,
-    WalletProjectionReadyEvidence, WalletProjectionRowFamily, WalletProjectionSourcePosition,
-    WalletReorgUndo, WalletSpentOutput, WalletStoreControlRecord, WalletTransactionPosition,
-    WalletUnspentOutput, WalletUtxoSetSummary,
+    StoredWalletSpentOutput, StoredWalletUnspentOutput, WalletAddressBalance,
+    WalletAddressTransaction, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
+    WalletBlockHash, WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildState,
+    WalletProjectionDigestBuilder, WalletProjectionEventCursor, WalletProjectionReadyEvidence,
+    WalletProjectionRowFamily, WalletProjectionSourcePosition, WalletReorgUndo,
+    WalletStoreControlRecord, WalletStoredTransactionPosition, WalletUtxoSetSummary,
 };
 
 use crate::store::{
-    REORG_UNDO_COLUMN_FAMILY, TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
-    TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY, TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
-    column_family, decode_only_control,
+    BLOCK_HASH_BY_HEIGHT_COLUMN_FAMILY, REORG_UNDO_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY, TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY,
+    TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY, TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
+    TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, column_family, decode_only_control,
 };
 use crate::{RocksDbWalletError, RocksDbWalletStore};
 
@@ -494,6 +494,8 @@ impl RocksDbWalletStore {
         crash_point("wallet_projection.transition.after_atomic_write");
 
         self.control = next_control;
+        self.block_hash_cache
+            .invalidate_from(self.ready_evidence.settled_tip.height);
         self.ready_evidence = ready_evidence;
         let persisted = decode_only_control(&self.bounded_open)?;
         if persisted != self.control {
@@ -1311,6 +1313,13 @@ impl<'store> WalletTransitionPlanner<'store> {
         source_sequence_digest_before: CanonicalBlockFactsSequenceDigest,
         source_sequence_digest_after: CanonicalBlockFactsSequenceDigest,
     ) -> Result<(), RocksDbWalletError> {
+        let block_hash_row = WalletBlockHash::new(block);
+        self.insert_row(
+            WalletProjectionRowFamily::BlockHashByHeight,
+            BLOCK_HASH_BY_HEIGHT_COLUMN_FAMILY,
+            &block_hash_row.encode_key(),
+            block_hash_row.encode_value().to_vec(),
+        )?;
         let mut created_outpoints = Vec::new();
         let mut created_outpoint_keys = BTreeSet::new();
         let mut spent_outpoints = Vec::new();
@@ -1321,8 +1330,11 @@ impl<'store> WalletTransitionPlanner<'store> {
                 zinder_wallet_projection::WalletProjectionContractError::FactIndexOverflow
             })?;
             let transaction_id = transaction.public_facts.transaction_id;
-            let transaction_position =
-                WalletTransactionPosition::new(transaction_id, tx_index_in_block, block);
+            let transaction_position = WalletStoredTransactionPosition::new(
+                transaction_id,
+                tx_index_in_block,
+                block.height,
+            );
             let mut touched_addresses = BTreeSet::new();
 
             for (input_position, input) in transaction.transparent_inputs.iter().enumerate() {
@@ -1353,7 +1365,7 @@ impl<'store> WalletTransitionPlanner<'store> {
                 };
                 self.remove_unspent(&output)?;
                 touched_addresses.insert(output.address_script_hash.as_bytes());
-                self.insert_spent(&WalletSpentOutput::new(
+                self.insert_spent(&StoredWalletSpentOutput::new(
                     output,
                     transaction_position,
                     input.input_index,
@@ -1381,7 +1393,7 @@ impl<'store> WalletTransitionPlanner<'store> {
                             .into(),
                     );
                 }
-                let unspent = WalletUnspentOutput::new(
+                let unspent = StoredWalletUnspentOutput::new(
                     outpoint,
                     output.address_script_hash,
                     output.value_zat,
@@ -1643,18 +1655,40 @@ impl<'store> WalletTransitionPlanner<'store> {
         }
         for key in &undo.spent_outpoints {
             let spent = self.remove_spent(*key)?;
-            if spent.spent_at.block != undo.block {
+            if spent.spent_at.block_height != undo.block.height {
                 return Err(RocksDbWalletError::ProjectionTransitionRejected {
                     reason: "wallet undo restores a spend from a different block",
                 });
             }
             self.insert_unspent(&spent.output)?;
         }
+        self.remove_block_hash(undo.block)?;
         self.remove_row_after_value_observed(
             WalletProjectionRowFamily::ReorgUndo,
             REORG_UNDO_COLUMN_FAMILY,
             &undo.encode_key(),
             encoded_undo,
+        )
+    }
+
+    fn remove_block_hash(&mut self, block: BlockId) -> Result<(), RocksDbWalletError> {
+        let key = block.height.value().to_be_bytes();
+        let encoded = self.raw(BLOCK_HASH_BY_HEIGHT_COLUMN_FAMILY, &key)?.ok_or(
+            RocksDbWalletError::ProjectionTransitionRejected {
+                reason: "wallet undo block hash is absent from durable rows",
+            },
+        )?;
+        let decoded = WalletBlockHash::decode(&key, &encoded)?;
+        if decoded.block != block {
+            return Err(RocksDbWalletError::ProjectionTransitionRejected {
+                reason: "wallet undo block hash disagrees with durable block hash row",
+            });
+        }
+        self.remove_row_after_value_observed(
+            WalletProjectionRowFamily::BlockHashByHeight,
+            BLOCK_HASH_BY_HEIGHT_COLUMN_FAMILY,
+            &key,
+            &encoded,
         )
     }
 
@@ -1666,11 +1700,12 @@ impl<'store> WalletTransitionPlanner<'store> {
         let unspent = self.read_unspent(key)?;
         let spent = self.read_spent(key)?;
         match (unspent, spent) {
-            (Some(output), None) if output.created_at.block == block => {
+            (Some(output), None) if output.created_at.block_height == block.height => {
                 self.remove_unspent(&output)
             }
             (None, Some(output))
-                if output.output.created_at.block == block && output.spent_at.block == block =>
+                if output.output.created_at.block_height == block.height
+                    && output.spent_at.block_height == block.height =>
             {
                 self.remove_spent(key).map(|_| ())
             }
@@ -1691,22 +1726,27 @@ impl<'store> WalletTransitionPlanner<'store> {
     fn read_unspent(
         &mut self,
         key: WalletOutpointKey,
-    ) -> Result<Option<WalletUnspentOutput>, RocksDbWalletError> {
+    ) -> Result<Option<StoredWalletUnspentOutput>, RocksDbWalletError> {
         self.raw(TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, key.as_bytes())?
-            .map(|encoded| WalletUnspentOutput::decode_value(key, &encoded).map_err(Into::into))
+            .map(|encoded| {
+                StoredWalletUnspentOutput::decode_value(key, &encoded).map_err(Into::into)
+            })
             .transpose()
     }
 
     fn read_spent(
         &mut self,
         key: WalletOutpointKey,
-    ) -> Result<Option<WalletSpentOutput>, RocksDbWalletError> {
+    ) -> Result<Option<StoredWalletSpentOutput>, RocksDbWalletError> {
         self.raw(TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY, key.as_bytes())?
-            .map(|encoded| WalletSpentOutput::decode_value(key, &encoded).map_err(Into::into))
+            .map(|encoded| StoredWalletSpentOutput::decode_value(key, &encoded).map_err(Into::into))
             .transpose()
     }
 
-    fn insert_unspent(&mut self, output: &WalletUnspentOutput) -> Result<(), RocksDbWalletError> {
+    fn insert_unspent(
+        &mut self,
+        output: &StoredWalletUnspentOutput,
+    ) -> Result<(), RocksDbWalletError> {
         let key = WalletOutpointKey::new(output.outpoint);
         if self.read_unspent(key)?.is_some() || self.read_spent(key)?.is_some() {
             return Err(
@@ -1721,7 +1761,11 @@ impl<'store> WalletTransitionPlanner<'store> {
             key.as_bytes(),
             encoded,
         )?;
-        let address_key = WalletAddressUnspentOutputKey::new(output);
+        let address_key = WalletAddressUnspentOutputKey::from_parts(
+            output.address_script_hash,
+            output.created_at.block_height,
+            output.outpoint,
+        );
         self.insert_row(
             WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
             TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
@@ -1733,7 +1777,10 @@ impl<'store> WalletTransitionPlanner<'store> {
         Ok(())
     }
 
-    fn remove_unspent(&mut self, output: &WalletUnspentOutput) -> Result<(), RocksDbWalletError> {
+    fn remove_unspent(
+        &mut self,
+        output: &StoredWalletUnspentOutput,
+    ) -> Result<(), RocksDbWalletError> {
         let key = WalletOutpointKey::new(output.outpoint);
         let encoded = output.encode_value()?;
         let observed = self
@@ -1746,7 +1793,11 @@ impl<'store> WalletTransitionPlanner<'store> {
                 reason: "wallet unspent output bytes differ from its decoded row",
             });
         }
-        let address_key = WalletAddressUnspentOutputKey::new(output);
+        let address_key = WalletAddressUnspentOutputKey::from_parts(
+            output.address_script_hash,
+            output.created_at.block_height,
+            output.outpoint,
+        );
         let address_index = self
             .raw(
                 TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
@@ -1778,7 +1829,7 @@ impl<'store> WalletTransitionPlanner<'store> {
         Ok(())
     }
 
-    fn insert_spent(&mut self, spent: &WalletSpentOutput) -> Result<(), RocksDbWalletError> {
+    fn insert_spent(&mut self, spent: &StoredWalletSpentOutput) -> Result<(), RocksDbWalletError> {
         let key = WalletOutpointKey::new(spent.output.outpoint);
         if self.read_spent(key)?.is_some() {
             return Err(
@@ -1797,13 +1848,13 @@ impl<'store> WalletTransitionPlanner<'store> {
     fn remove_spent(
         &mut self,
         key: WalletOutpointKey,
-    ) -> Result<WalletSpentOutput, RocksDbWalletError> {
+    ) -> Result<StoredWalletSpentOutput, RocksDbWalletError> {
         let encoded = self
             .raw(TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY, key.as_bytes())?
             .ok_or(RocksDbWalletError::ProjectionTransitionRejected {
                 reason: "wallet spent output is absent while reversing a reorg",
             })?;
-        let spent = WalletSpentOutput::decode_value(key, &encoded)?;
+        let spent = StoredWalletSpentOutput::decode_value(key, &encoded)?;
         self.remove_row_after_value_observed(
             WalletProjectionRowFamily::TransparentSpentOutput,
             TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
@@ -1839,8 +1890,8 @@ impl<'store> WalletTransitionPlanner<'store> {
             .ok_or(RocksDbWalletError::ProjectionTransitionRejected {
                 reason: "wallet undo address transaction is absent",
             })?;
-        let transaction = WalletAddressTransaction::decode_value(key, &encoded)?;
-        if key.block_height() != block.height || transaction.block_hash != block.hash {
+        WalletAddressTransaction::decode_stored_value(key, &encoded)?;
+        if key.block_height() != block.height {
             return Err(RocksDbWalletError::ProjectionTransitionRejected {
                 reason: "wallet undo address transaction belongs to a different block",
             });
@@ -1891,7 +1942,7 @@ impl<'store> WalletTransitionPlanner<'store> {
 
     fn validate_add_unspent(
         &mut self,
-        output: &WalletUnspentOutput,
+        output: &StoredWalletUnspentOutput,
     ) -> Result<(), RocksDbWalletError> {
         self.utxo_summary
             .utxo_count
@@ -1913,7 +1964,7 @@ impl<'store> WalletTransitionPlanner<'store> {
 
     fn validate_remove_unspent(
         &mut self,
-        output: &WalletUnspentOutput,
+        output: &StoredWalletUnspentOutput,
     ) -> Result<(), RocksDbWalletError> {
         self.utxo_summary
             .utxo_count
@@ -1931,7 +1982,7 @@ impl<'store> WalletTransitionPlanner<'store> {
         Ok(())
     }
 
-    fn commit_add_unspent(&mut self, output: &WalletUnspentOutput) {
+    fn commit_add_unspent(&mut self, output: &StoredWalletUnspentOutput) {
         self.utxo_summary.utxo_count += 1;
         self.utxo_summary.total_value_zat += output.value_zat;
         self.utxo_summary
@@ -1941,11 +1992,11 @@ impl<'store> WalletTransitionPlanner<'store> {
                 outpoint: output.outpoint,
                 value_zat: output.value_zat,
                 script_pub_key: &output.script_pub_key,
-                block_height: output.created_at.block.height,
+                block_height: output.created_at.block_height,
             });
     }
 
-    fn commit_remove_unspent(&mut self, output: &WalletUnspentOutput) {
+    fn commit_remove_unspent(&mut self, output: &StoredWalletUnspentOutput) {
         self.utxo_summary.utxo_count -= 1;
         self.utxo_summary.total_value_zat -= output.value_zat;
         self.utxo_summary
@@ -1955,7 +2006,7 @@ impl<'store> WalletTransitionPlanner<'store> {
                 outpoint: output.outpoint,
                 value_zat: output.value_zat,
                 script_pub_key: &output.script_pub_key,
-                block_height: output.created_at.block.height,
+                block_height: output.created_at.block_height,
             });
     }
 
@@ -2192,28 +2243,29 @@ mod tests {
         CommitmentTreeAccumulator, CommitmentTreeCheckpoint, CommitmentTreeFrontiers,
         CompactBlockArtifact, CompactChainMetadata, ConsensusBranchId, LockTime, Network,
         NetworkUpgradeActivation, NetworkUpgradeActivations, PrivacyShape, SerializedBytesDigest,
-        TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
-        TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
-        TransactionVersion, TransparentAddressScriptHash, TransparentInputFact,
-        TransparentOutPoint, TransparentOutputFact, TransparentUtxoSetCommitment,
-        UnixTimestampMillis, UnsupportedSection, encode_canonical_block_replay,
+        TransactionComponentCounts, TransactionId, TransactionIntrinsicValueBalances,
+        TransactionPublicFacts, TransactionVersion, TransparentAddressScriptHash,
+        TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
+        TransparentUtxoSetCommitment, UnixTimestampMillis, UnsupportedSection,
+        encode_canonical_block_replay,
     };
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
         CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalLiveReplacement,
         CanonicalReorgPolicy, CanonicalReplacementBlock, CanonicalRetainedEvent,
-        CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
+        CanonicalStoreBuildPlan, RawBlobRetention, RocksDbCanonicalBuilder,
         RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbOpenRole, RocksDbResourceBudget,
         build_block_based_table_factory, open_bounded_rocksdb,
     };
     use zinder_testkit::process_crash;
     use zinder_wallet_projection::{
-        WALLET_STORE_CONTROL_KEY, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
-        WalletOutpointKey, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
-        WalletProjectionBuildState, WalletProjectionContractError, WalletProjectionDigestBuilder,
+        StoredWalletSpentOutput, WALLET_STORE_CONTROL_KEY, WalletAddressUnspentOutputKey,
+        WalletBlockHash, WalletCanonicalSourceIdentity, WalletOutpointKey,
+        WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner, WalletProjectionBuildState,
+        WalletProjectionContractError, WalletProjectionDigestBuilder,
         WalletProjectionReadyEvidence, WalletProjectionRetainedEventAnchor,
-        WalletProjectionSourcePosition, WalletReorgUndo, WalletSpentOutput,
-        WalletStoreControlRecord, WalletUtxoSetSummary,
+        WalletProjectionSourcePosition, WalletReorgUndo, WalletStoreControlRecord,
+        WalletUtxoSetSummary,
     };
 
     use super::{
@@ -2226,7 +2278,7 @@ mod tests {
         RocksDbWalletBuildOptions, RocksDbWalletBuildStore, RocksDbWalletError,
         RocksDbWalletFollowingStore, RocksDbWalletStore, build_wallet_from_canonical,
         store::{
-            REORG_UNDO_COLUMN_FAMILY, RocksDbWalletBuilder,
+            BLOCK_HASH_BY_HEIGHT_COLUMN_FAMILY, REORG_UNDO_COLUMN_FAMILY, RocksDbWalletBuilder,
             TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
             TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
             TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
@@ -2300,8 +2352,7 @@ mod tests {
             &canonical_path,
             temporary.path().join("canonical-secondary"),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2449,8 +2500,7 @@ mod tests {
             &canonical_path,
             temporary.path().join("canonical-secondary"),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2726,8 +2776,7 @@ mod tests {
             root.join("canonical"),
             root.join(secondary_directory),
             &checkpointed_activations()?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?)
@@ -2752,12 +2801,11 @@ mod tests {
             &activations,
             CommitmentTreeCheckpoint::new(predecessor, 99, CommitmentTreeFrontiers::default()),
             checkpoint_block,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
         )?;
         let mut canonical_builder = RocksDbCanonicalBuilder::create_fresh(
             root.join("canonical"),
-            CanonicalStoreWorkload::Wallet,
             plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2812,7 +2860,26 @@ mod tests {
             lease_request,
             UnixTimestampMillis::new(0),
         )?;
-        let projection_digest = WalletProjectionDigestBuilder::new();
+        let checkpoint_block_hash = WalletBlockHash::new(initial_fence.visible_tip());
+        let encoded_key = checkpoint_block_hash.encode_key();
+        let encoded_value = checkpoint_block_hash.encode_value();
+        {
+            let block_hash_family = column_family(
+                wallet_builder.test_bounded_open(),
+                BLOCK_HASH_BY_HEIGHT_COLUMN_FAMILY,
+            )?;
+            wallet_builder.test_bounded_open().db.put_cf(
+                &block_hash_family,
+                encoded_key,
+                encoded_value,
+            )?;
+        }
+        let mut projection_digest = WalletProjectionDigestBuilder::new();
+        projection_digest.append_row(
+            zinder_wallet_projection::WalletProjectionRowFamily::BlockHashByHeight,
+            &encoded_key,
+            &encoded_value,
+        )?;
         let row_counts = projection_digest.row_counts();
         let (projection_accumulator, projection_display_digest) =
             projection_digest.finish_with_accumulator();
@@ -2835,10 +2902,13 @@ mod tests {
         };
         wallet_builder
             .reopen_for_validation()?
+            .0
             .validate_rows(
                 ready_evidence,
                 WalletColdValidationConfig {
                     max_accounted_reorg_undo_bytes: 16 * 1024 * 1024,
+                    family_scan_ranges: std::num::NonZeroU32::MIN,
+                    min_rows_per_scan_range: std::num::NonZeroU64::MIN,
                 },
             )?
             .publish_ready_at(UnixTimestampMillis::new(0))?;
@@ -3002,21 +3072,6 @@ mod tests {
     ) -> CanonicalBuildBlock {
         let block_height = BlockHeight::new(height);
         let block_hash = BlockHash::from_bytes(block_hash);
-        let transaction_blobs = transactions
-            .iter()
-            .enumerate()
-            .map(|(transaction_index, transaction)| {
-                TransactionBlobArtifact::new(
-                    TransactionLocation::new(
-                        transaction.public_facts.transaction_id,
-                        block_height,
-                        block_hash,
-                        u32::try_from(transaction_index).unwrap_or(u32::MAX),
-                    ),
-                    vec![0x66],
-                )
-            })
-            .collect();
         let facts = CanonicalBlockFacts {
             block_header: BlockHeaderArtifact::new(
                 block_height,
@@ -3062,8 +3117,7 @@ mod tests {
                     CommitmentTreeFrontiers::default(),
                 )
             }),
-            block_final_note_commitment_roots: None,
-            transaction_blobs,
+            transaction_blobs: Vec::new(),
             block_blob: None,
         }
     }
@@ -3281,13 +3335,13 @@ mod tests {
     /// address's balance absent. The same-block spend finds its rows among
     /// the plan's writes, and its spent row among the absences the plan
     /// already observed. Each touched address proves one address-transaction
-    /// row absent, and the block proves its new undo row absent and reads the
-    /// one undo row it prunes.
+    /// row absent, and the block proves its new block-hash and undo rows absent
+    /// and reads the one undo row it prunes.
     const fn remembered_read_gate_keys_read() -> u64 {
         let spends = READ_GATE_SPENDS as u64;
         let created_outputs = READ_GATE_CREATED_OUTPUTS as u64;
         let touched_addresses = spends + created_outputs + 1;
-        4 * spends + 4 * created_outputs + touched_addresses + 2
+        4 * spends + 4 * created_outputs + touched_addresses + 3
     }
 
     /// Point reads of the read-gate transition for a plan that remembers no
@@ -3301,12 +3355,12 @@ mod tests {
     /// inserts the output, proves its address-index row absent, and proves its
     /// balance absent to check, compute, and insert the new total: 8 reads.
     /// The same-block spend proves its spent row absent again. Address
-    /// transactions and undo rows cost what they cost with the memo.
+    /// transactions, block hashes, and undo rows cost what they cost with the memo.
     const fn unremembered_read_gate_keys_read() -> u64 {
         let spends = READ_GATE_SPENDS as u64;
         let created_outputs = READ_GATE_CREATED_OUTPUTS as u64;
         let touched_addresses = spends + created_outputs + 1;
-        7 * spends + 8 * created_outputs + 1 + touched_addresses + 2
+        7 * spends + 8 * created_outputs + 1 + touched_addresses + 3
     }
 
     #[test]
@@ -3379,15 +3433,16 @@ mod tests {
         let plan = |wallet: &mut RocksDbWalletStore, limit| {
             plan_next_event_and_cancel(wallet, &secondary, settled_tip, limit)
         };
-        // The rollback reads the block's undo row, and the address-transaction
-        // row of each address its coinbase paid. Each created output then
-        // costs its unspent row, the absence of its spent row, its
-        // address-index row, and its balance, which the rollback removes. The
-        // empty replacement reads nothing durable. Without the memo, each
-        // output rereads its unspent row once and its balance twice more.
+        // The rollback reads the block's undo and block-hash rows, and the
+        // address-transaction row of each address its coinbase paid. Each
+        // created output then costs its unspent row, the absence of its spent
+        // row, its address-index row, and its balance, which the rollback
+        // removes. The empty replacement reads nothing durable. Without the
+        // memo, each output rereads its unspent row once and its balance twice
+        // more.
         let outputs = u64::from(ROLLED_BACK_OUTPUTS);
-        let remembered = 5 * outputs + 1;
-        let unremembered = 8 * outputs + 1;
+        let remembered = 5 * outputs + 2;
+        let unremembered = 8 * outputs + 2;
         let generous = test_transition_logical_byte_limit();
         assert_eq!(plan(&mut wallet, generous)??, remembered);
         assert_eq!(
@@ -3636,10 +3691,12 @@ mod tests {
         let WalletProjectionBuildState::Ready(ready_evidence) = &control.build_state else {
             return Err("wallet is not READY".into());
         };
+        let block_hash_cache = crate::store::BlockHashChunkCache::for_bounded_open(&bounded_open);
         Ok(RocksDbWalletStore {
             ready_evidence: ready_evidence.clone(),
             bounded_open,
             control,
+            block_hash_cache,
             verified_undo_suffix_generation: None,
             last_transition_footprint: None,
         })
@@ -3862,14 +3919,14 @@ mod tests {
         let mut wallet = open_wallet_at_depth(temporary.path(), depth)?;
         // A block without transparent activity reads no output, balance, or
         // address-transaction row, so each of its point reads is a durable
-        // undo-row read.
+        // undo-row read plus the single block-hash row read.
         let work = |durable_reads, value_copies, full_decodes| AppendWork {
             undo_rows: UndoRowWorkCounts {
                 durable_reads,
                 value_copies,
                 full_decodes,
             },
-            keys_read: durable_reads,
+            keys_read: durable_reads + 1,
         };
         let window = u64::from(depth);
         let mut observed = Vec::new();
@@ -4503,7 +4560,7 @@ mod tests {
             // replays every row of the cold build, so its plan holds the final
             // entry of each of their keys and of each unspent and address-index
             // row it restores or creates for an output that it then spends.
-            let touched = rewritten_row_keys(&before, &after)?;
+            let touched = rewritten_row_keys(&before, &after, fixture.settled_tip.height)?;
             let final_entry_bytes: usize = touched
                 .iter()
                 .map(|key| key.1.len() + after.get(key).map_or(0, Vec::len))
@@ -4814,8 +4871,18 @@ mod tests {
     fn rewritten_row_keys(
         before: &WalletRows,
         after: &WalletRows,
+        settled_tip_height: BlockHeight,
     ) -> Result<BTreeSet<OverlayKey>, Box<dyn std::error::Error>> {
-        let mut keys: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
+        let settled_block_hash_key = settled_tip_height.value().to_be_bytes();
+        let mut keys: BTreeSet<_> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|(family_name, key)| {
+                !(*family_name == BLOCK_HASH_BY_HEIGHT_COLUMN_FAMILY
+                    && key.as_slice() == settled_block_hash_key)
+            })
+            .cloned()
+            .collect();
         let spent_rows = before
             .iter()
             .map(|row| (row, false))
@@ -4824,16 +4891,21 @@ mod tests {
             if *family_name != TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY {
                 continue;
             }
-            let spent = WalletSpentOutput::decode_value(WalletOutpointKey::decode(key)?, encoded)?;
-            if !replayed && spent.spent_at.block == spent.output.created_at.block {
+            let spent =
+                StoredWalletSpentOutput::decode_value(WalletOutpointKey::decode(key)?, encoded)?;
+            if !replayed && spent.spent_at.block_height == spent.output.created_at.block_height {
                 continue;
             }
             keys.insert((TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, key.clone()));
             keys.insert((
                 TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
-                WalletAddressUnspentOutputKey::new(&spent.output)
-                    .as_bytes()
-                    .to_vec(),
+                WalletAddressUnspentOutputKey::from_parts(
+                    spent.output.address_script_hash,
+                    spent.output.created_at.block_height,
+                    spent.output.outpoint,
+                )
+                .as_bytes()
+                .to_vec(),
             ));
         }
         Ok(keys)
@@ -4844,5 +4916,76 @@ mod tests {
             .bounded_open
             .statistics
             .get_ticker_count(Ticker::NumberKeysWritten)
+    }
+
+    #[test]
+    fn reorg_and_secondary_catchup_invalidate_cached_block_hashes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = HotAddressReorg::publish(HotAddressBranch::SameTransactions)?;
+        let hot_address = TransparentAddressScriptHash::from_bytes([0xd7; 32]);
+        let page_size = NonZeroU16::new(64).ok_or("nonzero page size")?;
+        let mut wallet_secondary = crate::RocksDbWalletSecondary::open_ready(
+            fixture.temporary.path().join("wallet"),
+            fixture.temporary.path().join("wallet-secondary"),
+            Network::ZcashRegtest,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+
+        let pre_primary_history =
+            fixture
+                .wallet
+                .address_transaction_history_page(hot_address, None, page_size)?;
+        let pre_secondary_history =
+            wallet_secondary.address_transaction_history_page(hot_address, None, page_size)?;
+        assert_eq!(pre_primary_history, pre_secondary_history);
+        let pre_primary_utxos =
+            fixture
+                .wallet
+                .address_unspent_outputs_page(hot_address, None, page_size)?;
+        let pre_secondary_utxos =
+            wallet_secondary.address_unspent_outputs_page(hot_address, None, page_size)?;
+        assert_eq!(pre_primary_utxos, pre_secondary_utxos);
+
+        fixture.apply_reorg(test_transition_logical_byte_limit().get())??;
+        wallet_secondary.try_catch_up()?;
+
+        let cold = build_wallet_from_canonical(
+            &fixture.secondary,
+            fixture.temporary.path().join("wallet-cold"),
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: HOT_ADDRESS_BLOCKS,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        let expected_history =
+            cold.store
+                .address_transaction_history_page(hot_address, None, page_size)?;
+        let expected_utxos =
+            cold.store
+                .address_unspent_outputs_page(hot_address, None, page_size)?;
+        assert_ne!(expected_history, pre_primary_history);
+        assert_ne!(expected_utxos, pre_primary_utxos);
+
+        assert_eq!(
+            fixture
+                .wallet
+                .address_transaction_history_page(hot_address, None, page_size)?,
+            expected_history
+        );
+        assert_eq!(
+            wallet_secondary.address_transaction_history_page(hot_address, None, page_size)?,
+            expected_history
+        );
+        assert_eq!(
+            fixture
+                .wallet
+                .address_unspent_outputs_page(hot_address, None, page_size)?,
+            expected_utxos
+        );
+        assert_eq!(
+            wallet_secondary.address_unspent_outputs_page(hot_address, None, page_size)?,
+            expected_utxos
+        );
+        Ok(())
     }
 }

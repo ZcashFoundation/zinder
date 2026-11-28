@@ -1,16 +1,16 @@
 //! Background densification of settled tree-state checkpoints.
 //!
-//! Construction checkpoints the commitment trees every 100 blocks, so a
-//! tree-state read between two checkpoints replays stored blocks. This pass
-//! fills each settled stride with the checkpoints its selection picks, so
-//! those reads become stored-checkpoint reads. A canonical secondary replays
-//! the stride on a bounded number of blocking threads, and the writer commits
-//! the rows through its command queue between live commits. The pass runs only
-//! while historical work may run. It records its progress as a watermark in
-//! [`TREE_STATE_DENSIFICATION_WATERMARK_FILE`] in the canonical store
-//! directory, bound to the store's construction manifest and the selection. A
-//! restart resumes at that watermark once the stride ending there still
-//! satisfies the selection, and otherwise scans from the first stride. A
+//! Fresh construction checkpoints the commitment trees every 100 blocks and at
+//! the build tip by default. Operators can apply the selected densification policy during construction.
+//! This background pass fills settled strides with the selected checkpoints. For fully covered strides,
+//! the pass checks checkpoint heights and advances the watermark. A canonical secondary replays
+//! incomplete strides on a bounded number of blocking threads, and the writer
+//! commits the rows through its command queue between live commits. The pass
+//! runs only while historical work may run. It records its progress as a
+//! watermark in [`TREE_STATE_DENSIFICATION_WATERMARK_FILE`] in the canonical
+//! store directory, bound to the store's construction manifest and the
+//! selection. A restart resumes at that watermark once the stride ending there
+//! still satisfies the selection, and otherwise scans from the first stride. A
 //! stride skipped as an integrity failure holds the watermark below it, so the
 //! next run examines it again.
 
@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, DensifiedTreeStateStride,
+    CanonicalReorgPolicy, CanonicalStoreError, DensifiedTreeStateStride,
     MAX_TREE_STATE_STRIDE_SCAN_READS, RawBlobRetention, RocksDbCanonicalSecondary,
     RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
     TreeStateStride, TreeStateStrideCommit,
@@ -89,6 +89,8 @@ const FAILED_SCAN_CHARGE_BLOCKS: u32 =
 pub struct TreeStateDensificationConfig {
     /// Whether the pass runs.
     pub enabled: bool,
+    /// Whether the selected densification policy also applies during fresh construction.
+    pub during_construction: bool,
     /// Which blocks of a stride receive a stored checkpoint.
     pub selection: TreeStateCheckpointSelection,
     /// Strides replayed at once, each on one blocking thread.
@@ -98,10 +100,20 @@ pub struct TreeStateDensificationConfig {
     pub max_blocks_per_second: NonZeroU32,
 }
 
+impl TreeStateDensificationConfig {
+    /// Returns the optional selection applied in addition to the fresh
+    /// construction cadence and build tip.
+    #[must_use]
+    pub fn construction_selection(&self) -> Option<TreeStateCheckpointSelection> {
+        (self.during_construction && self.enabled).then_some(self.selection)
+    }
+}
+
 impl Default for TreeStateDensificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            during_construction: false,
             selection: TreeStateCheckpointSelection::EveryBlock,
             workers: NonZeroU32::new(DEFAULT_TREE_STATE_DENSIFICATION_WORKERS)
                 .unwrap_or(NonZeroU32::MIN),
@@ -168,8 +180,6 @@ pub struct TreeStateDensificationContext<Writer> {
     pub secondary_path: PathBuf,
     /// Node-observed activations used to admit the store and replay strides.
     pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    /// Workload the canonical store was built for.
-    pub workload: CanonicalStoreWorkload,
     /// Raw-blob retention the canonical store was built with.
     pub raw_blob_retention: RawBlobRetention,
     /// Reorg policy the canonical store was built with.
@@ -210,13 +220,12 @@ async fn run_tree_state_densification<Writer: TreeStateStrideWriter>(
         canonical_primary_path: &context.canonical_primary_path,
         secondary_path: &context.secondary_path,
         network_upgrade_activations: &context.network_upgrade_activations,
-        workload: context.workload,
         raw_blob_retention: context.raw_blob_retention,
         reorg_policy: context.reorg_policy,
         resource_budget: context.resource_budget,
     }
     .open_when_published(
-        Some(&context.gate),
+        || context.gate.record_open_metric(),
         &cancel,
         "tree_state_densification_secondary_unavailable",
     )

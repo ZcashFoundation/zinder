@@ -26,8 +26,8 @@ concurrency:
 
 env:
   BUF_VERSION: "1.75.0"
+  PROTOC_VERSION: "36.2"
   RELEASE_IMAGES_FILE: deploy/release-images.json
-  RELEASE_SINGLE_VOLUME_IMAGES_FILE: deploy/release-single-volume-images.json
 
 jobs:
   validate:
@@ -127,7 +127,7 @@ jobs:
 
       - name: Resolve release images
         id: images
-        run: printf 'release_images=%s\n' "$(jq -c -s 'add' "$RELEASE_IMAGES_FILE" "$RELEASE_SINGLE_VOLUME_IMAGES_FILE")" >> "$GITHUB_OUTPUT"
+        run: printf 'release_images=%s\n' "$(jq -c '.' "$RELEASE_IMAGES_FILE")" >> "$GITHUB_OUTPUT"
 
   api-docs:
     name: build API release artifacts
@@ -146,25 +146,20 @@ jobs:
           version: ${{ env.BUF_VERSION }}
           github_token: ${{ github.token }}
 
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ github.token }}
+
       - name: Generate and verify API artifacts
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          bash scripts/generate-api-artifacts.sh
-
-          mkdir -p dist/release
-          cp -R dist/openapi dist/release/openapi
-          cp -R dist/proto dist/release/proto
-          cp dist/zinder.v1.descriptor.bin dist/release/zinder.v1.descriptor.bin
-          bash scripts/check-native-proto-closure.sh dist/release
-          tar \
-            -C dist/release \
-            -czf "dist/zinder-api-docs-${RELEASE_TAG}.tar.gz" \
-            openapi \
-            proto \
-            zinder.v1.descriptor.bin
+          scripts/generate-api-artifacts.sh "$RELEASE_TAG"
+          scripts/check-api-artifact.sh "dist/zinder-api-docs-${RELEASE_TAG}.tar.gz"
 
       - name: Upload API artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -269,14 +264,27 @@ jobs:
             rust: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             jemalloc_page_size: 4096
+          - name: x86_64-unknown-linux-gnu
+            docker: linux/amd64
+            rust: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            jemalloc_page_size: 4096
+            cpu_baseline: x86-64
+            pasta_asm: '0'
           - name: aarch64-unknown-linux-gnu
             docker: linux/arm64
             rust: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             jemalloc_page_size: 65536
+          - name: aarch64-apple-darwin
+            rust: aarch64-apple-darwin
+            runner: macos-15
     env:
+      PLATFORM_NAME: ${{ matrix.platform.name }}
+      CPU_BASELINE: ${{ matrix.platform.cpu_baseline }}
+      PASTA_ASM: ${{ matrix.platform.pasta_asm || '1' }}
       JEMALLOC_PAGE_SIZE: ${{ matrix.platform.jemalloc_page_size }}
-      RELEASE_CACHE_SCOPE: release-${{ needs.validate.outputs.commit }}-${{ matrix.platform.rust }}-1
+      RELEASE_CACHE_SCOPE: release-${{ needs.validate.outputs.commit }}-${{ matrix.platform.name }}-1
       RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
       RELEASE_TAG: ${{ github.ref_name }}
       RELEASE_VERSION: ${{ needs.validate.outputs.version }}
@@ -289,7 +297,14 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.validate.outputs.commit }}
 
+      - name: Build native Apple Silicon binary
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/build-macos-release-binary
+        with:
+          commit: ${{ needs.validate.outputs.commit }}
+
       - name: Set up Docker Buildx
+        if: runner.os == 'Linux'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Install Syft
@@ -304,16 +319,20 @@ jobs:
           source_date_epoch="$(git show -s --format=%ct "$RELEASE_COMMIT")"
           export_root="${RUNNER_TEMP}/binary-export"
           archive_root="${RUNNER_TEMP}/binary-archive"
-          docker buildx build \
-            --no-cache \
-            --platform "$TARGET_PLATFORM" \
-            --target release-binaries \
-            --build-arg "RELEASE_CACHE_SCOPE=${RELEASE_CACHE_SCOPE}" \
-            --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
-            --build-arg "ZINDER_BUILD_GIT_COMMIT=${RELEASE_COMMIT}" \
-            --output "type=local,dest=${export_root}" \
-            --file deploy/Dockerfile \
-            .
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            docker buildx build \
+              --no-cache \
+              --platform "$TARGET_PLATFORM" \
+              --target release-binaries \
+              --build-arg "ZINDER_X86_64_CPU_BASELINE=${CPU_BASELINE:-x86-64-v3}" \
+              --build-arg "ZINDER_PASTA_ASM=${PASTA_ASM}" \
+              --build-arg "RELEASE_CACHE_SCOPE=${RELEASE_CACHE_SCOPE}" \
+              --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
+              --build-arg "ZINDER_BUILD_GIT_COMMIT=${RELEASE_COMMIT}" \
+              --output "type=local,dest=${export_root}" \
+              --file deploy/Dockerfile \
+              .
+          fi
           scripts/build-release-binary-archive.sh \
             --binaries "${export_root}/bin" \
             --output "$archive_root" \
@@ -321,6 +340,8 @@ jobs:
             --tag "$RELEASE_TAG" \
             --commit "$RELEASE_COMMIT" \
             --target "$RUST_TARGET" \
+            --cpu-baseline "$CPU_BASELINE" \
+            --pasta-asm "$PASTA_ASM" \
             --source-date-epoch "$source_date_epoch"
           archive_path="$(find "$archive_root" -maxdepth 1 -type f -name '*.tar.gz')"
           scripts/check-release-binary-archive.sh "$archive_path" \
@@ -328,24 +349,28 @@ jobs:
             --tag "$RELEASE_TAG" \
             --commit "$RELEASE_COMMIT" \
             --target "$RUST_TARGET" \
+            --cpu-baseline "$CPU_BASELINE" \
+            --pasta-asm "$PASTA_ASM" \
             --source-date-epoch "$source_date_epoch"
 
-          docker run --rm \
-            --platform "$TARGET_PLATFORM" \
-            --env JEMALLOC_PAGE_SIZE \
-            --volume "${export_root}/bin:/opt/zinder/bin:ro" \
-            debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 \
-            sh -ec '
-              apt-get update >/dev/null
-              apt-get install -y --no-install-recommends ca-certificates libstdc++6 >/dev/null
-              for binary in /opt/zinder/bin/*; do
-                "$binary" --version
-                "$binary" --help >/dev/null
-                MALLOC_CONF=stats_print:true "$binary" --version 2>&1 >/dev/null \
-                  | grep -Fqx "Page size: ${JEMALLOC_PAGE_SIZE}" \
-                  || { echo "$binary: jemalloc page size is not ${JEMALLOC_PAGE_SIZE}" >&2; exit 1; }
-              done
-            '
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            docker run --rm \
+              --platform "$TARGET_PLATFORM" \
+              --env JEMALLOC_PAGE_SIZE \
+              --volume "${export_root}/bin:/opt/zinder/bin:ro" \
+              debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 \
+              sh -ec '
+                apt-get update >/dev/null
+                apt-get install -y --no-install-recommends ca-certificates libstdc++6 >/dev/null
+                for binary in /opt/zinder/bin/*; do
+                  "$binary" --version
+                  "$binary" --help >/dev/null
+                  MALLOC_CONF=stats_print:true "$binary" --version 2>&1 >/dev/null \
+                    | grep -Fqx "Page size: ${JEMALLOC_PAGE_SIZE}" \
+                    || { echo "$binary: jemalloc page size is not ${JEMALLOC_PAGE_SIZE}" >&2; exit 1; }
+                done
+              '
+          fi
 
           candidate_root="${RUNNER_TEMP}/release-candidate"
           mkdir -p "$candidate_root"
@@ -389,11 +414,23 @@ jobs:
             docker: linux/amd64
             rust: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+          - name: x86_64-unknown-linux-gnu
+            docker: linux/amd64
+            rust: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            jemalloc_page_size: 4096
+            cpu_baseline: x86-64
+            pasta_asm: '0'
           - name: aarch64-unknown-linux-gnu
             docker: linux/arm64
             rust: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+          - name: aarch64-apple-darwin
+            rust: aarch64-apple-darwin
+            runner: macos-15
     env:
+      CPU_BASELINE: ${{ matrix.platform.cpu_baseline }}
+      PASTA_ASM: ${{ matrix.platform.pasta_asm || '1' }}
       PLATFORM_NAME: ${{ matrix.platform.name }}
       RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
       RELEASE_TAG: ${{ github.ref_name }}
@@ -407,7 +444,14 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.validate.outputs.commit }}
 
+      - name: Build native Apple Silicon binary
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/build-macos-release-binary
+        with:
+          commit: ${{ needs.validate.outputs.commit }}
+
       - name: Set up Docker Buildx
+        if: runner.os == 'Linux'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build the independent reproduction archive
@@ -416,16 +460,20 @@ jobs:
 
           source_date_epoch="$(git show -s --format=%ct "$RELEASE_COMMIT")"
           export_root="${RUNNER_TEMP}/binary-export"
-          docker buildx build \
-            --no-cache \
-            --platform "$TARGET_PLATFORM" \
-            --target release-binaries \
-            --build-arg "RELEASE_CACHE_SCOPE=release-${RELEASE_COMMIT}-${RUST_TARGET}-2" \
-            --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
-            --build-arg "ZINDER_BUILD_GIT_COMMIT=${RELEASE_COMMIT}" \
-            --output "type=local,dest=${export_root}" \
-            --file deploy/Dockerfile \
-            .
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            docker buildx build \
+              --no-cache \
+              --platform "$TARGET_PLATFORM" \
+              --target release-binaries \
+              --build-arg "ZINDER_X86_64_CPU_BASELINE=${CPU_BASELINE:-x86-64-v3}" \
+              --build-arg "ZINDER_PASTA_ASM=${PASTA_ASM}" \
+              --build-arg "RELEASE_CACHE_SCOPE=release-${RELEASE_COMMIT}-${PLATFORM_NAME}-2" \
+              --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
+              --build-arg "ZINDER_BUILD_GIT_COMMIT=${RELEASE_COMMIT}" \
+              --output "type=local,dest=${export_root}" \
+              --file deploy/Dockerfile \
+              .
+          fi
           scripts/build-release-binary-archive.sh \
             --binaries "${export_root}/bin" \
             --output dist/reproduction \
@@ -433,6 +481,8 @@ jobs:
             --tag "$RELEASE_TAG" \
             --commit "$RELEASE_COMMIT" \
             --target "$RUST_TARGET" \
+            --cpu-baseline "$CPU_BASELINE" \
+            --pasta-asm "$PASTA_ASM" \
             --source-date-epoch "$source_date_epoch"
           archive_path="$(find dist/reproduction -maxdepth 1 -type f -name '*.tar.gz')"
           scripts/check-release-binary-archive.sh "$archive_path" \
@@ -440,6 +490,8 @@ jobs:
             --tag "$RELEASE_TAG" \
             --commit "$RELEASE_COMMIT" \
             --target "$RUST_TARGET" \
+            --cpu-baseline "$CPU_BASELINE" \
+            --pasta-asm "$PASTA_ASM" \
             --source-date-epoch "$source_date_epoch"
           (cd "${export_root}/bin" && sha256sum -- * | sort -k2) \
             > dist/reproduction/binaries.sha256
@@ -448,6 +500,7 @@ jobs:
       # job packages after approval, so this no-push run of the same packaging
       # catches an image defect before approval and before any crate publishes.
       - name: Package every release image without pushing
+        if: matrix.platform.name == 'x86_64-v3-unknown-linux-gnu' || matrix.platform.name == 'aarch64-unknown-linux-gnu'
         env:
           RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}
         run: |
@@ -487,7 +540,9 @@ jobs:
       matrix:
         platform:
           - x86_64-v3-unknown-linux-gnu
+          - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
+          - aarch64-apple-darwin
     steps:
       - name: Download binary archive candidate
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -522,6 +577,8 @@ jobs:
             awk '{ printf "| `%s` | `%s` |\n", $2, $1 }' dist/build/binaries.sha256
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Enable the wallet gate here after provisioning the pinned client bundle.
+  # See scripts/release-wallet-roundtrip.md for the publication prerequisite.
   publish-sdk-crates:
     name: publish public SDK crates
     needs:
@@ -673,7 +730,9 @@ jobs:
       matrix:
         platform:
           - x86_64-v3-unknown-linux-gnu
+          - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
+          - aarch64-apple-darwin
     steps:
       - name: Download binary archive candidate
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -738,12 +797,16 @@ jobs:
 
           expected="$({
             printf '%s\n' \
+              "zinder-${RELEASE_VERSION}-aarch64-apple-darwin.spdx.json" \
+              "zinder-${RELEASE_VERSION}-aarch64-apple-darwin.tar.gz" \
               "zinder-${RELEASE_VERSION}-aarch64-unknown-linux-gnu.spdx.json" \
               "zinder-${RELEASE_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+              "zinder-${RELEASE_VERSION}-x86_64-unknown-linux-gnu.spdx.json" \
+              "zinder-${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
               "zinder-${RELEASE_VERSION}-x86_64-v3-unknown-linux-gnu.spdx.json" \
               "zinder-${RELEASE_VERSION}-x86_64-v3-unknown-linux-gnu.tar.gz"
           })"
-          actual="$(find dist/binaries -maxdepth 1 -type f -printf '%f\n' | sort)"
+          actual="$(find dist/binaries -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
           [[ "$actual" == "$expected" ]]
 
       - name: Upload binary release assets
@@ -767,6 +830,8 @@ jobs:
       packages: write
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      verified_zinder_image_digest: ${{ steps.verified-image.outputs.zinder_image_digest }}
     strategy:
       fail-fast: false
       matrix:
@@ -913,6 +978,7 @@ jobs:
         run: cosign sign --yes "${IMAGE}@${ROOT_DIGEST}"
 
       - name: Verify image signature and attestations
+        id: verified-image
         env:
           AMD64_DIGEST: ${{ steps.evidence.outputs.amd64_digest }}
           ARM64_DIGEST: ${{ steps.evidence.outputs.arm64_digest }}
@@ -933,6 +999,9 @@ jobs:
             --workflow release.yml \
             --tag "$RELEASE_TAG" \
             --commit "$BUILD_GIT_COMMIT"
+          if [[ "$IMAGE" == */zinder ]]; then
+            printf 'zinder_image_digest=%s\n' "$ROOT_DIGEST" >> "$GITHUB_OUTPUT"
+          fi
 
   assemble-and-sign:
     name: assemble and sign release assets
@@ -979,19 +1048,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          ZINDER_IMAGE_DIGEST: ${{ needs.merge.outputs.verified_zinder_image_digest }}
         run: |
           set -euo pipefail
 
           expected="$({
             printf '%s\n' \
+              "zinder-${RELEASE_VERSION}-aarch64-apple-darwin.spdx.json" \
+              "zinder-${RELEASE_VERSION}-aarch64-apple-darwin.tar.gz" \
               "zinder-${RELEASE_VERSION}-aarch64-unknown-linux-gnu.spdx.json" \
               "zinder-${RELEASE_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+              "zinder-${RELEASE_VERSION}-x86_64-unknown-linux-gnu.spdx.json" \
+              "zinder-${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
               "zinder-${RELEASE_VERSION}-x86_64-v3-unknown-linux-gnu.spdx.json" \
               "zinder-${RELEASE_VERSION}-x86_64-v3-unknown-linux-gnu.tar.gz" \
               "zinder-api-docs-${RELEASE_TAG}.tar.gz" \
+              "zinder-personal-compose.yaml" \
               "zinder.v1.descriptor.bin"
           })"
-          actual="$(find dist/release-assets -maxdepth 1 -type f -printf '%f\n' | sort)"
+          scripts/render-personal-compose.sh "$ZINDER_IMAGE_DIGEST" \
+            > dist/release-assets/zinder-personal-compose.yaml
+          actual="$(find dist/release-assets -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
           [[ "$actual" == "$expected" ]] || {
             echo "release asset candidates differ from the exact catalog" >&2
             diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
@@ -1007,7 +1084,7 @@ jobs:
             --source-ref "refs/tags/${RELEASE_TAG}"
             --source-digest "$BUILD_GIT_COMMIT"
           )
-          for platform in aarch64-unknown-linux-gnu x86_64-v3-unknown-linux-gnu; do
+          for platform in aarch64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu x86_64-v3-unknown-linux-gnu; do
             archive="dist/release-assets/zinder-${RELEASE_VERSION}-${platform}.tar.gz"
             sbom="dist/release-assets/zinder-${RELEASE_VERSION}-${platform}.spdx.json"
             scripts/check-release-sbom.sh "$sbom" \
@@ -1026,6 +1103,7 @@ jobs:
             sha256sum \
               zinder-*.tar.gz \
               zinder-*.spdx.json \
+              zinder-personal-compose.yaml \
               zinder.v1.descriptor.bin \
               | sort -k2 > SHA256SUMS
           )
@@ -1090,7 +1168,7 @@ jobs:
             }
             gh release edit "$RELEASE_TAG" \
               --notes-file release-notes/release-notes.md
-            expected_assets="$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)"
+            expected_assets="$(find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
             while IFS= read -r existing_asset; do
               if ! grep -Fxq "$existing_asset" <<< "$expected_assets"; then
                 gh release delete-asset "$RELEASE_TAG" "$existing_asset" --yes
@@ -1193,7 +1271,7 @@ jobs:
               and .isImmutable == true
               and (.assets | length) == $expected_count
             ' <<< "$release_json" >/dev/null
-          expected_assets="$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)"
+          expected_assets="$(find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
           actual_assets="$(jq -r '.assets[].name' <<< "$release_json" | sort)"
           [[ "$actual_assets" == "$expected_assets" ]]
 

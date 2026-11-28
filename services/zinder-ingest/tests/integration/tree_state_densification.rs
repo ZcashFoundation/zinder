@@ -30,9 +30,9 @@ use zinder_query::{
 };
 use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, DensifiedTreeStateStride,
-    RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
-    TreeStateCheckpointSelection, TreeStateStrideCommit,
+    CanonicalReorgPolicy, CanonicalStoreError, ConstructionTreeStateCheckpointPolicy,
+    DensifiedTreeStateStride, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget, TreeStateCheckpointSelection, TreeStateStrideCommit,
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, commitment_tree_checkpoints,
@@ -69,6 +69,54 @@ async fn every_block_pass_stores_the_tree_state_of_every_settled_height() -> eyr
         Ok(())
     })?;
     harness.assert_reads_match_the_chain(1..=BASELINE_TIP)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_densely_constructed_store_commits_nothing_and_serves_even_the_partial_tail_as_stored()
+-> eyre::Result<()> {
+    let harness = Harness::new_dense()?;
+
+    harness.with_primary(|primary| {
+        for height in 0..=BASELINE_TIP {
+            eyre::ensure!(
+                stored_checkpoint_heights(primary, height, height)?.len() == 1,
+                "densely constructed height {height} has no stored checkpoint"
+            );
+        }
+        Ok(())
+    })?;
+    harness.assert_reads_match_the_chain(1..=BASELINE_TIP)?;
+
+    let commits = harness
+        .run_pass_to_completion(EVERY_BLOCK, &Hooks::default())
+        .await?;
+    eyre::ensure!(
+        commits.is_empty(),
+        "a densely constructed store should need zero densification commits, got {commits:?}"
+    );
+    let watermark = harness.watermark()?;
+    eyre::ensure!(
+        watermark["selection"] == "every-block"
+            && watermark["through_height"] == DENSIFIED_THROUGH
+            && watermark["construction_manifest_sha256"] == harness.manifest_sha256()?,
+        "unexpected watermark {watermark}"
+    );
+    let resumed = harness
+        .run_pass_to_completion(EVERY_BLOCK, &Hooks::default())
+        .await?;
+    eyre::ensure!(resumed.is_empty(), "a resumed pass committed {resumed:?}");
+
+    let budget = TreeStateCheckpointSelection::CommitmentBudget(
+        NonZeroU32::new(1_024).ok_or_else(|| eyre::eyre!("zero budget"))?,
+    );
+    let budgeted = harness
+        .run_pass_to_completion(budget, &Hooks::default())
+        .await?;
+    eyre::ensure!(
+        budgeted.is_empty(),
+        "switching a densely constructed store to commitment-budget should commit nothing, got {budgeted:?}"
+    );
     Ok(())
 }
 
@@ -113,6 +161,52 @@ async fn commitment_budget_pass_stores_a_checkpoint_where_each_budget_fills() ->
     })?;
     harness.assert_reads_match_the_chain(1..=DENSIFIED_THROUGH)?;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_budget_constructed_store_needs_new_rows_only_for_the_smaller_budget() -> eyre::Result<()>
+{
+    let construction = TreeStateCheckpointSelection::CommitmentBudget(
+        NonZeroU32::new(20).ok_or_else(|| eyre::eyre!("zero budget"))?,
+    );
+    let tighter = TreeStateCheckpointSelection::CommitmentBudget(
+        NonZeroU32::new(10).ok_or_else(|| eyre::eyre!("zero budget"))?,
+    );
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(CHAIN_TIP);
+    let harness = Harness::publish_with_coverage(&chain, None, Some(construction))?;
+    let before = harness.with_primary(|primary| {
+        let scan =
+            primary.scan_tree_state_strides(BlockHeight::new(0), construction, NonZeroU32::MAX)?;
+        eyre::ensure!(scan.examined == 3 && scan.incomplete.is_empty() && scan.damaged.is_empty());
+        stored_checkpoint_heights(primary, 0, DENSIFIED_THROUGH)
+    })?;
+    eyre::ensure!(
+        before.len() > 4,
+        "construction must include budget checkpoints"
+    );
+    let commits = harness
+        .run_pass_to_completion(construction, &Hooks::default())
+        .await?;
+    eyre::ensure!(
+        commits.is_empty(),
+        "the same budget wrote more rows: {commits:?}"
+    );
+
+    let commits = harness
+        .run_pass_to_completion(tighter, &Hooks::default())
+        .await?;
+    eyre::ensure!(commits.len() == 3 && commits.iter().all(|commit| commit.rows_written > 0));
+    harness.with_primary(|primary| {
+        let after = stored_checkpoint_heights(primary, 0, DENSIFIED_THROUGH)?;
+        eyre::ensure!(
+            after.len() > before.len() && before.iter().all(|height| after.contains(height))
+        );
+        let scan =
+            primary.scan_tree_state_strides(BlockHeight::new(0), tighter, NonZeroU32::MAX)?;
+        eyre::ensure!(scan.examined == 3 && scan.incomplete.is_empty() && scan.damaged.is_empty());
+        Ok(())
+    })?;
+    harness.assert_reads_match_the_chain(1..=BASELINE_TIP)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -399,14 +493,20 @@ async fn an_unreadable_watermark_is_discarded() -> eyre::Result<()> {
 async fn a_changed_commitment_budget_rescans_and_records_progress_under_the_new_budget()
 -> eyre::Result<()> {
     let harness = Harness::new()?;
+    let manifest_path = harness
+        .primary_path()?
+        .join("canonical-construction-manifest.v2.json");
+    let construction_manifest = std::fs::read(&manifest_path)?;
+    let construction_digest = harness.manifest_sha256()?;
     let budget = |commitments| {
         NonZeroU32::new(commitments)
             .map(TreeStateCheckpointSelection::CommitmentBudget)
             .ok_or_else(|| eyre::eyre!("zero budget"))
     };
-    harness
+    let commits = harness
         .run_pass_to_completion(budget(20)?, &Hooks::default())
         .await?;
+    eyre::ensure!(!commits.is_empty(), "expected new checkpoint rows");
     eyre::ensure!(harness.watermark()?["commitment_budget"] == 20);
 
     // A looser budget needs no new rows, but its progress is its own.
@@ -420,6 +520,15 @@ async fn a_changed_commitment_budget_rescans_and_records_progress_under_the_new_
         watermark["commitment_budget"] == 30 && watermark["through_height"] == DENSIFIED_THROUGH,
         "unexpected watermark {watermark}"
     );
+    assert_eq!(std::fs::read(manifest_path)?, construction_manifest);
+    assert_eq!(harness.manifest_sha256()?, construction_digest);
+    harness.with_primary(|primary| {
+        assert_eq!(
+            primary.construction_tree_state_checkpoint_policy(),
+            Some(ConstructionTreeStateCheckpointPolicy::CadenceAndTip)
+        );
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -546,7 +655,6 @@ async fn every_runtime_admits_and_serves_a_densified_store() -> eyre::Result<()>
     let primary = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &primary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
         RawBlobRetention::None,
         CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
@@ -562,8 +670,7 @@ async fn every_runtime_admits_and_serves_a_densified_store() -> eyre::Result<()>
         &primary_path,
         primary_path.with_extension("compat-secondary"),
         Network::ZcashRegtest,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::None,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -616,7 +723,6 @@ async fn opening_the_secondary_leaves_the_async_runtime_free() -> eyre::Result<(
             canonical_primary_path: primary_path,
             secondary_path: root.path().join("secondary"),
             network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
-            workload: CanonicalStoreWorkload::Wallet,
             raw_blob_retention: RawBlobRetention::None,
             reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -658,7 +764,6 @@ async fn the_pass_opens_its_secondary_only_once_historical_work_may_run() -> eyr
             canonical_primary_path: harness.primary_path()?,
             secondary_path: secondary_path.clone(),
             network_upgrade_activations: Arc::new(harness.activations.clone()),
-            workload: CanonicalStoreWorkload::Wallet,
             raw_blob_retention: RawBlobRetention::None,
             reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -706,7 +811,6 @@ async fn replays_the_writer_did_not_commit_are_charged_against_the_rate() -> eyr
             canonical_primary_path: harness.primary_path()?,
             secondary_path: next_secondary_path(harness.secondary_root.path()),
             network_upgrade_activations: Arc::new(harness.activations.clone()),
-            workload: CanonicalStoreWorkload::Wallet,
             raw_blob_retention: RawBlobRetention::None,
             reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -714,6 +818,7 @@ async fn replays_the_writer_did_not_commit_are_charged_against_the_rate() -> eyr
             gate: following_tip_gate(),
             config: TreeStateDensificationConfig {
                 enabled: true,
+                during_construction: false,
                 selection: EVERY_BLOCK,
                 workers: NonZeroU32::new(2).ok_or_else(|| eyre::eyre!("zero workers"))?,
                 max_blocks_per_second: NonZeroU32::MIN,
@@ -789,7 +894,6 @@ async fn the_following_writer_commits_strides_from_its_command_queue() -> eyre::
     let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &primary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
         RawBlobRetention::None,
         CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
@@ -908,6 +1012,14 @@ impl Harness {
         Self::with_chain(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(CHAIN_TIP))
     }
 
+    fn new_dense() -> eyre::Result<Self> {
+        Self::publish_with_coverage(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(CHAIN_TIP),
+            None,
+            Some(EVERY_BLOCK),
+        )
+    }
+
     /// Publishes `chain`, with note commitments added, through the baseline tip.
     fn with_chain(chain: &ChainFixture) -> eyre::Result<Self> {
         Self::publish(chain, None)
@@ -923,6 +1035,14 @@ impl Harness {
     }
 
     fn publish(chain: &ChainFixture, history_floor: Option<BlockHeight>) -> eyre::Result<Self> {
+        Self::publish_with_coverage(chain, history_floor, None)
+    }
+
+    fn publish_with_coverage(
+        chain: &ChainFixture,
+        history_floor: Option<BlockHeight>,
+        selection: Option<TreeStateCheckpointSelection>,
+    ) -> eyre::Result<Self> {
         let activations = sample_regtest_upgrade_activations();
         let chain = with_note_commitments(chain, &activations)?;
         let heights = (1..=CHAIN_TIP).map(BlockHeight::new).collect::<Vec<_>>();
@@ -931,6 +1051,11 @@ impl Harness {
         let baseline = match history_floor {
             Some(floor) => baseline.with_history_floor(floor),
             None => baseline,
+        };
+        let baseline = if let Some(selection) = selection {
+            baseline.with_tree_state_checkpoint_selection(selection)
+        } else {
+            baseline
         };
         let fixture = CanonicalWriterFixture::publish(&baseline, &activations)?;
         Ok(Self {
@@ -1049,7 +1174,6 @@ impl Harness {
                 canonical_primary_path: self.primary_path()?,
                 secondary_path: next_secondary_path(self.secondary_root.path()),
                 network_upgrade_activations: Arc::new(self.activations.clone()),
-                workload: CanonicalStoreWorkload::Wallet,
                 raw_blob_retention: RawBlobRetention::None,
                 reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
                 resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -1057,6 +1181,7 @@ impl Harness {
                 gate: following_tip_gate(),
                 config: TreeStateDensificationConfig {
                     enabled: true,
+                    during_construction: false,
                     selection,
                     workers: NonZeroU32::new(2).ok_or_else(|| eyre::eyre!("zero workers"))?,
                     max_blocks_per_second: NonZeroU32::MAX,

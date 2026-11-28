@@ -1,104 +1,84 @@
 # Use cases
 
-This page shows what Zinder gives each kind of consumer and what you enable for
-it. For a feature-by-feature table beside Zebra, Zakura, ztreamer, Zingod, and
-Go lightwalletd, see the [indexer comparison](reference/indexer-comparison.md).
+This page maps each Zcash consumer pattern to the Zinder surface and deployment pieces it needs. For capability details, reliability guarantees, and deployment profiles, see [Features and roadmap](features.md).
 
-In every case, Zinder serves public chain data from the node you configure. The
-node validates consensus, and Zinder trusts what it reports. Keys, note
-scanning, transaction building, and signing stay in your application.
+In every pattern, Zinder serves public chain data from your configured node. Keys, trial decryption, shielded balances, transaction building, and signing stay in your application.
 
 ## At a glance
 
-| Consumer | Zinder surface | Enabled by default | Zinder adds |
+| Consumer | Zinder surface | Enabled by default | Pattern summary |
 | --- | --- | --- | --- |
-| Light wallet that speaks lightwalletd | `CompactTxStreamer` on `zinder-compat-lightwalletd` | Yes | Serving from stored data during a node outage |
-| Wallet or wallet backend built for Zinder | `WalletQuery` on `zinder-query`, or the `zinder-client` crate | Yes | Reads pinned to one chain snapshot across calls |
-| Payment or deposit tracking | `ChainEvents` and transparent address queries on `zinder-query` | Yes | A resumable event cursor that reports reorgs |
-| Block explorer | `ExplorerQuery` on `zinder-explorer` | No | Search and aggregate views over the same index |
-| Faucet or other transaction sender | `BroadcastTransaction` and `Transaction` on `zinder-query` | Yes | Typed broadcast outcomes and failover between nodes |
-| Several of these at once | All of the above from one deployment | Explorer is optional | One index instead of one per product |
+| Light wallet | `CompactTxStreamer` on `zinder-compat-lightwalletd` | Yes | Existing lightwalletd client with no protocol changes |
+| Browser wallet | gRPC-Web on `zinder-compat-lightwalletd` | Optional (CORS origins) | Browser SDK (e.g., WebZjs) over the same HTTPS endpoint |
+| Native wallet or backend | `WalletQuery` on `zinder-query`, or `zinder-client` | Yes | Multi-call epoch-pinned reads, typed retries, capability checks |
+| Mobile wallet wake-up | `zinder-client` companion over `ChainEvents` | Planned | Coalesced public tip wake-ups for the wallet operator's push gateway |
+| Payment or deposit tracker | `ChainEvents` + transparent queries on `zinder-query` | Yes | Resumable reorg-aware cursor + outpoint spend checks |
+| Faucet or transaction sender | `BroadcastTransaction` + `Transaction` on `zinder-query` | Yes | Typed broadcast verdicts with multi-node failover |
+| Block explorer | `ExplorerQuery` on `zinder-explorer` (plus optional `zinder-compat-cipherscan`) | Optional (`--preset explorer`) | Displaced-block queries from canonical store; `BlockDetail`, block production, `BlockTransactions`, search, fee/pool/address views, and mempool with materialized views and `WalletQuery` |
+| Multi-product operator | All of the above | Explorer optional | Several products sharing one canonical index |
 
-## Light wallets that speak lightwalletd
+## Light wallets
 
-Point the wallet's existing `CompactTxStreamer` client at
-`zinder-compat-lightwalletd`. No client change is needed. Zinder serves compact
-blocks, tree states, and transparent address data from its own store, so
-wallets keep syncing while the node is down. `Ping` is off by default, and
-`GetAddressUtxos` and address history apply Zinder-specific limits. The
-[lightwalletd compatibility reference](reference/lightwalletd-compatibility.md)
-lists each method.
+Point an existing `CompactTxStreamer` wallet or SDK at `zinder-compat-lightwalletd`. No client code change is required.
 
-Zinder supports a named wallet release once that release passes end-to-end
-certification.
+- Choose the `wallet` preset for local transparent indexes or `light-wallet` for a smaller shielded-focused footprint ([Features and roadmap](features.md#deployment-profiles)).
+- `Ping` stays disabled unless explicitly enabled for load testing, and `GetAddressUtxos` and transparent address history enforce Zinder-specific limits. See [Lightwalletd compatibility](reference/lightwalletd-compatibility.md).
+- A named wallet release is supported once it passes end-to-end certification for the target network.
 
-## Wallets and backends built for Zinder
+## Browser wallets
 
-Use the native `WalletQuery` gRPC API, or the `zinder-client` crate in Rust.
-The native API adds what the lightwalletd protocol cannot express:
+Point a browser SDK such as WebZjs at the same HTTPS URL native light wallets use, after enabling your wallet's browser origin on `zinder-compat-lightwalletd` ([Exposing over TLS](runbooks/exposing-over-tls.md#enable-browser-wallets)).
 
-- **Pinned reads.** A client pins several calls to the same chain snapshot. A
-  sync that reads blocks, a tree state, and transparent outputs never combines
-  two competing tips.
-- **Typed errors.** Most failures carry a stable reason, and each reason maps
-  to a documented retry rule. A client knows whether to retry, restart at a
-  newer snapshot, or stop. A few transport-level rejections, such as listener
-  overload, carry a gRPC status code without a reason.
-- **Capability discovery.** `ServerInfo` lists exactly what a deployment can
-  serve, so a client checks before it relies on a method.
+- Use a `wallet` or `light-wallet` endpoint so subtree roots and tree states are available alongside compact blocks.
+- Prefer binary gRPC-Web (`application/grpc-web+proto`) for block ranges to avoid base64 payload expansion, and use `GetTaddressBalance` for unary transparent balances. See [Browser wallets](reference/integration-surfaces.md#browser-wallets).
 
-A server-side wallet pairs `zinder-client` with a wallet library such as
-librustzcash. [Integration surfaces](reference/integration-surfaces.md) shows
-the smallest working call for each path.
+## Native wallets and backends
+
+Build new wallets, SDKs, and server-side services on `WalletQuery` (or the typed `zinder-client` Rust crate) rather than `CompactTxStreamer`:
+
+1. Call `ServerInfo` on connect to confirm `network`, `contract_revision`, and required [capabilities](reference/capabilities.md).
+2. Capture a chain snapshot (`snapshot()` / `at_epoch_id`) so block reads, tree states, and transparent queries agree on one chain epoch.
+3. Branch on `google.rpc.ErrorInfo` reasons (or `IndexerError::retry_policy()` in Rust) instead of message text.
+
+A server-side wallet pairs `zinder-client` with a wallet library such as `librustzcash` while keeping keys and scanning local. Start from the [Rust quickstart](reference/integration-surfaces.md#quickstart).
+
+## Mobile wallet wake-ups
+
+The ratified silent wake-up design is a stateless `zinder-client` companion example outside `bin/zinder`. The bridge holds no device push tokens or viewing keys. It subscribes to `ChainEvents` with `live_tail` on every connection, without persisting or replaying cursors. Each webhook is a level-triggered signal to sync to the current tip. See [ADR-0013](adrs/0013-chain-event-streams.md) and [#698](https://github.com/ZcashFoundation/zinder/issues/698).
+
+The bridge coalesces tip changes for 20–30 minutes by default, within Apple's guidance of about two to three background pushes per hour. It sends only public `(network, chain_epoch_id, visible_tip, settled_tip_height)` facts to the wallet operator's push gateway and signs the payload and timestamp with HMAC-SHA256. The operator's gateway manages device tokens and push delivery. Wallets jitter reconnects before syncing from their last durable state. [APNs background updates](https://developer.apple.com/documentation/usernotifications/pushing-background-updates-to-your-app).
 
 ## Payment and deposit tracking
 
-A payment backend needs to learn about new blocks and reorgs without missing
-one, and to check transparent outputs and their spend status. Zinder provides:
+Backends that credit deposits or reconcile settlements combine three `WalletQuery` contracts:
 
-- **`ChainEvents`.** A stream of committed blocks and reorgs. The client stores
-  the cursor from each event and resumes from it after a disconnect. Events are
-  kept for seven days by default; a client that stays away longer rebuilds its
-  state from block and address queries.
-- **Transparent address queries.** Unspent outputs, transaction ids in a height
-  range, and the spend status of up to 1,024 outpoints per call.
-- **Mempool snapshots and events** for unconfirmed payments.
+- **`ChainEvents`:** Persist the opaque `cursor` from each `ChainCommitted` and `ChainReorged` event and pass it back on reconnect. Events are retained for 7 days by default; older gaps rebuild from block and address reads. See [Chain events](architecture/chain-events.md).
+- **Transparent queries:** Read address UTXOs, height-bounded transaction IDs, and mined spend status for up to 1,024 outpoints per call via `TransparentOutpointSpendStatus`.
+- **Mempool:** Observe unconfirmed activity through mempool snapshots and events, and detect shielded deposits by scanning compact blocks with your own viewing keys.
 
-Your application detects shielded payments by scanning compact blocks with its
-own viewing keys, which Zinder never sees.
-[Chain events](architecture/chain-events.md) and the
-[wallet data plane](architecture/wallet-data-plane.md) describe these contracts.
-
-## Block explorers
-
-The optional `zinder-explorer` runtime serves block and transaction detail,
-typed search, mempool views, transparent address activity and ranking, fee
-summaries, and value-pool flows. It answers a shielded address with a typed
-refusal and never scans shielded data.
-
-The Explorer is off by default. Turning it on makes ingest build a second,
-rebuildable store of explorer views, which needs its own disk and build time.
-The [Explorer plane](architecture/explorer-plane.md) explains how to enable it,
-what it needs, and what each method returns.
+See [Wallet data plane](architecture/wallet-data-plane.md) for range and epoch rules.
 
 ## Faucets and transaction senders
 
-A faucet builds and signs transactions itself, then needs to send them and
-watch them confirm. `BroadcastTransaction` returns a typed outcome, such as
-accepted, duplicate, or rejected with a reason, and moves to the next
-configured node when the first is unreachable. `Transaction` reports whether a
-transaction is mined, in the mempool, or proven absent at one snapshot.
+Build and sign transactions in your service, submit them with `BroadcastTransaction`, and confirm status with `Transaction`:
 
-Block templates and mined-block submission stay with the node. A miner or a
-mining faucet uses the node's RPC for them.
+- `BroadcastTransaction` returns typed verdicts (accepted, duplicate, or rejected with reason) and fails over across configured nodes on transport or consensus-branch failure.
+- `Transaction` reports mined, in-mempool, or proven-absent status at one snapshot.
 
-## Several consumers from one deployment
+Block templates and mined-block submission stay on the node; miners and mining faucets call the node's JSON-RPC directly.
 
-The case Zinder is built for is one operator serving several products: a
-lightwalletd wallet, a native backend, and an explorer read the same index
-through separate processes. Each product sees the same chain at the same
-snapshot, and you operate one index instead of one per product.
+## Block explorers
 
-To run it, start with [Deploying Zinder](runbooks/deploying.md). It lists what
-a deployment needs and what to put in front of the listeners before you expose
-them.
+Run with `--preset explorer` (or set `deployment.profile = "explorer"`) to start `zinder-explorer` and `zinder-compat-cipherscan` alongside the wallet plane. Canonical-only displaced-block RPCs (`DisplacedBlockHistory`, `DisplacedBlockDetail`) read `RocksDbCanonicalSecondary` directly once canonical ingest is `READY`, while `BlockDetail`, block-production queries, `BlockTransactions`, `CommitmentRootSearch`, fee/flow/ranking analytics, and mempool/search endpoints require `explorer_views` (enabled automatically by `--preset explorer`) qualified by catch-up/backfill coverage and/or `WalletQuery`:
+
+- Explorer views live in a separate, rebuildable store and never block wallet serving.
+- Shielded addresses return a typed privacy refusal; the Explorer never scans shielded data.
+- `zinder-compat-cipherscan` fronts an unchanged Cipherscan UI ([Cipherscan adapter](architecture/cipherscan-adapter.md)).
+
+See [Explorer plane](architecture/explorer-plane.md) for setup and method contracts.
+
+## Multi-product operators
+
+Run one Zinder deployment to serve lightwalletd wallets, browser wallets, native backends, payment trackers, and an optional explorer simultaneously. Separate reader processes share one canonical index on the host, observe the same chain epochs, and avoid operating a separate indexer per product.
+
+To deploy, start with [Deploying Zinder](runbooks/deploying.md).

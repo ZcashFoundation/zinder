@@ -70,6 +70,7 @@ enum BroadcastOutcome {
 enum MockSourceError {
     BroadcastDisabled,
     NodeUnavailable { reason: String },
+    NodeRateLimited,
 }
 
 impl MockSourceError {
@@ -78,6 +79,9 @@ impl MockSourceError {
             Self::BroadcastDisabled => SourceError::TransactionBroadcastDisabled,
             Self::NodeUnavailable { reason } => SourceError::NodeUnavailable {
                 reason: reason.clone(),
+            },
+            Self::NodeRateLimited => SourceError::NodeRateLimited {
+                operation: "sendrawtransaction",
             },
         }
     }
@@ -117,6 +121,16 @@ impl MockTransactionBroadcaster {
             MockSourceError::NodeUnavailable {
                 reason: reason.into(),
             },
+        ))
+    }
+
+    /// Returns a broadcaster that fails every call with
+    /// [`SourceError::NodeRateLimited`], as a node at its JSON-RPC
+    /// connection limit answers with HTTP 429.
+    #[must_use]
+    pub fn node_rate_limited() -> Self {
+        Self::with_outcome(BroadcastOutcome::SourceError(
+            MockSourceError::NodeRateLimited,
         ))
     }
 

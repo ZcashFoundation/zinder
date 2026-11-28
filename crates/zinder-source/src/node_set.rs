@@ -355,6 +355,10 @@ where
         self.active().tip_id().await
     }
 
+    async fn probe_tip_id(&self) -> Result<BlockId, SourceError> {
+        self.active().probe_tip_id().await
+    }
+
     async fn fetch_subtree_roots(
         &self,
         protocol: ShieldedProtocol,

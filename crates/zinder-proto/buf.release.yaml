@@ -1,0 +1,14 @@
+version: v2
+
+modules:
+  - path: proto
+    excludes:
+      - proto/compat
+      - proto/external
+  - path: proto/compat/lightwalletd
+  - path: proto/compat/darkside
+  - path: proto/external/zebra
+
+breaking:
+  use:
+    - PACKAGE

@@ -10,6 +10,8 @@
     reason = "Each live test file consumes only a subset of the common helpers."
 )]
 
+pub(crate) mod construction_fixture;
+
 use std::{path::Path, process::Command, sync::Arc};
 
 use eyre::{Result, eyre};
@@ -22,8 +24,8 @@ use zinder_query::{
 };
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbResourceBudget,
+    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbResourceBudget,
 };
 use zinder_testkit::{WalletServingStoreFixture, live::LiveTestEnv};
 
@@ -37,6 +39,7 @@ pub(crate) async fn fetch_live_tip_height(env: &LiveTestEnv) -> Result<BlockHeig
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?;
     Ok(NodeSource::tip_id(&probe_source).await?.height)
@@ -168,6 +171,7 @@ pub(crate) fn zebra_source_for_live_env(env: &LiveTestEnv) -> Result<ZebraJsonRp
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?)
 }
@@ -191,7 +195,7 @@ pub(crate) struct LiveServingPair {
 /// one serving pair.
 ///
 /// Construction runs the same fresh-load and baseline publication path the
-/// canonical writer uses, retaining transaction bytes and settling the build
+/// canonical writer uses, retaining raw block and transaction bytes and settling the build
 /// tip. History is genesis-complete because the wallet projection must
 /// resolve every transparent input's predecessor output; a checkpoint-bounded
 /// window fails that check as soon as it spends an older output.
@@ -210,14 +214,13 @@ pub(crate) async fn live_serving_pair(
         activations,
         genesis_block.block_time_seconds,
         build_tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         reorg_policy,
     )?;
     let temporary_directory = tempfile::tempdir()?;
     let canonical_primary_path = temporary_directory.path().join("canonical-primary");
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &canonical_primary_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;

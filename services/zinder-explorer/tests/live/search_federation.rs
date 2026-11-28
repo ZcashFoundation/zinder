@@ -338,6 +338,7 @@ async fn sample_block_at(env: &LiveTestEnv, height: BlockHeight) -> Result<Sampl
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?;
     sample_tip(&source.fetch_block_at(height).await?)

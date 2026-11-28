@@ -22,8 +22,10 @@ For example, `wallet.read.compact_block_range_v2` gates
   `_v2` is a different capability from `_v1`, not an upgrade of it.
 - A server advertises a capability only when the endpoint it composed can
   serve it: the method, the stored data it needs, and the providers behind
-  it. Readiness and temporary dependency outages do not remove a capability.
-  They affect individual requests instead.
+  it. Wallet capabilities describe the admitted runtime. A temporary outage
+  can cause a wallet request to fail while its capability remains advertised.
+  The Explorer also checks view coverage and the wallet descriptor for methods
+  that require them.
 - A method can exist in the protobuf schema without its capability being
   advertised. On `WalletQuery`, calling such a method fails with
   `ENDPOINT_CAPABILITY_UNAVAILABLE`.
@@ -40,7 +42,7 @@ For example, `wallet.read.compact_block_range_v2` gates
 | Native wallet client | `WalletQuery.ServerInfo`, in `info.common.capabilities` |
 | Rust SDK (`zinder-client`) | `EndpointBackedIndex::server_info()`, in `ServerInfo.capabilities` |
 | Explorer client | `ExplorerQuery.ServerInfo`, in `info.common.capabilities` |
-| Operator or dashboard | The `capabilities` field of `/healthz` on the operational endpoint |
+| Operator or dashboard | The `capabilities` field of `/healthz` on the operational endpoint. The Explorer reports its startup snapshot here; use `ExplorerQuery.ServerInfo` for current capabilities |
 | Lightwalletd client | None. `CompactTxStreamer` has no capability strings; see [Lightwalletd compatibility](lightwalletd-compatibility.md). |
 
 The same `ServerInfo` also carries `contract_revision`, which increases when
@@ -78,6 +80,11 @@ wallet.read.block_id_by_selector_v1
 wallet.read.block_header_by_selector_v1
 wallet.read.compact_block_at_v2
 wallet.read.compact_block_range_v2
+wallet.read.compact_block_range_v3
+wallet.read.compact_nullifier_range_v1
+wallet.read.standard_fee_v1
+wallet.address.transparent_balances_v1
+wallet.address.transparent_batch_unspent_outputs_v1
 wallet.read.compact_block_ironwood_v2
 wallet.read.full_block_at_v1
 wallet.read.full_block_range_v1
@@ -147,8 +154,10 @@ explorer.migration.denominations_v1
 
 `zinder-query` derives its wallet capability set once, after it admits its
 storage and its ingest control connection, and keeps it for the life of the
-process. The set follows from the deployment's configuration, so operators do
-not select capabilities individually.
+process. The admitted storage and dependencies determine the set.
+`storage.raw_blob_policy` on the reader sets minimum retention. An admitted
+primary may retain additional blobs, and capabilities reflect the primary's
+persisted retention.
 
 "Always" below means every `zinder-query` that starts advertises it.
 
@@ -157,18 +166,23 @@ not select capabilities individually.
 | `wallet.read.visible_tip_block_v1` | `VisibleTipBlock` | Always |
 | `wallet.read.settled_tip_block_v1` | `SettledTipBlock` | Always |
 | `wallet.read.block_id_by_selector_v1` | `BlockIdBySelector` | Always |
-| `wallet.read.block_header_by_selector_v1` | `BlockHeaderBySelector` | Never; `zinder-query` does not serve it |
+| `wallet.read.block_header_by_selector_v1` | `BlockHeaderBySelector` | Always |
 | `wallet.read.compact_block_at_v2` | `CompactBlock` | Always |
 | `wallet.read.compact_block_range_v2` | `CompactBlocksInRange` | Always |
+| `wallet.read.compact_block_range_v3` | `CompactBlocksInRange` | With canonical range projection |
+| `wallet.read.compact_nullifier_range_v1` | `CompactNullifiersInRange` | With canonical nullifier projection |
+| `wallet.read.standard_fee_v1` | `StandardFee` | With a configured upstream node; reads require verification |
+| `wallet.address.transparent_balances_v1` | `TransparentAddressBalances` | With the wallet projection |
+| `wallet.address.transparent_batch_unspent_outputs_v1` | `TransparentAddressesUnspentOutputs` | With the wallet projection |
 | `wallet.read.compact_block_ironwood_v2` | Ironwood fields on compact blocks | Always |
-| `wallet.read.full_block_at_v1` | `FullBlock` | `storage.raw_blob_policy = "all"` |
-| `wallet.read.full_block_range_v1` | `FullBlocksInRange` | `storage.raw_blob_policy = "all"` |
+| `wallet.read.full_block_at_v1` | `FullBlock` | The admitted canonical store retains all raw blobs |
+| `wallet.read.full_block_range_v1` | `FullBlocksInRange` | The admitted canonical store retains all raw blobs |
 | `wallet.read.tree_state_at_height_v2` | `TreeStateAtHeight` | Always |
 | `wallet.read.latest_tree_state_checkpoint_v2` | `LatestTreeStateCheckpoint` | Always |
 | `wallet.read.subtree_roots_in_range_v1` | `SubtreeRoots` | Always |
 | `wallet.read.subtree_roots_ironwood_v1` | Ironwood protocol on `SubtreeRoots` | Always |
 | `wallet.read.transaction_by_id_v2` | `Transaction` | Ingest control serves mempool transaction lookups |
-| `wallet.read.transaction_bytes_v1` | `raw_transaction_bytes` on `Transaction` | As above, and `storage.raw_blob_policy` is `transactions` or `all` |
+| `wallet.read.transaction_bytes_v1` | `raw_transaction_bytes` on `Transaction` | As above, and the admitted query retains transaction bodies or has a verified node byte source |
 | `wallet.read.server_info_v2` | `ServerInfo` | Always |
 | `wallet.read.network_upgrade_activations_v1` | `NetworkUpgradeActivations` | Always |
 | `wallet.broadcast.transaction_v1` | `BroadcastTransaction` | A `[node]` endpoint is configured |
@@ -188,14 +202,24 @@ endpoint is verified; see
 [Node source boundary](../architecture/node-source-boundary.md#capabilities)
 for verification.
 
+`BlockHeaderBySelector` returns the block identity, previous block hash,
+transaction Merkle root, raw commitment bytes, block time in Unix seconds,
+compact difficulty target, nonce, and version. Hashes and the Merkle root use
+lowercase hex in RPC byte order. The header omits the Equihash solution. For
+the consensus-serialized header, decode it from a `FullBlock` response on a
+store that retains all raw block blobs.
+
 ## Explorer capabilities
 
 `zinder-explorer` computes its set from what it has open, each time it
-answers `ServerInfo`. In the table, "wallet query" means
-`explorer.wallet_query_endpoint` is set, and "views" means the Explorer
-materialized-view store is open, which requires `ingest.explorer_views = true`
-on the writer. The explorer does not read the canonical store, so it never
-advertises a capability that needs it.
+answers `ServerInfo`. For `ValuePoolSummary`, it also checks the wallet
+endpoint's advertised capabilities. It caches a successful probe for 60
+seconds. A probe has two seconds to connect and read the descriptor. When a
+probe fails, the Explorer omits the capability and can retry after five seconds. In the table, "wallet query" means
+`explorer.wallet_query_endpoint` is set, "views" means the Explorer
+materialized-view store is open (which requires `ingest.explorer_views = true`
+on the writer), and "canonical store" means the read-only canonical secondary
+for `storage.path` is open.
 
 | Capability | Gates | Advertised when |
 | --- | --- | --- |
@@ -204,48 +228,50 @@ advertises a capability that needs it.
 | `explorer.mempool.summary_v1` | `MempoolSummary` | Wallet query |
 | `explorer.mempool.snapshot_v1` | `MempoolSnapshot` | Wallet query |
 | `explorer.mempool.activity_v1` | `MempoolActivity` | Wallet query |
-| `explorer.value_pool.summary_v1` | `ValuePoolSummary` | Wallet query. Calls still fail with `ENDPOINT_CAPABILITY_UNAVAILABLE`, because `zinder-query` does not serve `ChainValuePoolsAtTip` |
+| `explorer.value_pool.summary_v1` | `ValuePoolSummary` | Wallet query advertises `wallet.read.chain_value_pools_at_tip_v1` |
 | `explorer.network_upgrade.status_v1` | `NetworkUpgradeStatus` | Wallet query |
 | `explorer.chain.reorg_history_v1` | `ChainReorgHistory` | Views |
+| `explorer.chain.displaced_block_history_v1` | `DisplacedBlockHistory` | Canonical store |
+| `explorer.chain.displaced_block_detail_v1` | `DisplacedBlockDetail` | Canonical store |
 | `explorer.transaction.detail_v4` | `TransactionDetail` | Views and wallet query |
 | `explorer.transaction.fees_v1` | Input values and paid fee on `TransactionDetail` | Views and wallet query |
+| `explorer.transaction.intrinsic_value_balances_v1` | `intrinsic_value_balances` on `TransactionDetail` and `TransactionHistory` | Views, wallet query, and canonical store |
 | `explorer.transaction.recent_v1` | `RecentTransactions` | Views and wallet query |
 | `explorer.transaction.component_summary_v2` | `TransactionComponentSummary` | Views and wallet query |
 | `explorer.transaction.history_v1` | `TransactionHistory` | Wallet query, and the transaction history view has data |
+| `explorer.transaction.history_v2` | `TransactionHistory` | Wallet query, canonical store, and complete transaction-history coverage matching the canonical tip |
 | `explorer.block.summary_v1` | `BlockSummariesInRange` | Views and wallet query |
+| `explorer.block.production_series_v2` | `BlockProductionSeries` | Views and canonical store |
+| `explorer.block.production_time_range_v1` | `BlockProductionInTimeRange` | Views, canonical store, and the block production time view covers the chain |
 | `explorer.block.detail_v1` | `BlockDetail` | Views and wallet query |
+| `explorer.block.transactions_v2` | `BlockTransactions` | Views, wallet query, and canonical store |
+| `explorer.block.final_note_commitment_roots_v1` | `final_note_commitment_roots` on `BlockTransactions` | Views, wallet query, and canonical store |
 | `explorer.block.activity_distribution_v1` | `BlockActivityDistribution` | Views and wallet query |
+| `explorer.commitment_root.search_v1` | `CommitmentRootSearch` | Views and canonical store |
+| `explorer.commitment_root.displaced_matches_v1` | Displaced matches and coverage on `CommitmentRootSearch` | Views and canonical store |
 | `explorer.transparent_address.activity_v2` | `TransparentAddressActivity` | Views and wallet query, and the address ranking is built |
 | `explorer.transparent_address.ranking_v1` | `TransparentAddressRanking` | Views and wallet query, and the address ranking is built |
 | `explorer.transparent_address.deltas_v1` | `TransparentAddressDeltas` | Views and wallet query |
 | `explorer.fee.summary_v1` | `FeeSummary` | Views and wallet query |
 | `explorer.fee.conventional_distribution_v1` | `ConventionalFeeDistribution` | Views and wallet query, and the distribution covers the chain |
+| `explorer.fee.paid_distribution_v1` | `PaidFeeDistribution` | Unadvertised. No runtime builds a canonical paid-fee distribution view |
 | `explorer.value_pool.flow_history_v1` | `ValuePoolFlowHistory` | Views and wallet query |
 | `explorer.value_pool.flow_events_in_range_v1` | `ValuePoolFlowEventsInRange` | Views and wallet query |
 | `explorer.value_pool.flow_summary_v1` | `ValuePoolFlowSummary` | Views and wallet query |
 | `explorer.value_pool.flow_amount_threshold_summary_v1` | `ValuePoolFlowAmountThresholdSummary` | Views and wallet query |
 | `explorer.value_pool.flow_rounded_amount_summary_v1` | `ValuePoolFlowRoundedAmountSummary` | Views and wallet query |
-| `explorer.value_pool.balance_history_v1` | `ValuePoolBalanceHistory` | Views and wallet query |
-| `explorer.mempool.event_counts_v1` | `MempoolEventCounts` | Views and wallet query |
+| `explorer.value_pool.balance_history_v1` | `ValuePoolBalanceHistory` | Unadvertised. No runtime writes balance history |
+| `explorer.mempool.event_counts_v1` | `MempoolEventCounts` | Unadvertised. No runtime indexes mempool events |
 | `explorer.overview.snapshot_v1` | `OverviewSnapshot` | Views and wallet query |
 | `explorer.migration.overview_v1` | `MigrationOverview` | Views and wallet query |
 | `explorer.migration.cohorts_v1` | `MigrationCohorts` | Views and wallet query |
 | `explorer.migration.denominations_v1` | `MigrationDenominations` | Views and wallet query |
 
-These explorer capabilities are defined but never advertised, because they
-need the canonical store or complete canonical history:
+These explorer capabilities are defined on the wire but never advertised by `zinder-explorer` in this release:
 
-- `explorer.block.production_series_v2`
-- `explorer.block.production_time_range_v1`
-- `explorer.block.transactions_v2`
-- `explorer.block.final_note_commitment_roots_v1`
-- `explorer.commitment_root.search_v1`
-- `explorer.commitment_root.displaced_matches_v1`
-- `explorer.chain.displaced_block_history_v1`
-- `explorer.chain.displaced_block_detail_v1`
-- `explorer.transaction.intrinsic_value_balances_v1`
-- `explorer.transaction.history_v2`
 - `explorer.fee.paid_distribution_v1`
+- `explorer.value_pool.balance_history_v1`
+- `explorer.mempool.event_counts_v1`
 
 [Explorer plane](../architecture/explorer-plane.md) describes what each
 explorer method returns.

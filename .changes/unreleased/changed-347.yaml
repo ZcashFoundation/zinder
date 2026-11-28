@@ -1,6 +1,0 @@
-kind: changed
-body: "`GetBlockRange` and `GetBlockRangeNullifiers` streams now open after a first read of at most 256 KiB of stored compact blocks instead of up to 1,000 blocks and 2 MiB, and each later chunk is read while the one before it is sent, holding at most two chunks per stream. A descending range that runs below retained history now sends every height checked before it ends with `NOT_FOUND`. A pre-stream `UNAVAILABLE` or `DATA_LOSS` now applies only to blocks the first read reaches."
-time: 2026-11-20T08:00:00.000000000Z
-custom:
-    Bump: patch
-    PR: "347"

@@ -19,12 +19,12 @@ use prost::Message as _;
 use tonic::{Code, Request, Response, Status};
 use tonic_types::StatusExt as _;
 use zinder_core::{
-    BlockHeight, explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
+    BlockHeight,
+    explorer_reasons::{MEMPOOL_EVENT_COUNTS_NOT_INDEXED, WALLET_QUERY_CAPABILITY_NOT_SUPPORTED},
     wire::encode_height_key_ascending,
 };
 use zinder_materialized_views::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MaterializedViewStore,
-    MempoolEventCountsConsumer, TRANSACTION_HISTORY_COLUMN_FAMILY,
+    BLOCK_SUMMARY_COLUMN_FAMILY, MaterializedViewStore, TRANSACTION_HISTORY_COLUMN_FAMILY,
 };
 use zinder_proto::ZINDER_ERROR_DOMAIN;
 use zinder_proto::capabilities::{
@@ -32,14 +32,17 @@ use zinder_proto::capabilities::{
     WALLET_SNAPSHOT_MEMPOOL_V3,
 };
 use zinder_proto::v1::explorer::{
-    BlockSummary, BlockSummaryRecord, OverviewFeeSummary, OverviewMempool, OverviewMempoolEvents,
-    OverviewSnapshotRequest, OverviewSnapshotResponse, TransactionHistoryEntry, UnavailableField,
-    UnavailableReason,
+    BlockSummary, BlockSummaryRecord, OverviewFeeSummary, OverviewMempool, OverviewSnapshotRequest,
+    OverviewSnapshotResponse, TransactionHistoryEntry, UnavailableField, UnavailableReason,
 };
 use zinder_proto::v1::ops::ErrorReason;
 use zinder_proto::v1::wallet::{
-    self, ChainValuePoolsAtTipRequest, MempoolSnapshotRequest, VisibleTipBlockRequest,
+    self, ChainValuePoolsAtTipRequest, VisibleTipBlockRequest,
     wallet_query_client::WalletQueryClient,
+};
+use zinder_proto::wire::{
+    OVERVIEW_MEMPOOL_EVENTS_FIELD_PATH, OVERVIEW_MEMPOOL_FIELD_PATH,
+    OVERVIEW_VALUE_POOLS_FIELD_PATH,
 };
 use zinder_runtime::AuthenticatedChannel;
 
@@ -47,6 +50,8 @@ use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
+use super::mempool::{MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST, drain_wallet_mempool_snapshot};
+use super::mempool_event_counts::{clamp_window, read_mempool_event_counts};
 use super::transaction_history::decode_history_entry;
 
 /// Range cap on `recent_blocks_limit`.
@@ -63,29 +68,12 @@ const MAX_RECENT_TRANSACTIONS_LIMIT: u32 = 64;
 /// Server default when `recent_transactions_limit == 0`.
 const DEFAULT_RECENT_TRANSACTIONS_LIMIT: u32 = 32;
 
-/// Lower bound on `mempool_window_seconds` (matches `MempoolEventCounts`).
-const MIN_MEMPOOL_WINDOW_SECONDS: u32 = 60;
-/// Upper bound on `mempool_window_seconds` (matches `MempoolEventCounts`).
-const MAX_MEMPOOL_WINDOW_SECONDS: u32 = 3_600;
-/// Server default when `mempool_window_seconds == 0`.
-const DEFAULT_MEMPOOL_WINDOW_SECONDS: u32 = 300;
-
 /// Range cap on `fee_summary_block_count`.
 const MIN_FEE_SUMMARY_BLOCK_COUNT: u32 = 1;
 /// Server-side ceiling matches the per-request cap of `FeeSummary`.
 const MAX_FEE_SUMMARY_BLOCK_COUNT: u32 = 256;
 /// Server default when `fee_summary_block_count == 0`.
 const DEFAULT_FEE_SUMMARY_BLOCK_COUNT: u32 = 50;
-
-/// Cap on entries the bundle's mempool aggregation hydrates from the
-/// wallet `MempoolSnapshot`. Mirrors the cap in the per-feature mempool
-/// handlers.
-const MAX_MEMPOOL_SNAPSHOT_ENTRIES: u32 = 4_096;
-
-/// Field path for an unavailable Overview mempool snapshot.
-const MEMPOOL_FIELD_PATH: &str = "mempool";
-/// Field path for unavailable Overview chain value pools.
-const VALUE_POOLS_FIELD_PATH: &str = "value_pools";
 
 /// Executes one `ExplorerQuery.OverviewSnapshot` request.
 pub(crate) async fn query_overview_snapshot(
@@ -120,8 +108,15 @@ pub(crate) async fn query_overview_snapshot(
         freshness
             .unavailable
             .push(build_wallet_capability_unavailable_field(
-                MEMPOOL_FIELD_PATH,
+                OVERVIEW_MEMPOOL_FIELD_PATH,
             ));
+    }
+    if mempool_events.is_none() {
+        freshness.unavailable.push(UnavailableField {
+            field_path: OVERVIEW_MEMPOOL_EVENTS_FIELD_PATH.to_owned(),
+            reason: UnavailableReason::UnavailableNotIndexed as i32,
+            human_reason: MEMPOOL_EVENT_COUNTS_NOT_INDEXED.to_owned(),
+        });
     }
     let value_pools = if let Some(value_pools) = available_value_pools {
         value_pools
@@ -129,7 +124,7 @@ pub(crate) async fn query_overview_snapshot(
         freshness
             .unavailable
             .push(build_wallet_capability_unavailable_field(
-                VALUE_POOLS_FIELD_PATH,
+                OVERVIEW_VALUE_POOLS_FIELD_PATH,
             ));
         Vec::new()
     };
@@ -138,7 +133,7 @@ pub(crate) async fn query_overview_snapshot(
         freshness: Some(freshness),
         tip_block_time_unix_seconds,
         mempool,
-        mempool_events: Some(mempool_events),
+        mempool_events,
         fee_summary: Some(fee_summary),
         value_pools,
         recent_blocks,
@@ -170,12 +165,7 @@ impl RequestLimits {
                 MIN_RECENT_TRANSACTIONS_LIMIT,
                 MAX_RECENT_TRANSACTIONS_LIMIT,
             ),
-            mempool_window_seconds: clamp(
-                request.mempool_window_seconds,
-                DEFAULT_MEMPOOL_WINDOW_SECONDS,
-                MIN_MEMPOOL_WINDOW_SECONDS,
-                MAX_MEMPOOL_WINDOW_SECONDS,
-            ),
+            mempool_window_seconds: clamp_window(request.mempool_window_seconds),
             fee_summary_blocks: clamp(
                 request.fee_summary_block_count,
                 DEFAULT_FEE_SUMMARY_BLOCK_COUNT,
@@ -318,40 +308,12 @@ fn read_recent_transactions(
     Ok(entries)
 }
 
-fn read_mempool_event_counts(
-    materialized_view_store: &MaterializedViewStore,
-    window_seconds: u32,
-) -> Result<OverviewMempoolEvents, Status> {
-    let now_seconds = current_unix_seconds();
-    let window_start = now_seconds.saturating_sub(u64::from(window_seconds));
-    let start_key = MempoolEventCountsConsumer::key_for_second(window_start);
-    let end_key = MempoolEventCountsConsumer::key_for_second(now_seconds);
-    let cap = usize::try_from(window_seconds).unwrap_or(MAX_MEMPOOL_WINDOW_SECONDS as usize);
-    let entries = materialized_view_store
-        .range_iterate_consumer(
-            MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
-            &start_key,
-            &end_key,
-            cap,
-        )
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let mut added_count: u32 = 0;
-    let mut mined_count: u32 = 0;
-    let mut invalidated_count: u32 = 0;
-    for (_, payload) in entries {
-        if let Some((added, mined, invalidated)) = MempoolEventCountsConsumer::decode_row(&payload)
-        {
-            added_count = added_count.saturating_add(added);
-            mined_count = mined_count.saturating_add(mined);
-            invalidated_count = invalidated_count.saturating_add(invalidated);
-        }
-    }
-    Ok(OverviewMempoolEvents {
-        window_seconds,
-        added_count,
-        mined_count,
-        invalidated_count,
-    })
+#[derive(Default)]
+struct OverviewMempoolTotals {
+    transaction_count: u32,
+    total_size_bytes: u64,
+    oldest_first_seen: Option<u64>,
+    newest_first_seen: Option<u64>,
 }
 
 async fn aggregate_mempool_summary(
@@ -360,45 +322,49 @@ async fn aggregate_mempool_summary(
     // Mempool is an optional Overview field. Structural absence is
     // represented through the response freshness envelope; transient
     // transport failures still fail the request.
-    let snapshot = match wallet_client
-        .mempool_snapshot(Request::new(MempoolSnapshotRequest {
-            max_entries: MAX_MEMPOOL_SNAPSHOT_ENTRIES,
-            from_cursor: Vec::new(),
-        }))
-        .await
+    let drained = match drain_wallet_mempool_snapshot(
+        wallet_client,
+        MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST,
+        OverviewMempoolTotals::default,
+        |totals, entry| {
+            totals.transaction_count = totals.transaction_count.saturating_add(1);
+            let entry_size = u64::try_from(entry.raw_transaction_bytes.len()).unwrap_or(u64::MAX);
+            totals.total_size_bytes = totals.total_size_bytes.saturating_add(entry_size);
+            totals.oldest_first_seen = Some(
+                totals
+                    .oldest_first_seen
+                    .map_or(entry.first_seen_unix_millis, |prior| {
+                        prior.min(entry.first_seen_unix_millis)
+                    }),
+            );
+            totals.newest_first_seen = Some(
+                totals
+                    .newest_first_seen
+                    .map_or(entry.first_seen_unix_millis, |prior| {
+                        prior.max(entry.first_seen_unix_millis)
+                    }),
+            );
+            Ok(())
+        },
+    )
+    .await
     {
-        Ok(response) => response.into_inner(),
+        Ok(drained) => drained,
         Err(status) if is_endpoint_capability_unavailable(&status, WALLET_SNAPSHOT_MEMPOOL_V3) => {
             return Ok(None);
         }
         Err(status) => return Err(status),
     };
     let now_millis = current_unix_millis();
-    let mut transaction_count: u32 = 0;
-    let mut total_size_bytes: u64 = 0;
-    let mut oldest_first_seen: Option<u64> = None;
-    let mut newest_first_seen: Option<u64> = None;
-    for entry in &snapshot.entries {
-        transaction_count = transaction_count.saturating_add(1);
-        let entry_size = u64::try_from(entry.raw_transaction_bytes.len()).unwrap_or(u64::MAX);
-        total_size_bytes = total_size_bytes.saturating_add(entry_size);
-        oldest_first_seen = Some(
-            oldest_first_seen.map_or(entry.first_seen_unix_millis, |prior| {
-                prior.min(entry.first_seen_unix_millis)
-            }),
-        );
-        newest_first_seen = Some(
-            newest_first_seen.map_or(entry.first_seen_unix_millis, |prior| {
-                prior.max(entry.first_seen_unix_millis)
-            }),
-        );
-    }
+    let totals = drained.output;
     Ok(Some(OverviewMempool {
-        transaction_count,
-        total_size_bytes,
-        oldest_entry_age_millis: oldest_first_seen
+        transaction_count: totals.transaction_count,
+        total_size_bytes: totals.total_size_bytes,
+        oldest_entry_age_millis: totals
+            .oldest_first_seen
             .map_or(0, |seen| now_millis.saturating_sub(seen)),
-        newest_entry_age_millis: newest_first_seen
+        newest_entry_age_millis: totals
+            .newest_first_seen
             .map_or(0, |seen| now_millis.saturating_sub(seen)),
     }))
 }
@@ -456,12 +422,6 @@ fn build_wallet_capability_unavailable_field(field_path: &str) -> UnavailableFie
         reason: UnavailableReason::UnavailableUpstreamNotSupported as i32,
         human_reason: WALLET_QUERY_CAPABILITY_NOT_SUPPORTED.to_owned(),
     }
-}
-
-fn current_unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 fn current_unix_millis() -> u64 {

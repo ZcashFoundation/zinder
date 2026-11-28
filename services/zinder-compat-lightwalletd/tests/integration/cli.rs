@@ -7,6 +7,19 @@ use std::{fs, path::Path, process::Command};
 
 use tempfile::tempdir;
 
+#[tokio::test]
+async fn explicit_args_use_the_callers_tracing_subscriber() -> eyre::Result<()> {
+    const BINARY: &str = "zinder-compat-lightwalletd";
+    zinder_runtime::install_tracing_subscriber()?;
+    let exit = zinder_compat_lightwalletd::runtime::run_from_args(
+        BINARY,
+        [BINARY, "--print-config", "--network", "zcash-regtest"],
+    )
+    .await;
+    assert_eq!(exit, std::process::ExitCode::SUCCESS);
+    Ok(())
+}
+
 #[test]
 fn version_reports_the_product_version() -> eyre::Result<()> {
     let output = zinder_compat_command().arg("--version").output()?;
@@ -139,7 +152,7 @@ fn browser_origins_read_the_file_and_honor_environment_overrides() -> eyre::Resu
             &["http://[::1]:5173", "https://wallet.example"],
         ),
         (Some("*"), &["*"][..]),
-        (Some(""), &[][..]),
+        (Some("none"), &[][..]),
     ] {
         let mut command = zinder_compat_command();
         command
@@ -172,6 +185,7 @@ fn browser_origins_reject_invalid_or_ambiguous_configuration_without_echoing_cre
         )?,
     )?;
     for invalid in [
+        "",
         "null",
         "file:///wallet",
         "https://wallet.example/path",
@@ -243,20 +257,39 @@ fn wallet_serving_accepts_node_fallbacks_only_with_a_primary_node() -> eyre::Res
 /// secondary roots and with the cache budget pinned as query's is.
 #[test]
 fn wallet_serving_image_config_resolves() -> eyre::Result<()> {
-    let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../deploy/config/wallet-serving/compat-lightwalletd.toml");
     let temporary = tempdir()?;
     let token_path = temporary.path().join("ingest.token");
     fs::write(&token_path, "fixture-token\n")?;
 
     let output = zinder_compat_command()
-        .args(["--config", path_str(&config_path)?, "--print-config"])
+        .args(["--print-config"])
+        .env("ZINDER_DEPLOYMENT__PROFILE", "wallet")
         .env("ZINDER_NETWORK__NAME", "zcash-testnet")
         .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+        .env("ZINDER_STORAGE__PATH", "/var/lib/zinder/canonical")
+        .env(
+            "ZINDER_STORAGE__SECONDARY_PATH",
+            "/var/lib/zinder/compat/canonical-secondary",
+        )
+        .env(
+            "ZINDER_STORAGE__CANONICAL__ROCKSDB__BLOCK_CACHE_BYTES",
+            "268435456",
+        )
+        .env("ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES", "1024")
+        .env("ZINDER_WALLET__PATH", "/var/lib/zinder/wallet")
+        .env(
+            "ZINDER_WALLET__SECONDARY_PATH",
+            "/var/lib/zinder/compat/wallet-secondary",
+        )
+        .env("ZINDER_INGEST_CONTROL__ADDR", "http://127.0.0.1:9100")
         .env(
             "ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH",
             path_str(&token_path)?,
         )
+        .env("ZINDER_COMPAT__LISTEN_ADDR", "[::]:9067")
+        .env("ZINDER_COMPAT__REORG_WINDOW_BLOCKS", "1000")
+        .env("ZINDER_OPS__LISTEN_ADDR", "[::]:9107")
+        .env("ZINDER_SECURITY__ALLOW_PUBLIC_BIND", "true")
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
@@ -265,11 +298,12 @@ fn wallet_serving_image_config_resolves() -> eyre::Result<()> {
         "path = \"/var/lib/zinder/canonical\"",
         "secondary_path = \"/var/lib/zinder/compat/canonical-secondary\"",
         "block_cache_bytes = 268435456",
+        "max_open_files = 1024",
         "path = \"/var/lib/zinder/wallet\"",
         "secondary_path = \"/var/lib/zinder/compat/wallet-secondary\"",
         "addr = \"http://127.0.0.1:9100\"",
         "listen_addr = \"[::]:9067\"",
-        "serving = \"wallet\"",
+        "profile = \"wallet\"",
         "listen_addr = \"[::]:9107\"",
         "allow_public_bind = true",
     ] {
@@ -420,31 +454,143 @@ fn wallet_node_settings_without_an_address_are_rejected() -> eyre::Result<()> {
 }
 
 #[test]
+fn light_wallet_profile_resolves_with_standard_binary() -> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let path = temporary.path().join("compat.toml");
+    let config = compact_blocks_config_toml(
+        &temporary.path().join("canonical"),
+        &temporary.path().join("secondary"),
+    )?
+    .replace("serving = \"compact-blocks\"\n", "");
+    fs::write(
+        &path,
+        format!("{config}\n[node]\njson_rpc_addr = \"http://127.0.0.1:1\"\n"),
+    )?;
+    let output = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&path)?])
+        .env("ZINDER_DEPLOYMENT__PROFILE", "light-wallet")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("[deployment]"), "{stdout}");
+    assert!(stdout.contains("profile = \"light-wallet\""), "{stdout}");
+    assert!(!stdout.contains("serving ="), "{stdout}");
+    assert!(!stdout.contains("raw_blob_policy ="), "{stdout}");
+    assert!(!stdout.contains("[wallet]"), "{stdout}");
+
+    let conflict = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&path)?])
+        .env("ZINDER_DEPLOYMENT__PROFILE", "light-wallet")
+        .env("ZINDER_COMPAT__SERVING", "compact-blocks")
+        .output()?;
+    assert!(!conflict.status.success(), "{conflict:?}");
+    assert!(String::from_utf8(conflict.stderr)?.contains("remove conflicting overrides"));
+    let legacy_key = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&path)?])
+        .env("ZINDER_PROFILE", "light-wallet")
+        .output()?;
+    assert!(!legacy_key.status.success(), "{legacy_key:?}");
+
+    Ok(())
+}
+
+#[test]
 fn compatibility_serving_rejects_unapproved_aliases() -> eyre::Result<()> {
     let temporary = tempdir()?;
     let storage_path = temporary.path().join("compat-alias-store");
     let secondary_path = temporary.path().join("compat-alias-secondary");
     let config_path = temporary.path().join("compat-alias.toml");
-    let config = compact_blocks_config_toml(&storage_path, &secondary_path)?
-        .replace("serving = \"compact-blocks\"", "serving = \"canonical\"");
-    fs::write(&config_path, config)?;
-
-    let output = zinder_compat_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
+    let config = compact_blocks_config_toml(&storage_path, &secondary_path)?;
+    for alias in ["canonical", "light-wallet-qualification"] {
+        fs::write(
+            &config_path,
+            config.replace(
+                "serving = \"compact-blocks\"",
+                &format!("serving = \"{alias}\""),
+            ),
+        )?;
+        let output = zinder_compat_command()
+            .args(["--print-config", "--config", path_str(&config_path)?])
+            .output()?;
+        assert!(!output.status.success(), "{output:?}");
+        assert!(String::from_utf8(output.stderr)?.contains("serving"));
+    }
+    let cli_alias = zinder_compat_command()
+        .args(["--print-config", "--serving", "light-wallet-qualification"])
         .output()?;
-    assert!(!output.status.success(), "{output:?}");
-    assert!(String::from_utf8(output.stderr)?.contains("serving"));
+    assert!(!cli_alias.status.success(), "{cli_alias:?}");
+    assert!(String::from_utf8(cli_alias.stderr)?.contains("invalid value"));
     Ok(())
 }
 
 #[test]
-fn missing_storage_path_is_rejected_before_binding() -> eyre::Result<()> {
-    let output = zinder_compat_command()
+fn omitted_paths_default_from_data_dir_and_partial_explicit_paths_require_storage_path()
+-> eyre::Result<()> {
+    let default_output = zinder_compat_command()
         .args(["--print-config", "--network", "zcash-regtest"])
         .output()?;
+    assert!(default_output.status.success(), "{default_output:?}");
+    let default_stdout = String::from_utf8(default_output.stdout)?;
+    assert!(
+        default_stdout.contains("path = \"/var/lib/zinder/canonical\""),
+        "{default_stdout}"
+    );
+    assert!(
+        default_stdout.contains(
+            "secondary_path = \"/var/lib/zinder/canonical-secondary/compat-lightwalletd\""
+        ),
+        "{default_stdout}"
+    );
+    assert!(
+        default_stdout.contains("path = \"/var/lib/zinder/wallet\""),
+        "{default_stdout}"
+    );
+    assert!(
+        default_stdout
+            .contains("secondary_path = \"/var/lib/zinder/wallet-secondary/compat-lightwalletd\""),
+        "{default_stdout}"
+    );
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
+    let temporary = tempdir()?;
+    let derived_root = temporary.path().join("custom-root");
+    let derived_output = zinder_compat_command()
+        .args(["--print-config", "--network", "zcash-regtest"])
+        .env("ZINDER_STORAGE__DATA_DIR", &derived_root)
+        .output()?;
+    assert!(derived_output.status.success(), "{derived_output:?}");
+    let derived_stdout = String::from_utf8(derived_output.stdout)?;
+    assert!(
+        derived_stdout.contains(&format!(
+            "path = \"{}\"",
+            derived_root.join("canonical").display()
+        )),
+        "{derived_stdout}"
+    );
+    assert!(
+        derived_stdout.contains(&format!(
+            "secondary_path = \"{}\"",
+            derived_root
+                .join("canonical-secondary/compat-lightwalletd")
+                .display()
+        )),
+        "{derived_stdout}"
+    );
+
+    let partial_output = zinder_compat_command()
+        .args([
+            "--print-config",
+            "--network",
+            "zcash-regtest",
+            "--canonical-secondary-root",
+            path_str(&temporary.path().join("explicit-secondary"))?,
+            "--wallet-primary-path",
+            path_str(&temporary.path().join("explicit-wallet"))?,
+            "--wallet-secondary-root",
+            path_str(&temporary.path().join("explicit-wallet-secondary"))?,
+        ])
+        .output()?;
+    assert!(!partial_output.status.success());
+    let stderr = String::from_utf8(partial_output.stderr)?;
     assert!(
         stderr.contains("missing configuration field: storage.path"),
         "{stderr}"
@@ -593,6 +739,120 @@ fn tree_state_replay_waiters_per_slot_default_to_64_and_are_bounded() -> eyre::R
     Ok(())
 }
 
+const FORWARDED_READ_SETTINGS: [(&str, &str, &str, &str, &str); 4] = [
+    (
+        "FORWARDED_READ_MAX_CONCURRENT",
+        "forwarded_read_max_concurrent",
+        "32",
+        "256",
+        "0",
+    ),
+    (
+        "FORWARDED_READ_WAIT_MS",
+        "forwarded_read_wait_ms",
+        "10000",
+        "0",
+        "30001",
+    ),
+    (
+        "FORWARDED_READ_WAITERS_PER_SLOT",
+        "forwarded_read_waiters_per_slot",
+        "64",
+        "256",
+        "257",
+    ),
+    (
+        "FORWARDED_TRANSACTION_CACHE_BYTES",
+        "forwarded_transaction_cache_bytes",
+        "67108864",
+        "0",
+        "1073741825",
+    ),
+];
+
+/// Wallet serving's forwarded-read admission and cache settings render their
+/// defaults, follow their environment variables, and are refused outside
+/// their ranges.
+#[test]
+fn forwarded_read_settings_default_and_are_bounded() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        compat_config_toml(
+            &tempdir.path().join("compat-forwarded-store"),
+            &tempdir.path().join("compat-forwarded-secondary"),
+            &tempdir.path().join("compat-forwarded-wallet"),
+        )?,
+    )?;
+    let rendered = |variable: &str, value: Option<&str>| -> eyre::Result<std::process::Output> {
+        let mut command = zinder_compat_command();
+        command.args(["--print-config", "--config", path_str(&config_path)?]);
+        for (suffix, ..) in FORWARDED_READ_SETTINGS {
+            command.env_remove(format!("ZINDER_COMPAT__{suffix}"));
+        }
+        if let Some(value) = value {
+            command.env(format!("ZINDER_COMPAT__{variable}"), value);
+        }
+        Ok(command.output()?)
+    };
+    for (variable, key, default, accepted, refused) in FORWARDED_READ_SETTINGS {
+        for (value, expected) in [(None, default), (Some(accepted), accepted)] {
+            let output = rendered(variable, value)?;
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout)?;
+            assert!(stdout.contains(&format!("{key} = {expected}")), "{stdout}");
+        }
+        let output = rendered(variable, Some(refused))?;
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains(&format!("compat.{key} must be in")),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// Compact-block serving forwards no wallet read, so it refuses every
+/// forwarded-read setting and renders none.
+#[test]
+fn compact_blocks_rejects_the_forwarded_read_settings() -> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let config_path = temporary.path().join("compact-blocks.toml");
+    fs::write(
+        &config_path,
+        compact_blocks_config_toml(
+            &temporary.path().join("compact-blocks-store"),
+            &temporary.path().join("compact-blocks-secondary"),
+        )?,
+    )?;
+    let command = || -> eyre::Result<std::process::Command> {
+        let mut command = zinder_compat_command();
+        command.args(["--print-config", "--config", path_str(&config_path)?]);
+        for (suffix, ..) in FORWARDED_READ_SETTINGS {
+            command.env_remove(format!("ZINDER_COMPAT__{suffix}"));
+        }
+        Ok(command)
+    };
+    for (variable, key, default, ..) in FORWARDED_READ_SETTINGS {
+        let output = command()?
+            .env(format!("ZINDER_COMPAT__{variable}"), default)
+            .output()?;
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains(&format!("does not accept compat.{key}")),
+            "{stderr}"
+        );
+    }
+    let output = command()?.output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(!stdout.contains("forwarded_"), "{stdout}");
+    Ok(())
+}
+
 /// Compact-block serving answers no tree-state request, so it refuses the
 /// tree-state rebuild wait and waiters like any other wallet setting.
 #[test]
@@ -701,6 +961,190 @@ fn stale_tip_limit_defaults_to_25_minutes_and_is_bounded() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Prints the effective configuration with the given environment settings.
+fn print_config_with_env(
+    config_path: &Path,
+    settings: &[(&str, &str)],
+) -> eyre::Result<std::process::Output> {
+    let mut command = zinder_compat_command();
+    command.args(["--print-config", "--config", path_str(config_path)?]);
+    command.envs(settings.iter().copied());
+    Ok(command.output()?)
+}
+
+/// The tip wait defaults to 3000 ms, 2 blocks, and 256 waiters, and 0 turns
+/// the wait off.
+#[test]
+fn tip_wait_defaults_to_three_seconds_two_blocks_and_256_waiters() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        compat_config_toml(
+            &tempdir.path().join("compat-tip-wait-store"),
+            &tempdir.path().join("compat-tip-wait-secondary"),
+            &tempdir.path().join("compat-tip-wait-wallet"),
+        )?,
+    )?;
+
+    let defaults = print_config_with_env(&config_path, &[])?;
+    assert!(defaults.status.success(), "{defaults:?}");
+    let stdout = String::from_utf8(defaults.stdout)?;
+    assert!(stdout.contains("tip_wait_ms = 3000"), "{stdout}");
+    assert!(stdout.contains("tip_wait_max_blocks = 2"), "{stdout}");
+    assert!(stdout.contains("tip_wait_max_waiters = 256"), "{stdout}");
+
+    let disabled = print_config_with_env(&config_path, &[("ZINDER_COMPAT__TIP_WAIT_MS", "0")])?;
+    assert!(disabled.status.success(), "{disabled:?}");
+    let stdout = String::from_utf8(disabled.stdout)?;
+    assert!(stdout.contains("tip_wait_ms = 0"), "{stdout}");
+
+    let raised = print_config_with_env(
+        &config_path,
+        &[
+            ("ZINDER_COMPAT__TIP_WAIT_MS", "60000"),
+            ("ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS", "1000"),
+            ("ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS", "4096"),
+        ],
+    )?;
+    assert!(raised.status.success(), "{raised:?}");
+    let stdout = String::from_utf8(raised.stdout)?;
+    assert!(stdout.contains("tip_wait_ms = 60000"), "{stdout}");
+    assert!(stdout.contains("tip_wait_max_blocks = 1000"), "{stdout}");
+    assert!(stdout.contains("tip_wait_max_waiters = 4096"), "{stdout}");
+    Ok(())
+}
+
+/// A nonzero tip wait must span two catch-up intervals, because a shorter
+/// wait cannot reliably see the next publication.
+#[test]
+fn tip_wait_shorter_than_two_catchup_intervals_is_rejected() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        compat_config_toml(
+            &tempdir.path().join("compat-tip-wait-short-store"),
+            &tempdir.path().join("compat-tip-wait-short-secondary"),
+            &tempdir.path().join("compat-tip-wait-short-wallet"),
+        )?,
+    )?;
+
+    let too_short = print_config_with_env(
+        &config_path,
+        &[
+            ("ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS", "1000"),
+            ("ZINDER_COMPAT__TIP_WAIT_MS", "1999"),
+        ],
+    )?;
+    assert!(!too_short.status.success(), "{too_short:?}");
+    let stderr = String::from_utf8(too_short.stderr)?;
+    assert!(
+        stderr.contains("compat.tip_wait_ms must be 0 or at least twice")
+            && stderr.contains("storage.secondary_catchup_interval_ms (2000)"),
+        "{stderr}"
+    );
+
+    let boundary = print_config_with_env(
+        &config_path,
+        &[
+            ("ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS", "1000"),
+            ("ZINDER_COMPAT__TIP_WAIT_MS", "2000"),
+        ],
+    )?;
+    assert!(boundary.status.success(), "{boundary:?}");
+
+    let slow_catchup = print_config_with_env(
+        &config_path,
+        &[("ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS", "2000")],
+    )?;
+    assert!(!slow_catchup.status.success(), "{slow_catchup:?}");
+    let stderr = String::from_utf8(slow_catchup.stderr)?;
+    assert!(
+        stderr.contains("storage.secondary_catchup_interval_ms (4000)"),
+        "{stderr}"
+    );
+
+    let disabled_with_slow_catchup = print_config_with_env(
+        &config_path,
+        &[
+            ("ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS", "2000"),
+            ("ZINDER_COMPAT__TIP_WAIT_MS", "0"),
+        ],
+    )?;
+    assert!(
+        disabled_with_slow_catchup.status.success(),
+        "{disabled_with_slow_catchup:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn tip_wait_blocks_and_waiters_of_zero_are_rejected() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        compat_config_toml(
+            &tempdir.path().join("compat-tip-wait-zero-store"),
+            &tempdir.path().join("compat-tip-wait-zero-secondary"),
+            &tempdir.path().join("compat-tip-wait-zero-wallet"),
+        )?,
+    )?;
+
+    for (variable, message) in [
+        (
+            "ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS",
+            "compat.tip_wait_max_blocks must be at least 1",
+        ),
+        (
+            "ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS",
+            "compat.tip_wait_max_waiters must be at least 1",
+        ),
+    ] {
+        let output = print_config_with_env(&config_path, &[(variable, "0")])?;
+        assert!(!output.status.success(), "{variable}: {output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains(message), "{variable}: {stderr}");
+    }
+    Ok(())
+}
+
+/// Every serving mode answers height-selected block reads, so compact-block
+/// serving accepts and renders the tip wait settings.
+#[test]
+fn compact_blocks_accepts_the_tip_wait() -> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let config_path = temporary.path().join("compact-blocks.toml");
+    fs::write(
+        &config_path,
+        compact_blocks_config_toml(
+            &temporary.path().join("compact-blocks-tip-wait-store"),
+            &temporary.path().join("compact-blocks-tip-wait-secondary"),
+        )?,
+    )?;
+
+    let defaults = print_config_with_env(&config_path, &[])?;
+    assert!(defaults.status.success(), "{defaults:?}");
+    let stdout = String::from_utf8(defaults.stdout)?;
+    assert!(stdout.contains("tip_wait_ms = 3000"), "{stdout}");
+
+    let configured = print_config_with_env(
+        &config_path,
+        &[
+            ("ZINDER_COMPAT__TIP_WAIT_MS", "5000"),
+            ("ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS", "3"),
+            ("ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS", "8"),
+        ],
+    )?;
+    assert!(configured.status.success(), "{configured:?}");
+    let stdout = String::from_utf8(configured.stdout)?;
+    assert!(stdout.contains("tip_wait_ms = 5000"), "{stdout}");
+    assert!(stdout.contains("tip_wait_max_blocks = 3"), "{stdout}");
+    assert!(stdout.contains("tip_wait_max_waiters = 8"), "{stdout}");
+    Ok(())
+}
+
 #[test]
 fn block_range_stream_limit_outside_its_range_is_rejected() -> eyre::Result<()> {
     for configured_streams in ["0", "65537"] {
@@ -794,17 +1238,33 @@ fn nested_or_lexically_aliased_storage_roots_are_rejected_before_binding() -> ey
 }
 
 #[test]
-fn ingest_only_section_is_rejected() -> eyre::Result<()> {
+fn sibling_ingest_section_is_tolerated_and_unknown_section_is_rejected() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("compat-sibling.toml");
+    let config = compat_config_with_ingest_section_toml(
+        &tempdir.path().join("compat-sibling-store"),
+        &tempdir.path().join("compat-sibling-secondary"),
+        &tempdir.path().join("compat-sibling-wallet"),
+    )?;
+    fs::write(&config_path, &config)?;
+    let tolerated = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+    assert!(tolerated.status.success(), "{tolerated:?}");
+
     assert_compat_cli_rejects(
         |root| {
-            compat_config_with_ingest_section_toml(
-                &root.join("compat-node-source-store"),
-                &root.join("compat-node-source-secondary"),
-                &root.join("compat-node-source-wallet"),
-            )
+            Ok(format!(
+                "{}\n[injest]\nsource = \"zebra-json-rpc\"\n",
+                compat_config_toml(
+                    &root.join("compat-typo-store"),
+                    &root.join("compat-typo-secondary"),
+                    &root.join("compat-typo-wallet"),
+                )?
+            ))
         },
         &[],
-        "unknown field `ingest`",
+        "unknown field `injest`",
     )
 }
 
@@ -1016,4 +1476,88 @@ fn zinder_compat_command() -> Command {
 fn path_str(path: &Path) -> eyre::Result<&str> {
     path.to_str()
         .ok_or_else(|| eyre::eyre!("path is not valid UTF-8: {}", path.display()))
+}
+
+#[tokio::test]
+async fn wallet_profiles_refuse_checkpointed_canonical_history() -> eyre::Result<()> {
+    use std::time::Duration;
+
+    use zinder_core::{BlockHeight, Network};
+    use zinder_store::RawBlobRetention;
+    use zinder_testkit::{
+        CanonicalBaseline, CanonicalWriterFixture, ChainFixture, IngestControlFixture,
+        sample_regtest_upgrade_activations,
+    };
+
+    let network = Network::ZcashRegtest;
+    let control = IngestControlFixture::spawn(network).await?;
+    let activations = sample_regtest_upgrade_activations();
+    for (profile, full_blocks, retention) in [
+        ("wallet", None, RawBlobRetention::None),
+        ("wallet", Some("true"), RawBlobRetention::All),
+        ("explorer", Some("true"), RawBlobRetention::All),
+    ] {
+        let chain = ChainFixture::new(network)
+            .with_raw_blob_retention(retention)
+            .extend_blocks(2);
+        let baseline = CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(1));
+        let writer = CanonicalWriterFixture::publish(&baseline, &activations)?;
+        let reorg_window = writer
+            .canonical_primary()?
+            .reorg_policy()
+            .reorg_window_blocks();
+        let directory = tempfile::tempdir()?;
+        let mut command =
+            tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"));
+        command
+            .env_clear()
+            .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+            .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+            .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
+            .env(
+                "ZINDER_STORAGE__SECONDARY_PATH",
+                directory.path().join("canonical-secondary"),
+            )
+            .env("ZINDER_WALLET__PATH", directory.path().join("wallet"))
+            .env(
+                "ZINDER_WALLET__SECONDARY_PATH",
+                directory.path().join("wallet-secondary"),
+            )
+            .env("ZINDER_INGEST_CONTROL__ADDR", control.endpoint())
+            .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:1")
+            .env(
+                "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
+                reorg_window.to_string(),
+            )
+            .kill_on_drop(true);
+        if let Some(full_blocks) = full_blocks {
+            command.env("ZINDER_STORAGE__FULL_BLOCKS", full_blocks);
+        }
+        let output = tokio::time::timeout(Duration::from_secs(10), command.output()).await??;
+        assert!(!output.status.success(), "{profile} unexpectedly started");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("lacks required BlockHistory coverage"),
+            "{profile} failed for a different reason: {stderr}",
+        );
+    }
+    control.shutdown().await?;
+    Ok(())
+}
+
+#[test]
+fn inline_ingest_control_bearer_token_is_accepted_and_redacted() -> eyre::Result<()> {
+    let default_output = zinder_compat_command()
+        .args(["--print-config", "--network", "zcash-regtest"])
+        .env(
+            "ZINDER_INGEST_CONTROL__BEARER_TOKEN",
+            "compat-inline-secret",
+        )
+        .env("ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS", "100")
+        .output()?;
+    assert!(default_output.status.success(), "{default_output:?}");
+    let stdout = String::from_utf8(default_output.stdout)?;
+    assert!(stdout.contains("bearer_token = \"[REDACTED]\""), "{stdout}");
+    assert!(!stdout.contains("compat-inline-secret"), "{stdout}");
+    Ok(())
 }

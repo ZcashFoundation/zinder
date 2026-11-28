@@ -1,7 +1,8 @@
 //! Transparent UTXO-set commitment element encoder.
 //!
-//! Owns the snapshot-immutable per-UTXO preimage and the 16-byte BLAKE2X
-//! personalization tag that domain-separates the commitment XOF. The
+//! Owns the snapshot-immutable per-UTXO preimage and the 16-byte `BLAKE2b`
+//! personalization tag that domain-separates the commitment's element
+//! expansion ([`crate::expand_lthash16_element`]). The
 //! accumulator type in [`crate::utxo_set_commitment`] feeds every element it
 //! folds through [`encode_utxo_set_commitment_element`]; inline element
 //! serialization elsewhere is a forbidden pattern enforced by
@@ -25,11 +26,12 @@
 
 use crate::{BlockHeight, TransactionId, TransparentOutPoint};
 
-/// BLAKE2X personalization tag for the transparent UTXO-set commitment.
+/// `BLAKE2b` root personalization tag for the transparent UTXO-set commitment.
 ///
 /// Exactly 16 bytes (the full `BLAKE2b` `personal` field). Domain-separates the
-/// commitment XOF from every other BLAKE2 use in the codebase.
-pub const UTXO_SET_COMMITMENT_PERSONAL: [u8; 16] = *b"ZinderUtxoSet___";
+/// commitment's element expansion from every other BLAKE2 use in the codebase.
+/// Its trailing `1` matches [`crate::UtxoSetCommitmentScheme::LtHash16ChaCha12`].
+pub const UTXO_SET_COMMITMENT_PERSONAL: [u8; 16] = *b"ZinderUtxoRoot_1";
 
 /// Encoding version embedded in every commitment element preimage.
 ///
@@ -58,8 +60,8 @@ pub struct UtxoSetCommitmentElement<'a> {
 /// Serializes one transparent output into its canonical commitment preimage.
 ///
 /// The byte layout is the snapshot-immutable contract documented at the module
-/// level. The returned bytes are fed directly to the BLAKE2X XOF; no field is
-/// hashed or projected first.
+/// level. The returned bytes are expanded directly; no field is hashed or
+/// projected first.
 #[must_use]
 pub fn encode_utxo_set_commitment_element(element: &UtxoSetCommitmentElement<'_>) -> Vec<u8> {
     let txid: [u8; 32] = encode_internal_commitment_transaction_id(element.outpoint.transaction_id);

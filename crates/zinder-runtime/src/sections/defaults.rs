@@ -1,12 +1,13 @@
-//! Default ports and addresses used by every shared section helper.
-//!
-//! Centralizing defaults here keeps the per-service port table in one
-//! place. Operators reviewing port assignments read this module; service
-//! binaries look up their defaults through the shared
-//! `ConfigLoader::with_*_section` helpers rather than re-declaring
-//! constants.
+//! Shared configuration defaults for Zinder runtimes.
 
 use crate::sections::RuntimeService;
+
+/// Default base data directory from which Zinder services derive store paths
+/// when `storage.data_dir` and explicit storage paths are unset.
+pub const DEFAULT_DATA_DIR: &str = "/var/lib/zinder";
+
+/// Default canonical store directory for ingest, Explorer, and the projector.
+pub const DEFAULT_CANONICAL_PATH: &str = "/var/lib/zinder/canonical";
 
 /// Default operational endpoint listen address per service.
 ///
@@ -18,6 +19,7 @@ use crate::sections::RuntimeService;
 pub const fn default_ops_listen_addr(service: RuntimeService) -> &'static str {
     match service {
         RuntimeService::Ingest => "127.0.0.1:9105",
+        RuntimeService::Projector => "127.0.0.1:9110",
         RuntimeService::Query => "127.0.0.1:9106",
         RuntimeService::CompatLightwalletd => "127.0.0.1:9107",
         RuntimeService::CompatCipherscan => "127.0.0.1:9108",
@@ -36,7 +38,9 @@ pub const fn default_grpc_listen_addr(service: RuntimeService) -> Option<&'stati
         RuntimeService::Query => Some("127.0.0.1:9102"),
         RuntimeService::CompatLightwalletd => Some("127.0.0.1:9067"),
         RuntimeService::Explorer => Some("127.0.0.1:9068"),
-        RuntimeService::CompatCipherscan | RuntimeService::Ingest => None,
+        RuntimeService::CompatCipherscan | RuntimeService::Ingest | RuntimeService::Projector => {
+            None
+        }
     }
 }
 
@@ -64,6 +68,7 @@ mod tests {
     fn ops_default_ports_are_distinct() {
         let ports: HashSet<&'static str> = [
             default_ops_listen_addr(RuntimeService::Ingest),
+            default_ops_listen_addr(RuntimeService::Projector),
             default_ops_listen_addr(RuntimeService::Query),
             default_ops_listen_addr(RuntimeService::CompatLightwalletd),
             default_ops_listen_addr(RuntimeService::CompatCipherscan),
@@ -73,9 +78,9 @@ mod tests {
         .collect();
         assert_eq!(
             ports.len(),
-            5,
+            6,
             "per-service ops ports must be distinct so a single host can run \
-             all five binaries without port conflicts",
+             all six binaries without port conflicts",
         );
     }
 

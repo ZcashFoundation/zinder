@@ -11,6 +11,9 @@
 //! twin: it owns the translations whose return type is one of the
 //! generated `zinder_proto::v1::*` enums.
 
+/// Initial gRPC metadata on a settled wallet chain-event subscription. Its value is `"settled"`.
+pub const CHAIN_EVENT_FAMILY_HEADER: &str = "zinder-chain-event-family";
+
 mod activation_schedule;
 mod canonical_store_damaged;
 mod canonical_writer_fence;
@@ -27,7 +30,10 @@ pub use activation_schedule::{
 };
 pub use canonical_store_damaged::{canonical_store_damaged_detail, canonical_store_damaged_pool};
 pub use canonical_writer_fence::canonical_writer_fence_message;
-pub use explorer_field_path::TRANSPARENT_OUTPUT_SPENT_BY_FIELD_PATH;
+pub use explorer_field_path::{
+    OVERVIEW_MEMPOOL_EVENTS_FIELD_PATH, OVERVIEW_MEMPOOL_FIELD_PATH,
+    OVERVIEW_VALUE_POOLS_FIELD_PATH, TRANSPARENT_OUTPUT_SPENT_BY_FIELD_PATH,
+};
 pub use privacy_shape::{decode_privacy_shape, encode_privacy_shape};
 pub use reorg_window_exceeded::{
     ReorgWindowExceededMetadata, decode_reorg_window_exceeded_metadata,
@@ -45,9 +51,12 @@ pub use transparent_delta_kind::{
 };
 pub use wallet::{
     WalletWireDecodeError, chain_epoch_from_message, chain_epoch_message,
-    compact_block_from_message, compact_block_message, compact_transaction_data_from_message,
-    compact_transaction_data_message, decode_compact_block, encode_compact_block,
-    mempool_entry_from_message, mempool_entry_message, outpoint_from_message, outpoint_message,
+    compact_block_from_message, compact_block_message, compact_block_message_for_pools,
+    compact_block_nullifiers_from_message, compact_block_nullifiers_message,
+    compact_pool_from_message, compact_pool_message, compact_transaction_data_from_message,
+    compact_transaction_data_message, decode_compact_block, decode_projected_block_nullifiers,
+    encode_compact_block, mempool_entry_from_message, mempool_entry_message, outpoint_from_message,
+    outpoint_message, standard_fee_from_message, standard_fee_message,
     transparent_outpoint_spend_status_entry_from_message,
     transparent_outpoint_spend_status_entry_message,
 };

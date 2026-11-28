@@ -18,13 +18,14 @@
 //! from that description, which shows a second engine can implement the
 //! canonical interface.
 
-use zinder_core::{BlockHeight, NetworkUpgradeActivations};
+use zinder_core::{BlockHeight, BlockId, NetworkUpgradeActivations};
 use zinder_query::{CanonicalReader, WalletProjectionReader};
 use zinder_testkit::{CanonicalBaseline, ChainFixture};
 
 pub(crate) mod canonical;
 mod in_memory;
 mod rocksdb;
+pub(crate) mod stateless_serving;
 pub(crate) mod wallet;
 
 /// Stores chains for one storage engine and opens canonical readers over
@@ -44,9 +45,9 @@ pub(crate) trait ReaderHarness: Sized {
         activations: &NetworkUpgradeActivations,
     ) -> eyre::Result<Self>;
 
-    /// Appends the block of `chain` above the visible tip, leaving it
-    /// unsettled.
-    fn append_live_block(&mut self, chain: &ChainFixture) -> eyre::Result<()>;
+    /// Appends the block of `chain` above the visible tip and publishes `settled_tip`.
+    fn append_live_block(&mut self, chain: &ChainFixture, settled_tip: BlockId)
+    -> eyre::Result<()>;
 
     /// Replaces the canonical blocks from `first_replaced_height` with the
     /// blocks of `replacement_chain` from that height through its tip.
@@ -94,7 +95,7 @@ macro_rules! canonical_reader_conformance {
             a_subtree_root_below_retained_history_is_unavailable,
             chain_event_pages_are_bounded_and_resume_after_their_cursor,
             chain_event_starts_resolve_to_a_resume_position,
-            the_settled_stream_carries_only_settled_commits,
+            the_settled_stream_commits_each_newly_settled_range,
             a_settled_cursor_resumes_with_the_default_family,
             pruned_and_malformed_chain_event_cursors_are_refused,
             a_reader_keeps_its_fence_while_the_writer_appends,
@@ -136,4 +137,22 @@ macro_rules! conformance_cases {
     };
 }
 
-pub(crate) use {canonical_reader_conformance, conformance_cases, wallet_reader_conformance};
+/// Instantiates every stateless multi-instance reader conformance case as a test
+/// against `$harness`.
+macro_rules! stateless_serving_conformance {
+    ($harness:ty) => {
+        $crate::integration::read_conformance::conformance_cases!(
+            $harness,
+            stateless_serving,
+            cross_instance_transparent_history_and_chain_event_cursors_continue_across_readers,
+            cross_instance_mempool_snapshot_and_events_continue_with_shared_cursor_key,
+            append_and_max_depth_reorg_invalidate_pinned_walks_without_mixing_forks,
+            stale_writer_heartbeat_fails_mempool_immediately_then_closes_gate_with_service_not_ready,
+        );
+    };
+}
+
+pub(crate) use {
+    canonical_reader_conformance, conformance_cases, stateless_serving_conformance,
+    wallet_reader_conformance,
+};

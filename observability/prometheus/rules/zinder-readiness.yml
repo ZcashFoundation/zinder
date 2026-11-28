@@ -1,14 +1,32 @@
 groups:
   - name: zinder-readiness
     rules:
+      - record: zinder:target_scrape_status
+        # A job removed on reload can leave its last sample in the five-minute
+        # query lookback. The slower reference stack scrapes every 15 seconds.
+        expr: |
+          (min by (stack, service, job, instance) (
+            up{service!=""} and (time() - timestamp(up{service!=""}) <= 45)
+          ) and zinder:expected_target)
+          or -zinder:expected_target
+
       - alert: ZinderTargetDown
-        expr: up{stack="zinder-local"} == 0
+        expr: zinder:target_scrape_status == 0
         for: 30s
         labels:
           severity: critical
         annotations:
           summary: "Zinder scrape target is down"
           description: "{{ $labels.service }} has not been scrapeable for 30 seconds."
+
+      - alert: ZinderTargetMissing
+        expr: zinder:target_scrape_status == -1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Zinder scrape target is missing"
+          description: "Prometheus has no current scrape result for expected {{ $labels.service }} at {{ $labels.instance }}."
 
       - alert: ZinderServiceNotReady
         expr: zinder_readiness_state{cause!~"^(ready|cursor_at_risk|serving_pair_stale)$"} == 1
@@ -93,22 +111,31 @@ groups:
           description: "{{ $labels.service }} {{ $labels.operation }} p95 is above 250ms."
 
       - alert: ZinderRocksDbCompactionPressure
-        expr: max by (service, cf) (zinder_store_rocksdb_property{property="rocksdb.estimate-pending-compaction-bytes"}) > 268435456
+        expr: max by (service, store_role, cf) (zinder_store_rocksdb_property{property="rocksdb.estimate-pending-compaction-bytes"}) > 268435456
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "Zinder RocksDB compaction pressure"
-          description: "{{ $labels.service }} {{ $labels.cf }} has more than 256MiB pending compaction bytes."
+          description: "{{ $labels.service }} {{ $labels.store_role }} {{ $labels.cf }} has more than 256MiB pending compaction bytes."
 
       - alert: ZinderRocksDbCompactionRunningTooLong
-        expr: max by (service, cf) (zinder_store_rocksdb_property{property="rocksdb.num-running-compactions"}) > 4
+        expr: max by (service, store_role, cf) (zinder_store_rocksdb_property{property="rocksdb.num-running-compactions"}) > 4
         for: 15m
         labels:
           severity: warning
         annotations:
           summary: "Zinder RocksDB compaction is running for too long"
-          description: "{{ $labels.service }} {{ $labels.cf }} reports more than four running compactions for 15 minutes."
+          description: "{{ $labels.service }} {{ $labels.store_role }} {{ $labels.cf }} reports more than four running compactions for 15 minutes."
+
+      - alert: ZinderRocksDbWriteStopped
+        expr: max by (service, store_role) (zinder_store_rocksdb_property{cf="__db__", property="rocksdb.is-write-stopped"}) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Zinder RocksDB writes are stopped"
+          description: "{{ $labels.service }} {{ $labels.store_role }} reports rocksdb.is-write-stopped > 0; check compaction backlog, WAL ceiling, and disk health."
 
       - alert: ZinderStoreWalGrowth
         expr: max by (service, store_role) (zinder_store_wal_bytes) / max by (service, store_role) (zinder_store_wal_bytes_limit) > 0.75
@@ -127,3 +154,59 @@ groups:
         annotations:
           summary: "Zinder open_storage p95 is high"
           description: "{{ $labels.service }} open_storage p95 exceeds 60 seconds; sustained values point at WAL-replay-on-restart or filesystem contention."
+
+      - alert: ZinderCanonicalStoreDamaged
+        expr: |
+          max by (service) (zinder_ingest_tree_state_verification_mismatches_total) > 0
+          or max by (service) (zinder_ingest_tree_state_densification_strides_total{outcome="integrity_failure"}) > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Zinder canonical store integrity failure"
+          description: "{{ $labels.service }} detected tree-state verification mismatches or densification integrity failures; the canonical store is damaged and must be rebuilt."
+
+      - alert: ZinderIngestOnFallbackNode
+        expr: zinder_ingest_node_endpoint_active{position="0"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder ingest is running on a fallback node"
+          description: "{{ $labels.service }} is not reading from its primary node endpoint (position=0) and stays on the fallback until that endpoint fails or ingest restarts."
+
+      - alert: ZinderIngestMemoryPressureHigh
+        expr: max by (service) (zinder_ingest_memory_pressure_ratio) > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder ingest memory pressure is high"
+          description: "{{ $labels.service }} anonymous memory exceeds 85% of its cgroup memory ceiling."
+
+      - alert: ZinderCompatBlockRangeRefusals
+        expr: sum by (service, reason) (rate(zinder_compat_block_range_stream_refusals_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder compat block-range streams are being refused"
+          description: "{{ $labels.service }} is refusing lightwalletd block-range stream requests ({{ $labels.reason }}); check compat.max_concurrent_block_range_streams and proxy per-client limits."
+
+      - alert: ZinderForwardedReadRefusals
+        expr: sum by (service, kind, reason) (rate(zinder_forwarded_read_refusals_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder node-forwarded reads are being refused"
+          description: "{{ $labels.service }} is refusing forwarded {{ $labels.kind }} reads ({{ $labels.reason }}); check forwarded_read_max_concurrent and upstream node JSON-RPC capacity."
+
+      - alert: ZinderWalletRpcReadinessRefusals
+        expr: sum by (service, surface, method) (rate(zinder_wallet_rpc_readiness_refusals_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder wallet RPCs are being refused by readiness"
+          description: "{{ $labels.service }} is refusing {{ $labels.surface }}/{{ $labels.method }} requests at the readiness gate."

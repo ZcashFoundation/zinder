@@ -1,49 +1,32 @@
 # Local observability smoke
 
-This guide runs Zinder from your checkout against a node you already run, with
-Prometheus and Grafana scraping it. Use it to check that metrics, alerts, and
-dashboards work after you change them. It is not a benchmark.
+This guide runs Zinder from your checkout against a node you already run, with Prometheus and Grafana scraping it. Use it to check that metrics, alerts, and dashboards work after you change them. It is not a benchmark.
 
-The same Prometheus rules and Grafana dashboard ship with the reference
-Compose deployment. Metric names and alerts are described in
-[Metrics](../docs/reference/metrics.md).
+The same Prometheus rules and Grafana dashboard ship with the reference Compose deployment. Metric names and alerts are described in [Metrics](../docs/reference/metrics.md).
 
 ## What it starts
 
 `scripts/observability-smoke.sh run` does the following:
 
-1. Builds `zinder-ingest`, `zinder-projector`, `zinder-query`, and
-   `zinder-compat-lightwalletd` with `cargo build`.
-2. Starts Prometheus and Grafana from `docker-compose.observability.yml`.
-   They load `observability/prometheus/` and `observability/grafana/`.
+1. Builds `zinder-ingest`, `zinder-projector`, `zinder-query`, and `zinder-compat-lightwalletd` with `cargo build`.
+2. Starts Prometheus and Grafana from `docker-compose.observability.yml`. They load `observability/prometheus/` and `observability/grafana/`.
 3. Builds a fresh store from a checkpoint 50 blocks below the node's tip.
-4. Starts the four runtimes as host processes and waits until every
-   `/readyz` reports ready.
-5. Sends native `WalletQuery` and lightwalletd `CompactTxStreamer` requests
-   with `grpcurl`.
-6. Fails if Prometheus sees a runtime refusing traffic or fewer than four
-   scrape targets up.
-7. Writes a readiness report and an evidence directory, and leaves
-   everything running so you can inspect the dashboards.
+4. Starts the four runtimes as host processes and waits until every `/readyz` reports ready.
+5. Sends native `WalletQuery` and lightwalletd `CompactTxStreamer` requests with `grpcurl`.
+6. Fails if Prometheus sees a runtime refusing traffic or fewer than four scrape targets up.
+7. Writes a readiness report and an evidence directory, and leaves everything running so you can inspect the dashboards.
 
-The readiness report records restore as `blocked`, because Zinder recovers
-by rebuilding from the node, as
-[Service operations](../docs/architecture/service-operations.md#recovery)
-describes.
+The smoke's readiness report records restore as `not_exercised` because this smoke harness builds a fresh store from the node rather than exercising backup restore. In production, Zinder recovers either by rebuilding from the node or by restoring a coherent canonical and wallet checkpoint via [private backups](../docs/runbooks/private-backups.md); see [Service operations](../docs/architecture/service-operations.md#recovery).
+
+To test the shipped Prometheus configs, rules, and Scrape Targets panel with isolated samples and no node, run `python3 scripts/test-observability-rules.py`. It checks base Compose, the Explorer overlay, and the local smoke stack using their configured Prometheus images. A down target and a target that disappears from discovery must each produce their own alert.
 
 ## Prerequisites
 
-- A Zebra node with JSON-RPC enabled. The default is Regtest at
-  `http://127.0.0.1:39232` with basic auth `zebra`/`zebra`.
-- These commands: `cargo`, `curl`, `docker` with Compose, `grpcurl`, `jq`,
-  `python3`, and `ps`.
-- Free host ports: 9095 and 3002 for Prometheus and Grafana, 9190, 9192,
-  9193, and 9194 for the operational endpoints, and 9067, 9100, and 9102 on
-  loopback for gRPC and ingest control.
+- A Zebra node with JSON-RPC enabled. The default is Regtest at `http://127.0.0.1:39232` with basic auth `zebra`/`zebra`.
+- These commands: `cargo`, `curl`, `docker` with Compose, `grpcurl`, `jq`, `python3`, and `ps`.
+- Free host ports: 9095 and 3002 for Prometheus and Grafana, 9190, 9192, 9193, and 9194 for the operational endpoints, and 9067, 9100, and 9102 on loopback for gRPC and ingest control.
 
-The operational endpoints bind `0.0.0.0` so the Prometheus container can
-scrape them, and the generated configs set `security.allow_public_bind`. Run
-the smoke only on a machine whose ports untrusted networks cannot reach.
+The operational endpoints bind `0.0.0.0` so the Prometheus container can scrape them, and the generated configs set `security.allow_public_bind`. Run the smoke only on a machine whose ports untrusted networks cannot reach.
 
 ## Run the smoke
 
@@ -71,22 +54,15 @@ Then open:
 | Evidence: readiness samples, raw metrics, gRPC responses, writer fences, and logs | `.tmp/observability/reports/<run-id>-evidence/`, indexed by `manifest.json` |
 | Process logs | `.tmp/observability/logs/` |
 
-To print the endpoints and current Prometheus values again, run
-`scripts/observability-smoke.sh snapshot`.
+To print the endpoints and current Prometheus values again, run `scripts/observability-smoke.sh snapshot`.
 
-A run with the default settings mines no blocks. Ingest follows the tip, but
-`zinder_ingest_canonical_live_appends_total` stays absent until a block
-arrives. To mine Regtest blocks after startup, set
-`ZINDER_OBSERVABILITY_GENERATE_BLOCKS` to a positive number.
+A run with the default settings mines no blocks. Ingest follows the tip, but `zinder_ingest_canonical_live_appends_total` stays absent until a block arrives. To mine Regtest blocks after startup, set `ZINDER_OBSERVABILITY_GENERATE_BLOCKS` to a positive number.
 
-If the run fails, it prints the error and copies the logs into the evidence
-directory. The full logs are under `.tmp/observability/logs/`.
+If the run fails, it prints the error and copies the logs into the evidence directory. The full logs are under `.tmp/observability/logs/`.
 
 ## Run against Testnet or Mainnet
 
-Point the smoke at a synced node and disable mining, because public networks
-cannot mine on demand. With a Z3 stack, read the node's cookie from its
-volume:
+Point the smoke at a synced node and disable mining, because public networks cannot mine on demand. With a Z3 stack, read the node's cookie from its volume:
 
 ```bash
 cookie=$(docker run --rm -v z3-testnet-cookie:/auth:ro alpine cat /auth/.cookie)
@@ -99,9 +75,7 @@ ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS=100 \
 scripts/observability-smoke.sh run
 ```
 
-For Mainnet, use `zcash-mainnet`, the `z3-mainnet-cookie` volume, your
-node's Mainnet RPC address, and a larger
-`ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS`, such as 1000.
+For Mainnet, use `zcash-mainnet`, the `z3-mainnet-cookie` volume, your node's Mainnet RPC address, and a larger `ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS`, such as 1000.
 
 ## Certify lag, restarts, and a reorg on Regtest
 
@@ -111,31 +85,23 @@ This optional run changes the node's chain, so it works only on Regtest:
 ZINDER_OBSERVABILITY_CERTIFY_TOPOLOGY=1 scripts/observability-smoke.sh run
 ```
 
-After the normal smoke, it does the following and requires every runtime to
-report ready again after each step:
+After the normal smoke, it does the following and requires every runtime to report ready again after each step:
 
-1. Pauses the projector, mines past the compatibility lag threshold, requires
-   `replica_lagging`, and resumes the projector.
+1. Pauses the projector, mines past the compatibility lag threshold, requires `replica_lagging`, and resumes the projector.
 2. Restarts compatibility, query, the projector, and ingest, one at a time.
-3. Invalidates one block and mines a two-block replacement. The run passes
-   only if both the node and compatibility return the new block hash at that
-   height and the writer moves onto the new branch.
+3. Invalidates one block and mines a two-block replacement. The run passes only if both the node and compatibility return the new block hash at that height and the writer moves onto the new branch.
 
-Before it mines anything, the script checks that the node really is Regtest:
-every network upgrade must activate at height 1, and every RPC it needs must
-exist. It refuses to mine on any other node.
+Before it mines anything, the script checks that the node really is Regtest: every network upgrade must activate at height 1, and every RPC it needs must exist. It refuses to mine on any other node.
 
 ## Calibrate
 
-`calibrate` repeats the smoke and writes P50, P95, P99, and worst-case values
-to `.tmp/observability/reports/latest-calibration.md` and `.json`:
+`calibrate` repeats the smoke and writes P50, P95, P99, and worst-case values to `.tmp/observability/reports/latest-calibration.md` and `.json`:
 
 ```bash
 ZINDER_OBSERVABILITY_RUNS=6 scripts/observability-smoke.sh calibrate
 ```
 
-Set the node variables as in the Testnet example to calibrate against a
-public network. Calibration cannot run the Regtest certification.
+Set the node variables as in the Testnet example to calibrate against a public network. Calibration cannot run the Regtest certification.
 
 ## Tunables
 
@@ -155,10 +121,7 @@ public network. Calibration cannot run the Regtest certification.
 | `ZINDER_PROMETHEUS_PORT`, `ZINDER_GRAFANA_PORT` | `9095`, `3002` | Host ports for Prometheus and Grafana. |
 | `ZINDER_OBSERVABILITY_INGEST_OPS_ADDR`, `ZINDER_OBSERVABILITY_PROJECTOR_OPS_ADDR`, `ZINDER_OBSERVABILITY_QUERY_OPS_ADDR`, `ZINDER_OBSERVABILITY_COMPAT_OPS_ADDR` | `0.0.0.0:9190`, `:9194`, `:9193`, `:9192` | Operational endpoint addresses. Prometheus scrapes the fixed ports in `observability/prometheus/prometheus.yml`. |
 
-The script refuses a work directory that is not empty and was not created by
-the smoke, so it cannot delete a real store. Do not point it at an operator
-directory. The runtimes start with a clean environment, so other `ZINDER_*`
-variables in your shell do not reach them.
+The script refuses a work directory that is not empty and was not created by the smoke, so it cannot delete a real store. Do not point it at an operator directory. The runtimes start with a clean environment, so other `ZINDER_*` variables in your shell do not reach them.
 
 ## Stop
 
@@ -166,5 +129,4 @@ variables in your shell do not reach them.
 scripts/observability-smoke.sh stop
 ```
 
-This stops the four runtimes and removes the Prometheus and Grafana
-containers. The work directory stays until the next run resets it.
+This stops the four runtimes and removes the Prometheus and Grafana containers. The work directory stays until the next run resets it.

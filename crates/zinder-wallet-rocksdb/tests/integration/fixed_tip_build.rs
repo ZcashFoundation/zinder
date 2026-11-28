@@ -1,6 +1,7 @@
 use std::{
     fs,
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 #[cfg(unix)]
@@ -22,23 +23,26 @@ use zinder_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
     CanonicalBuildBlock, CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest,
     CanonicalLiveAppend, CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, ProjectionBuildAnchor,
-    ProjectionBuildLease, ProjectionBuildLeaseId, RawBlobRetention, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalReplayScan, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreReadyEvidence,
+    ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_testkit::process_crash;
 use zinder_wallet_projection::{
-    WALLET_PROJECTION_STORE_IDENTITY, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
-    WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildLeaseRequest,
+    REQUIRED_CANONICAL_STORE_SCHEMA_VERSION, WALLET_PROJECTION_STORE_IDENTITY,
+    WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
+    WalletOutpointKey, WalletProjectionBuildLease, WalletProjectionBuildLeaseRequest,
     WalletProjectionBuildOwner, WalletProjectionContractError, WalletProjectionFamilyRowCounts,
     WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition,
 };
 use zinder_wallet_rocksdb::{
-    RocksDbWalletBuildOptions, RocksDbWalletBuildOutcome, RocksDbWalletBuildStore,
-    RocksDbWalletError, RocksDbWalletFollowingStore, RocksDbWalletStore,
+    RocksDbWalletBuildOptions, RocksDbWalletBuildOutcome, RocksDbWalletBuildReport,
+    RocksDbWalletBuildStore, RocksDbWalletError, RocksDbWalletFollowingStore, RocksDbWalletStore,
     WALLET_ROCKSDB_SCHEMA_VERSION, WalletBuildLeaseHeartbeat, WalletBuildLeasePhase,
-    WalletProjectionBuildLeaseExecution, WalletRecoveryAdmissionConfig,
-    build_wallet_from_canonical, build_wallet_from_canonical_with_lease_and_heartbeat,
+    WalletProjectionBuildLeaseExecution, WalletProjectionReplaySource,
+    WalletRecoveryAdmissionConfig, build_wallet_from_canonical,
+    build_wallet_from_canonical_with_lease_and_heartbeat,
     validate_wallet_projection_pre_promotion_fence,
 };
 
@@ -235,7 +239,6 @@ fn owner_checkpoints_are_cold_admitted_and_remain_exact_after_sources_advance()
         CANONICAL_STORE_SCHEMA_VERSION
     );
     assert_eq!(canonical_checkpoint.ready_evidence, canonical_before);
-    assert_eq!(canonical_checkpoint.workload, canonical_store.workload());
     assert_eq!(
         canonical_checkpoint.build_plan,
         *canonical_store.build_plan()
@@ -297,8 +300,7 @@ fn owner_checkpoints_are_cold_admitted_and_remain_exact_after_sources_advance()
     let cold_canonical_checkpoint = RocksDbCanonicalStore::open_ready(
         &canonical_checkpoint_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -503,6 +505,10 @@ fn fixed_tip_build_matches_exact_version_one_wallet_contract()
     let temporary = TempDir::new()?;
     let fixture = wallet_baseline_fixture();
     let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    assert_eq!(
+        canonical_store.ready_evidence().schema_version,
+        zinder_wallet_projection::REQUIRED_CANONICAL_STORE_SCHEMA_VERSION
+    );
 
     let outcome = build_wallet_from_canonical(
         &canonical_store,
@@ -598,6 +604,7 @@ fn bulk_built_hash_keyed_families_carry_partitioned_filters_and_the_rest_do_not(
         ("transparent_address_transaction", true),
         ("transparent_address_balance", false),
         ("reorg_undo", false),
+        ("block_hash_by_height", false),
     ] {
         let property = |field| aggregated_table_property(&wallet, name, field);
         assert!(property("# entries")? > Some(0), "{name} has no SST rows");
@@ -710,8 +717,7 @@ fn closed_canonical_primary_secondary_build_matches_primary_oracle()
         temporary.path().join("canonical"),
         temporary.path().join("canonical-secondary"),
         &inactive_upgrade_activations()?,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -920,8 +926,7 @@ fn reopen_canonical_primary(
     Ok(RocksDbCanonicalStore::open_ready(
         root.join("canonical"),
         &inactive_upgrade_activations()?,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)
@@ -947,6 +952,137 @@ fn acquire_owner_canonical_lease(
         ),
         now,
     )?)
+}
+
+#[test]
+fn an_over_limit_hashing_worker_count_is_refused_before_building_state_exists()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let wallet_path = temporary.path().join("wallet-over-limit-workers");
+    let options = RocksDbWalletBuildOptions {
+        accumulator_hashing_workers: std::num::NonZeroU32::new(65)
+            .ok_or("the test worker count must be nonzero")?,
+        ..RocksDbWalletBuildOptions::for_local_tests()
+    };
+
+    assert!(matches!(
+        build_wallet_from_canonical(&canonical_store, &wallet_path, options),
+        Err(RocksDbWalletError::AccumulatorHashingWorkersOutOfRange {
+            workers: 65,
+            maximum: 64,
+        })
+    ));
+    assert!(!wallet_path.exists());
+    Ok(())
+}
+
+/// A replay source that reports a canonical store whose schema version differs
+/// from the wallet projection contract while every other fence field matches,
+/// and records whether a replay scan was opened.
+struct SchemaVersionMismatchReplaySource<'a> {
+    network: Network,
+    ready: CanonicalStoreReadyEvidence,
+    scan_invocations: &'a AtomicU64,
+}
+
+impl WalletProjectionReplaySource for SchemaVersionMismatchReplaySource<'_> {
+    fn wallet_projection_network(&self) -> Network {
+        self.network
+    }
+
+    fn wallet_projection_ready_evidence(&self) -> CanonicalStoreReadyEvidence {
+        self.ready
+    }
+
+    fn wallet_projection_scan(&self) -> Result<CanonicalReplayScan<'_>, CanonicalStoreError> {
+        self.scan_invocations.fetch_add(1, Ordering::Relaxed);
+        Err(CanonicalStoreError::ReplayCancelled)
+    }
+}
+
+fn schema_version_mismatch_source<'a>(
+    canonical_store: &RocksDbCanonicalStore,
+    scan_invocations: &'a AtomicU64,
+) -> SchemaVersionMismatchReplaySource<'a> {
+    let mut ready = canonical_store.ready_evidence();
+    ready.schema_version = REQUIRED_CANONICAL_STORE_SCHEMA_VERSION.saturating_add(1);
+    SchemaVersionMismatchReplaySource {
+        network: canonical_store.network(),
+        ready,
+        scan_invocations,
+    }
+}
+
+#[test]
+fn canonical_schema_mismatch_is_rejected_at_build_startup_before_scanning_or_creating_paths()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let scan_invocations = AtomicU64::new(0);
+    let source = schema_version_mismatch_source(&canonical_store, &scan_invocations);
+    let wallet_path = temporary.path().join("wallet-schema-mismatch");
+    let staging_path = temporary
+        .path()
+        .join("wallet-schema-mismatch.projection-load-staging");
+    let initialization_path = temporary.path().join("wallet-schema-mismatch.initializing");
+
+    assert!(matches!(
+        build_wallet_from_canonical(
+            &source,
+            &wallet_path,
+            RocksDbWalletBuildOptions::for_local_tests(),
+        ),
+        Err(RocksDbWalletError::CanonicalSourceFenceMismatch { .. })
+    ));
+    assert_eq!(scan_invocations.load(Ordering::Relaxed), 0);
+    assert!(!wallet_path.exists());
+    assert!(!staging_path.exists());
+    assert!(!initialization_path.exists());
+    Ok(())
+}
+
+#[test]
+fn pre_promotion_fence_rejects_a_canonical_schema_mismatch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let scan_invocations = AtomicU64::new(0);
+    let source = schema_version_mismatch_source(&canonical_store, &scan_invocations);
+    let ready = source.wallet_projection_ready_evidence();
+    let pinned_anchor = WalletCanonicalSourceIdentity::new(
+        WalletProjectionSourcePosition::new(
+            ready.visible_epoch,
+            ready.visible_tip,
+            ready.visible_event_sequence,
+        ),
+        CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+            ready.sequence_digest_version,
+            ready.visible_block_count,
+            ready.visible_sequence_digest,
+        ),
+        ready.sequence_checkpoint.through(),
+    );
+    let lease = WalletProjectionBuildLease::from_request(
+        WalletProjectionBuildLeaseRequest::new(
+            WalletProjectionBuildOwner::from_bytes([0x91; 16]),
+            pinned_anchor,
+            WalletProjectionRetainedEventAnchor::new(ready.visible_event_sequence),
+            UnixTimestampMillis::new(1),
+        ),
+        0,
+        source.wallet_projection_network(),
+    );
+
+    assert!(matches!(
+        validate_wallet_projection_pre_promotion_fence(&source, lease),
+        Err(RocksDbWalletError::CanonicalSourceFenceMismatch { .. })
+    ));
+    assert_eq!(scan_invocations.load(Ordering::Relaxed), 0);
+    Ok(())
 }
 
 #[test]
@@ -1513,12 +1649,11 @@ fn build_ready_canonical_store(
         &inactive_upgrade_activations()?,
         0,
         tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         temporary.path().join("canonical"),
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1553,12 +1688,11 @@ fn build_ready_checkpointed_canonical_store(
         &inactive_upgrade_activations()?,
         checkpoint,
         tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         temporary.path().join("canonical-checkpointed"),
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1566,7 +1700,9 @@ fn build_ready_checkpointed_canonical_store(
     let build_blocks = blocks
         .iter()
         .enumerate()
-        .map(|(index, facts)| canonical_build_block(facts.clone(), index == last_index))
+        .map(|(index, facts)| {
+            canonical_build_block_without_blobs(facts.clone(), index == last_index)
+        })
         .map(Ok::<_, std::io::Error>);
     builder.bulk_load_blocks(&inactive_upgrade_activations()?, build_blocks)?;
     builder.load_subtree_roots(std::iter::empty())?;
@@ -1590,8 +1726,7 @@ fn open_incremental_secondary(
         temporary.path().join("canonical"),
         temporary.path().join(secondary_name),
         activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)
@@ -1697,6 +1832,7 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
             transparent_address_transaction_count: 6,
             transparent_address_balance_count: 2,
             reorg_undo_count: 0,
+            block_hash_by_height_count: 3,
         }
     );
     assert_eq!(
@@ -1708,9 +1844,9 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
     assert_eq!(
         outcome.report.projection_digest.as_bytes(),
         [
-            0x00, 0x68, 0xe0, 0x28, 0x2d, 0x7f, 0x1e, 0xd5, 0x05, 0x78, 0xf5, 0x29, 0x5c, 0x9e,
-            0x12, 0x04, 0x48, 0x4d, 0x2b, 0x41, 0xe9, 0x8b, 0x5d, 0x72, 0x2d, 0x52, 0x21, 0xc9,
-            0xa5, 0x8b, 0x7d, 0xeb,
+            0x25, 0xfd, 0xcb, 0x0b, 0x49, 0x39, 0x64, 0x7d, 0xc8, 0x30, 0x29, 0xe9, 0xd5, 0xa1,
+            0x1e, 0x8f, 0xf7, 0x41, 0xf5, 0x42, 0x75, 0xb9, 0x99, 0xb1, 0xd3, 0x67, 0x4e, 0xde,
+            0xcb, 0x6a, 0x93, 0x8a,
         ]
     );
     assert_eq!(outcome.report.scanned_block_count, 3);
@@ -1758,6 +1894,78 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
         + phases.ready_publication;
     assert!(measured_phase_total <= phases.total);
     assert!(!phases.total.is_zero());
+    assert_phase_breakdowns_fit_their_parents(&outcome.report);
+}
+
+fn assert_phase_breakdowns_fit_their_parents(report: &RocksDbWalletBuildReport) {
+    let phases = report.phase_durations;
+    let secondary = phases.secondary_row_derivation_phases;
+    assert!(
+        secondary.address_index_sort + secondary.address_index_drain
+            <= secondary.concurrent_address_derivation
+    );
+    assert!(
+        secondary.address_transaction_sort + secondary.address_transaction_drain
+            <= secondary.concurrent_address_derivation
+    );
+    assert!(
+        secondary.concurrent_address_derivation + secondary.reorg_undo_write
+            <= phases.secondary_row_derivation
+    );
+    let sst_write = phases.sst_write;
+    assert!(sst_write.primary_outputs <= phases.outpoint_merge);
+    assert!(sst_write.address_index_and_balance <= secondary.address_index_drain);
+    assert!(sst_write.address_transaction <= secondary.address_transaction_drain);
+    assert!(sst_write.reorg_undo <= secondary.reorg_undo_write);
+    let reopen = phases.flush_and_cold_reopen_phases;
+    assert!(reopen.flush_and_close + reopen.cold_reopen <= phases.flush_and_cold_reopen);
+    let validation = phases.cold_validation_phases;
+    for scan in [
+        validation.primary_output_scan,
+        validation.address_index_and_balance_readback,
+        validation.address_transaction_readback,
+    ] {
+        assert!(scan <= validation.concurrent_family_readback);
+    }
+    assert!(
+        validation.concurrent_family_readback + validation.reorg_undo_readback
+            <= phases.cold_validation
+    );
+    assert!(report.outpoint_sort_durations.initial_run_spill <= phases.canonical_scan);
+    assert!(
+        report.outpoint_sort_durations.final_run_flush + report.outpoint_sort_durations.merge
+            <= phases.outpoint_sort
+    );
+
+    let stages = report.stage_durations();
+    // The metrics reference documents exactly these stages, in this order.
+    assert_eq!(
+        stages.iter().map(|stage| stage.stage).collect::<Vec<_>>(),
+        [
+            "store_initialization",
+            "canonical_scan",
+            "outpoint_run_spill",
+            "outpoint_sort",
+            "outpoint_drain",
+            "primary_sst_write",
+            "address_index_run_spill",
+            "address_transaction_run_spill",
+            "secondary_address_derivation",
+            "reorg_undo_write",
+            "logical_evidence",
+            "row_load",
+            "flush_and_close",
+            "cold_reopen",
+            "cold_validation_family_readback",
+            "cold_validation_reorg_undo_readback",
+            "ready_publication",
+        ]
+    );
+    let stage_total = stages
+        .iter()
+        .map(|stage| stage.duration)
+        .sum::<std::time::Duration>();
+    assert!(stage_total <= phases.total);
 }
 
 fn assert_store(
@@ -2011,7 +2219,11 @@ fn inactive_upgrade_activations()
     NetworkUpgradeActivations::new(Network::ZcashRegtest, activations)
 }
 
-fn canonical_build_block(facts: CanonicalBlockFacts, is_tip: bool) -> CanonicalBuildBlock {
+fn canonical_build_block_inner(
+    facts: CanonicalBlockFacts,
+    is_tip: bool,
+    retain_blobs: bool,
+) -> CanonicalBuildBlock {
     let height = facts.block_header.height;
     let block_hash = facts.block_header.block_hash;
     let parent_hash = facts.block_header.parent_hash;
@@ -2025,22 +2237,33 @@ fn canonical_build_block(facts: CanonicalBlockFacts, is_tip: bool) -> CanonicalB
             ironwood_commitment_tree_size: 0,
         },
     );
-    let transaction_blobs = facts
-        .transactions
-        .iter()
-        .enumerate()
-        .map(|(index, transaction)| {
-            TransactionBlobArtifact::new(
-                TransactionLocation::new(
-                    transaction.public_facts.transaction_id,
-                    height,
-                    block_hash,
-                    u32::try_from(index).unwrap_or(u32::MAX),
-                ),
-                transaction.public_facts.transaction_id.as_bytes(),
-            )
-        })
-        .collect();
+    let (transaction_blobs, block_blob) = if retain_blobs {
+        let transaction_blobs: Vec<TransactionBlobArtifact> = facts
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(index, transaction)| {
+                TransactionBlobArtifact::new(
+                    TransactionLocation::new(
+                        transaction.public_facts.transaction_id,
+                        height,
+                        block_hash,
+                        u32::try_from(index).unwrap_or(u32::MAX),
+                    ),
+                    transaction.public_facts.transaction_id.as_bytes(),
+                )
+            })
+            .collect();
+        let mut raw_block_bytes = block_hash.as_bytes().to_vec();
+        for blob in &transaction_blobs {
+            raw_block_bytes.extend_from_slice(&blob.raw_transaction_bytes);
+        }
+        let block_blob =
+            zinder_core::BlockBlobArtifact::new(height, block_hash, parent_hash, raw_block_bytes);
+        (transaction_blobs, Some(block_blob))
+    } else {
+        (Vec::new(), None)
+    };
     let tree_state_checkpoint = is_tip.then(|| {
         CommitmentTreeCheckpoint::new(
             BlockId::new(height, block_hash),
@@ -2059,10 +2282,20 @@ fn canonical_build_block(facts: CanonicalBlockFacts, is_tip: bool) -> CanonicalB
         compact_block,
         tip_metadata: ChainTipMetadata::new(0, 0, 0),
         tree_state_checkpoint,
-        block_final_note_commitment_roots: None,
         transaction_blobs,
-        block_blob: None,
+        block_blob,
     }
+}
+
+fn canonical_build_block(facts: CanonicalBlockFacts, is_tip: bool) -> CanonicalBuildBlock {
+    canonical_build_block_inner(facts, is_tip, true)
+}
+
+fn canonical_build_block_without_blobs(
+    facts: CanonicalBlockFacts,
+    is_tip: bool,
+) -> CanonicalBuildBlock {
+    canonical_build_block_inner(facts, is_tip, false)
 }
 
 fn block_id(facts: &CanonicalBlockFacts) -> BlockId {
@@ -2075,6 +2308,10 @@ fn block_facts(
     block_hash: [u8; 32],
     transactions: Vec<CanonicalTransactionFacts>,
 ) -> CanonicalBlockFacts {
+    let mut raw_block_bytes = block_hash.to_vec();
+    for transaction in &transactions {
+        raw_block_bytes.extend_from_slice(&transaction.public_facts.transaction_id.as_bytes());
+    }
     CanonicalBlockFacts {
         block_header: BlockHeaderArtifact::new(
             BlockHeight::new(height),
@@ -2088,7 +2325,7 @@ fn block_facts(
             0,
             0,
         ),
-        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&block_hash),
+        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&raw_block_bytes),
         transactions,
     }
 }
@@ -2129,4 +2366,47 @@ fn transaction_facts(
         transparent_inputs,
         transparent_outputs,
     }
+}
+
+#[test]
+fn parallel_multi_shard_wallet_build_from_canonical_store_matches_serial_and_passes_cold_validation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let serial_options = RocksDbWalletBuildOptions::for_local_tests();
+    let serial = build_wallet_from_canonical(
+        &canonical_store,
+        temporary.path().join("wallet-serial"),
+        serial_options,
+    )?;
+
+    let mut multi_shard_options = RocksDbWalletBuildOptions::for_local_tests();
+    multi_shard_options.accumulator_hashing_workers =
+        NonZeroU32::new(4).ok_or("worker count must be non-zero")?;
+    multi_shard_options.max_outpoint_sort_memory_bytes = 512 * 1024 * 1024;
+    multi_shard_options.max_secondary_sort_memory_bytes_per_sorter = 512 * 1024 * 1024;
+    let parallel = build_wallet_from_canonical(
+        &canonical_store,
+        temporary.path().join("wallet-multi-shard"),
+        multi_shard_options,
+    )?;
+
+    assert_eq!(
+        parallel.report.projection_digest,
+        serial.report.projection_digest
+    );
+    assert_eq!(
+        parallel.report.projection_accumulator,
+        serial.report.projection_accumulator
+    );
+    assert_eq!(parallel.report.row_counts, serial.report.row_counts);
+    assert_eq!(parallel.report.utxo_summary, serial.report.utxo_summary);
+    assert_eq!(
+        parallel.report.logical_row_bytes,
+        serial.report.logical_row_bytes
+    );
+    assert_report(&parallel);
+    assert_store(&parallel, &fixture)?;
+    Ok(())
 }

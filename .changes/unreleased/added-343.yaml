@@ -1,6 +1,0 @@
-kind: added
-body: "Ingest now re-verifies every settled tree-state checkpoint in paced background cycles (25 rows per second by default). A damaged row parks ingest readiness and is reported in `CanonicalControl.WriterStatus` through the new `canonical_store_damaged` field and readiness cause, so `zinder-query` and `zinder-compat-lightwalletd` refuse wallet traffic with `canonical_store_damaged` until a later check clears it, and the single-volume entrypoint treats it as a park instead of restarting. The damage survives restarts. The bulk loader now refuses a checkpoint whose frontiers do not match the pools active at its height. Readers built before this change ignore the new field."
-time: 2026-11-20T06:30:00.000000000Z
-custom:
-    Bump: minor
-    PR: "343"

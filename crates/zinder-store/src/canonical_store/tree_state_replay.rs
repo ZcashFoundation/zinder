@@ -147,13 +147,15 @@ pub(super) fn read_tree_state_checkpoint_at(
     height: BlockHeight,
     activations: &NetworkUpgradeActivations,
 ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
-    match find_tree_state(store, height, activations)? {
+    match find_tree_state(store, height, activations, || Ok(()))? {
         None => Ok(None),
         Some(TreeStateSource::StoredRow(encoded)) => {
             decode_stored_tree_state_checkpoint(store, height, &encoded).map(Some)
         }
         Some(TreeStateSource::Seed(seed)) => {
-            reconstruct(store, &seed, height, activations).map(Some)
+            replay_compact_blocks(store, &seed, height, activations, |_| Ok(()))?
+                .checkpoint(store)
+                .map(Some)
         }
     }
 }
@@ -165,7 +167,23 @@ pub(super) fn lookup_tree_state(
     height: BlockHeight,
     activations: &NetworkUpgradeActivations,
 ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
-    Ok(match find_tree_state(store, height, activations)? {
+    lookup_until_cancelled(store, height, activations, || false)
+}
+
+pub(super) fn lookup_until_cancelled(
+    store: &impl CanonicalServingRead,
+    height: BlockHeight,
+    activations: &NetworkUpgradeActivations,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
+    let check = || {
+        if cancelled() {
+            Err(CanonicalStoreError::ReplayCancelled)
+        } else {
+            Ok(())
+        }
+    };
+    Ok(match find_tree_state(store, height, activations, check)? {
         None => None,
         Some(TreeStateSource::StoredRow(encoded)) => Some(TreeStateLookup::Stored(
             decode_served_tree_state(store, height, &encoded)?,
@@ -198,7 +216,9 @@ fn find_tree_state(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
     activations: &NetworkUpgradeActivations,
+    check: impl Fn() -> Result<(), CanonicalStoreError>,
 ) -> Result<Option<TreeStateSource>, CanonicalStoreError> {
+    check()?;
     refuse_unadmitted_activations(store, height, activations)?;
     let history_predecessor_height = store
         .serving_build_plan()
@@ -219,6 +239,7 @@ fn find_tree_state(
                 required_seed.value()
             ))
         })?;
+    check()?;
     if row.height == height {
         return Ok(Some(TreeStateSource::StoredRow(row.encoded)));
     }
@@ -238,11 +259,28 @@ pub(super) fn replay_tree_state(
     replay: &TreeStateReplay,
     activations: &NetworkUpgradeActivations,
 ) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
+    replay_until_cancelled(store, replay, activations, || false)
+}
+
+pub(super) fn replay_until_cancelled(
+    store: &impl CanonicalServingRead,
+    replay: &TreeStateReplay,
+    activations: &NetworkUpgradeActivations,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<TreeStateReplayOutcome>, CanonicalStoreError> {
+    let check = || {
+        if cancelled() {
+            Err(CanonicalStoreError::ReplayCancelled)
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
     let replay = if replay.seed_read_at == Some(VisibleChain::of(store)) {
         refuse_unadmitted_activations(store, replay.height, activations)?;
         replay.clone()
     } else {
-        match lookup_tree_state(store, replay.height, activations)? {
+        match lookup_until_cancelled(store, replay.height, activations, &cancelled)? {
             None => return Ok(None),
             Some(TreeStateLookup::Stored(tree_state)) => {
                 return Ok(Some(TreeStateReplayOutcome::Stored(tree_state)));
@@ -250,14 +288,22 @@ pub(super) fn replay_tree_state(
             Some(TreeStateLookup::Replay(reread)) => reread,
         }
     };
-    let checkpoint = reconstruct(store, &replay.seed, replay.height, activations)?;
+    let mut trees =
+        replay_compact_blocks(store, &replay.seed, replay.height, activations, |_| check())?;
+    let block_time_seconds = trees.canonical_block_time(store)?;
+    let tree_state = ServedTreeState::from_replayed_accumulator(
+        trees.tip,
+        block_time_seconds,
+        &trees.accumulator,
+    )
+    .map_err(|source| replay_refused(trees.tip.height, &source))?;
     Ok(Some(TreeStateReplayOutcome::Replayed {
         replay: Box::new(replay),
-        tree_state: ServedTreeState::from(checkpoint),
+        tree_state,
     }))
 }
 
-fn refuse_unadmitted_activations(
+pub(super) fn refuse_unadmitted_activations(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
     activations: &NetworkUpgradeActivations,
@@ -270,17 +316,6 @@ fn refuse_unadmitted_activations(
             "tree-state reconstruction activation table differs from the admitted schedule at or below the requested height",
         ))
     }
-}
-
-/// Replays the stored compact blocks above `seed` through `height` and checks
-/// the result against the canonical block at `height`.
-fn reconstruct(
-    store: &impl CanonicalServingRead,
-    seed: &CommitmentTreeCheckpoint,
-    height: BlockHeight,
-    activations: &NetworkUpgradeActivations,
-) -> Result<CommitmentTreeCheckpoint, CanonicalStoreError> {
-    replay_compact_blocks(store, seed, height, activations, |_| Ok(()))?.checkpoint(store)
 }
 
 /// Returns the lowest checkpoint height a reconstruction of `height` may seed

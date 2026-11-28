@@ -10,9 +10,8 @@ Each time `zinder-ingest` changes the canonical chain, it records one chain
 event in the same atomic write as the blocks. The event names the block range
 that was committed and, after a reorg, the range that was replaced. A client
 reads events in order and keeps an opaque cursor. After a disconnect, it sends
-the cursor back and receives exactly the events it has not seen. Events carry
-no block data; a client fetches what it needs through the other `WalletQuery`
-methods. See [Wallet data plane](wallet-data-plane.md).
+the cursor back to recover changes since that position. A client fetches block
+data through the other `WalletQuery` methods. See [Wallet data plane](wallet-data-plane.md).
 
 ## Event contents
 
@@ -27,9 +26,9 @@ Each message on the stream is a `ChainEventEnvelope`:
 
 The two event types:
 
-- **`ChainCommitted`** adds a block range on top of the previous chain. Ingest
-  produces one for the store's first publication, covering every stored block,
-  and one for each appended block.
+- **`ChainCommitted`** reports the block range that joined the selected
+  family. On the Visible stream, the first publication covers every stored
+  block. Each subsequent append reports the new block.
 - **`ChainReorged`** carries a `reverted` range and a `committed` range that
   start at the same height. The blocks in `reverted` are no longer on the
   chain. The blocks in `committed` replace them and may extend past them.
@@ -54,7 +53,7 @@ your application's policy, at any depth between those two tips.
 
 | Start | Delivers |
 | --- | --- |
-| `after_cursor` | Every event after the cursor. Use it to resume. |
+| `after_cursor` | Changes since the saved position. Use it to resume. |
 | `earliest_retained` | Every event still retained, from the oldest. Use it to build state from scratch. |
 | `live_tail` | Only events committed after the subscription opens. |
 
@@ -62,13 +61,25 @@ your application's policy, at any depth between those two tips.
 
 - `CHAIN_EVENT_STREAM_FAMILY_VISIBLE`, the default, carries every commit and
   every reorg. A client on this family must handle reorgs.
-- `CHAIN_EVENT_STREAM_FAMILY_SETTLED` carries only `ChainCommitted` events
-  after which the visible tip is at or below the settled tip. It never carries
+- `CHAIN_EVENT_STREAM_FAMILY_SETTLED` delivers one `ChainCommitted` whenever
+  the settled tip advances. Its range starts one block above the previous
+  settled tip and ends at the new settled tip, inclusive. The first
+  publication starts at the first stored block. For example, if the settled
+  tip moves from 40 to 42 while the visible tip reaches 45, the event covers
+  blocks 41 and 42. Its cursor points to block 42. Transitions that leave the
+  settled tip in place produce no Settled event. This family never delivers
   a reorg.
 
 A cursor records its family. With `after_cursor`, the cursor's family applies.
 The request's `family` must be left at its default or match the cursor, or the
 request fails with `INVALID_ARGUMENT`.
+
+For Settled subscriptions, use a server advertising `contract_revision` 12 or
+later. It sends `zinder-chain-event-family: settled` in the initial gRPC
+metadata whenever the resolved family is Settled, including on cursor resume.
+Earlier servers can stay silent as blocks settle. Rust SDK consumers also
+need a client that supports revision 12. Earlier clients reject a committed
+range that ends below the visible tip.
 
 ## Resume with a cursor
 
@@ -82,22 +93,38 @@ last cursor you stored.
 
 The server resumes as follows:
 
-- When the cursor's block is still on the chain and later events are retained,
-  the stream continues with the next event.
-- When the cursor's block was replaced by a reorg that is still retained, the
-  stream continues with the next event, which includes that `ChainReorged`.
-- When the cursor's block was replaced and the reorg event has been pruned, the
-  server sends one synthesized `ChainReorged` first. Its `reverted` range runs
-  from just above the last block both chains share to the cursor's tip. Its
-  `committed` range runs from the same height to the current tip. The stream
-  then continues from the oldest retained event.
-- When the cursor is too old or none of its recorded blocks is still on the
-  chain, the request fails with `CHAIN_EVENT_CURSOR_EXPIRED`.
+- When the next unseen event is retained, the stream replays from that
+  sequence in the cursor's family. Visible streams include retained reorgs.
+- When events are missing and a visible cursor's block has been replaced,
+  the server can send one synthesized `ChainReorged`. Its `reverted` range
+  starts just above a verified common block and ends at the cursor's tip.
+  Its `committed` range runs from the same height to the current visible tip.
+  The replacement can have settled in the meantime, so
+  `committed.chain_epoch.settled_tip` can advance past the common block.
+  Apply the replacement before discarding undo state through the new settled tip.
+- When events are missing and the cursor still points to the canonical chain,
+  or the server cannot establish a common block and a valid replacement range,
+  the request fails with `CHAIN_EVENT_CURSOR_EXPIRED`.
 
 A cursor carries up to 32 recorded blocks, most recent first and spaced further
-apart going back, so the server can find where the client's chain and the
-current chain split. The synthesized reorg's cursor points at that split. A
-client that disconnects before applying it receives the same reorg again.
+apart going back. If the matching block is below the cursor epoch's settled
+tip, the server verifies the settled block against the current chain and starts
+the replacement above it. Each delivered epoch advances, and settlement never
+moves backward or changes hash at the same height.
+
+The synthesized event carries the current event sequence and a cursor anchored
+at the current visible tip. It covers the retained changes through that tip.
+The stream continues only with later events. If you disconnect before applying
+the replacement, reconnect with your saved cursor and the server computes
+recovery against the tip it then serves.
+
+For durable recovery across pruning, use a server advertising `contract_revision`
+10 or later. On revisions 8 and 9, the Rust SDK replays retained events
+normally. If the server synthesizes a reorg after pruning, the SDK ends the
+stream with `ChainEventCursorExpired` before delivering the replacement or
+its cursor. Rebuild your state and start a new stream from `earliest_retained`.
+If the revision lookup times out, the SDK returns `ServiceUnavailable`.
+Reconnect with your last saved cursor.
 
 A `SETTLED` cursor whose block is no longer on the chain is always expired,
 because a settled stream never carries a reorg.
@@ -114,8 +141,9 @@ feed:
 - A `ChainReorged` always passes, because a client must invalidate cached data
   after any reorg.
 
-The filter does not change cursors, so a client can resume with a different
-filter. After a hint, the client still reads the address or block data it
+While your subscription is open, the server scans past every examined event,
+including a full page of quiet blocks. Delivered events keep their original
+cursors, so you can reconnect with a different filter. After a hint, the client still reads the address or block data it
 needs.
 
 ## Retention
@@ -125,7 +153,7 @@ hours (seven days) by default, and prunes older ones without renumbering the
 rest. `0` disables pruning. Events that a running projector build has leased
 are kept. See [Configuration](../reference/configuration.md).
 
-A client that stays disconnected longer than the retention window gets
+If the server cannot recover a cursor after pruning, the client gets
 `CHAIN_EVENT_CURSOR_EXPIRED`. It must rebuild its state from Zinder's block and
 address queries and then open a new stream with `earliest_retained` or
 `live_tail`.

@@ -40,8 +40,8 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, RocksDbResourceBudget,
+    RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_testkit::{LogCapture, sample_regtest_upgrade_activations};
 
@@ -906,12 +906,11 @@ impl CanonicalHarness {
             &activations,
             block_at(&blocks, 1)?.block_time_seconds.saturating_sub(1),
             block_id(&blocks, BASELINE_TIP_HEIGHT)?,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         )?;
         let builder = RocksDbCanonicalBuilder::create_fresh(
             &store_path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1031,8 +1030,9 @@ fn open_secondary(
         store_path,
         temporary_path.join("canonical-secondary"),
         activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(
+            zinder_store::RawBlobRetention::None,
+        ),
         CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)

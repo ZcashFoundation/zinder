@@ -1,6 +1,0 @@
-kind: added
-body: "Wallet-mode `zinder-compat-lightwalletd` now answers `GetStandardFee` with the fee and estimator version its verified node reports through `getstandardfee`, instead of `UNIMPLEMENTED`, using the same endpoint admission and failover as `SendTransaction`. A zero fee or a malformed node reply returns `INTERNAL`, as Go lightwalletd v0.6.2 does. Compact-blocks serving and deployments without a node still answer `UNIMPLEMENTED`, and a node outage now also makes `GetStandardFee` fail with `UNAVAILABLE`."
-time: 2026-11-20T07:00:00.000000000Z
-custom:
-    Bump: minor
-    PR: "344"

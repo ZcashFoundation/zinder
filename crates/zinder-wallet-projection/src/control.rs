@@ -425,6 +425,8 @@ pub struct WalletProjectionFamilyRowCounts {
     pub transparent_address_balance_count: u64,
     /// Rows in the contiguous retained `reorg_undo` suffix.
     pub reorg_undo_count: u64,
+    /// Rows in `block_hash_by_height`.
+    pub block_hash_by_height_count: u64,
 }
 
 /// Complete UTXO aggregate published with wallet readiness.
@@ -434,7 +436,7 @@ pub struct WalletUtxoSetSummary {
     pub utxo_count: u64,
     /// Sum of all currently unspent transparent output values.
     pub total_value_zat: u64,
-    /// Full order-independent `LtHash16` accumulator.
+    /// Full order-independent `LtHash16` UTXO set commitment.
     pub commitment: TransparentUtxoSetCommitment,
 }
 
@@ -460,6 +462,10 @@ pub struct WalletProjectionReadyEvidence {
 /// Durable wallet store lifecycle state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "keeping Ready evidence unboxed preserves match ergonomics across store adapters"
+)]
 pub enum WalletProjectionBuildState {
     /// Rows are incomplete and query admission must refuse the store.
     Building(WalletProjectionBuildPlan),
@@ -529,10 +535,7 @@ impl WalletStoreControlRecord {
                 field: "wallet store control",
             });
         }
-        decoder.require_u16(
-            "wallet projection schema version",
-            WALLET_PROJECTION_SCHEMA_VERSION,
-        )?;
+        decoder.require_projection_schema_version()?;
         decoder.require_u16(
             "wallet projection value encoding version",
             WALLET_PROJECTION_VALUE_ENCODING_VERSION,
@@ -661,10 +664,14 @@ impl<'a> WalletControlDecoder<'a> {
         let source_position = self.read_source_position()?;
         let source_sequence_digest = self.read_source_sequence_digest()?;
         let settled_tip = self.read_block_id()?;
-        self.require_u16(
-            "wallet projection accumulator version",
-            WALLET_PROJECTION_ACCUMULATOR_VERSION,
-        )?;
+        let accumulator_version = self.read_u16()?;
+        if accumulator_version != WALLET_PROJECTION_ACCUMULATOR_VERSION {
+            return Err(
+                WalletProjectionContractError::UnsupportedProjectionAccumulatorVersion {
+                    encoded: u64::from(accumulator_version),
+                },
+            );
+        }
         let projection_accumulator = WalletProjectionAccumulator::from_bytes(
             self.read_bytes(WALLET_PROJECTION_ACCUMULATOR_LEN)?,
         )?;
@@ -676,6 +683,7 @@ impl<'a> WalletControlDecoder<'a> {
             transparent_address_transaction_count: self.read_u64()?,
             transparent_address_balance_count: self.read_u64()?,
             reorg_undo_count: self.read_u64()?,
+            block_hash_by_height_count: self.read_u64()?,
         };
         let utxo_count = self.read_u64()?;
         let total_value_zat = self.read_u64()?;
@@ -751,6 +759,19 @@ impl<'a> WalletControlDecoder<'a> {
             BlockHeight::new(self.read_u32()?),
             BlockHash::from_bytes(self.read_array::<32>()?),
         ))
+    }
+
+    fn require_projection_schema_version(&mut self) -> Result<(), WalletProjectionContractError> {
+        let encoded = self.read_u16()?;
+        if encoded != WALLET_PROJECTION_SCHEMA_VERSION {
+            return Err(
+                WalletProjectionContractError::UnsupportedWalletProjectionSchemaVersion {
+                    encoded: u64::from(encoded),
+                    supported: WALLET_PROJECTION_SCHEMA_VERSION,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn require_u16(
@@ -950,6 +971,7 @@ fn encode_ready_evidence(
     bytes.extend_from_slice(&counts.transparent_address_transaction_count.to_be_bytes());
     bytes.extend_from_slice(&counts.transparent_address_balance_count.to_be_bytes());
     bytes.extend_from_slice(&counts.reorg_undo_count.to_be_bytes());
+    bytes.extend_from_slice(&counts.block_hash_by_height_count.to_be_bytes());
     bytes.extend_from_slice(&evidence.utxo_summary.utxo_count.to_be_bytes());
     bytes.extend_from_slice(&evidence.utxo_summary.total_value_zat.to_be_bytes());
     bytes.extend_from_slice(&evidence.utxo_summary.commitment.scheme().id().to_be_bytes());
@@ -1001,7 +1023,12 @@ fn validate_ready_evidence(
     {
         return Err(WalletProjectionContractError::ReadyReorgUndoCountMismatch);
     }
-    if evidence.utxo_summary.commitment.scheme() != UtxoSetCommitmentScheme::LtHash16 {
+    if evidence.row_counts.block_hash_by_height_count
+        != evidence.source_sequence_digest.block_count()
+    {
+        return Err(WalletProjectionContractError::ReadyBlockHashCountMismatch);
+    }
+    if evidence.utxo_summary.commitment.scheme() != UtxoSetCommitmentScheme::LtHash16ChaCha12 {
         return Err(WalletProjectionContractError::ReadyUtxoCommitmentSchemeMismatch);
     }
     Ok(())
@@ -1053,6 +1080,7 @@ mod tests {
                 transparent_address_transaction_count: 3,
                 transparent_address_balance_count: 1,
                 reorg_undo_count: 1,
+                block_hash_by_height_count: 1,
             },
             utxo_summary: WalletUtxoSetSummary {
                 utxo_count: 1,
@@ -1085,15 +1113,17 @@ mod tests {
 
         assert!(matches!(
             WalletStoreControlRecord::decode(&pre_reset),
-            Err(WalletProjectionContractError::UnsupportedEncodedValue {
-                field: "wallet projection schema version",
-                encoded: 0x2d70,
-            })
+            Err(
+                WalletProjectionContractError::UnsupportedWalletProjectionSchemaVersion {
+                    encoded: 0x2d70,
+                    ..
+                }
+            )
         ));
     }
 
     #[test]
-    fn building_control_has_exact_version_one_bytes() {
+    fn building_control_has_exact_version_two_bytes() {
         let control = sample_control(WalletProjectionBuildState::Building(
             WalletProjectionBuildPlan::complete_history(sample_source_position(0x0a0b_0c0d)),
         ));
@@ -1104,10 +1134,10 @@ mod tests {
             hex::encode(&encoded),
             concat!(
                 "77616c6c6574",
-                "0001",
+                "0002",
                 "0002",
                 "00000003",
-                "0006",
+                "0002",
                 "00000001",
                 "0001",
                 "0001",
@@ -1126,7 +1156,53 @@ mod tests {
     }
 
     #[test]
-    fn ready_control_has_exact_version_one_bytes() {
+    fn identity_mismatch_names_the_expected_store_identity() {
+        let control = sample_control(WalletProjectionBuildState::Building(
+            WalletProjectionBuildPlan::complete_history(sample_source_position(1)),
+        ));
+        let mut encoded = control
+            .encode()
+            .unwrap_or_else(|error| unreachable!("valid building control: {error}"));
+        encoded[..WALLET_PROJECTION_STORE_IDENTITY.len()].copy_from_slice(b"canonx");
+        let message = WalletStoreControlRecord::decode(&encoded)
+            .err()
+            .unwrap_or_else(|| unreachable!("a foreign identity was admitted"))
+            .to_string();
+        assert_eq!(
+            message,
+            "wallet store control does not begin with the wallet store identity \"wallet\""
+        );
+    }
+
+    #[test]
+    fn ready_decode_names_an_unsupported_accumulator_version() {
+        let evidence = ready_evidence();
+        let control = sample_control(WalletProjectionBuildState::Ready(evidence.clone()));
+        let mut encoded = control
+            .encode()
+            .unwrap_or_else(|error| unreachable!("valid ready control: {error}"));
+        let mut versioned_accumulator =
+            WALLET_PROJECTION_ACCUMULATOR_VERSION.to_be_bytes().to_vec();
+        versioned_accumulator.extend_from_slice(evidence.projection_accumulator.as_bytes());
+        let offset = encoded
+            .windows(versioned_accumulator.len())
+            .position(|window| window == versioned_accumulator.as_slice())
+            .unwrap_or_else(|| unreachable!("encoded READY evidence holds its accumulator"));
+        encoded[offset..offset + 2].copy_from_slice(&2_u16.to_be_bytes());
+
+        // The schema is current, so only the READY accumulator version is stale.
+        assert_eq!(
+            WalletStoreControlRecord::decode(&encoded),
+            Err(
+                WalletProjectionContractError::UnsupportedProjectionAccumulatorVersion {
+                    encoded: 2
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn ready_control_has_exact_version_two_bytes() {
         let evidence = ready_evidence();
         let control = sample_control(WalletProjectionBuildState::Ready(evidence.clone()));
         let mut expected = Vec::new();
@@ -1168,6 +1244,7 @@ mod tests {
         expected.extend_from_slice(&counts.transparent_address_transaction_count.to_be_bytes());
         expected.extend_from_slice(&counts.transparent_address_balance_count.to_be_bytes());
         expected.extend_from_slice(&counts.reorg_undo_count.to_be_bytes());
+        expected.extend_from_slice(&counts.block_hash_by_height_count.to_be_bytes());
         expected.extend_from_slice(&evidence.utxo_summary.utxo_count.to_be_bytes());
         expected.extend_from_slice(&evidence.utxo_summary.total_value_zat.to_be_bytes());
         expected.extend_from_slice(&evidence.utxo_summary.commitment.scheme().id().to_be_bytes());
@@ -1235,13 +1312,35 @@ mod tests {
             .encode()
             .unwrap_or_else(|error| unreachable!("valid building control: {error}"));
 
-        let mut wrong_schema = encoded.clone();
         let schema_offset = WALLET_PROJECTION_STORE_IDENTITY.len();
-        wrong_schema[schema_offset..schema_offset + 2].copy_from_slice(&5_u16.to_be_bytes());
-        assert!(matches!(
-            WalletStoreControlRecord::decode(&wrong_schema),
-            Err(WalletProjectionContractError::UnsupportedEncodedValue { .. })
-        ));
+        for unsupported_schema in [1_u16, 3_u16] {
+            let mut wrong_schema = encoded.clone();
+            wrong_schema[schema_offset..schema_offset + 2]
+                .copy_from_slice(&unsupported_schema.to_be_bytes());
+            assert_eq!(
+                WalletStoreControlRecord::decode(&wrong_schema),
+                Err(
+                    WalletProjectionContractError::UnsupportedWalletProjectionSchemaVersion {
+                        encoded: u64::from(unsupported_schema),
+                        supported: WALLET_PROJECTION_SCHEMA_VERSION,
+                    }
+                )
+            );
+        }
+
+        let encoding_offset = schema_offset + 2;
+        for unsupported_encoding in [1_u16, 3_u16] {
+            let mut wrong_encoding = encoded.clone();
+            wrong_encoding[encoding_offset..encoding_offset + 2]
+                .copy_from_slice(&unsupported_encoding.to_be_bytes());
+            assert_eq!(
+                WalletStoreControlRecord::decode(&wrong_encoding),
+                Err(WalletProjectionContractError::UnsupportedEncodedValue {
+                    field: "wallet projection value encoding version",
+                    encoded: u64::from(unsupported_encoding),
+                })
+            );
+        }
 
         let mut unknown_state = encoded.clone();
         let state_offset =
@@ -1261,7 +1360,60 @@ mod tests {
     }
 
     #[test]
+    fn control_rejects_mismatched_build_lease_schema_versions() {
+        let source = sample_source_position(1);
+        let source_identity = WalletCanonicalSourceIdentity::new(
+            source,
+            sequence_digest(1),
+            BlockId::new(BlockHeight::new(0), BlockHash::from_bytes([0x22; 32])),
+        );
+        let lease = WalletProjectionBuildLease::from_request(
+            WalletProjectionBuildLeaseRequest::new(
+                WalletProjectionBuildOwner::from_bytes([0x55; 16]),
+                source_identity,
+                WalletProjectionRetainedEventAnchor::new(1),
+                UnixTimestampMillis::new(900),
+            ),
+            7,
+            Network::ZcashRegtest,
+        );
+        let mut encoded = WalletStoreControlRecord {
+            network: Network::ZcashRegtest,
+            supported_reorg_depth: 0,
+            writer_generation: 7,
+            build_lease: Some(lease),
+            build_state: WalletProjectionBuildState::Building(
+                WalletProjectionBuildPlan::complete_history(source),
+            ),
+        }
+        .encode()
+        .unwrap_or_else(|error| unreachable!("valid leased control: {error}"));
+        let lease_schema_offset = WALLET_PROJECTION_STORE_IDENTITY.len()
+            + 2
+            + 2
+            + 4
+            + 2
+            + 4
+            + 2
+            + 2
+            + 4
+            + 8
+            + 1
+            + 2
+            + 16
+            + 8
+            + 4;
+        for bad_lease_schema in [1_u16, 3_u16] {
+            encoded[lease_schema_offset..lease_schema_offset + 2]
+                .copy_from_slice(&bad_lease_schema.to_be_bytes());
+            assert_eq!(
+                WalletStoreControlRecord::decode(&encoded),
+                Err(WalletProjectionContractError::WalletProjectionBuildLeaseSchemaMismatch)
+            );
+        }
+    }
 
+    #[test]
     fn ready_control_rejects_inconsistent_evidence() {
         let mut cases = Vec::new();
 
@@ -1286,6 +1438,13 @@ mod tests {
         cases.push((
             evidence,
             WalletProjectionContractError::ReadyReorgUndoCountMismatch,
+        ));
+
+        let mut evidence = ready_evidence();
+        evidence.row_counts.block_hash_by_height_count = 0;
+        cases.push((
+            evidence,
+            WalletProjectionContractError::ReadyBlockHashCountMismatch,
         ));
 
         let mut evidence = ready_evidence();
@@ -1330,6 +1489,7 @@ mod tests {
         evidence.source_sequence_digest = sequence_digest(3);
         evidence.settled_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0x32; 32]));
         evidence.row_counts.reorg_undo_count = 1;
+        evidence.row_counts.block_hash_by_height_count = 3;
         let control = WalletStoreControlRecord {
             network: Network::ZcashRegtest,
             supported_reorg_depth: 2,

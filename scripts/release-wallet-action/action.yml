@@ -1,0 +1,170 @@
+name: Release wallet round-trip gate
+description: Provision pinned wallet inputs, run two fresh deterministic Regtest chains, and publish allowlisted aggregate evidence.
+
+inputs:
+  tag:
+    description: Complete release tag the candidate names
+    required: true
+  commit:
+    description: Full release commit the candidate names
+    required: true
+  version:
+    description: Product version without the v prefix
+    required: true
+  archive:
+    description: Candidate archive path relative to the workspace
+    required: true
+  archive-sha256:
+    description: Optional pinned SHA-256 of the candidate archive
+    required: false
+    default: ""
+  client-bundle-url:
+    description: Immutable URL of the checksummed pinned wallet client bundle
+    required: false
+    default: ""
+  client-bundle-sha256:
+    description: SHA-256 of the pinned wallet client bundle
+    required: false
+    default: ""
+  images:
+    description: JSON map of the unified zinder runtime image shell
+    required: false
+    default: scripts/release-wallet-images.json
+  baseline-matrix:
+    description: Versioned coverage matrix holding the four round-trip rows
+    required: false
+    default: scripts/wallet-clients/coverage-v0.22.0.json
+  state:
+    description: New private directory for the campaign and raw state
+    required: true
+  evidence:
+    description: New directory for allowlisted aggregate evidence
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Provision the pinned wallet client bundle
+      id: bundle
+      if: inputs.client-bundle-url != ''
+      shell: bash
+      env:
+        BUNDLE_URL: ${{ inputs.client-bundle-url }}
+        BUNDLE_SHA256: ${{ inputs.client-bundle-sha256 }}
+      run: |
+        set -euo pipefail
+        if [[ ! "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+          echo "::error::Operator gate: the client bundle digest must be a pinned SHA-256."
+          exit 1
+        fi
+        mkdir -p clients
+        curl --fail --location --silent --show-error \
+          --proto "=https" --proto-redir "=https" --retry 3 --retry-delay 2 \
+          --output clients/bundle.tar.gz \
+          -- "$BUNDLE_URL"
+        printf '%s  %s\n' "$BUNDLE_SHA256" clients/bundle.tar.gz | sha256sum --check --strict
+
+    - name: Note the operator gate state
+      id: operator
+      shell: bash
+      env:
+        BUNDLE_CONFIGURED: ${{ inputs.client-bundle-url != '' }}
+      run: |
+        if [[ "$BUNDLE_CONFIGURED" == "true" ]]; then
+          echo "Pinned wallet client bundle supplied; the gate will verify its digest." >> "$GITHUB_STEP_SUMMARY"
+        else
+          {
+            echo "### Operator gate: pinned wallet client bundle not supplied"
+            echo
+            echo "GitHub-hosted runners cannot build the pinned Zingo CLI and Zallet backend."
+            echo "The gate will fail closed and publish a blocked summary instead of passing."
+            echo "Publish the checksummed bundle and set \`WALLET_ROUNDTRIP_CLIENT_BUNDLE_URL\`"
+            echo "and \`WALLET_ROUNDTRIP_CLIENT_BUNDLE_SHA256\`, as described in"
+            echo "\`scripts/release-wallet-roundtrip.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Install the pinned wallet runtime
+      id: runtime
+      if: inputs.client-bundle-url != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 -m venv .wallet-venv
+        .wallet-venv/bin/pip install --disable-pip-version-check \
+          grpcio==1.85.3 \
+          grpcio-tools==1.85.3 \
+          protobuf==7.36.2 \
+          toml==0.10.2 \
+          mnemonic==0.21
+
+    - name: Generate the wallet protocol descriptors
+      id: descriptors
+      if: inputs.client-bundle-url != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p python-proto
+        .wallet-venv/bin/python -m grpc_tools.protoc \
+          -I crates/zinder-proto/proto/compat/lightwalletd \
+          --python_out=python-proto --grpc_python_out=python-proto \
+          crates/zinder-proto/proto/compat/lightwalletd/compact_formats.proto \
+          crates/zinder-proto/proto/compat/lightwalletd/service.proto
+        .wallet-venv/bin/python -m grpc_tools.protoc \
+          -I crates/zinder-proto/proto \
+          --python_out=python-proto \
+          crates/zinder-proto/proto/zinder/v1/ops/server_info.proto \
+          crates/zinder-proto/proto/zinder/v1/wallet/wallet.proto
+
+    - name: Qualify the candidate on two fresh chains
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        FAILED_STAGE: >-
+          ${{ steps.bundle.outcome == 'failure' && 'client-bundle' ||
+              steps.runtime.outcome == 'failure' && 'python-runtime' ||
+              steps.descriptors.outcome == 'failure' && 'protocol-descriptors' ||
+              steps.operator.outcome == 'failure' && 'operator-setup' || '' }}
+        PYTHONPATH: ${{ github.workspace }}/python-proto
+        TAG: ${{ inputs.tag }}
+        COMMIT: ${{ inputs.commit }}
+        ARCHIVE: ${{ inputs.archive }}
+        ARCHIVE_SHA256: ${{ inputs.archive-sha256 }}
+        CLIENT_BUNDLE_SHA256: ${{ inputs.client-bundle-sha256 }}
+        IMAGES: ${{ inputs.images }}
+        BASELINE_MATRIX: ${{ inputs.baseline-matrix }}
+        STATE: ${{ inputs.state }}
+        EVIDENCE: ${{ inputs.evidence }}
+      run: |
+        set -euo pipefail
+        python=python3
+        setup_args=()
+        if [[ -n "$FAILED_STAGE" ]]; then
+          setup_args+=(--provisioning-failure "$FAILED_STAGE")
+        elif [[ -x .wallet-venv/bin/python ]]; then
+          python=.wallet-venv/bin/python
+        fi
+        "$python" -B scripts/release-wallet-roundtrip.py \
+          --candidate-archive "$ARCHIVE" \
+          --archive-sha256 "$ARCHIVE_SHA256" \
+          --tag "$TAG" \
+          --commit "$COMMIT" \
+          --client-bundle clients/bundle.tar.gz \
+          --client-bundle-sha256 "$CLIENT_BUNDLE_SHA256" \
+          --images "$IMAGES" \
+          --baseline-matrix "$BASELINE_MATRIX" \
+          --state "$STATE" \
+          --evidence "$EVIDENCE" \
+          --port-bases 51500 51600 "${setup_args[@]}"
+
+    - name: Report the gate result
+      if: always()
+      shell: bash
+      env:
+        EVIDENCE: ${{ inputs.evidence }}
+      run: |
+        if [[ -f "$EVIDENCE/summary.json" ]]; then
+          python3 scripts/release-wallet-summary.py "$EVIDENCE/summary.json" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "::error::The gate produced no aggregate summary."
+        fi

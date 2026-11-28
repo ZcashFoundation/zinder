@@ -75,11 +75,11 @@ impl EventEnvelope for wallet::MempoolEventEnvelope {
 
 /// Repeatedly reads event pages for one family and sends them to a gRPC sink.
 ///
-/// A page may lead with a server-injected synthetic envelope (for chain
-/// events, a `ChainReorged` reconnect-reorg recovery); the runner forwards it
-/// like any other envelope and advances the cursor from the envelope it just
-/// sent, so the next page always makes forward progress. An empty page idle-
-/// polls until either the interval elapses or the receiver closes.
+/// The reader returns every envelope it scans, including a synthesized reorg
+/// when recovering a chain cursor. The next page starts after the last envelope
+/// sent to the sink. Apply delivery filters downstream so a page of quiet
+/// events still advances the scan. An empty page waits for the poll interval
+/// or receiver closure.
 pub async fn run_event_stream<E, ReadPage, ReadPageFuture>(
     mut cursor: Option<StreamCursorTokenV1>,
     mut read_page: ReadPage,

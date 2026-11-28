@@ -9,8 +9,9 @@
 //! every public wallet UI, block explorer, log record, and Zcash JSON-RPC
 //! reply uses; `encode_rpc_*_bytes` and `decode_rpc_*_bytes` for RPC byte
 //! order carried as raw bytes (Zebra's indexer gRPC fills hash `bytes` fields
-//! with `bytes_in_display_order`, and lightwalletd fills
-//! `SubtreeRoot.completingBlockHash` the same way).
+//! with `bytes_in_display_order`, and reference lightwalletd uses RPC byte
+//! order for `SubtreeRoot.completingBlockHash` responses and
+//! `GetTreeState(BlockID { height: 0, hash })` requests).
 //!
 //! RPC byte order is defined normatively in the Zcash protocol specification
 //! at protocol.tex:1127 (`\rpcByteOrder`) and used at protocol.tex:4036. It

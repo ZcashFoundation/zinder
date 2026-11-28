@@ -17,7 +17,12 @@
 //! only once it does, drives a read on that thread with
 //! [`read_on_blocking_thread`].
 
-use std::{cell::Cell, error::Error as StdError, num::NonZeroU16, num::NonZeroU32};
+use std::{
+    cell::Cell,
+    error::Error as StdError,
+    num::{NonZeroU16, NonZeroU32},
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -27,11 +32,13 @@ use zinder_core::{
     SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
     TransparentAddressScriptHash, TransparentOutPoint, TransparentOutpointSpendStatus,
 };
+use zinder_proto::compat::lightwalletd::EncodedBlock;
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence,
-    ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition,
-    HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1, TreeStateLookup,
-    TreeStateReplay, TreeStateReplayOutcome,
+    ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume,
+    CompactBlockSpliceSelection, EncodedCompactBlockRange, EncodedCompactBlockRangeRequest,
+    EventStreamStartPosition, HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1,
+    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionHistoryPage, WalletAddressTransactionKey,
@@ -39,6 +46,17 @@ use zinder_wallet_projection::{
 };
 
 use crate::ArtifactKey;
+
+/// Outcome of reading a pre-encoded unary compact block from storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EncodedCompactBlockLookup {
+    /// Pre-encoded protobuf wire block matching the requested splice selection.
+    Block(EncodedBlock),
+    /// Block height or hash is not present in the reader's retained best-chain index.
+    NotFound,
+    /// This reader does not support direct unary wire splicing.
+    Unsupported,
+}
 
 /// Canonical chain data read at one immutable admitted fence.
 ///
@@ -52,7 +70,7 @@ pub trait CanonicalReader: Send + Sync + 'static {
     fn network(&self) -> Network;
 
     /// Returns the network-upgrade schedule the canonical writer admitted
-    /// with this fence, or `None` before the writer's first admission.
+    /// with this fence.
     fn network_upgrade_schedule(&self) -> Option<&CanonicalActivationSchedule>;
 
     /// Returns the raw-blob retention the store was built with.
@@ -66,6 +84,13 @@ pub trait CanonicalReader: Send + Sync + 'static {
 
     /// Returns the canonical history range the store retains.
     fn history_bounds(&self) -> CanonicalHistoryBounds;
+
+    /// Returns a 32-byte digest of the store's full admitted history predecessor
+    /// checkpoint (block ID, timestamp, and every shielded seed frontier), or
+    /// `None` when the reader does not expose one.
+    fn history_predecessor_digest(&self) -> Option<[u8; 32]> {
+        None
+    }
 
     /// Reads the canonical header at `height`, or `None` above the visible
     /// tip or below retained history.
@@ -110,6 +135,26 @@ pub trait CanonicalReader: Send + Sync + 'static {
         height: BlockHeight,
     ) -> Result<Option<CompactBlockArtifact>, StorageReadError>;
 
+    /// Reads one wire-encoded unary compact block at `height` directly from canonical
+    /// `ZSHRNG02` + `ZSTSUP01` or `live_tail_block` when supported.
+    async fn encoded_compact_block_at(
+        &self,
+        _height: BlockHeight,
+        _selection: CompactBlockSpliceSelection,
+    ) -> Result<EncodedCompactBlockLookup, StorageReadError> {
+        Ok(EncodedCompactBlockLookup::Unsupported)
+    }
+
+    /// Reads one wire-encoded unary compact block by `block_hash` when supported,
+    /// resolving the best-chain height and splicing in one storage call.
+    async fn encoded_compact_block_by_hash(
+        &self,
+        _block_hash: BlockHash,
+        _selection: CompactBlockSpliceSelection,
+    ) -> Result<EncodedCompactBlockLookup, StorageReadError> {
+        Ok(EncodedCompactBlockLookup::Unsupported)
+    }
+
     /// Reads every compact block of an inclusive range in ascending height
     /// order.
     ///
@@ -137,6 +182,20 @@ pub trait CanonicalReader: Send + Sync + 'static {
         max_bytes: usize,
     ) -> Result<Vec<CompactBlockArtifact>, StorageReadError>;
 
+    /// Reads encoded compact-block wire payloads or pre-batched frames directly from canonical
+    /// `ZSHRNG02` settled segments and `live_tail_block` up to `request.max_bytes`, keeping at
+    /// least one block.
+    ///
+    /// Readers without segment wire framing return `Ok(None)` so adapters can fall back to
+    /// [`Self::compact_blocks_in_range_up_to`].
+    async fn encoded_compact_block_range_up_to(
+        &self,
+        _request: EncodedCompactBlockRangeRequest,
+        _cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<EncodedCompactBlockRange>, StorageReadError> {
+        Ok(None)
+    }
+
     /// Reads the retained raw block at `height`, or `None` when the store
     /// does not hold it.
     async fn block_blob_at(
@@ -163,6 +222,31 @@ pub trait CanonicalReader: Send + Sync + 'static {
         transaction_id: TransactionId,
     ) -> Result<Option<IndexedTransaction>, StorageReadError>;
 
+    /// Reads the mined transactions `transaction_ids` name, one entry per
+    /// requested id in request order, with the header of each block and raw
+    /// bytes when the store retains them.
+    ///
+    /// Unlike [`Self::mined_transaction`], a miss is `None` even when the
+    /// store's retained history starts after a checkpoint; callers check
+    /// [`Self::history_bounds`] when turning `None` into a proven absence so
+    /// earlier hits in the same batch are still served first.
+    async fn mined_transactions(
+        &self,
+        transaction_ids: &[TransactionId],
+    ) -> Result<Vec<Option<IndexedTransaction>>, StorageReadError> {
+        let mut transactions = Vec::with_capacity(transaction_ids.len());
+        for &transaction_id in transaction_ids {
+            match self.mined_transaction(transaction_id).await {
+                Ok(transaction) => transactions.push(transaction),
+                Err(StorageReadError::CanonicalHistoryUnavailable { .. }) => {
+                    transactions.push(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(transactions)
+    }
+
     /// Reads the raw bytes of the mined transaction `transaction_id` names.
     ///
     /// Fails with [`StorageReadError::ArtifactUnavailable`] for
@@ -180,6 +264,17 @@ pub trait CanonicalReader: Send + Sync + 'static {
         height: BlockHeight,
     ) -> Result<Option<ServedTreeState>, StorageReadError>;
 
+    /// Reads a checkpoint at exactly this height without reconstructing its frontier.
+    async fn stored_tree_state_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ServedTreeState>, StorageReadError> {
+        Ok(self
+            .tree_state_checkpoint_at_or_before(height)
+            .await?
+            .filter(|state| state.block_id().height == height))
+    }
+
     /// Finds how the tree state at `height` is answered under the admitted
     /// network-upgrade schedule: by the checkpoint stored there, or by a
     /// reconstruction [`Self::replay_tree_state`] runs.
@@ -189,6 +284,19 @@ pub trait CanonicalReader: Send + Sync + 'static {
         &self,
         height: BlockHeight,
     ) -> Result<Option<TreeStateLookup>, StorageReadError>;
+
+    /// Looks up a checkpoint while its wallet request still needs it.
+    /// Storage backends check again before a queued read starts and before validating the seed.
+    async fn tree_state_lookup_until_cancelled(
+        &self,
+        height: BlockHeight,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateLookup>, StorageReadError> {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        self.tree_state_lookup(height).await
+    }
 
     /// Reconstructs the tree state `replay` names from stored compact
     /// blocks, or answers from a checkpoint this reader stores at its
@@ -203,6 +311,16 @@ pub trait CanonicalReader: Send + Sync + 'static {
         &self,
         replay: TreeStateReplay,
     ) -> Result<Option<TreeStateReplayOutcome>, StorageReadError>;
+
+    /// Replays a frontier while the request group still has a reader.
+    /// Engines with a block replay loop should check the flag between blocks.
+    async fn replay_tree_state_until_cancelled(
+        &self,
+        replay: TreeStateReplay,
+        _cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateReplayOutcome>, StorageReadError> {
+        self.replay_tree_state(replay).await
+    }
 
     /// Reads a contiguous range of the subtree roots the visible chain has
     /// completed, which its chain epoch's tip metadata counts.
@@ -220,9 +338,10 @@ pub trait CanonicalReader: Send + Sync + 'static {
     /// `from_cursor`, or from the oldest retained event of `family`.
     ///
     /// A cursor records its family, which applies to the events after it
-    /// whatever `family` names. [`ChainEventStreamFamily::Settled`] carries
-    /// only a `ChainCommitted` event after which the visible tip is at or
-    /// below the settled tip.
+    /// whatever `family` names. [`ChainEventStreamFamily::Settled`] emits a
+    /// `ChainCommitted` for the baseline's retained settled blocks and for
+    /// each subsequent range of newly settled blocks. Each event keeps the
+    /// sequence and epoch of the canonical transition that settled the range.
     async fn wallet_chain_event_history(
         &self,
         from_cursor: Option<StreamCursorTokenV1>,
@@ -399,6 +518,19 @@ pub enum StorageReadError {
         /// Operator-facing failure reason.
         reason: String,
     },
+
+    /// An admitted stored artifact failed wire or integrity verification on read.
+    #[error("corrupt {family:?} artifact: {reason}")]
+    ArtifactCorrupt {
+        /// Corrupt artifact family.
+        family: ArtifactFamily,
+        /// Exact verification or decoding failure reason.
+        reason: String,
+    },
+
+    /// Cooperative cancellation stopped the storage read before completion.
+    #[error("canonical storage read cancelled")]
+    Cancelled,
 
     /// Storage failed to answer.
     #[error(transparent)]

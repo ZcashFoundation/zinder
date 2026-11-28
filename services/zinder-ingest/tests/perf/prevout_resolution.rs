@@ -28,8 +28,7 @@ use zinder_core::{
 };
 use zinder_ingest::{CanonicalBlockContextReader, IngestError, PrevoutCache};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary,
-    RocksDbResourceBudget,
+    CanonicalReorgPolicy, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbResourceBudget,
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
@@ -59,8 +58,7 @@ fn replay_resolves_transparent_dense_history_without_producing_block_reads() -> 
         writer.canonical_primary_path(),
         secondary_directory.path().join("canonical-secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::None,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(FIXTURE_REORG_WINDOW_BLOCKS)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -106,8 +104,7 @@ fn a_resumed_replay_warms_its_cache_instead_of_reading_producing_blocks() -> eyr
         writer.canonical_primary_path(),
         secondary_directory.path().join("canonical-secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::None,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(FIXTURE_REORG_WINDOW_BLOCKS)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -227,8 +224,7 @@ fn open_fixture_secondary(
         writer.canonical_primary_path(),
         secondary_directory.path().join("canonical-secondary"),
         activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::None,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(FIXTURE_REORG_WINDOW_BLOCKS)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)

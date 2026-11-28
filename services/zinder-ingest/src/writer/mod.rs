@@ -16,26 +16,19 @@ use zinder_source::{NodeSource, SourceError};
 use zinder_store::{
     CanonicalActivationSchedule, CanonicalBaselinePublication, CanonicalReadyStoreSummary,
     CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError,
-    CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
-    RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalStoreError, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
+    RocksDbResourceBudget, TreeStateCheckpointSelection,
 };
 
 use crate::{
     CanonicalConstructionConfig, CanonicalConstructionError, CanonicalControlCommand,
-    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, RawBlobPolicy,
-    follow_canonical_tip, follow_canonical_tip_with_control,
+    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, follow_canonical_tip,
+    follow_canonical_tip_with_control,
 };
 use construction::{
-    load_fresh_canonical_until_cancelled, record_construction_cancelled, record_construction_phase,
+    load_fresh_canonical_until_cancelled, progress::ConstructionProgress,
+    record_construction_cancelled, record_construction_phase,
 };
-
-pub(super) const fn raw_blob_policy_for_retention(retention: RawBlobRetention) -> RawBlobPolicy {
-    match retention {
-        RawBlobRetention::None => RawBlobPolicy::None,
-        RawBlobRetention::Transactions => RawBlobPolicy::Transactions,
-        RawBlobRetention::All => RawBlobPolicy::All,
-    }
-}
 
 /// Complete concrete configuration for the first `RocksDB` single-host writer.
 #[derive(Clone, Debug)]
@@ -53,6 +46,8 @@ pub struct CanonicalWriterConfig {
     /// Reorg window depth, which also places fresh construction's build tip,
     /// and so the baseline settled tip, this far below the node's tip.
     pub reorg_window_blocks: u32,
+    /// Optional checkpoints beyond the 100-block cadence and the build tip.
+    pub tree_state_checkpoint_selection: Option<TreeStateCheckpointSelection>,
     /// Continuous follower policy.
     pub follow: CanonicalFollowConfig,
 }
@@ -324,7 +319,6 @@ fn open_existing_store(
     let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &config.storage_path,
         network_upgrade_activations,
-        CanonicalStoreWorkload::Wallet,
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
@@ -360,7 +354,6 @@ fn recover_staged_store(
     match RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         staging_path,
         network_upgrade_activations,
-        CanonicalStoreWorkload::Wallet,
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
@@ -372,7 +365,6 @@ fn recover_staged_store(
             let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
                 &config.storage_path,
                 network_upgrade_activations,
-                CanonicalStoreWorkload::Wallet,
                 config.raw_blob_retention,
                 CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
                 config.resource_budget,
@@ -480,47 +472,46 @@ where
         record_construction_cancelled("construction_range");
         return Err(CanonicalWriterError::Cancelled);
     };
-    let (build_plan, build_tip) = construction_range?;
-    record_construction_phase("construction_range", range_started_at);
-    readiness.publish_admission(
-        ReadinessState::syncing(
-            Some(u64::from(build_tip.height.value().saturating_sub(
-                build_plan.history_bounds().first_available_height().value(),
-            ))),
-            None,
-            Some(build_tip.height.value()),
-        )
-        .with_phase(IngestPhase::BulkCatchup),
-    );
-    let builder = RocksDbCanonicalBuilder::create_fresh(
-        staging_path,
-        CanonicalStoreWorkload::Wallet,
+    let ResolvedConstructionRange {
         build_plan,
-        config.resource_budget,
-    )?;
+        build_tip,
+        source_tip,
+    } = construction_range?;
+    record_construction_phase("construction_range", range_started_at);
+    let progress = ConstructionProgress::start(&build_plan, Some(readiness.clone()));
+    let builder = create_fresh_canonical_builder(staging_path, build_plan, config)?;
     tracing::info!(
         target: "zinder::ingest",
         event = "canonical_fresh_construction_started",
         staging_path = %staging_path.display(),
         fixed_tip_height = build_tip.height.value(),
+        tree_state_checkpoint_selection = ?config.tree_state_checkpoint_selection,
         "started canonical construction"
     );
-    let loaded =
-        load_fresh_canonical_until_cancelled(builder, source, &config.construction, cancel)
-            .await
-            .map_err(|error| {
-                if matches!(error, CanonicalConstructionError::Cancelled) {
-                    CanonicalWriterError::Cancelled
-                } else {
-                    CanonicalWriterError::Construction(error)
-                }
-            })?;
+    warn_if_every_block_construction_lacks_qualified_cpus(config.tree_state_checkpoint_selection);
+    let loaded = load_fresh_canonical_until_cancelled(
+        builder,
+        source,
+        &config.construction,
+        construction::FreshCanonicalLoadOptions {
+            cancel,
+            progress: Some(progress),
+            known_source_tip_height: Some(source_tip.height),
+        },
+    )
+    .await
+    .map_err(|error| {
+        if matches!(error, CanonicalConstructionError::Cancelled) {
+            CanonicalWriterError::Cancelled
+        } else {
+            CanonicalWriterError::Construction(error)
+        }
+    })?;
     let published_fence = publish_constructed_baseline(loaded, build_tip, cancel).await?;
     install_staged_store(staging_path, &config.storage_path)?;
     let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &config.storage_path,
         network_upgrade_activations,
-        CanonicalStoreWorkload::Wallet,
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
@@ -536,9 +527,24 @@ where
         visible_tip_height = published_fence.visible_tip().height.value(),
         chain_epoch = published_fence.chain_epoch_id().value(),
         chain_event_sequence = published_fence.chain_event_sequence(),
+        construction_tree_state_checkpoint_policy = ?store.construction_tree_state_checkpoint_policy(),
         "published and cold-reopened the canonical baseline"
     );
     Ok(store)
+}
+
+fn create_fresh_canonical_builder(
+    staging_path: &std::path::Path,
+    build_plan: CanonicalStoreBuildPlan,
+    config: &CanonicalWriterConfig,
+) -> Result<RocksDbCanonicalBuilder, CanonicalStoreError> {
+    let builder =
+        RocksDbCanonicalBuilder::create_fresh(staging_path, build_plan, config.resource_budget)?;
+    if let Some(selection) = config.tree_state_checkpoint_selection {
+        builder.with_tree_state_checkpoint_selection(selection)
+    } else {
+        Ok(builder)
+    }
 }
 
 /// Validates and publishes the staged build on the blocking pool.
@@ -585,7 +591,10 @@ fn validate_retained_history_coverage(
     )
 }
 
-fn configured_first_available_height(checkpoint_height: Option<BlockHeight>) -> BlockHeight {
+/// Returns the first block a store must retain to satisfy a writer configured
+/// with `checkpoint_height`: genesis's successor, or the checkpoint's successor.
+#[must_use]
+pub fn configured_first_available_height(checkpoint_height: Option<BlockHeight>) -> BlockHeight {
     checkpoint_height.map_or(BlockHeight::new(1), |checkpoint_height| {
         BlockHeight::new(checkpoint_height.value().saturating_add(1))
     })
@@ -604,6 +613,12 @@ fn validate_first_available_height(
     Ok(())
 }
 
+struct ResolvedConstructionRange {
+    build_plan: CanonicalStoreBuildPlan,
+    build_tip: BlockId,
+    source_tip: BlockId,
+}
+
 /// Fixes the build tip and returns the build plan with that tip.
 ///
 /// The build tip is also the baseline's settled tip, so without a lower run
@@ -613,7 +628,7 @@ async fn resolve_construction_range<Source>(
     source: &Source,
     network_upgrade_activations: &NetworkUpgradeActivations,
     config: &CanonicalWriterConfig,
-) -> Result<(CanonicalStoreBuildPlan, BlockId), CanonicalWriterError>
+) -> Result<ResolvedConstructionRange, CanonicalWriterError>
 where
     Source: NodeSource,
 {
@@ -632,7 +647,11 @@ where
     };
     let build_plan =
         resolve_build_plan(source, network_upgrade_activations, config, build_tip).await?;
-    Ok((build_plan, build_tip))
+    Ok(ResolvedConstructionRange {
+        build_plan,
+        build_tip,
+        source_tip,
+    })
 }
 
 /// Returns the height construction builds to: one reorg window below the
@@ -725,6 +744,49 @@ fn install_staged_store(
     })
 }
 
+/// Logical CPUs of the measured run in which every-block construction reached
+/// Mainnet READY within the three-hour budget of ADR-0009: 8 physical cores
+/// with one thread per core.
+const EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS: usize = 8;
+
+/// Warns when a fresh construction stores every block's checkpoint on fewer
+/// logical CPUs than its Mainnet READY measurement used, or cannot count them.
+fn warn_if_every_block_construction_lacks_qualified_cpus(
+    selection: Option<TreeStateCheckpointSelection>,
+) {
+    let Ok(available_logical_cpus) =
+        std::thread::available_parallelism().map(std::num::NonZeroUsize::get)
+    else {
+        if selection.is_some() {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "construction_cpu_count_unavailable",
+                "could not detect the logical CPU count; construction hashes commitment trees on one thread unless ingest.construction.tree_hashing_workers is set"
+            );
+        }
+        return;
+    };
+    if every_block_construction_below_qualified_cpus(selection, available_logical_cpus) {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "every_block_construction_below_qualified_cpus",
+            available_logical_cpus,
+            qualified_logical_cpus = EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS,
+            "every-block construction reached Mainnet READY within three hours when measured with 6 hashing workers on 8 physical cores, one thread per core; this host reports fewer logical CPUs and will take longer; set ingest.tree_state_densification.selection = \"commitment-budget\" or during_construction = false for a faster first sync"
+        );
+    }
+}
+
+/// Whether a fresh construction stores every block's checkpoint on fewer
+/// logical CPUs than that measurement used.
+fn every_block_construction_below_qualified_cpus(
+    selection: Option<TreeStateCheckpointSelection>,
+    available_logical_cpus: usize,
+) -> bool {
+    selection == Some(TreeStateCheckpointSelection::EveryBlock)
+        && available_logical_cpus < EVERY_BLOCK_CONSTRUCTION_QUALIFIED_CPUS
+}
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, path::PathBuf, sync::Arc, time::Duration};
@@ -732,12 +794,12 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::tempdir;
     use zinder_core::{
-        BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight, BlockId,
-        CanonicalBlockFacts, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion,
-        ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
-        CommitmentTreeFrontiers, CommitmentTreeFrontiersError, CompactBlockArtifact,
-        CompactChainMetadata, ConsensusBranchId, Network, NetworkUpgradeActivation,
-        NetworkUpgradeActivations, SerializedBytesDigest, ShieldedProtocol, UnixTimestampMillis,
+        BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
+        CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion, ChainTipMetadata,
+        CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontiers,
+        CommitmentTreeFrontiersError, CompactBlockArtifact, CompactChainMetadata,
+        ConsensusBranchId, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
+        SerializedBytesDigest, ShieldedProtocol, UnixTimestampMillis,
         encode_canonical_block_replay,
     };
     use zinder_source::{
@@ -753,9 +815,9 @@ mod tests {
     };
     use crate::{CanonicalConstructionConfig, CanonicalFollowConfig};
     use zinder_store::{
-        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
-        CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
-        RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy, RawBlobRetention,
+        RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+        RocksDbResourceBudget,
     };
 
     #[derive(Clone)]
@@ -818,7 +880,7 @@ mod tests {
             store
                 .network_upgrade_schedule()
                 .map(zinder_store::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
         assert_eq!(store.network_upgrade_activations(), Some(&extended));
         assert_eq!(
@@ -854,7 +916,7 @@ mod tests {
             store
                 .network_upgrade_schedule()
                 .map(zinder_store::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
         assert_eq!(store.event_fence().visible_tip().height, next_height);
         assert_eq!(
@@ -883,7 +945,7 @@ mod tests {
             reopened
                 .network_upgrade_schedule()
                 .map(zinder_store::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
         assert_eq!(reopened.network_upgrade_activations(), Some(&extended));
 
@@ -891,8 +953,7 @@ mod tests {
             &store_path,
             temporary.path().join("canonical-secondary"),
             &extended,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -901,7 +962,7 @@ mod tests {
             secondary
                 .network_upgrade_schedule()
                 .map(zinder_store::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
         Ok(())
     }
@@ -931,19 +992,18 @@ mod tests {
             let manifest_before =
                 RocksDbCanonicalStore::read_construction_manifest_binding(&store_path)?;
 
-            let premature_reader = RocksDbCanonicalSecondary::open_ready(
+            let reader = RocksDbCanonicalSecondary::open_ready(
                 &store_path,
-                temporary.path().join("premature-secondary"),
+                temporary.path().join("initial-secondary"),
                 &zebra_seven,
-                CanonicalStoreWorkload::Wallet,
-                RawBlobRetention::Transactions,
+                zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                    RawBlobRetention::None,
+                ),
                 CanonicalReorgPolicy::new(1)?,
                 RocksDbResourceBudget::for_local_tests(),
-            );
-            assert!(
-                premature_reader.is_err(),
-                "{network:?}: a reader must not admit the Zebra 7 table before the writer does"
-            );
+            )?;
+            assert_eq!(reader.network_upgrade_activations(), Some(&zebra_six));
+            drop(reader);
 
             for rejected in [
                 swap_historical_upgrades(&zebra_seven)?,
@@ -954,9 +1014,9 @@ mod tests {
                     &checkpointed_writer_config(&store_path, &rejected, store_tip),
                 )
                 .err()
-                .ok_or("an unprovable legacy table must be refused")?;
+                .ok_or("a historical activation change must be refused")?;
                 assert!(
-                    error.to_string().contains("exact prefix"),
+                    error.to_string().contains("at or below canonical tip"),
                     "{network:?}: {error}"
                 );
             }
@@ -973,7 +1033,7 @@ mod tests {
             let schedule = store
                 .network_upgrade_schedule()
                 .ok_or("writer must admit the Zebra 7 schedule")?;
-            assert_eq!(schedule.revision(), 1);
+            assert_eq!(schedule.revision(), 2);
             assert_eq!(schedule.activations(), &zebra_seven);
             let admitted = admitted_network_upgrade_activations(&store)?;
             let nu7_height = admitted
@@ -1000,7 +1060,7 @@ mod tests {
                 reopened
                     .network_upgrade_schedule()
                     .map(zinder_store::CanonicalActivationSchedule::revision),
-                Some(1),
+                Some(2),
                 "{network:?}: restarting with the same table must not add a revision"
             );
             drop(reopened);
@@ -1028,8 +1088,9 @@ mod tests {
                         .path()
                         .join(format!("secondary-{}", reader_table.activations().len())),
                     reader_table,
-                    CanonicalStoreWorkload::Wallet,
-                    RawBlobRetention::Transactions,
+                    zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                        RawBlobRetention::None,
+                    ),
                     CanonicalReorgPolicy::new(1)?,
                     RocksDbResourceBudget::for_local_tests(),
                 )?;
@@ -1063,9 +1124,7 @@ mod tests {
         .err()
         .ok_or("NU7 at or below the stored tip must be refused")?;
         assert!(
-            error
-                .to_string()
-                .contains("adds an activation at or below canonical tip"),
+            error.to_string().contains("at or below canonical tip"),
             "{error}"
         );
         let unchanged = open_existing_store(
@@ -1204,12 +1263,11 @@ mod tests {
                 test_frontiers(activations, parent.height)?,
             ),
             build_tip,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1242,8 +1300,9 @@ mod tests {
                 Arc::new(activations.clone()),
             ),
             checkpoint_height: None,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::None,
             reorg_window_blocks: 1,
+            tree_state_checkpoint_selection: None,
             follow: CanonicalFollowConfig {
                 request_timeout: Duration::from_secs(1),
                 poll_interval: Duration::from_millis(1),
@@ -1268,12 +1327,11 @@ mod tests {
             activations,
             1_700_000_000,
             build_tip,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             reorg_policy,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1352,7 +1410,6 @@ mod tests {
             replay_envelope,
             tip_metadata: ChainTipMetadata::new(0, 0, 0),
             tree_state_checkpoint,
-            block_final_note_commitment_roots: None::<BlockFinalNoteCommitmentRoots>,
             transaction_blobs: Vec::new(),
             block_blob: None,
             facts,
@@ -1421,8 +1478,9 @@ mod tests {
                 Arc::new(activations.clone()),
             ),
             checkpoint_height: Some(BlockHeight::new(0)),
-            raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
+            raw_blob_retention: zinder_store::RawBlobRetention::None,
             reorg_window_blocks: 100,
+            tree_state_checkpoint_selection: None,
             follow: CanonicalFollowConfig {
                 request_timeout: Duration::from_secs(1),
                 poll_interval: Duration::from_millis(1),
@@ -1533,12 +1591,19 @@ mod tests {
         config.reorg_window_blocks = 1_000;
         let source = LinearSource { tip_height: 1_500 };
 
-        let (plan, settled_tip) =
-            resolve_construction_range(&source, &activations, &config).await?;
+        let super::ResolvedConstructionRange {
+            build_plan: plan,
+            build_tip: settled_tip,
+            source_tip,
+        } = resolve_construction_range(&source, &activations, &config).await?;
 
         let expected_build_tip = BlockId::new(BlockHeight::new(500), linear_block_hash(500));
         assert_eq!(plan.build_tip(), expected_build_tip);
         assert_eq!(settled_tip, expected_build_tip);
+        assert_eq!(
+            source_tip,
+            BlockId::new(BlockHeight::new(1_500), linear_block_hash(1_500))
+        );
         Ok(())
     }
 
@@ -1603,5 +1668,25 @@ mod tests {
         discard_unpublished_block_load_staging(&tempdir.path().join("store.building"))?;
 
         Ok(())
+    }
+
+    #[test]
+    fn only_every_block_construction_on_fewer_than_eight_cpus_warns() {
+        use zinder_store::TreeStateCheckpointSelection::{CommitmentBudget, EveryBlock};
+
+        let budget = std::num::NonZeroU32::new(256).map(CommitmentBudget);
+        for (selection, cpus, warns) in [
+            (Some(EveryBlock), 2, true),
+            (Some(EveryBlock), 7, true),
+            (Some(EveryBlock), 8, false),
+            (budget, 2, false),
+            (None, 2, false),
+        ] {
+            assert_eq!(
+                super::every_block_construction_below_qualified_cpus(selection, cpus),
+                warns,
+                "{selection:?} on {cpus} CPUs"
+            );
+        }
     }
 }

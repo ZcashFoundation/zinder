@@ -1,14 +1,11 @@
-use std::{
-    num::NonZeroU32,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use rust_rocksdb::{DB, IteratorMode, ReadOptions, WriteBatch};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zinder_core::{
-    BlockHash, BlockHeight, ChainTipMetadata, CompletedSubtreeRoot, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    BlockHash, BlockHeight, CompletedSubtreeRoot, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
 };
 
 use super::{
@@ -20,8 +17,8 @@ use super::{
 
 const SUBTREE_ROOT_KEY_LEN: usize = 1 + 4;
 const SUBTREE_ROOT_VALUE_LEN: usize = 32 + 4 + 32;
-const SUBTREE_ROOT_SEQUENCE_DIGEST_VERSION: u16 = 2;
-const SUBTREE_ROOT_SEQUENCE_DIGEST_DOMAIN: &[u8] = b"zinder.canonical.subtree-root-sequence.v2\0";
+pub(super) const SUBTREE_ROOT_SEQUENCE_DIGEST_VERSION: u16 = 1;
+const SUBTREE_ROOT_SEQUENCE_DIGEST_DOMAIN: &[u8] = b"zinder.canonical.subtree-root-sequence.v1\0";
 type EncodedSubtreeRoot = ([u8; SUBTREE_ROOT_KEY_LEN], [u8; SUBTREE_ROOT_VALUE_LEN]);
 
 /// Caller-authenticated subtree-root fields before canonical block identity is attached.
@@ -110,30 +107,6 @@ impl PersistedSubtreeRootValidation {
     }
 }
 
-pub(super) fn required_subtree_root_ranges(
-    predecessor_tip_metadata: ChainTipMetadata,
-    build_tip_metadata: ChainTipMetadata,
-) -> Result<Vec<SubtreeRootRange>, CanonicalStoreError> {
-    let mut ranges = Vec::with_capacity(3);
-    for protocol in shielded_protocols() {
-        let start_index = predecessor_tip_metadata.completed_subtree_count(protocol);
-        let completed_at_tip = build_tip_metadata.completed_subtree_count(protocol);
-        let root_count = completed_at_tip.checked_sub(start_index).ok_or_else(|| {
-            CanonicalStoreError::subtree_root_sequence(format!(
-                "{protocol:?} completed-subtree count regressed from {start_index} to {completed_at_tip}"
-            ))
-        })?;
-        if let Some(max_entries) = NonZeroU32::new(root_count) {
-            ranges.push(SubtreeRootRange::new(
-                protocol,
-                SubtreeRootIndex::new(start_index),
-                max_entries,
-            ));
-        }
-    }
-    Ok(ranges)
-}
-
 pub(super) fn load_subtree_roots(
     db: &DB,
     build_plan: &CanonicalStoreBuildPlan,
@@ -148,10 +121,8 @@ pub(super) fn load_subtree_roots(
         })?;
         return Err(CanonicalStoreError::SubtreeRootLoadAlreadyLoaded);
     }
-    let required_ranges = required_subtree_root_ranges(
-        build_plan.history_predecessor().tip_metadata(),
-        block_evidence.tip_metadata,
-    )?;
+    let coverage = CanonicalSubtreeRootLoadCoverage::RetainedRange;
+    let required_ranges = build_plan.subtree_root_ranges(coverage, block_evidence.tip_metadata)?;
     let mut stager = SubtreeRootStager::new(db, &family, build_plan, subtree_roots.into_iter());
     for range in required_ranges {
         stager.stage_range(range)?;
@@ -171,10 +142,7 @@ pub(super) fn load_subtree_roots(
                 source,
             })?;
     }
-    complete_subtree_root_load(
-        &expected_rows,
-        CanonicalSubtreeRootLoadCoverage::RetainedRange,
-    )
+    complete_subtree_root_load(&expected_rows, coverage)
 }
 
 pub(super) fn load_complete_subtree_root_prefix(
@@ -191,8 +159,8 @@ pub(super) fn load_complete_subtree_root_prefix(
         })?;
         return Err(CanonicalStoreError::SubtreeRootLoadAlreadyLoaded);
     }
-    let required_ranges =
-        required_subtree_root_ranges(ChainTipMetadata::empty(), block_evidence.tip_metadata)?;
+    let coverage = CanonicalSubtreeRootLoadCoverage::CompletePrefix;
+    let required_ranges = build_plan.subtree_root_ranges(coverage, block_evidence.tip_metadata)?;
     let mut stager =
         CompleteSubtreeRootPrefixStager::new(db, &family, build_plan, subtree_roots.into_iter());
     for range in required_ranges {
@@ -213,10 +181,7 @@ pub(super) fn load_complete_subtree_root_prefix(
                 source,
             })?;
     }
-    complete_subtree_root_load(
-        &expected_rows,
-        CanonicalSubtreeRootLoadCoverage::CompletePrefix,
-    )
+    complete_subtree_root_load(&expected_rows, coverage)
 }
 
 fn complete_subtree_root_load(
@@ -263,7 +228,7 @@ pub(super) fn validate_persisted_subtree_root_family(
     let family = subtree_root_family(db)?;
     validate_subtree_root_digest_version(expected_evidence.sequence_digest_version)?;
     let required_ranges =
-        persisted_subtree_root_ranges(build_plan, block_evidence, expected_evidence.coverage)?;
+        build_plan.subtree_root_ranges(expected_evidence.coverage, block_evidence.tip_metadata)?;
     let mut iteration_options = ReadOptions::default();
     iteration_options.fill_cache(false);
     iteration_options.set_readahead_size(2 * 1024 * 1024);
@@ -349,20 +314,6 @@ fn validate_subtree_root_digest_version(
     Ok(())
 }
 
-fn persisted_subtree_root_ranges(
-    build_plan: &CanonicalStoreBuildPlan,
-    block_evidence: &CanonicalBlockLoadEvidence,
-    coverage: CanonicalSubtreeRootLoadCoverage,
-) -> Result<Vec<SubtreeRootRange>, CanonicalStoreError> {
-    let predecessor_metadata = match coverage {
-        CanonicalSubtreeRootLoadCoverage::RetainedRange => {
-            build_plan.history_predecessor().tip_metadata()
-        }
-        CanonicalSubtreeRootLoadCoverage::CompletePrefix => ChainTipMetadata::empty(),
-    };
-    required_subtree_root_ranges(predecessor_metadata, block_evidence.tip_metadata)
-}
-
 fn persisted_completion_block_matches(
     db: &DB,
     build_plan: &CanonicalStoreBuildPlan,
@@ -373,10 +324,10 @@ fn persisted_completion_block_matches(
     if artifact.completing_block_height > build_plan.build_tip().height {
         return Ok(false);
     }
-    let first_retained_height = build_plan.history_bounds().first_available_height();
+    let first_retained_height = build_plan.first_retained_height();
     if artifact.completing_block_height < first_retained_height {
         let predecessor = build_plan.history_predecessor().block_id;
-        return Ok(coverage == CanonicalSubtreeRootLoadCoverage::CompletePrefix
+        return Ok(coverage.includes_preceding_roots()
             && (artifact.completing_block_height < predecessor.height
                 || (artifact.completing_block_height == predecessor.height
                     && artifact.completing_block_hash == predecessor.hash)));
@@ -608,7 +559,7 @@ fn validate_complete_prefix_subtree_root(
             expected.protocol
         )));
     }
-    let first_retained_height = build_plan.history_bounds().first_available_height();
+    let first_retained_height = build_plan.first_retained_height();
     if subtree_root.completing_block_height < first_retained_height {
         let predecessor = build_plan.history_predecessor().block_id;
         if subtree_root.completing_block_height > predecessor.height {
@@ -655,7 +606,7 @@ fn validate_source_subtree_root(
             source_root.subtree_index.value()
         )));
     }
-    let first_height = build_plan.history_bounds().first_available_height();
+    let first_height = build_plan.first_retained_height();
     if source_root.completing_block_height < first_height
         || source_root.completing_block_height > build_plan.build_tip().height
     {
@@ -725,9 +676,16 @@ fn retained_block_hash_with_options(
 pub(super) fn encode_subtree_root_key(
     artifact: &SubtreeRootArtifact,
 ) -> [u8; SUBTREE_ROOT_KEY_LEN] {
+    encode_subtree_root_position(artifact.protocol, artifact.subtree_index)
+}
+
+pub(super) fn encode_subtree_root_position(
+    protocol: ShieldedProtocol,
+    index: SubtreeRootIndex,
+) -> [u8; SUBTREE_ROOT_KEY_LEN] {
     let mut key = [0; SUBTREE_ROOT_KEY_LEN];
-    key[0] = artifact.protocol.id();
-    key[1..].copy_from_slice(&artifact.subtree_index.value().to_be_bytes());
+    key[0] = protocol.id();
+    key[1..].copy_from_slice(&index.value().to_be_bytes());
     key
 }
 
@@ -770,16 +728,9 @@ pub(in crate::canonical_store) fn decode_subtree_root(
     ))
 }
 
-const fn shielded_protocols() -> [ShieldedProtocol; 3] {
-    [
-        ShieldedProtocol::Sapling,
-        ShieldedProtocol::Orchard,
-        ShieldedProtocol::Ironwood,
-    ]
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::canonical_store::stored_set::required_subtree_root_ranges;
     use std::{num::NonZeroU32, path::Path};
 
     use incrementalmerkletree::{
@@ -802,12 +753,12 @@ mod tests {
 
     use super::{
         CanonicalSubtreeRootLoadCoverage, decode_subtree_root, encode_subtree_root_key,
-        encode_subtree_root_value, required_subtree_root_ranges,
+        encode_subtree_root_value,
     };
     use crate::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
-        CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
-        RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+        CanonicalStoreBuildPlan, CanonicalStoreError, RawBlobRetention, RocksDbCanonicalBuilder,
+        RocksDbCanonicalStore, RocksDbResourceBudget,
     };
 
     const PREDECESSOR: BlockId =
@@ -1015,8 +966,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             temporary.path().join("canonical"),
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1031,6 +981,366 @@ mod tests {
             ),
             "unexpected reopened missing-root error: {reopened_error:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_requires_complete_subtree_prefix_from_the_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{CanonicalStoreRequirements, RocksDbCanonicalSecondary};
+
+        let temporary = tempdir()?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let frontiers = completed_sapling_tip_frontiers()?;
+        let reorg_policy = CanonicalReorgPolicy::new(100)?;
+        let pre_floor_root = complete_prefix_root(ShieldedProtocol::Sapling, 0, 0x51, PREDECESSOR);
+        let range = SubtreeRootRange::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            NonZeroU32::MIN,
+        );
+        for (label, coverage) in [
+            ("complete", CanonicalSubtreeRootLoadCoverage::CompletePrefix),
+            ("retained", CanonicalSubtreeRootLoadCoverage::RetainedRange),
+        ] {
+            let path = temporary.path().join(label);
+            let mut builder = loaded_checkpointed_builder_from(
+                &path,
+                frontiers.clone(),
+                frontiers.clone(),
+                frontiers.clone(),
+            )?;
+            match coverage {
+                CanonicalSubtreeRootLoadCoverage::CompletePrefix => {
+                    builder.load_complete_subtree_root_prefix([pre_floor_root.clone()])?;
+                }
+                CanonicalSubtreeRootLoadCoverage::RetainedRange => {
+                    builder.load_subtree_roots(std::iter::empty())?;
+                }
+            }
+            builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
+                BUILD_TIP,
+                BUILD_TIP.height.value(),
+                frontiers.clone(),
+            ))?;
+            let validated = builder.prepare_cold_certified_publication()?;
+            let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+                BUILD_TIP,
+                UnixTimestampMillis::new(1_750_000_000_001),
+            ))?;
+            let store = validated.publish_baseline(publication)?;
+            assert_eq!(store.stored_set().subtree_root_coverage(), Some(coverage));
+            let open = |suffix, requirements| {
+                RocksDbCanonicalSecondary::open_ready(
+                    &path,
+                    temporary.path().join(format!("{label}-{suffix}")),
+                    &activations,
+                    requirements,
+                    reorg_policy,
+                    RocksDbResourceBudget::for_local_tests(),
+                )
+            };
+            let requirements =
+                CanonicalStoreRequirements::default().from_height(FIRST_RETAINED.height);
+            let secondary = open("ordinary", requirements.clone())?;
+            assert_eq!(secondary.stored_set(), store.stored_set());
+            let prefix = open("prefix", requirements.with_complete_subtree_root_prefix());
+            match coverage {
+                CanonicalSubtreeRootLoadCoverage::CompletePrefix => {
+                    assert_eq!(
+                        prefix?.subtree_roots(range)?,
+                        std::slice::from_ref(&pre_floor_root)
+                    );
+                }
+                CanonicalSubtreeRootLoadCoverage::RetainedRange => {
+                    assert!(secondary.subtree_roots(range).is_err());
+                    assert!(matches!(
+                        prefix,
+                        Err(CanonicalStoreError::IncompleteSubtreeRootPrefix { .. })
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn retained_sapling_root(index: u32) -> SubtreeRootArtifact {
+        let mut hash = [0; 32];
+        hash[..4].copy_from_slice(&index.to_be_bytes());
+        SubtreeRootArtifact::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(index),
+            SubtreeRootHash::from_bytes(hash),
+            BUILD_TIP.height,
+            BUILD_TIP.hash,
+        )
+    }
+
+    fn published_retained_roots(
+        path: &Path,
+        completed: u32,
+    ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+        let predecessor = completed_sapling_tip_frontiers()?;
+        let tip = CommitmentTreeFrontiers::from_validated_parts(
+            Some(zinder_testkit::frontier_of_size(
+                ShieldedProtocol::Sapling,
+                completed * SUBTREE_LEAF_COUNT,
+            )?),
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Ironwood)),
+        )?;
+        let mut builder =
+            loaded_checkpointed_builder_from(path, predecessor.clone(), predecessor, tip.clone())?;
+        builder.load_subtree_roots((1..completed).map(|index| {
+            let root = retained_sapling_root(index);
+            super::CanonicalBuildSubtreeRoot {
+                protocol: root.protocol,
+                subtree_index: root.subtree_index,
+                root_hash: root.root_hash,
+                completing_block_height: root.completing_block_height,
+            }
+        }))?;
+        builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
+            BUILD_TIP,
+            BUILD_TIP.height.value(),
+            tip,
+        ))?;
+        let validated = builder.prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+            BUILD_TIP,
+            UnixTimestampMillis::new(1_750_000_000_001),
+        ))?;
+        Ok(validated.publish_baseline(publication)?)
+    }
+
+    #[test]
+    fn subtree_root_pages_batch_full_pages_and_get_partial_tails_in_index_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let page_size = zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST;
+        let temporary = tempdir()?;
+        let store =
+            published_retained_roots(&temporary.path().join("canonical"), 2 * page_size + 3)?;
+        for count in [
+            1,
+            page_size - 1,
+            page_size,
+            page_size + 1,
+            2 * page_size + 1,
+        ] {
+            let range = SubtreeRootRange::new(
+                ShieldedProtocol::Sapling,
+                SubtreeRootIndex::new(2),
+                NonZeroU32::new(count).ok_or("page length must be nonzero")?,
+            );
+            let before = subtree_read_counts(&store);
+            let page = store.subtree_roots(range)?;
+            let after = subtree_read_counts(&store);
+            assert_eq!(
+                page,
+                (2..2 + count)
+                    .map(retained_sapling_root)
+                    .collect::<Vec<_>>()
+            );
+            let tail = count % page_size;
+            assert_eq!(
+                std::array::from_fn(|i| after[i] - before[i]),
+                [
+                    u64::from(tail),
+                    u64::from(count / page_size),
+                    u64::from(count - tail),
+                    0,
+                    0,
+                    0
+                ]
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn subtree_root_pages_check_history_before_batching() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let page_size = zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST;
+        let temporary = tempdir()?;
+        let store = published_retained_roots(&temporary.path().join("canonical"), page_size + 1)?;
+        let unavailable = SubtreeRootRange::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            NonZeroU32::new(page_size).ok_or("page must be nonempty")?,
+        );
+        let before = subtree_read_counts(&store);
+        assert!(matches!(
+            store.subtree_roots(unavailable),
+            Err(CanonicalStoreError::SubtreeRootUnavailable {
+                protocol: ShieldedProtocol::Sapling,
+                subtree_index,
+            }) if subtree_index == SubtreeRootIndex::new(0)
+        ));
+        let after = subtree_read_counts(&store);
+        assert_eq!(
+            std::array::from_fn(|i| after[i] - before[i]),
+            [1, 0, 0, 0, 0, 0]
+        );
+
+        let prefix = retained_sapling_root(0);
+        let family = store
+            .bounded_open
+            .db
+            .cf_handle(super::SUBTREE_ROOT_COLUMN_FAMILY)
+            .ok_or("subtree-root family must exist")?;
+        store.bounded_open.db.put_cf(
+            &family,
+            encode_subtree_root_key(&prefix),
+            encode_subtree_root_value(&prefix),
+        )?;
+        let with_prefix = SubtreeRootRange::new(
+            ShieldedProtocol::Sapling,
+            prefix.subtree_index,
+            NonZeroU32::new(page_size + 1).ok_or("prefix and page must be nonempty")?,
+        );
+        let before = subtree_read_counts(&store);
+        let roots = store.subtree_roots(with_prefix)?;
+        let after = subtree_read_counts(&store);
+        assert_eq!(
+            roots,
+            (0..=page_size)
+                .map(retained_sapling_root)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::array::from_fn(|i| after[i] - before[i]),
+            [1, 1, u64::from(page_size), 0, 0, 0]
+        );
+        Ok(())
+    }
+
+    fn subtree_read_counts(store: &RocksDbCanonicalStore) -> [u64; 6] {
+        use rust_rocksdb::statistics::Ticker;
+        [
+            Ticker::NumberKeysRead,
+            Ticker::NumberMultigetCalls,
+            Ticker::NumberMultigetKeysRead,
+            Ticker::NumberDbSeek,
+            Ticker::NumberDbNext,
+            Ticker::NumberDbPrev,
+        ]
+        .map(|ticker| store.bounded_open.statistics.get_ticker_count(ticker))
+    }
+
+    #[test]
+    fn subtree_root_pages_return_the_first_fault_in_the_requested_pool()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let store = published_retained_roots(&temporary.path().join("canonical"), 3)?;
+        let family = store
+            .bounded_open
+            .db
+            .cf_handle(super::SUBTREE_ROOT_COLUMN_FAMILY)
+            .ok_or("subtree-root family must exist")?;
+        let first = encode_subtree_root_key(&retained_sapling_root(1));
+        store.bounded_open.db.put_cf(&family, first, [])?;
+        store
+            .bounded_open
+            .db
+            .delete_cf(&family, encode_subtree_root_key(&retained_sapling_root(2)))?;
+        let orchard = complete_prefix_root(ShieldedProtocol::Orchard, 2, 0x82, BUILD_TIP);
+        store.bounded_open.db.put_cf(
+            &family,
+            encode_subtree_root_key(&orchard),
+            encode_subtree_root_value(&orchard),
+        )?;
+        for limit in [
+            NonZeroU32::new(3).ok_or("page length must be nonzero")?,
+            NonZeroU32::MAX,
+        ] {
+            let range = |start| {
+                SubtreeRootRange::new(
+                    ShieldedProtocol::Sapling,
+                    SubtreeRootIndex::new(start),
+                    limit,
+                )
+            };
+            assert!(
+                matches!(store.subtree_roots(range(0)), Err(CanonicalStoreError::SubtreeRootUnavailable { protocol: ShieldedProtocol::Sapling, subtree_index }) if subtree_index == SubtreeRootIndex::new(0))
+            );
+            assert!(matches!(
+                store.subtree_roots(range(1)),
+                Err(CanonicalStoreError::SubtreeRootSequenceInvalid { .. })
+            ));
+            assert!(
+                matches!(store.subtree_roots(range(2)), Err(CanonicalStoreError::PublicationRefused { reason }) if reason == "advertised Sapling subtree root 2 is absent")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn subtree_root_pages_report_damage_in_the_full_page_before_its_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let page_size = zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST;
+        let temporary = tempdir()?;
+        let store = published_retained_roots(&temporary.path().join("canonical"), page_size + 2)?;
+        let family = store
+            .bounded_open
+            .db
+            .cf_handle(super::SUBTREE_ROOT_COLUMN_FAMILY)
+            .ok_or("subtree-root family must exist")?;
+        let last = retained_sapling_root(page_size);
+        let tail = retained_sapling_root(page_size + 1);
+        let db = &store.bounded_open.db;
+        db.delete_cf(&family, encode_subtree_root_key(&last))?;
+        db.put_cf(&family, encode_subtree_root_key(&tail), [])?;
+        let range = SubtreeRootRange::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(1),
+            NonZeroU32::new(page_size + 1).ok_or("full page and tail must be nonempty")?,
+        );
+        assert!(
+            matches!(store.subtree_roots(range), Err(CanonicalStoreError::PublicationRefused { reason }) if reason == format!("advertised Sapling subtree root {page_size} is absent"))
+        );
+        db.put_cf(
+            &family,
+            encode_subtree_root_key(&last),
+            encode_subtree_root_value(&last),
+        )?;
+        assert!(matches!(
+            store.subtree_roots(range),
+            Err(CanonicalStoreError::SubtreeRootSequenceInvalid { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn subtree_root_pages_preserve_saturating_indices() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let store = published_retained_roots(&temporary.path().join("canonical"), 2)?;
+        let family = store
+            .bounded_open
+            .db
+            .cf_handle(super::SUBTREE_ROOT_COLUMN_FAMILY)
+            .ok_or("subtree-root family must exist")?;
+        let penultimate = retained_sapling_root(u32::MAX - 1);
+        let last = retained_sapling_root(u32::MAX);
+        for root in [&penultimate, &last] {
+            store.bounded_open.db.put_cf(
+                &family,
+                encode_subtree_root_key(root),
+                encode_subtree_root_value(root),
+            )?;
+        }
+        for count in [3, zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST] {
+            let range = SubtreeRootRange::new(
+                ShieldedProtocol::Sapling,
+                penultimate.subtree_index,
+                NonZeroU32::new(count).ok_or("page length must be nonzero")?,
+            );
+            let roots = store.subtree_roots(range)?;
+            assert_eq!(roots.len(), usize::try_from(count)?);
+            assert_eq!(roots.first(), Some(&penultimate));
+            assert!(roots.iter().skip(1).all(|root| root == &last));
+        }
         Ok(())
     }
 
@@ -1103,12 +1413,11 @@ mod tests {
                 predecessor_frontiers,
             ),
             BUILD_TIP,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1176,7 +1485,6 @@ mod tests {
             replay_envelope,
             tip_metadata,
             tree_state_checkpoint: None,
-            block_final_note_commitment_roots: None,
             transaction_blobs: Vec::new(),
             block_blob: None,
             facts,

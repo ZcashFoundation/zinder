@@ -1,0 +1,63 @@
+{
+  "network": "test",
+  "tip": 4644091,
+  "tip_hash": "000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+  "birthday": 4624102,
+  "sapling_roots": [
+    [
+      "1f8322ef806eb2430dc4a7a41c1b344bea5be946efc7b4349c1c9edb14ff9d39",
+      490074,
+      "00148c6cb01f1f76182297e3464dd8d0d1edc9fb7c63e3aef4940d59c32c2bea"
+    ],
+    [
+      "935ce124c4a0e082b89b202c9311808e72e8269b56bd86ddb367ffe82029293e",
+      3008820,
+      "002435fce58671ef7e09f7d89e9df327f3367546fd65c7ae69a04e5ff0cee54b"
+    ],
+    [
+      "b5a29ce44fa0c86b45faa10078c343c3de74f8f7b47a9c3d116b4c9569a0d608",
+      3115393,
+      "000933ffc539ac9799b763e04d72dda25186bb434273e33056a2480fb54d61aa"
+    ],
+    [
+      "e746b0f72364e2dda94aafcfcd21f5e6f5a1d2b3f15db64910eba0acfe1e180c",
+      3381108,
+      "00309d919f9615ba8d1ea7c9f4987e1c96c97debd1ee268d2be613fb087b9869"
+    ],
+    [
+      "dd49c2114699f3cdcbf7b573cf9fb0782b4d893bf068cccf83d7b69a63ad2716",
+      3724064,
+      "0045818707226318dc8350f6f22cf6efcc9b2cfca62243afcbd66fd4b3f7c3f7"
+    ],
+    [
+      "f270af9347a8d41a1a7fe942078db7839ff7fab8c5ae3faf0623c314d1b37433",
+      4254253,
+      "0015ab1ad12e8742ce1246419268d5e16af34a256b5452b32852d0f06d374fd1"
+    ]
+  ],
+  "cli_revision": "81d799775f11e882896e8710e8af12d6d4d29a41",
+  "cli_sha256": "0eb8c60c097058f9750caaafcc27e9e3692a9b6cff6927f92e684784161ea79a",
+  "expected_outputs": 143049,
+  "expected_confirmed_zat": {
+    "ironwood": 275000,
+    "orchard": 0,
+    "sapling": 0,
+    "transparent": 0
+  },
+  "history_sha256": "3ea8b142250a8961e1ecbdbdcc58371800aedb65c6813f075b2137eaaf372ede",
+  "ztreamer_witness": {
+    "version": "0.2.0",
+    "witnesses_sha256": "d96f8a22c55aa94d8c24d7be7d375c96b5e988ece9a2ab1024f46929cc851564",
+    "network": "main",
+    "row": {
+      "height": 558822,
+      "sapling_root": "754bb593ea42d231a7ddf367640f09bbf59dc00f2c1d2003cc340e0c016b5b13",
+      "zebra_display_hex_as_bytes": "00000000008f9ac0636d81dc795cb0f5495a6fd074e815a19e199f0da49151fe",
+      "ztreamer_bytes": "fe5191a40d9f199ea115e874d06f5a49f5b05c79dc816d63c09a8f0000000000"
+    },
+    "source_rows": 1129,
+    "reversed_rows": 1129,
+    "prior_wallet_periods_with_subtree_calls": 0
+  },
+  "expected_spendable_zat": 275000
+}

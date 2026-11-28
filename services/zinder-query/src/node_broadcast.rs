@@ -1,6 +1,7 @@
 //! Transaction broadcast through the ordered node list, with every endpoint
 //! verified on first contact.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
@@ -12,15 +13,15 @@ use tokio::{
 };
 use zebra_chain::{serialization::ZcashDeserializeInto as _, transaction::Transaction};
 use zinder_core::{
-    BlockHeight, BlockId, BroadcastAccepted, BroadcastRejected, BroadcastRejectionReason,
-    ChainEpochId, ConsensusBranchId, NetworkUpgradeActivations, RawTransactionBytes, StandardFee,
+    BlockHeight, BroadcastAccepted, BroadcastRejected, BroadcastRejectionReason, ChainEpochId,
+    ConsensusBranchId, NetworkUpgradeActivations, RawTransactionBytes, StandardFee,
     TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
     BroadcastNodeProbe, NodeCapability, NodeSet, NodeSetSwitch, NodeTarget, SourceError,
     SourceFailureClass, TransactionBroadcaster, ZebraJsonRpcSource,
 };
-use zinder_store::CanonicalActivationSchedule;
+use zinder_store::{CanonicalActivationSchedule, CanonicalEventFence};
 
 use crate::{
     UpstreamNodeCapabilities, WalletServingPairSlot, WalletServingReadPair,
@@ -34,7 +35,8 @@ const EXCLUSION_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
 /// Longest an endpoint stays excluded before it is verified again.
 const EXCLUSION_MAX_BACKOFF: Duration = Duration::from_mins(5);
 
-/// Longest an endpoint stays verified against an earlier basis.
+/// Longest an endpoint stays verified against an earlier basis. Light-wallet node
+/// verification uses the same bound for capability and schedule evidence at a fixed URL.
 ///
 /// It counts from when the serving pair was first seen on a new basis, or
 /// from the start of an inconclusive repeat against the same basis, and
@@ -208,7 +210,7 @@ impl<Source> OrderedBroadcaster<Source> {
                 .is_some_and(|verification| {
                     !verification.table_agrees_through(
                         pair.network_upgrade_activations(),
-                        broadcast_height(pair),
+                        broadcast_height(pair.canonical_fence()),
                     )
                 })
     }
@@ -225,6 +227,10 @@ impl<Source> OrderedBroadcaster<Source> {
 }
 
 impl OrderedBroadcaster<ZebraJsonRpcSource> {
+    pub(crate) fn primary_source(&self) -> Option<&ZebraJsonRpcSource> {
+        self.inner.nodes.endpoint(0)
+    }
+
     /// Builds the JSON-RPC source of `primary`, position 0, and of every
     /// fallback target after it, without contacting any node.
     ///
@@ -326,7 +332,10 @@ where
             if !self.inner.verifications.is_verified(position) {
                 continue;
             }
-            let outcome = source.broadcast_transaction(raw_transaction.clone()).await;
+            let outcome = zinder_runtime::trace_node_rpc(
+                source.broadcast_transaction(raw_transaction.clone()),
+            )
+            .await;
             record_attempt(position, &outcome);
             match outcome {
                 Ok(TransactionBroadcastOutcome::Rejected(rejected))
@@ -347,6 +356,12 @@ where
                     attempt.pass_over(PassOver::NodeUnreachable);
                     attempt.unreachable = Some(error);
                 }
+                Err(error)
+                    if error.upstream_classification() == SourceFailureClass::NodeRateLimited =>
+                {
+                    attempt.pass_over(PassOver::NodeRateLimited);
+                    attempt.rate_limited = Some(error);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -356,8 +371,9 @@ where
     /// Reads the recommended fee from the first verified endpoint, in
     /// preference order, that answers.
     ///
-    /// Moves to the next endpoint when one is unreachable or does not
-    /// implement `getstandardfee`, and leaves the preferred endpoint in place.
+    /// Moves to the next endpoint when one is unreachable, refuses the call
+    /// with HTTP 429, or does not implement `getstandardfee`, and leaves the
+    /// preferred endpoint in place.
     /// Fails as unreachable when an endpoint was unreachable and none
     /// answered. Also fails as unreachable when an endpoint still awaits its
     /// first-contact verification and none answered, because that endpoint
@@ -381,7 +397,10 @@ where
             match source.standard_fee().await {
                 Ok(fee) => return Ok(fee),
                 Err(error)
-                    if error.upstream_classification() == SourceFailureClass::NodeUnreachable =>
+                    if matches!(
+                        error.upstream_classification(),
+                        SourceFailureClass::NodeUnreachable | SourceFailureClass::NodeRateLimited
+                    ) =>
                 {
                     unreachable = Some(error);
                 }
@@ -436,6 +455,7 @@ impl<Source> OrderedBroadcaster<Source> {
 #[derive(Clone, Copy, Debug)]
 enum PassOver {
     NodeUnreachable,
+    NodeRateLimited,
     BadConsensusBranch,
 }
 
@@ -443,6 +463,7 @@ impl PassOver {
     const fn label(self) -> &'static str {
         match self {
             Self::NodeUnreachable => "node_unreachable",
+            Self::NodeRateLimited => "node_rate_limited",
             Self::BadConsensusBranch => "bad_consensus_branch",
         }
     }
@@ -455,6 +476,9 @@ struct BroadcastAttempt {
     /// The last failure of an unreachable endpoint. Such an endpoint may have
     /// received the transaction before it failed.
     unreachable: Option<SourceError>,
+    /// The last HTTP 429 refusal. The refusing endpoint did not read the
+    /// transaction, so the refusal is retryable.
+    rate_limited: Option<SourceError>,
     branch_rejection: Option<BroadcastRejected>,
 }
 
@@ -497,9 +521,11 @@ impl BroadcastAttempt {
 
     /// Ends a broadcast that no endpoint answered with anything other than a
     /// consensus-branch rejection. An unreachable endpoint may have accepted
-    /// the transaction, so its failure takes precedence over a rejection.
+    /// the transaction, so its failure takes precedence over a rejection. A
+    /// rate-limited endpoint may accept the transaction on a retry, so its
+    /// refusal also takes precedence over a rejection.
     fn exhausted(self) -> Result<TransactionBroadcastOutcome, SourceError> {
-        if let Some(error) = self.unreachable {
+        if let Some(error) = self.unreachable.or(self.rate_limited) {
             return Err(error);
         }
         self.branch_rejection
@@ -544,7 +570,10 @@ async fn submitted_transaction_id(raw_transaction: RawTransactionBytes) -> Optio
     clippy::wildcard_enum_match_arm,
     reason = "non-exhaustive broadcast outcomes from zinder-core are counted as unknown"
 )]
-fn record_attempt(position: usize, outcome: &Result<TransactionBroadcastOutcome, SourceError>) {
+pub(crate) fn record_attempt(
+    position: usize,
+    outcome: &Result<TransactionBroadcastOutcome, SourceError>,
+) {
     let outcome = match outcome {
         Ok(TransactionBroadcastOutcome::Accepted(_)) => "accepted",
         Ok(TransactionBroadcastOutcome::Duplicate(_)) => "duplicate",
@@ -653,7 +682,7 @@ impl EndpointVerifications {
 
     /// Captures the evidence a verification checks against and tracks it.
     fn target(&self, pair_slot: &WalletServingPairSlot) -> Arc<VerificationTarget> {
-        let target = Arc::new(VerificationTarget::of(&pair_slot.capture()));
+        let target = Arc::new(VerificationTarget::of(&pair_slot.capture_ephemeral()));
         self.track(&target);
         target
     }
@@ -676,7 +705,11 @@ impl EndpointVerifications {
         if let Some(settled) = verification.settled(target) {
             return settled;
         }
-        let outcome = verify_node_endpoint(source, target).await;
+        // The attempt lock is shared with readiness probes, so the attempt
+        // calls through the endpoint's verification view, never behind
+        // forwarded calls that hold its shared call slots.
+        let view = source.verification_view();
+        let outcome = verify_node_endpoint(view.as_ref().unwrap_or(source), target).await;
         let admission = self.admission.lock();
         verification.record(outcome, target, admission.as_deref())
     }
@@ -1009,45 +1042,89 @@ pub(crate) struct VerificationBasis {
 
 impl VerificationBasis {
     pub(crate) fn of(pair: &WalletServingReadPair) -> Self {
-        Self {
-            schedule_revision: pair
-                .canonical()
+        Self::new(
+            pair.canonical()
                 .network_upgrade_schedule()
                 .map(CanonicalActivationSchedule::revision),
-            broadcast_branch: pair
-                .network_upgrade_activations()
-                .consensus_branch_id_at(broadcast_height(pair)),
+            pair.network_upgrade_activations(),
+            broadcast_height(pair.canonical_fence()),
+        )
+    }
+
+    fn new(
+        schedule_revision: Option<u64>,
+        activations: &NetworkUpgradeActivations,
+        height: BlockHeight,
+    ) -> Self {
+        Self {
+            schedule_revision,
+            broadcast_branch: activations.consensus_branch_id_at(height),
         }
     }
 }
 
 /// Returns the height of the block a transaction broadcast now targets, the
 /// one after the pair's visible tip.
-fn broadcast_height(pair: &WalletServingReadPair) -> BlockHeight {
-    let tip_height = pair.canonical_fence().visible_tip().height;
+fn broadcast_height(fence: CanonicalEventFence) -> BlockHeight {
+    let tip_height = fence.visible_tip().height;
     tip_height.next().unwrap_or(tip_height)
 }
 
 /// The serving-pair evidence a verification checks endpoints against and a
 /// broadcast checks kept tables against, captured without retaining the pair
 /// across node calls.
-struct VerificationTarget {
+pub(crate) struct VerificationTarget {
     basis: VerificationBasis,
     admitted_activations: NetworkUpgradeActivations,
     broadcast_height: BlockHeight,
-    chain_epoch_id: ChainEpochId,
-    visible_tip: BlockId,
+    fence: CanonicalEventFence,
     captured_at: Instant,
 }
 
 impl VerificationTarget {
+    pub(crate) fn from_canonical(reader: &dyn crate::CanonicalReader) -> Result<Self, SourceError> {
+        let schedule =
+            reader
+                .network_upgrade_schedule()
+                .ok_or(SourceError::SourceProtocolMismatch {
+                    reason: "canonical reader has no admitted upgrade schedule",
+                })?;
+        Ok(Self::new(
+            reader.event_fence(),
+            schedule.activations(),
+            Some(schedule.revision()),
+        ))
+    }
+
+    pub(crate) fn still_served_by(&self, reader: &dyn crate::CanonicalReader) -> bool {
+        self.fence == reader.event_fence()
+            && self.basis.schedule_revision
+                == reader
+                    .network_upgrade_schedule()
+                    .map(CanonicalActivationSchedule::revision)
+    }
+
     fn of(pair: &WalletServingReadPair) -> Self {
+        Self::new(
+            pair.canonical_fence(),
+            pair.network_upgrade_activations(),
+            pair.canonical()
+                .network_upgrade_schedule()
+                .map(CanonicalActivationSchedule::revision),
+        )
+    }
+
+    fn new(
+        fence: CanonicalEventFence,
+        activations: &NetworkUpgradeActivations,
+        revision: Option<u64>,
+    ) -> Self {
+        let broadcast_height = broadcast_height(fence);
         Self {
-            basis: VerificationBasis::of(pair),
-            admitted_activations: pair.network_upgrade_activations().clone(),
-            broadcast_height: broadcast_height(pair),
-            chain_epoch_id: pair.canonical_fence().chain_epoch_id(),
-            visible_tip: pair.canonical_fence().visible_tip(),
+            basis: VerificationBasis::new(revision, activations, broadcast_height),
+            admitted_activations: activations.clone(),
+            broadcast_height,
+            fence,
             captured_at: Instant::now(),
         }
     }
@@ -1062,7 +1139,7 @@ impl VerificationTarget {
     /// within one epoch by schedule revision, since a writer restart can
     /// admit a revision without moving the chain epoch.
     fn publication_order(&self) -> (ChainEpochId, Option<u64>) {
-        (self.chain_epoch_id, self.basis.schedule_revision)
+        (self.fence.chain_epoch_id(), self.basis.schedule_revision)
     }
 }
 
@@ -1106,6 +1183,20 @@ async fn verify_node_endpoint(
     source: &impl BroadcastNodeProbe,
     target: &VerificationTarget,
 ) -> Result<PassedVerification, VerificationFailure> {
+    let passed = verify_node_schedule(source, target).await?;
+    verify_served_tip(source, target)
+        .await
+        .map_err(VerificationFailure::Inconclusive)?;
+    Ok(passed)
+}
+
+/// Checks that the endpoint lists `sendrawtransaction` and that its
+/// activation table agrees with the writer-admitted schedule through the
+/// height after the served tip, without checking the tip itself.
+async fn verify_node_schedule(
+    source: &impl BroadcastNodeProbe,
+    target: &VerificationTarget,
+) -> Result<PassedVerification, VerificationFailure> {
     let capabilities = source
         .probe_capabilities()
         .await
@@ -1124,21 +1215,387 @@ async fn verify_node_endpoint(
             VerificationRefusal::ScheduleMismatch,
         ));
     }
-    // A tip block replaced by a reorg the pair has not published yet also
-    // fails here, so this refusal is retried on the next probe round.
-    if !source
-        .holds_block(target.visible_tip)
-        .await
-        .map_err(VerificationFailure::Inconclusive)?
-    {
-        return Err(VerificationFailure::Inconclusive(
-            SourceError::SourceProtocolMismatch {
-                reason: "node best chain holds another block at the served tip height",
-            },
-        ));
-    }
     Ok(PassedVerification {
         capabilities: UpstreamNodeCapabilities::from_probed(capabilities),
         node_activations,
     })
 }
+
+async fn verify_served_tip(
+    source: &impl BroadcastNodeProbe,
+    target: &VerificationTarget,
+) -> Result<(), SourceError> {
+    if source.holds_block(target.fence.visible_tip()).await? {
+        Ok(())
+    } else {
+        Err(served_tip_mismatch())
+    }
+}
+
+fn served_tip_mismatch() -> SourceError {
+    SourceError::SourceProtocolMismatch {
+        reason: "node best chain holds another block at the served tip height",
+    }
+}
+
+/// Verification of the one node a light-wallet reader forwards reads to.
+///
+/// The schedule check confirms that the node lists `sendrawtransaction` and
+/// that its activation table agrees with the writer-admitted schedule through
+/// the height after the served tip. A pass holds for
+/// [`STALE_VERIFICATION_GRACE`] against the same basis, and concurrent
+/// callers share one check. An inconclusive repeat, such as an unreachable,
+/// rate-limited, or lagging node, fails the callers that waited on it but
+/// never discards the earlier pass or forces later callers into a full
+/// verification of their own.
+///
+/// The served-tip check confirms that the node's best chain holds a block.
+/// Concurrent callers checking the same block share one `getblockhash` call,
+/// and no answer is reused once that call returns.
+#[derive(Default)]
+pub(crate) struct LightWalletNodeVerification {
+    schedule: Mutex<LightWalletNodeVerificationSchedule>,
+    failed_attempts: AtomicU64,
+    tip_checks: TipChecks,
+}
+
+#[derive(Default)]
+enum LightWalletNodeVerificationSchedule {
+    #[default]
+    Unverified,
+    Refused(VerificationBasis, VerificationRefusal),
+    Verified(VerificationBasis, NetworkUpgradeActivations, Instant),
+}
+
+impl LightWalletNodeVerification {
+    /// Verifies the node's capabilities and activation table against
+    /// `target`, reusing a pass against the same basis for up to
+    /// [`STALE_VERIFICATION_GRACE`].
+    pub(crate) async fn verify_schedule_and_capabilities(
+        &self,
+        source: &impl BroadcastNodeProbe,
+        target: &VerificationTarget,
+    ) -> Result<(), SourceError> {
+        // Callers already waiting on a failed attempt share its outcome. A caller
+        // arriving after it can retry even while earlier waiters are draining.
+        let observed_failures = self.failed_attempts.load(Ordering::Acquire);
+        let mut schedule = self.schedule.lock().await;
+        if matches!(
+            &*schedule,
+            LightWalletNodeVerificationSchedule::Verified(basis, activations, checked)
+                if *basis == target.basis
+                    && checked.elapsed() < STALE_VERIFICATION_GRACE
+                    && target.agrees_with(activations)
+        ) {
+            drop(schedule);
+            return Ok(());
+        }
+
+        if self.failed_attempts.load(Ordering::Relaxed) != observed_failures {
+            let shared = match *schedule {
+                LightWalletNodeVerificationSchedule::Refused(basis, refusal)
+                    if basis == target.basis =>
+                {
+                    refusal.error()
+                }
+                LightWalletNodeVerificationSchedule::Unverified
+                | LightWalletNodeVerificationSchedule::Refused(..)
+                | LightWalletNodeVerificationSchedule::Verified(..) => {
+                    SourceError::NodeUnavailable {
+                        reason: "concurrent verification did not confirm the served schedule"
+                            .to_owned(),
+                    }
+                }
+            };
+            drop(schedule);
+            return Err(shared);
+        }
+
+        // The schedule lock is held across these calls and readiness probes
+        // wait on it, so they go through the node's verification view, never
+        // behind forwarded calls that hold its shared call slots.
+        let view = source.verification_view();
+        let outcome = match verify_node_schedule(view.as_ref().unwrap_or(source), target).await {
+            Ok(evidence) => {
+                *schedule = LightWalletNodeVerificationSchedule::Verified(
+                    target.basis,
+                    evidence.node_activations,
+                    Instant::now(),
+                );
+                Ok(())
+            }
+            Err(failure) => {
+                self.failed_attempts.fetch_add(1, Ordering::Release);
+                match failure {
+                    VerificationFailure::Refused(refusal) => {
+                        *schedule =
+                            LightWalletNodeVerificationSchedule::Refused(target.basis, refusal);
+                        Err(refusal.error())
+                    }
+                    VerificationFailure::Inconclusive(error) => Err(error),
+                }
+            }
+        };
+        drop(schedule);
+        outcome
+    }
+
+    /// Verifies the schedule as [`Self::verify_schedule_and_capabilities`]
+    /// does, then that the node's best chain holds the served tip of
+    /// `target`.
+    pub(crate) async fn verify<Source>(
+        &self,
+        source: &Source,
+        target: &VerificationTarget,
+    ) -> Result<(), SourceError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        self.verify_schedule_and_capabilities(source, target)
+            .await?;
+        self.verify_served_tip(source, target).await
+    }
+
+    /// Verifies the schedule as [`Self::verify`] does, then checks the served
+    /// tip through `source` alone, without joining a check another caller
+    /// started.
+    pub(crate) async fn verify_with_own_tip_check(
+        &self,
+        source: &impl BroadcastNodeProbe,
+        target: &VerificationTarget,
+    ) -> Result<(), SourceError> {
+        self.verify_schedule_and_capabilities(source, target)
+            .await?;
+        verify_served_tip(source, target).await
+    }
+
+    /// Verifies that the node's best chain holds the served tip of `target`,
+    /// sharing the call with concurrent callers checking the same block.
+    pub(crate) async fn verify_served_tip<Source>(
+        &self,
+        source: &Source,
+        target: &VerificationTarget,
+    ) -> Result<(), SourceError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        if self.holds_block(source, target.fence.visible_tip()).await? {
+            Ok(())
+        } else {
+            Err(served_tip_mismatch())
+        }
+    }
+
+    /// Verifies that the node's best chain holds the served tip of `target`,
+    /// charging one `check.kind` slot of `check.limit` inside the shared tip
+    /// check.
+    pub(crate) async fn verify_served_tip_admitted<Source>(
+        &self,
+        source: &Source,
+        target: &VerificationTarget,
+        check: AdmittedTipCheck<'_>,
+    ) -> Result<(), crate::QueryError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        if self
+            .holds_block_admitted(source, target.fence.visible_tip(), check)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(crate::QueryError::Node(served_tip_mismatch()))
+        }
+    }
+
+    /// Returns whether the node's best chain holds `block`, sharing one
+    /// `getblockhash` call with concurrent callers asking about the same
+    /// block. The answer is not kept after the call returns.
+    pub(crate) async fn holds_block<Source>(
+        &self,
+        source: &Source,
+        block: zinder_core::BlockId,
+    ) -> Result<bool, SourceError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        self.tip_checks.holds_block(source, block).await
+    }
+
+    /// Returns whether the node's best chain holds `block`, charging one
+    /// `check.kind` slot of `check.limit` inside the shared check.
+    pub(crate) async fn holds_block_admitted<Source>(
+        &self,
+        source: &Source,
+        block: zinder_core::BlockId,
+        check: AdmittedTipCheck<'_>,
+    ) -> Result<bool, crate::QueryError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        self.tip_checks
+            .holds_block_admitted(source, block, check)
+            .await
+    }
+}
+
+/// Admission parameters for a foreground served-tip check.
+#[derive(Clone, Copy)]
+pub(crate) struct AdmittedTipCheck<'a> {
+    pub(crate) limit: &'a crate::ForwardedReadLimit,
+    pub(crate) kind: crate::ForwardedReadKind,
+    pub(crate) deadline: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum TipCheckKey {
+    Unadmitted(zinder_core::BlockId),
+    Admitted(zinder_core::BlockId, crate::ForwardedReadKind),
+}
+
+#[derive(Clone)]
+enum TipCheckError {
+    Refused(crate::ForwardedReadRefused),
+    Node(Arc<SourceError>),
+}
+
+impl TipCheckError {
+    fn into_query_error(self) -> crate::QueryError {
+        match self {
+            Self::Refused(refused) => refused.into(),
+            Self::Node(error) => {
+                crate::QueryError::Node(crate::forwarded_read::owned_source_error(error))
+            }
+        }
+    }
+
+    fn into_source_error(self) -> SourceError {
+        match self {
+            Self::Refused(refused) => SourceError::NodeUnavailable {
+                reason: refused.to_string(),
+            },
+            Self::Node(error) => crate::forwarded_read::owned_source_error(error),
+        }
+    }
+}
+
+type TipCheck = futures_util::future::BoxFuture<'static, Result<bool, TipCheckError>>;
+
+/// Running checks by key, each with the number that tells it apart from a
+/// later check of the same key, and the next such number.
+type RunningTipChecks = (
+    std::collections::HashMap<TipCheckKey, (u64, futures_util::future::WeakShared<TipCheck>)>,
+    u64,
+);
+
+/// Served-tip checks in progress, by key.
+#[derive(Default)]
+struct TipChecks {
+    running: Arc<parking_lot::Mutex<RunningTipChecks>>,
+}
+
+impl TipChecks {
+    async fn holds_block<Source>(
+        &self,
+        source: &Source,
+        block: zinder_core::BlockId,
+    ) -> Result<bool, SourceError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        let source = source.clone();
+        self.run(TipCheckKey::Unadmitted(block), move || async move {
+            source
+                .holds_block(block)
+                .await
+                .map_err(|error| TipCheckError::Node(Arc::new(error)))
+        })
+        .await
+        .map_err(TipCheckError::into_source_error)
+    }
+
+    async fn holds_block_admitted<Source>(
+        &self,
+        source: &Source,
+        block: zinder_core::BlockId,
+        check: AdmittedTipCheck<'_>,
+    ) -> Result<bool, crate::QueryError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        let source = source.clone();
+        let limit = check.limit.clone();
+        let kind = check.kind;
+        let deadline = check.deadline;
+        self.run(TipCheckKey::Admitted(block, kind), move || async move {
+            limit
+                .node_call(kind, deadline, source.holds_block(block))
+                .await
+                .map_err(TipCheckError::Refused)?
+                .map_err(|error| TipCheckError::Node(Arc::new(error)))
+        })
+        .await
+        .map_err(TipCheckError::into_query_error)
+    }
+
+    async fn run<Check, Started>(
+        &self,
+        key: TipCheckKey,
+        start: Check,
+    ) -> Result<bool, TipCheckError>
+    where
+        Check: FnOnce() -> Started,
+        Started: Future<Output = Result<bool, TipCheckError>> + Send + 'static,
+    {
+        use futures_util::FutureExt as _;
+
+        let check = {
+            let mut running = self.running.lock();
+            let joined = running.0.get(&key).and_then(|(_, weak)| weak.upgrade());
+            let check = joined.unwrap_or_else(|| {
+                let flight = running.1;
+                running.1 += 1;
+                let registry = Arc::clone(&self.running);
+                let started = start();
+                let check = async move {
+                    let held = started.await;
+                    // Leave the running set before answering, so a caller
+                    // arriving after this answer makes its own call.
+                    let mut running = registry.lock();
+                    if running
+                        .0
+                        .get(&key)
+                        .is_some_and(|(current, _)| *current == flight)
+                    {
+                        running.0.remove(&key);
+                    }
+                    drop(running);
+                    held
+                }
+                .boxed()
+                .shared();
+                running.0.retain(|_, (_, weak)| weak.upgrade().is_some());
+                if let Some(weak) = check.downgrade() {
+                    running.0.insert(key, (flight, weak));
+                }
+                check
+            });
+            drop(running);
+            check
+        };
+        check.await
+    }
+
+    #[cfg(test)]
+    fn running(&self) -> usize {
+        self.running
+            .lock()
+            .0
+            .values()
+            .filter(|(_, weak)| weak.upgrade().is_some())
+            .count()
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -9,9 +9,10 @@ mod shutdown_stream;
 
 use tonic::Status;
 use tonic_types::{ErrorDetails, FieldViolation, PreconditionViolation};
-use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
 use zinder_proto::wire::canonical_history_unavailable_status;
 use zinder_proto::{BoundaryError, status_with_reason};
+use zinder_runtime::RetryPushback;
+use zinder_source::SourceError;
 use zinder_store::status_from_store_error;
 
 use crate::QueryError;
@@ -28,9 +29,10 @@ pub use native::{
     build_transparent_unspent_outputs_header, build_wallet_server_info, chain_events_response,
     chain_value_pools_at_tip_response, compact_block_response, compact_blocks_in_range_header,
     compact_blocks_in_range_item, full_block_response, latest_tree_state_checkpoint_response,
-    network_upgrade_activations_response, subtree_roots_response, transaction_response,
-    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
-    transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
+    network_upgrade_activations_response, parse_receivable_transparent_address,
+    subtree_roots_response, transaction_response, transparent_address_tx_ids_response,
+    transparent_address_unspent_outputs_response, transparent_outpoint_spend_status_response,
+    tree_state_at_response, visible_tip_block_response,
 };
 pub use request_limits::WALLET_QUERY_FIELD_LIMITS;
 
@@ -57,11 +59,23 @@ pub fn status_from_query_error(error: &QueryError) -> Status {
             precondition_failure_details(error),
         );
     }
-    status_with_reason(
+    let status = status_with_reason(
         error.error_reason(),
         error.to_string(),
         typed_detail_for(error),
-    )
+    );
+    if matches!(
+        error,
+        QueryError::BroadcastBudgetExhausted { .. }
+            | QueryError::CompactBlockStreamLimitReached { .. }
+            | QueryError::ForwardedReadLimitReached { .. }
+            | QueryError::Node(SourceError::NodeRateLimited { .. })
+            | QueryError::TreeStateReplayLimitReached { .. }
+    ) {
+        RetryPushback::Backoff.apply(status)
+    } else {
+        status
+    }
 }
 
 #[allow(
@@ -79,8 +93,7 @@ fn typed_detail_for(error: &QueryError) -> ErrorDetails {
         | QueryError::UnsupportedShieldedProtocol { .. }
         | QueryError::TransparentOutpointCountOutOfRange { .. }
         | QueryError::BroadcastTransactionTooLarge { .. } => bad_request_details(error),
-        QueryError::TransactionBroadcastDisabled
-        | QueryError::MaterializedViewUnavailable { .. }
+        QueryError::MaterializedViewUnavailable { .. }
         | QueryError::EndpointCapabilityUnavailable { .. }
         | QueryError::ChainEventCursorExpired { .. }
         | QueryError::ChainEpochPinUnavailable { .. } => precondition_failure_details(error),
@@ -168,13 +181,6 @@ fn bad_request_details(error: &QueryError) -> ErrorDetails {
 )]
 fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
     match error {
-        QueryError::TransactionBroadcastDisabled => {
-            ErrorDetails::with_precondition_failure_violation(
-                "TRANSACTION_BROADCAST_DISABLED",
-                WALLET_BROADCAST_TRANSACTION_V1,
-                "transaction broadcast is not configured for this deployment",
-            )
-        }
         QueryError::MaterializedViewUnavailable { capability } => {
             ErrorDetails::with_precondition_failure_violation(
                 "MATERIALIZED_VIEW_UNAVAILABLE",

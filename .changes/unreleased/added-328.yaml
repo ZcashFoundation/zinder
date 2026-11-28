@@ -1,6 +1,0 @@
-kind: added
-body: "`zinder-bench lightwalletd-wallet-load` can now read distinct tree-state frontiers, report `GetSubtreeRoots` observations, mix `GetTransaction` and transparent-address reads with supplied or discovered transaction IDs, and connect through a private-CA TLS proxy by virtual host. All new flags are opt-in, and existing workloads and report fields are unchanged."
-time: 2026-11-19T20:00:00.000000000Z
-custom:
-    Bump: minor
-    PR: "328"

@@ -13,14 +13,15 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use jsonrpsee::core::ClientError;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::core::params::{ArrayParams, BatchRequestBuilder};
-use jsonrpsee::http_client::{HeaderMap, HeaderValue, HttpClient};
+use jsonrpsee::http_client::{HeaderMap, HeaderValue};
 use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
-use serde::de::{MapAccess, Visitor, value::MapAccessDeserializer};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
+use tokio::sync::SemaphorePermit;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, BlockValuePoolBalances, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
@@ -33,23 +34,26 @@ use zinder_core::{
 };
 
 use crate::{
-    BroadcastNodeProbe, CookieSource, CookieSourceError, JsonRpcMempoolSource,
-    JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceAdmissionLimits, MempoolSourceFactory,
-    NodeAuth, NodeCapabilities, NodeCapability, NodeHealthConfig, NodeSource, NodeStorageMode,
-    NodeTarget, ResilientClient, SourceBlock, SourceChainCursor, SourceChainSegment,
-    SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate, SourceError,
-    SourceSubtreeRoot, SourceSubtreeRoots, SourceTransparentAddressBalance,
-    SourceTransparentUnspentOutput, TransactionBroadcaster, TransparentAddressLookup,
-    TransparentAddressRowLimit, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
+    BroadcastNodeProbe, CookieSource, CookieSourceError, DEFAULT_NODE_MAX_CONCURRENT_REQUESTS,
+    JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceAdmissionLimits,
+    MempoolSourceFactory, NodeAuth, NodeCapabilities, NodeCapability, NodeHealthConfig, NodeSource,
+    NodeStorageMode, NodeTarget, ResilientClient, SourceBlock, SourceChainCursor,
+    SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate,
+    SourceError, SourceSubtreeRoot, SourceSubtreeRoots, SourceTransparentAddressBalance,
+    SourceTransparentUnspentOutput, SourceTransparentUtxoPage, TransactionBroadcaster,
+    TransparentAddressLookup, TransparentAddressRowLimit,
+    UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
     ZEBRA_REBUILD_THRESHOLD, ZebraIndexerMempoolSource, ZebraIndexerMempoolSourceOptions,
     ZebraIndexerSourceTarget, ZebraTransportError, decode_rpc_block_hash, encode_rpc_block_hash,
+    node_call_budget::{NodeCallBudget, NodeCallLane},
     source_block::wire_error_to_transaction_id_error,
     source_chain_update::SourceChainCursorPosition,
     source_transparent_address::{
         UtxoRowBound, ZebraAddressBalance, ZebraAddressUtxo, decode_address_utxos,
     },
+    transport::ZebraSourceClient,
     zebra_ready_endpoint::ZebraReadyClient,
 };
 
@@ -150,17 +154,123 @@ const JSON_RPC_VERIFY_CODE: i32 = -25;
 /// per-RPC metrics so operators can correlate the two.
 const ZEBRA_JSON_RPC_PEER_LABEL: &str = "zebra_json_rpc";
 
+/// Counter of JSON-RPC calls the upstream node refused with HTTP 429,
+/// labelled by `source` and `method`.
+const NODE_RATE_LIMITED_COUNTER: &str = "zinder_node_rate_limited_total";
+
+/// Every JSON-RPC `method` label [`ZebraJsonRpcSource`] emits on node
+/// request and rate-limit metrics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonRpcMethod {
+    BatchGetblock,
+    GetAddressBalance,
+    GetAddressTxids,
+    GetAddressUtxos,
+    GetBestBlockHeightAndHash,
+    GetBlock,
+    GetBlockchainInfo,
+    GetBlockHash,
+    GetRawMempool,
+    GetRawTransaction,
+    GetStandardFee,
+    RpcDiscover,
+    SendRawTransaction,
+    ZGetSubtreesByIndex,
+    ZGetTreestate,
+}
+
+impl JsonRpcMethod {
+    #[cfg(test)]
+    const ALL: [Self; 15] = [
+        Self::BatchGetblock,
+        Self::GetAddressBalance,
+        Self::GetAddressTxids,
+        Self::GetAddressUtxos,
+        Self::GetBestBlockHeightAndHash,
+        Self::GetBlock,
+        Self::GetBlockchainInfo,
+        Self::GetBlockHash,
+        Self::GetRawMempool,
+        Self::GetRawTransaction,
+        Self::GetStandardFee,
+        Self::RpcDiscover,
+        Self::SendRawTransaction,
+        Self::ZGetSubtreesByIndex,
+        Self::ZGetTreestate,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BatchGetblock => "batch_getblock",
+            Self::GetAddressBalance => "getaddressbalance",
+            Self::GetAddressTxids => "getaddresstxids",
+            Self::GetAddressUtxos => "getaddressutxos",
+            Self::GetBestBlockHeightAndHash => "getbestblockheightandhash",
+            Self::GetBlock => "getblock",
+            Self::GetBlockchainInfo => "getblockchaininfo",
+            Self::GetBlockHash => "getblockhash",
+            Self::GetRawMempool => "getrawmempool",
+            Self::GetRawTransaction => "getrawtransaction",
+            Self::GetStandardFee => "getstandardfee",
+            Self::RpcDiscover => "rpc.discover",
+            Self::SendRawTransaction => "sendrawtransaction",
+            Self::ZGetSubtreesByIndex => "z_getsubtreesbyindex",
+            Self::ZGetTreestate => "z_gettreestate",
+        }
+    }
+}
+
+/// Canonical finite set of JSON-RPC `method` labels pre-registered at startup.
+const KNOWN_JSON_RPC_METHODS: &[&str] = &[
+    JsonRpcMethod::BatchGetblock.as_str(),
+    JsonRpcMethod::GetAddressBalance.as_str(),
+    JsonRpcMethod::GetAddressTxids.as_str(),
+    JsonRpcMethod::GetAddressUtxos.as_str(),
+    JsonRpcMethod::GetBestBlockHeightAndHash.as_str(),
+    JsonRpcMethod::GetBlock.as_str(),
+    JsonRpcMethod::GetBlockchainInfo.as_str(),
+    JsonRpcMethod::GetBlockHash.as_str(),
+    JsonRpcMethod::GetRawMempool.as_str(),
+    JsonRpcMethod::GetRawTransaction.as_str(),
+    JsonRpcMethod::GetStandardFee.as_str(),
+    JsonRpcMethod::RpcDiscover.as_str(),
+    JsonRpcMethod::SendRawTransaction.as_str(),
+    JsonRpcMethod::ZGetSubtreesByIndex.as_str(),
+    JsonRpcMethod::ZGetTreestate.as_str(),
+];
+
+/// Describes and pre-registers `zinder_node_rate_limited_total` at zero for
+/// every JSON-RPC method [`ZebraJsonRpcSource`] emits.
+fn register_node_rate_limited_counter() {
+    metrics::describe_counter!(
+        NODE_RATE_LIMITED_COUNTER,
+        metrics::Unit::Count,
+        "JSON-RPC calls the upstream node refused with HTTP 429, labelled by \
+         `source` and `method`."
+    );
+    for method_name in KNOWN_JSON_RPC_METHODS {
+        metrics::counter!(
+            NODE_RATE_LIMITED_COUNTER,
+            "source" => ZEBRA_JSON_RPC_PEER_LABEL,
+            "method" => *method_name
+        )
+        .increment(0);
+    }
+}
+
 /// Node source backed by Zebra's JSON-RPC API.
 #[derive(Clone)]
 pub struct ZebraJsonRpcSource {
     network: Network,
-    client: ResilientClient<HttpClient>,
+    client: ResilientClient<ZebraSourceClient>,
     awaited_cookie: Option<Arc<AwaitedCookie>>,
     max_response_bytes: NonZeroU64,
+    request_timeout: Duration,
     broadcast_timeout: Option<Duration>,
+    call_budget: NodeCallBudget,
     cached_capabilities: Arc<Mutex<NodeCapabilities>>,
-    health_config: Option<NodeHealthConfig>,
-    ready_http_client: Option<ZebraReadyClient>,
+    health_floors: (f64, u32),
+    ready_endpoint: Option<(String, ZebraReadyClient)>,
     indexer_target: Option<ZebraIndexerSourceTarget>,
 }
 
@@ -173,8 +283,8 @@ struct JsonRpcClientSettings {
 }
 
 impl JsonRpcClientSettings {
-    fn client_with(&self, headers: HeaderMap) -> Result<HttpClient, ZebraTransportError> {
-        crate::transport::build_zebra_json_rpc_client(
+    fn client_with(&self, headers: HeaderMap) -> Result<ZebraSourceClient, ZebraTransportError> {
+        crate::transport::build_zebra_source_client(
             &self.json_rpc_addr,
             self.request_timeout,
             self.max_response_bytes,
@@ -182,7 +292,7 @@ impl JsonRpcClientSettings {
         )
     }
 
-    fn authorized_client(&self) -> Result<HttpClient, SourceError> {
+    fn authorized_client(&self) -> Result<ZebraSourceClient, SourceError> {
         let headers = derive_authorization_headers(&self.node_auth)?;
         self.client_with(headers)
             .map_err(|error| SourceError::NodeUnavailable {
@@ -230,6 +340,12 @@ pub struct ZebraJsonRpcSourceOptions {
     /// fetches, which legitimately run long. `None` falls back to
     /// `request_timeout`.
     pub broadcast_timeout: Option<Duration>,
+    /// Most JSON-RPC calls the source and its clones have in flight at once.
+    ///
+    /// A call waits for a free slot for at most its own timeout, then fails
+    /// with [`SourceError::NodeUnavailable`] without contacting the node.
+    /// Upstream-health probes use a separate slot.
+    pub max_concurrent_requests: NonZeroU32,
 }
 
 impl Default for ZebraJsonRpcSourceOptions {
@@ -238,6 +354,7 @@ impl Default for ZebraJsonRpcSourceOptions {
             request_timeout: Duration::from_secs(30),
             max_response_bytes: DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
             broadcast_timeout: None,
+            max_concurrent_requests: DEFAULT_NODE_MAX_CONCURRENT_REQUESTS,
         }
     }
 }
@@ -359,7 +476,7 @@ impl ZebraJsonRpcSource {
             block_hash.map_or_else(|| height.value().to_string(), encode_rpc_block_hash);
         let tree_state: ZebraGetTreestate = self
             .call_typed(
-                "z_gettreestate",
+                JsonRpcMethod::ZGetTreestate,
                 positional_params([Value::from(request_key)])?,
                 |error| match block_hash {
                     Some(block_hash) => {
@@ -413,7 +530,7 @@ impl ZebraJsonRpcSource {
     pub async fn fetch_block_hash(&self, height: BlockHeight) -> Result<BlockHash, SourceError> {
         let block_hash_hex = self
             .call_typed::<String>(
-                "getblockhash",
+                JsonRpcMethod::GetBlockHash,
                 positional_params([Value::from(height.value())])?,
                 |error| block_read_error(height, error.message),
             )
@@ -498,15 +615,19 @@ impl ZebraJsonRpcSource {
             },
         );
 
+        register_node_rate_limited_counter();
+
         Ok(Self {
             network,
             client,
             awaited_cookie,
             max_response_bytes,
+            request_timeout: options.request_timeout,
             broadcast_timeout,
+            call_budget: NodeCallBudget::new(options.max_concurrent_requests),
             cached_capabilities: Arc::new(Mutex::new(default_zebra_capabilities())),
-            health_config: None,
-            ready_http_client: None,
+            health_floors: NodeHealthConfig::default_floors(),
+            ready_endpoint: None,
             indexer_target: None,
         })
     }
@@ -522,6 +643,7 @@ impl ZebraJsonRpcSource {
                 request_timeout: target.request_timeout,
                 max_response_bytes: target.max_response_bytes,
                 broadcast_timeout: target.broadcast_timeout,
+                max_concurrent_requests: target.max_concurrent_requests,
             },
         )
         .map(|source| {
@@ -529,6 +651,21 @@ impl ZebraJsonRpcSource {
                 .with_health_config(target.health.clone())
                 .with_indexer_target(ZebraIndexerSourceTarget::from_node_target(target))
         })
+    }
+
+    /// Returns a clone whose every JSON-RPC call uses the readiness-probe
+    /// slot instead of the `node.max_concurrent_requests` budget.
+    ///
+    /// A readiness probe that verifies the node before it observes it, such
+    /// as reading its methods, activation table, and tip block, runs through
+    /// this view so calls holding every shared slot cannot fail readiness.
+    /// The clone shares the client, capability cache, and both slot pools.
+    #[must_use]
+    pub fn for_readiness_probes(&self) -> Self {
+        Self {
+            call_budget: self.call_budget.readiness_view(),
+            ..self.clone()
+        }
     }
 
     /// Sets the indexer endpoint whose mempool stream
@@ -543,22 +680,31 @@ impl ZebraJsonRpcSource {
     /// Installs the upstream-health probe configuration.
     ///
     /// Pass the resolved [`NodeHealthConfig`] from
-    /// [`NodeTarget::health`](crate::NodeTarget::health). With it set, the
-    /// trait method [`NodeSource::poll_upstream_health`] hits Zebra's
-    /// `/ready` endpoint; without it, the same method falls back to
-    /// `getblockchaininfo.verificationprogress` per
-    /// [ADR-0009 §Upstream sync detection].
+    /// [`NodeTarget::health`](crate::NodeTarget::health).
+    /// [`NodeSource::poll_upstream_health`] tries Zebra's `/ready` endpoint
+    /// when configured and uses the JSON-RPC floors whenever it falls back
+    /// to `getblockchaininfo` per [ADR-0009 §Upstream sync detection].
     ///
     /// [ADR-0009 §Upstream sync detection]:
     ///     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
     #[must_use]
     pub fn with_health_config(mut self, health_config: Option<NodeHealthConfig>) -> Self {
-        self.ready_http_client = health_config
-            .as_ref()
-            .map(|config| ZebraReadyClient::new(config.poll_interval));
-        self.health_config = health_config;
+        self.health_floors =
+            health_config
+                .as_ref()
+                .map_or(NodeHealthConfig::default_floors(), |config| {
+                    (
+                        config.verification_progress_floor,
+                        config.estimated_gap_floor_blocks,
+                    )
+                });
+        self.ready_endpoint = health_config.and_then(|config| {
+            config
+                .addr
+                .map(|addr| (addr, ZebraReadyClient::new(config.poll_interval)))
+        });
         let mut cache = self.cached_capabilities.lock();
-        *cache = with_readiness_probe_capability(*cache, self.health_config.is_some());
+        *cache = with_readiness_probe_capability(*cache, self.ready_endpoint.is_some());
         drop(cache);
         self
     }
@@ -567,7 +713,7 @@ impl ZebraJsonRpcSource {
     ///
     /// While a cookie file awaited since construction is unread, this reads
     /// it first and fails when it is still missing or empty.
-    fn request_client(&self) -> Result<Arc<HttpClient>, SourceError> {
+    fn request_client(&self) -> Result<Arc<ZebraSourceClient>, SourceError> {
         if let Some(awaited) = &self.awaited_cookie
             && !awaited.read.load(Ordering::Acquire)
         {
@@ -578,9 +724,21 @@ impl ZebraJsonRpcSource {
         Ok(self.client.snapshot())
     }
 
+    /// Waits for a JSON-RPC call slot on `lane`, for at most the request
+    /// timeout.
+    async fn admit(
+        &self,
+        lane: NodeCallLane,
+        operation: &'static str,
+    ) -> Result<SemaphorePermit<'_>, SourceError> {
+        self.call_budget
+            .admit(lane, operation, self.request_timeout)
+            .await
+    }
+
     async fn call_typed<Response>(
         &self,
-        method: &'static str,
+        method: JsonRpcMethod,
         params: ArrayParams,
         map_call_error: impl FnOnce(JsonRpcCallError) -> SourceError,
     ) -> Result<Response, SourceError>
@@ -601,7 +759,7 @@ impl ZebraJsonRpcSource {
     /// [`SourceError::NodeUnavailable`] instead.
     async fn call_with_result_shape<Response>(
         &self,
-        method: &'static str,
+        method: JsonRpcMethod,
         params: ArrayParams,
         map_call_error: impl FnOnce(JsonRpcCallError) -> SourceError,
         shape_mismatch_reason: &'static str,
@@ -626,7 +784,7 @@ impl ZebraJsonRpcSource {
 
     async fn call_decoding<WireResponse, Response>(
         &self,
-        method: &'static str,
+        method: JsonRpcMethod,
         params: ArrayParams,
         map_call_error: impl FnOnce(JsonRpcCallError) -> SourceError,
         decode: impl FnOnce(WireResponse) -> Result<Response, SourceError>,
@@ -634,20 +792,41 @@ impl ZebraJsonRpcSource {
     where
         WireResponse: for<'de> Deserialize<'de>,
     {
+        let _slot = self.admit(NodeCallLane::Shared, method.as_str()).await?;
+        self.call_decoding_admitted(method, params, map_call_error, decode)
+            .await
+    }
+
+    /// Calls `method` on a call slot the caller holds.
+    async fn call_decoding_admitted<WireResponse, Response>(
+        &self,
+        method: JsonRpcMethod,
+        params: ArrayParams,
+        map_call_error: impl FnOnce(JsonRpcCallError) -> SourceError,
+        decode: impl FnOnce(WireResponse) -> Result<Response, SourceError>,
+    ) -> Result<Response, SourceError>
+    where
+        WireResponse: for<'de> Deserialize<'de>,
+    {
+        let method_name = method.as_str();
         let started_at = Instant::now();
         let client_result = self
             .request_client()?
-            .request::<WireResponse, _>(method, params)
+            .request::<WireResponse, _>(method_name, params)
             .await;
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &client_result,
-            method,
+            method_name,
             self.max_response_bytes,
         ));
         let rpc_outcome = match client_result {
             Ok(response) => decode(response),
             Err(ClientError::Call(error)) => Err(map_call_error(JsonRpcCallError::from(error))),
-            Err(error) => Err(map_transport_error(&error, method, self.max_response_bytes)),
+            Err(error) => Err(map_transport_error(
+                &error,
+                method_name,
+                self.max_response_bytes,
+            )),
         };
         record_json_rpc_source_outcome(method, started_at, &rpc_outcome);
 
@@ -668,7 +847,7 @@ impl ZebraJsonRpcSource {
             let outcome = self
                 .fetch_blocks_at_batch_inner(range_start, range_end)
                 .await;
-            record_json_rpc_source_outcome("batch_getblock", started_at, &outcome);
+            record_json_rpc_source_outcome(JsonRpcMethod::BatchGetblock, started_at, &outcome);
             match outcome {
                 Ok(mut range_blocks) => {
                     stats = stats.with_added_response_payload_bytes(
@@ -746,62 +925,38 @@ impl ZebraJsonRpcSource {
             let height_param = Value::from(height.value().to_string());
             batch
                 .insert(
-                    "getblock",
+                    JsonRpcMethod::GetBlock.as_str(),
                     positional_params([height_param, Value::from(0)])?,
                 )
                 .map_err(|source| SourceError::SourcePayloadEncodingFailed { source })?;
         }
 
-        let batch_result = self.request_client()?.batch_request::<Value>(batch).await;
+        let batch_method = JsonRpcMethod::BatchGetblock.as_str();
+        let slot = self.admit(NodeCallLane::Shared, batch_method).await?;
+        let batch_result = self
+            .request_client()?
+            .batch_request::<BatchGetblockEntry>(batch)
+            .await;
+        drop(slot);
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &batch_result,
-            "batch_getblock",
+            batch_method,
             self.max_response_bytes,
         ));
-        let batch_response = match batch_result {
-            Ok(response) => response,
-            Err(error) => {
-                return Err(map_transport_error(
-                    &error,
-                    "batch_getblock",
-                    self.max_response_bytes,
-                ));
-            }
-        };
+        let batch_response: Vec<Result<BatchGetblockEntry, ErrorObjectOwned>> = batch_result
+            .map_err(|error| map_transport_error(&error, batch_method, self.max_response_bytes))?
+            .into_iter()
+            .map(|entry| entry.map_err(ErrorObject::into_owned))
+            .collect();
 
-        let mut responses = batch_response.into_iter();
-        let mut blocks = Vec::with_capacity(heights.len());
-        let mut response_payload_bytes = 0_u64;
-        for height in heights {
-            let raw_block_value = next_batch_value(&mut responses, height, "getblock")?;
-            let raw_block_hex = raw_block_value.as_str().ok_or({
-                SourceError::SourceProtocolMismatch {
-                    reason: "batched getblock response is not a hex string",
-                }
-            })?;
-            response_payload_bytes =
-                response_payload_bytes.saturating_add(usize_to_u64_saturating(raw_block_hex.len()));
-            let decode_started_at = Instant::now();
-            let raw_block_bytes_outcome = hex::decode(raw_block_hex)
-                .map_err(|source| SourceError::InvalidRawBlockHex { source })?;
-            record_block_decode_stage("hex_decode", decode_started_at);
-            let header_started_at = Instant::now();
-            let source_block =
-                SourceBlock::from_raw_block_bytes(self.network, height, raw_block_bytes_outcome)?;
-            record_block_decode_stage("block_header", header_started_at);
-            blocks.push(source_block);
-        }
-
-        if responses.next().is_some() {
-            return Err(SourceError::SourceProtocolMismatch {
-                reason: "batched block response contained more entries than requested",
-            });
-        }
-
-        Ok(BatchedSourceBlocks {
-            blocks,
-            stats: SourceChainSegmentStats::from_response_payload_bytes(response_payload_bytes),
+        let network = self.network;
+        tokio::task::spawn_blocking(move || {
+            decode_batch_block_entries(network, heights, batch_response)
         })
+        .await
+        .map_err(|join_error| SourceError::NodeUnavailable {
+            reason: format!("source block decode task failed: {join_error}"),
+        })?
     }
 
     /// Fetches the upstream node's current mempool transaction identifiers.
@@ -815,7 +970,11 @@ impl ZebraJsonRpcSource {
         &self,
     ) -> Result<Vec<TransactionId>, SourceError> {
         let txid_hex_list: Vec<String> = self
-            .call_typed("getrawmempool", ArrayParams::new(), map_node_unavailable)
+            .call_typed(
+                JsonRpcMethod::GetRawMempool,
+                ArrayParams::new(),
+                map_node_unavailable,
+            )
             .await?;
         let mut transaction_ids = Vec::with_capacity(txid_hex_list.len());
         for txid_hex in txid_hex_list {
@@ -842,50 +1001,96 @@ impl ZebraJsonRpcSource {
         &self,
         transaction_id: TransactionId,
     ) -> Result<UpstreamTransactionLookup, SourceError> {
+        let Some(reply) = self.verbose_transaction::<Value>(transaction_id).await? else {
+            return Ok(UpstreamTransactionLookup::NotFound);
+        };
+        let Some(height) = reply["height"].as_u64() else {
+            return Ok(UpstreamTransactionLookup::InMempool);
+        };
+        let block = mined_transaction_block(height, reply["blockhash"].as_str())?;
+        Ok(UpstreamTransactionLookup::Mined {
+            mined_height: block.height,
+            block_hash: block.hash,
+        })
+    }
+
+    /// Fetches a best-chain transaction's block and serialized bytes together
+    /// with one verbose `getrawtransaction`. Returns `None` if the node no
+    /// longer reports the transaction as mined on its best chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source error if the node is unavailable or its reply has
+    /// invalid bytes, an invalid mined location, or a different transaction ID.
+    pub async fn fetch_mined_transaction_bytes(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<(BlockId, Vec<u8>)>, SourceError> {
+        let Some(raw) = self
+            .verbose_transaction::<Box<RawValue>>(transaction_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let JsonObject(reply): JsonObject<MinedTransactionReply<'_>> =
+            serde_json::from_str(raw.get()).map_err(|_| SourceError::SourceProtocolMismatch {
+                reason: "verbose getrawtransaction returned an invalid transaction object",
+            })?;
+        let height = match reply.height {
+            Some(-1) | None => return Ok(None),
+            Some(height) => {
+                u64::try_from(height).map_err(|_| SourceError::SourceProtocolMismatch {
+                    reason: "verbose getrawtransaction returned an invalid mined height",
+                })?
+            }
+        };
+        let block = mined_transaction_block(height, reply.blockhash)?;
+        if decode_display_transaction_id(reply.txid)? != transaction_id {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "verbose getrawtransaction returned another transaction ID",
+            });
+        }
+        if reply.hex.is_empty() {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "verbose getrawtransaction returned empty transaction bytes",
+            });
+        }
+        let bytes = hex::decode(reply.hex)
+            .map_err(|source| SourceError::InvalidRawTransactionHex { source })?;
+        Ok(Some((block, bytes)))
+    }
+
+    async fn verbose_transaction<Reply: for<'de> Deserialize<'de>>(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<Reply>, SourceError> {
         let params = positional_params([
             Value::from(display_order_transaction_id_hex(transaction_id)),
             Value::from(1),
         ])?;
 
+        let method = JsonRpcMethod::GetRawTransaction;
+        let method_name = method.as_str();
+        let slot = self.admit(NodeCallLane::Shared, method_name).await?;
         let started_at = Instant::now();
         let response = self
             .request_client()?
-            .request::<Value, _>("getrawtransaction", params)
+            .request::<Reply, _>(method_name, params)
             .await;
-        record_json_rpc_client_result("getrawtransaction", started_at, &response);
+        drop(slot);
+        record_json_rpc_client_result(method, started_at, &response);
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &response,
-            "getrawtransaction",
+            method_name,
             self.max_response_bytes,
         ));
 
         match response {
-            Ok(verbose_response) => {
-                let height_value = verbose_response.get("height").and_then(Value::as_u64);
-                let Some(height_value) = height_value else {
-                    return Ok(UpstreamTransactionLookup::InMempool);
-                };
-                let mined_height = BlockHeight::new(u32::try_from(height_value).map_err(|_| {
-                    SourceError::SourceProtocolMismatch {
-                        reason: "verbose getrawtransaction height does not fit u32",
-                    }
-                })?);
-                let block_hash_hex = verbose_response
-                    .get("blockhash")
-                    .and_then(Value::as_str)
-                    .ok_or(SourceError::SourceProtocolMismatch {
-                        reason: "verbose getrawtransaction reports a height without a blockhash",
-                    })?;
-                let block_hash = decode_rpc_block_hash(block_hash_hex)?;
-                Ok(UpstreamTransactionLookup::Mined {
-                    mined_height,
-                    block_hash,
-                })
-            }
+            Ok(verbose_response) => Ok(Some(verbose_response)),
             Err(ClientError::Call(error)) => {
                 let call_error = JsonRpcCallError::from(error);
                 if call_error.is_not_found() {
-                    Ok(UpstreamTransactionLookup::NotFound)
+                    Ok(None)
                 } else {
                     Err(SourceError::NodeUnavailable {
                         reason: call_error.message,
@@ -894,7 +1099,7 @@ impl ZebraJsonRpcSource {
             }
             Err(error) => Err(map_transport_error(
                 &error,
-                "getrawtransaction",
+                method_name,
                 self.max_response_bytes,
             )),
         }
@@ -917,15 +1122,19 @@ impl ZebraJsonRpcSource {
             Value::from(0),
         ])?;
 
+        let method = JsonRpcMethod::GetRawTransaction;
+        let method_name = method.as_str();
+        let slot = self.admit(NodeCallLane::Shared, method_name).await?;
         let started_at = Instant::now();
         let response = self
             .request_client()?
-            .request::<String, _>("getrawtransaction", params)
+            .request::<String, _>(method_name, params)
             .await;
-        record_json_rpc_client_result("getrawtransaction", started_at, &response);
+        drop(slot);
+        record_json_rpc_client_result(method, started_at, &response);
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &response,
-            "getrawtransaction",
+            method_name,
             self.max_response_bytes,
         ));
 
@@ -948,7 +1157,7 @@ impl ZebraJsonRpcSource {
             }
             Err(error) => Err(map_transport_error(
                 &error,
-                "getrawtransaction",
+                method_name,
                 self.max_response_bytes,
             )),
         }
@@ -973,11 +1182,12 @@ impl ZebraJsonRpcSource {
         lookup: &TransparentAddressLookup,
     ) -> Result<SourceTransparentAddressBalance, SourceError> {
         self.check_transparent_address_lookup(lookup)?;
-        let balance: ZebraAddressBalance = self
+        let method = JsonRpcMethod::GetAddressBalance;
+        let JsonObject(balance): JsonObject<ZebraAddressBalance> = self
             .call_with_result_shape(
-                "getaddressbalance",
+                method,
                 positional_params([json!({ "addresses": lookup.rpc_addresses() })])?,
-                |error| transparent_address_call_error("getaddressbalance", error),
+                |error| transparent_address_call_error(method.as_str(), error),
                 "getaddressbalance returned a result without a numeric balance and received",
             )
             .await?;
@@ -1002,25 +1212,45 @@ impl ZebraJsonRpcSource {
     /// as the tip, so an empty range or one ending at genesis is answered
     /// without a node request.
     ///
+    /// Neither node reports the chain a `getaddresstxids` answer describes.
+    /// The source reads the node's hash at `chain_block`'s height immediately
+    /// before and after each request and keeps the answer only when both name
+    /// `chain_block`, so the answer comes from a chain that holds it unless the
+    /// node left that chain and returned to it within the request. A tip read
+    /// below `chain_block` is refused rather than answered as an empty range.
+    ///
     /// # Errors
     ///
     /// Returns [`SourceError::TransparentAddressRowLimitExceeded`] when the
     /// range holds more than [`TransparentAddressRowLimit::MAX`]
     /// transactions, [`SourceError::ChainTipChangedDuringFetch`] when the tip
-    /// changed during every attempt, and the errors of
+    /// changed during every attempt, a tip read lies below `chain_block`, or a
+    /// read around a request names another block than `chain_block`, and the
+    /// errors of
     /// [`Self::fetch_transparent_address_balance`].
     pub async fn fetch_transparent_address_transaction_ids(
         &self,
         lookup: &TransparentAddressLookup,
         start_height: BlockHeight,
         end_height: BlockHeight,
+        chain_block: BlockId,
     ) -> Result<Vec<TransactionId>, SourceError> {
         self.check_transparent_address_lookup(lookup)?;
         if start_height > end_height || end_height == BlockHeight::new(0) {
             return Ok(Vec::new());
         }
+        let operation = JsonRpcMethod::GetAddressTxids.as_str();
         let mut tip = self.tip_id().await?;
         for _ in 0..TRANSPARENT_ADDRESS_TIP_ATTEMPTS {
+            // A tip below `chain_block` may be a rollback the node recovers
+            // from before the next read, so it proves no range empty.
+            if tip.height < chain_block.height {
+                return Err(SourceError::ChainTipChangedDuringFetch {
+                    operation,
+                    attempts: 1,
+                });
+            }
+            self.require_chain_block(chain_block, operation).await?;
             let indexed_end_height = end_height.min(tip.height);
             if start_height > indexed_end_height || indexed_end_height == BlockHeight::new(0) {
                 return Ok(Vec::new());
@@ -1033,6 +1263,7 @@ impl ZebraJsonRpcSource {
                 Err(error) if is_answer_size_refusal(&error) => Err(error),
                 Err(error) => return Err(error),
             };
+            self.require_chain_block(chain_block, operation).await?;
             let tip_after_request = self.tip_id().await?;
             if tip_after_request == tip {
                 return txid_hex_list?
@@ -1043,9 +1274,24 @@ impl ZebraJsonRpcSource {
             tip = tip_after_request;
         }
         Err(SourceError::ChainTipChangedDuringFetch {
-            operation: "getaddresstxids",
+            operation,
             attempts: TRANSPARENT_ADDRESS_TIP_ATTEMPTS,
         })
+    }
+
+    async fn require_chain_block(
+        &self,
+        block: BlockId,
+        operation: &'static str,
+    ) -> Result<(), SourceError> {
+        if self.fetch_block_hash(block.height).await? == block.hash {
+            Ok(())
+        } else {
+            Err(SourceError::ChainTipChangedDuringFetch {
+                operation,
+                attempts: 1,
+            })
+        }
     }
 
     async fn request_address_transaction_ids(
@@ -1054,21 +1300,23 @@ impl ZebraJsonRpcSource {
         start_height: BlockHeight,
         end_height: BlockHeight,
     ) -> Result<Vec<String>, SourceError> {
+        let method = JsonRpcMethod::GetAddressTxids;
+        let operation = method.as_str();
         let txid_hex_list: Vec<String> = self
             .call_with_result_shape(
-                "getaddresstxids",
+                method,
                 positional_params([json!({
                     "addresses": lookup.rpc_addresses(),
                     "start": start_height.value(),
                     "end": end_height.value(),
                 })])?,
-                |error| transparent_address_call_error("getaddresstxids", error),
+                |error| transparent_address_call_error(operation, error),
                 "getaddresstxids returned a result that is not a list of transaction ids",
             )
             .await?;
         if txid_hex_list.len() > TransparentAddressRowLimit::MAX.row_count() {
             return Err(SourceError::TransparentAddressRowLimitExceeded {
-                operation: "getaddresstxids",
+                operation,
                 max_rows: TransparentAddressRowLimit::MAX.get(),
             });
         }
@@ -1082,7 +1330,9 @@ impl ZebraJsonRpcSource {
     /// [`TransparentAddressRowLimit::MAX`] outputs is refused on both nodes,
     /// never truncated. Zakura ignores `startHeight` and returns every
     /// unspent output of the addresses, so the whole answer counts toward
-    /// `node.max_response_bytes` and the node's own response limit.
+    /// `node.max_response_bytes` and the node's own response limit. The page
+    /// names the best-chain tip the node reports answering at, which both
+    /// nodes return for `chainInfo`.
     ///
     /// # Errors
     ///
@@ -1091,14 +1341,14 @@ impl ZebraJsonRpcSource {
     /// [`SourceError::SourceResponseTooLarge`] when the answer exceeds
     /// `node.max_response_bytes`, [`SourceError::SourceProtocolMismatch`]
     /// when any returned row names an address outside `lookup`, has a script
-    /// that does not pay its address, is out of chain order, or repeats an
-    /// outpoint, and the errors of
+    /// that does not pay its address, is out of chain order, repeats an
+    /// outpoint, or lies above the reported tip, and the errors of
     /// [`Self::fetch_transparent_address_balance`].
     pub async fn fetch_transparent_address_utxos(
         &self,
         lookup: &TransparentAddressLookup,
         start_height: BlockHeight,
-    ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
+    ) -> Result<SourceTransparentUtxoPage, SourceError> {
         self.fetch_bounded_address_utxos(lookup, start_height, UtxoRowBound::Complete)
             .await
     }
@@ -1126,7 +1376,28 @@ impl ZebraJsonRpcSource {
         start_height: BlockHeight,
         max_rows: TransparentAddressRowLimit,
     ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
-        self.fetch_bounded_address_utxos(lookup, start_height, UtxoRowBound::Prefix(max_rows))
+        let mut page = self
+            .fetch_transparent_address_utxo_page(lookup, start_height, max_rows)
+            .await?;
+        page.outputs.truncate(max_rows.row_count());
+        page.outputs.shrink_to_fit();
+        Ok(page.outputs)
+    }
+
+    /// Requests `requested_rows` outputs in chain order and keeps any additional matching rows
+    /// the node supplies, up to [`TransparentAddressRowLimit::MAX`]. The page
+    /// reports whether it contains the complete set.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::fetch_transparent_address_utxo_prefix`].
+    pub async fn fetch_transparent_address_utxo_page(
+        &self,
+        lookup: &TransparentAddressLookup,
+        start_height: BlockHeight,
+        requested_rows: TransparentAddressRowLimit,
+    ) -> Result<SourceTransparentUtxoPage, SourceError> {
+        self.fetch_bounded_address_utxos(lookup, start_height, UtxoRowBound::Prefix(requested_rows))
             .await
     }
 
@@ -1135,21 +1406,38 @@ impl ZebraJsonRpcSource {
         lookup: &TransparentAddressLookup,
         start_height: BlockHeight,
         bound: UtxoRowBound,
-    ) -> Result<Vec<SourceTransparentUnspentOutput>, SourceError> {
+    ) -> Result<SourceTransparentUtxoPage, SourceError> {
         self.check_transparent_address_lookup(lookup)?;
-        let rows: Vec<ZebraAddressUtxo> = self
+        let method = JsonRpcMethod::GetAddressUtxos;
+        let JsonObject(reply): JsonObject<ZebraAddressUtxosAtTip> = self
             .call_with_result_shape(
-                "getaddressutxos",
+                method,
                 positional_params([json!({
                     "addresses": lookup.rpc_addresses(),
                     "startHeight": start_height.value(),
                     "maxEntries": bound.rpc_max_entries(),
+                    "chainInfo": true,
                 })])?,
-                |error| transparent_address_call_error("getaddressutxos", error),
-                "getaddressutxos returned a result that is not a list of unspent outputs",
+                |error| transparent_address_call_error(method.as_str(), error),
+                "getaddressutxos returned a result without unspent outputs and the tip they describe",
             )
             .await?;
-        decode_address_utxos(&rows, lookup, start_height, bound)
+        let tip = BlockId::new(
+            BlockHeight::new(reply.height),
+            decode_rpc_block_hash(&reply.hash)?,
+        );
+        let rows: Vec<_> = reply.utxos.into_iter().map(|JsonObject(row)| row).collect();
+        if rows.iter().any(|row| row.height() > reply.height) {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "getaddressutxos returned an output above the tip it reports",
+            });
+        }
+        let decoded = decode_address_utxos(&rows, lookup, start_height, bound)?;
+        Ok(SourceTransparentUtxoPage {
+            outputs: decoded.outputs,
+            complete: decoded.complete,
+            tip,
+        })
     }
 
     fn check_transparent_address_lookup(
@@ -1174,7 +1462,7 @@ impl ZebraJsonRpcSource {
     ) -> Result<SourceSubtreeRoots, SourceError> {
         let subtree_response: ZebraSubtreeRootsByIndex = self
             .call_typed(
-                "z_getsubtreesbyindex",
+                JsonRpcMethod::ZGetSubtreesByIndex,
                 positional_params([
                     Value::from(protocol.rpc_pool_name()),
                     Value::from(start_index.value()),
@@ -1268,20 +1556,21 @@ impl NodeSource for ZebraJsonRpcSource {
     /// startup accept a node that cannot satisfy the source contract.
     async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
         let openrpc_response: Value = self
-            .call_typed("rpc.discover", ArrayParams::new(), |_error| {
+            .call_typed(JsonRpcMethod::RpcDiscover, ArrayParams::new(), |_error| {
                 SourceError::NodeCapabilityMissing {
                     capability: NodeCapability::OpenRpcDiscovery,
                 }
             })
             .await?;
         let method_names = openrpc_method_names(&openrpc_response);
-        let stores_historical_block_bodies = method_names.contains(&"getblockchaininfo")
+        let stores_historical_block_bodies = method_names
+            .contains(&JsonRpcMethod::GetBlockchainInfo.as_str())
             && self.reports_archive_block_storage().await;
         let json_rpc_capabilities =
             parse_openrpc_capabilities(&method_names, stores_historical_block_bodies);
 
         let probed_capabilities =
-            with_readiness_probe_capability(json_rpc_capabilities, self.health_config.is_some());
+            with_readiness_probe_capability(json_rpc_capabilities, self.ready_endpoint.is_some());
         *self.cached_capabilities.lock() = probed_capabilities;
         Ok(probed_capabilities)
     }
@@ -1298,11 +1587,13 @@ impl NodeSource for ZebraJsonRpcSource {
         &self,
     ) -> Result<NetworkUpgradeActivations, SourceError> {
         let blockchain_info: ZebraGetBlockchainInfoUpgrades = self
-            .call_typed("getblockchaininfo", ArrayParams::new(), |error| {
-                SourceError::NodeUnavailable {
+            .call_typed(
+                JsonRpcMethod::GetBlockchainInfo,
+                ArrayParams::new(),
+                |error| SourceError::NodeUnavailable {
                     reason: error.message,
-                }
-            })
+                },
+            )
             .await?;
 
         let activations = blockchain_info
@@ -1342,7 +1633,7 @@ impl NodeSource for ZebraJsonRpcSource {
     async fn fetch_storage_mode(&self) -> Result<NodeStorageMode, SourceError> {
         let storage_mode: ZebraGetBlockchainInfoStorage = self
             .call_typed(
-                "getblockchaininfo",
+                JsonRpcMethod::GetBlockchainInfo,
                 ArrayParams::new(),
                 map_node_unavailable,
             )
@@ -1358,64 +1649,22 @@ impl NodeSource for ZebraJsonRpcSource {
         &self,
         limits: SourceChainSegmentLimits,
     ) -> Result<SourceChainSegment, SourceError> {
-        let observed_tip_id = self.tip_id().await?;
-        let (start_height, expected_parent_id) = match limits.cursor.position() {
-            SourceChainCursorPosition::BeforeHeight(height) => (height, None),
-            SourceChainCursorPosition::AtBlock(block_id) => {
-                if observed_tip_id.height < block_id.height
-                    || (observed_tip_id.height == block_id.height
-                        && observed_tip_id.hash != block_id.hash)
-                {
-                    return Ok(SourceChainSegment::new([
-                        SourceChainUpdate::reverted_block(block_id),
-                    ]));
-                }
-                if observed_tip_id.height == block_id.height {
-                    return Ok(SourceChainSegment::default());
-                }
-                let Some(next_height) = block_id.height.next() else {
-                    return Ok(SourceChainSegment::default());
-                };
-                (next_height, Some(block_id))
-            }
-        };
-        if observed_tip_id.height < start_height {
-            return Ok(SourceChainSegment::default());
+        if let Some(range) = settled_segment_bounds_without_tip_poll(limits) {
+            return fetch_settled_chain_segment_without_tip_poll(self, limits, range).await;
         }
-
-        let end_height = bounded_segment_end_height(
-            start_height,
-            observed_tip_id.height,
-            limits.max_connected_blocks,
-        );
-        let batched_blocks = self.fetch_blocks_at_batch(start_height, end_height).await?;
-        if let (Some(expected_parent_id), Some(first_block)) =
-            (expected_parent_id, batched_blocks.blocks.first())
-            && first_block.parent_hash != expected_parent_id.hash
-        {
-            return Ok(SourceChainSegment::new([
-                SourceChainUpdate::reverted_block(expected_parent_id),
-            ]));
-        }
-        validate_source_block_links(&batched_blocks.blocks)?;
-
-        Ok(SourceChainSegment::connected_blocks_with_stats(
-            batched_blocks.blocks,
-            batched_blocks.stats,
-        ))
+        fetch_chain_segment_observing_tip(self, limits).await
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         let raw_block_hex = self
             .call_typed::<String>(
-                "getblock",
+                JsonRpcMethod::GetBlock,
                 positional_params([Value::from(height.value().to_string()), Value::from(0)])?,
                 |error| block_read_error(height, error.message),
             )
             .await?;
 
-        let raw_block_bytes = hex::decode(raw_block_hex)
-            .map_err(|source| SourceError::InvalidRawBlockHex { source })?;
+        let raw_block_bytes = decode_raw_block_hex(&raw_block_hex)?;
 
         SourceBlock::from_raw_block_bytes(self.network, height, raw_block_bytes)
     }
@@ -1442,17 +1691,11 @@ impl NodeSource for ZebraJsonRpcSource {
     }
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        let observed_tip: ZebraBestBlockHeightAndHash = self
-            .call_typed(
-                "getbestblockheightandhash",
-                ArrayParams::new(),
-                map_node_unavailable,
-            )
-            .await?;
-        Ok(BlockId::new(
-            BlockHeight::new(observed_tip.height),
-            BlockHash::from_bytes(observed_tip.hash),
-        ))
+        self.read_tip_id(NodeCallLane::Shared).await
+    }
+
+    async fn probe_tip_id(&self) -> Result<BlockId, SourceError> {
+        self.read_tip_id(NodeCallLane::Health).await
     }
 
     async fn fetch_subtree_roots(
@@ -1493,11 +1736,13 @@ impl NodeSource for ZebraJsonRpcSource {
 
     async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
         let blockchain_info: ZebraGetBlockchainInfoValuePools = self
-            .call_typed("getblockchaininfo", ArrayParams::new(), |error| {
-                SourceError::NodeUnavailable {
+            .call_typed(
+                JsonRpcMethod::GetBlockchainInfo,
+                ArrayParams::new(),
+                |error| SourceError::NodeUnavailable {
                     reason: error.message,
-                }
-            })
+                },
+            )
             .await?;
         if blockchain_info.value_pools.is_empty() {
             return Err(SourceError::NodeCapabilityMissing {
@@ -1524,7 +1769,7 @@ impl NodeSource for ZebraJsonRpcSource {
     ) -> Result<BlockValuePoolBalances, SourceError> {
         let block_response: ZebraGetBlockValuePools = self
             .call_typed(
-                "getblock",
+                JsonRpcMethod::GetBlock,
                 positional_params([
                     Value::from(encode_rpc_block_hash(block_id.hash)),
                     Value::from(1),
@@ -1596,16 +1841,14 @@ impl NodeSource for ZebraJsonRpcSource {
     }
 
     async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
-        if let (Some(config), Some(client)) =
-            (self.health_config.as_ref(), self.ready_http_client.as_ref())
-        {
-            match client.probe(&config.addr).await {
+        if let Some((addr, client)) = &self.ready_endpoint {
+            match client.probe(addr).await {
                 Ok(snapshot) => return Ok(snapshot),
                 Err(error) => {
                     tracing::warn!(
                         target: "zinder::source",
                         event = "upstream_health_endpoint_unreachable",
-                        addr = %crate::redact_endpoint_url(&config.addr),
+                        addr = %crate::redact_endpoint_url(addr),
                         reason = %error,
                         "ready endpoint probe failed; falling back to verificationprogress"
                     );
@@ -1618,6 +1861,18 @@ impl NodeSource for ZebraJsonRpcSource {
 }
 
 impl ZebraJsonRpcSource {
+    async fn read_tip_id(&self, lane: NodeCallLane) -> Result<BlockId, SourceError> {
+        let method = JsonRpcMethod::GetBestBlockHeightAndHash;
+        let _slot = self.admit(lane, method.as_str()).await?;
+        let observed_tip: ZebraBestBlockHeightAndHash = self
+            .call_decoding_admitted(method, ArrayParams::new(), map_node_unavailable, Ok)
+            .await?;
+        Ok(BlockId::new(
+            BlockHeight::new(observed_tip.height),
+            BlockHash::from_bytes(observed_tip.hash),
+        ))
+    }
+
     /// Returns whether the node reports `pruned: false`.
     ///
     /// Fails closed: a failed call or a response without `pruned` counts as
@@ -1650,23 +1905,23 @@ impl ZebraJsonRpcSource {
     async fn poll_upstream_health_from_blockchain_info(
         &self,
     ) -> Result<UpstreamHealthSnapshot, SourceError> {
+        // The probe has its own slot, so calls saturating the shared budget
+        // cannot fail readiness.
+        let method = JsonRpcMethod::GetBlockchainInfo;
+        let slot = self.admit(NodeCallLane::Health, method.as_str()).await?;
         let snapshot_fields: ZebraGetBlockchainInfoHealth = self
-            .call_typed("getblockchaininfo", ArrayParams::new(), |error| {
-                SourceError::NodeUnavailable {
+            .call_decoding_admitted(
+                method,
+                ArrayParams::new(),
+                |error| SourceError::NodeUnavailable {
                     reason: error.message,
-                }
-            })
+                },
+                Ok,
+            )
             .await?;
+        drop(slot);
 
-        let (progress_floor, gap_floor) =
-            self.health_config
-                .as_ref()
-                .map_or(NodeHealthConfig::default_floors(), |config| {
-                    (
-                        config.verification_progress_floor,
-                        config.estimated_gap_floor_blocks,
-                    )
-                });
+        let (progress_floor, gap_floor) = self.health_floors;
 
         let progress = snapshot_fields.verification_progress;
         let committed = snapshot_fields.blocks;
@@ -1757,6 +2012,12 @@ impl BroadcastNodeProbe for ZebraJsonRpcSource {
     async fn holds_block(&self, block: BlockId) -> Result<bool, SourceError> {
         Ok(self.fetch_block_hash(block.height).await? == block.hash)
     }
+
+    /// Verification calls through the readiness-probe view, whose calls use
+    /// the upstream-health slot instead of the shared call budget.
+    fn verification_view(&self) -> Option<Self> {
+        Some(self.for_readiness_probes())
+    }
 }
 
 #[async_trait]
@@ -1768,28 +2029,36 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
         let raw_transaction_hex = hex::encode(raw_transaction.as_slice());
         let params = positional_params([Value::from(raw_transaction_hex)])?;
 
+        let method = JsonRpcMethod::SendRawTransaction;
+        let method_name = method.as_str();
         let started_at = Instant::now();
+        // Waiting for a slot counts against the broadcast deadline, so a
+        // saturated budget never stretches one broadcast past its timeout and
+        // still fails over to the next endpoint in time.
+        let call_timeout = self.broadcast_timeout.unwrap_or(self.request_timeout);
+        let slot = self
+            .call_budget
+            .admit(NodeCallLane::Shared, method_name, call_timeout)
+            .await?;
         let client_snapshot = self.request_client()?;
-        let broadcast_fut = client_snapshot.request::<String, _>("sendrawtransaction", params);
+        let broadcast_fut = client_snapshot.request::<String, _>(method_name, params);
 
-        let response = if let Some(timeout_duration) = self.broadcast_timeout {
-            match tokio::time::timeout(timeout_duration, broadcast_fut).await {
-                Ok(outcome) => outcome,
-                Err(_elapsed) => Err(ClientError::Transport(
-                    std::io::Error::other(format!(
-                        "sendrawtransaction timed out after {}ms",
-                        timeout_duration.as_millis()
-                    ))
-                    .into(),
-                )),
-            }
-        } else {
-            broadcast_fut.await
+        let remaining = call_timeout.saturating_sub(started_at.elapsed());
+        let response = match tokio::time::timeout(remaining, broadcast_fut).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => Err(ClientError::Transport(
+                std::io::Error::other(format!(
+                    "sendrawtransaction timed out after {}ms",
+                    call_timeout.as_millis()
+                ))
+                .into(),
+            )),
         };
-        record_json_rpc_client_result("sendrawtransaction", started_at, &response);
+        drop(slot);
+        record_json_rpc_client_result(method, started_at, &response);
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &response,
-            "sendrawtransaction",
+            method_name,
             self.max_response_bytes,
         ));
 
@@ -1804,7 +2073,7 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
             }
             Err(error) => Err(map_transport_error(
                 &error,
-                "sendrawtransaction",
+                method_name,
                 self.max_response_bytes,
             )),
         }
@@ -1813,7 +2082,7 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
     async fn standard_fee(&self) -> Result<StandardFee, SourceError> {
         let JsonObject(reply): JsonObject<ZebraStandardFee> = self
             .call_with_result_shape(
-                "getstandardfee",
+                JsonRpcMethod::GetStandardFee,
                 ArrayParams::new(),
                 |error| {
                     if error.code == Some(JSON_RPC_METHOD_NOT_FOUND_CODE) {
@@ -2021,6 +2290,281 @@ struct BatchedSourceBlocks {
     stats: SourceChainSegmentStats,
 }
 
+#[derive(Debug)]
+enum BatchGetblockEntry {
+    Hex(String),
+    NonString,
+}
+
+impl<'de> Deserialize<'de> for BatchGetblockEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(BatchGetblockEntryVisitor)
+    }
+}
+
+struct BatchGetblockEntryVisitor;
+
+impl<'de> Visitor<'de> for BatchGetblockEntryVisitor {
+    type Value = BatchGetblockEntry;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a raw block hex string")
+    }
+
+    fn visit_str<E>(self, raw: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(BatchGetblockEntry::Hex(raw.to_owned()))
+    }
+
+    fn visit_string<E>(self, raw: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(BatchGetblockEntry::Hex(raw))
+    }
+
+    fn visit_bool<E>(self, _raw: bool) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_i64<E>(self, _raw: i64) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_i128<E>(self, _raw: i128) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_u64<E>(self, _raw: u64) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_u128<E>(self, _raw: u128) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_f64<E>(self, _raw: f64) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_bytes<E>(self, _raw: &[u8]) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        BatchGetblockEntry::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(BatchGetblockEntry::NonString)
+    }
+}
+
+fn decode_raw_block_hex(raw_block_hex: &str) -> Result<Vec<u8>, SourceError> {
+    let raw_bytes = raw_block_hex.as_bytes();
+    // `const-hex` strips leading `0x`/`0X` before decoding; route prefixed
+    // strings and any error path through `hex::decode` for exact error parity.
+    if raw_bytes.starts_with(b"0x") || raw_bytes.starts_with(b"0X") {
+        return hex::decode(raw_bytes).map_err(|source| SourceError::InvalidRawBlockHex { source });
+    }
+    const_hex::decode(raw_bytes).or_else(|_| {
+        hex::decode(raw_bytes).map_err(|source| SourceError::InvalidRawBlockHex { source })
+    })
+}
+
+fn decode_batch_block_entries(
+    network: Network,
+    heights: Vec<BlockHeight>,
+    batch_response: Vec<Result<BatchGetblockEntry, ErrorObjectOwned>>,
+) -> Result<BatchedSourceBlocks, SourceError> {
+    let mut blocks = Vec::with_capacity(heights.len());
+    let mut response_payload_bytes = 0_u64;
+    for (height, response) in heights.into_iter().zip(batch_response) {
+        let entry = response.map_err(|error| batch_block_error(height, &error))?;
+        let BatchGetblockEntry::Hex(raw_block_hex) = entry else {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "batched getblock response is not a hex string",
+            });
+        };
+        response_payload_bytes =
+            response_payload_bytes.saturating_add(usize_to_u64_saturating(raw_block_hex.len()));
+        let decode_started_at = Instant::now();
+        let raw_block_bytes = decode_raw_block_hex(&raw_block_hex)?;
+        record_block_decode_stage("hex_decode", decode_started_at);
+        let header_started_at = Instant::now();
+        let source_block = SourceBlock::from_raw_block_bytes(network, height, raw_block_bytes)?;
+        record_block_decode_stage("block_header", header_started_at);
+        blocks.push(source_block);
+    }
+    Ok(BatchedSourceBlocks {
+        blocks,
+        stats: SourceChainSegmentStats::from_response_payload_bytes(response_payload_bytes),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct SettledSegmentRange {
+    start_height: BlockHeight,
+    expected_parent_id: Option<BlockId>,
+    end_height: BlockHeight,
+}
+
+fn settled_segment_bounds_without_tip_poll(
+    limits: SourceChainSegmentLimits,
+) -> Option<SettledSegmentRange> {
+    let known_tip = limits.known_tip?;
+    let (start_height, expected_parent_id) = match limits.cursor.position() {
+        SourceChainCursorPosition::BeforeHeight(height) => (height, None),
+        SourceChainCursorPosition::AtBlock(block_id) => (block_id.height.next()?, Some(block_id)),
+    };
+    let settled_upper_bound =
+        known_tip.settled_upper_bound_below_window(start_height, limits.max_connected_blocks)?;
+    let end_height = bounded_segment_end_height(
+        start_height,
+        settled_upper_bound,
+        limits.max_connected_blocks,
+    );
+    Some(SettledSegmentRange {
+        start_height,
+        expected_parent_id,
+        end_height,
+    })
+}
+
+async fn fetch_settled_chain_segment_without_tip_poll(
+    source: &ZebraJsonRpcSource,
+    limits: SourceChainSegmentLimits,
+    range: SettledSegmentRange,
+) -> Result<SourceChainSegment, SourceError> {
+    let batched_blocks = match source
+        .fetch_blocks_at_batch(range.start_height, range.end_height)
+        .await
+    {
+        Ok(batched_blocks) => batched_blocks,
+        Err(error)
+            if matches!(
+                error,
+                SourceError::BlockUnavailable { .. }
+                    | SourceError::HistoricalBlockBodyUnavailable { .. }
+            ) =>
+        {
+            let observed_tip_id = source.tip_id().await?;
+            if observed_tip_id.height < range.end_height {
+                return fetch_chain_segment_from_observed_tip(source, limits, observed_tip_id)
+                    .await;
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    if let (Some(expected_parent_id), Some(first_block)) =
+        (range.expected_parent_id, batched_blocks.blocks.first())
+        && first_block.parent_hash != expected_parent_id.hash
+    {
+        let _observed_tip_id = source.tip_id().await?;
+        return Ok(SourceChainSegment::new([
+            SourceChainUpdate::reverted_block(expected_parent_id),
+        ]));
+    }
+    if let Err(error) = validate_source_block_links(&batched_blocks.blocks) {
+        let _observed_tip_id = source.tip_id().await?;
+        return Err(error);
+    }
+    Ok(SourceChainSegment::connected_blocks_with_stats(
+        batched_blocks.blocks,
+        batched_blocks.stats,
+    ))
+}
+
+async fn fetch_chain_segment_observing_tip(
+    source: &ZebraJsonRpcSource,
+    limits: SourceChainSegmentLimits,
+) -> Result<SourceChainSegment, SourceError> {
+    let observed_tip_id = source.tip_id().await?;
+    fetch_chain_segment_from_observed_tip(source, limits, observed_tip_id).await
+}
+
+async fn fetch_chain_segment_from_observed_tip(
+    source: &ZebraJsonRpcSource,
+    limits: SourceChainSegmentLimits,
+    observed_tip_id: BlockId,
+) -> Result<SourceChainSegment, SourceError> {
+    let (start_height, expected_parent_id) = match limits.cursor.position() {
+        SourceChainCursorPosition::BeforeHeight(height) => (height, None),
+        SourceChainCursorPosition::AtBlock(block_id) => {
+            if observed_tip_id.height < block_id.height
+                || (observed_tip_id.height == block_id.height
+                    && observed_tip_id.hash != block_id.hash)
+            {
+                return Ok(SourceChainSegment::new([
+                    SourceChainUpdate::reverted_block(block_id),
+                ]));
+            }
+            if observed_tip_id.height == block_id.height {
+                return Ok(SourceChainSegment::default());
+            }
+            let Some(next_height) = block_id.height.next() else {
+                return Ok(SourceChainSegment::default());
+            };
+            (next_height, Some(block_id))
+        }
+    };
+    if observed_tip_id.height < start_height {
+        return Ok(SourceChainSegment::default());
+    }
+
+    let end_height = bounded_segment_end_height(
+        start_height,
+        observed_tip_id.height,
+        limits.max_connected_blocks,
+    );
+    let batched_blocks = source
+        .fetch_blocks_at_batch(start_height, end_height)
+        .await?;
+    if let (Some(expected_parent_id), Some(first_block)) =
+        (expected_parent_id, batched_blocks.blocks.first())
+        && first_block.parent_hash != expected_parent_id.hash
+    {
+        return Ok(SourceChainSegment::new([
+            SourceChainUpdate::reverted_block(expected_parent_id),
+        ]));
+    }
+    validate_source_block_links(&batched_blocks.blocks)?;
+
+    Ok(SourceChainSegment::connected_blocks_with_stats(
+        batched_blocks.blocks,
+        batched_blocks.stats,
+    ))
+}
+
 fn bounded_segment_end_height(
     start_height: BlockHeight,
     tip_height: BlockHeight,
@@ -2111,25 +2655,8 @@ fn offending_range_split_retry_accounting(
     }
 }
 
-fn next_batch_value<'a>(
-    responses: &mut impl Iterator<Item = Result<Value, ErrorObject<'a>>>,
-    height: BlockHeight,
-    method: &'static str,
-) -> Result<Value, SourceError> {
-    match responses.next() {
-        Some(Ok(response_value)) => Ok(response_value),
-        Some(Err(error)) => Err(block_read_error(
-            height,
-            batch_call_error_message(method, &error),
-        )),
-        None => Err(SourceError::SourceProtocolMismatch {
-            reason: "batched block response contained fewer entries than requested",
-        }),
-    }
-}
-
-fn batch_call_error_message(method: &str, error: &ErrorObject<'_>) -> String {
-    format!("{method}: {}", error.message())
+fn batch_block_error(height: BlockHeight, error: &ErrorObject<'_>) -> SourceError {
+    block_read_error(height, format!("getblock: {}", error.message()))
 }
 
 pub(crate) fn validate_source_block_links(blocks: &[SourceBlock]) -> Result<(), SourceError> {
@@ -2163,49 +2690,73 @@ fn record_block_decode_stage(stage: &'static str, started_at: Instant) {
 }
 
 fn record_json_rpc_source_outcome<Response>(
-    method: &'static str,
+    method: JsonRpcMethod,
     started_at: Instant,
     rpc_outcome: &Result<Response, SourceError>,
 ) {
+    let method_name = method.as_str();
     metrics::histogram!(
         "zinder_node_request_duration_seconds",
-        "source" => "zebra_json_rpc",
-        "method" => method,
+        "source" => ZEBRA_JSON_RPC_PEER_LABEL,
+        "method" => method_name,
         "status" => outcome_status(rpc_outcome),
         "error_class" => source_error_class(rpc_outcome.as_ref().err())
     )
     .record(started_at.elapsed());
     metrics::counter!(
         "zinder_node_request_total",
-        "source" => "zebra_json_rpc",
-        "method" => method,
+        "source" => ZEBRA_JSON_RPC_PEER_LABEL,
+        "method" => method_name,
         "status" => outcome_status(rpc_outcome),
         "error_class" => source_error_class(rpc_outcome.as_ref().err())
+    )
+    .increment(1);
+    if matches!(rpc_outcome, Err(SourceError::NodeRateLimited { .. })) {
+        record_node_rate_limited(method);
+    }
+}
+
+/// Counts one call the node refused with HTTP 429.
+///
+/// Each call records its outcome through exactly one of
+/// [`record_json_rpc_source_outcome`] and [`record_json_rpc_client_result`],
+/// and each of those calls this once, so a refusal is counted once.
+fn record_node_rate_limited(method: JsonRpcMethod) {
+    metrics::counter!(
+        NODE_RATE_LIMITED_COUNTER,
+        "source" => ZEBRA_JSON_RPC_PEER_LABEL,
+        "method" => method.as_str()
     )
     .increment(1);
 }
 
 fn record_json_rpc_client_result<Response>(
-    method: &'static str,
+    method: JsonRpcMethod,
     started_at: Instant,
     rpc_outcome: &Result<Response, ClientError>,
 ) {
+    let method_name = method.as_str();
     metrics::histogram!(
         "zinder_node_request_duration_seconds",
-        "source" => "zebra_json_rpc",
-        "method" => method,
+        "source" => ZEBRA_JSON_RPC_PEER_LABEL,
+        "method" => method_name,
         "status" => outcome_status(rpc_outcome),
         "error_class" => client_error_class(rpc_outcome.as_ref().err())
     )
     .record(started_at.elapsed());
     metrics::counter!(
         "zinder_node_request_total",
-        "source" => "zebra_json_rpc",
-        "method" => method,
+        "source" => ZEBRA_JSON_RPC_PEER_LABEL,
+        "method" => method_name,
         "status" => outcome_status(rpc_outcome),
         "error_class" => client_error_class(rpc_outcome.as_ref().err())
     )
     .increment(1);
+    if let Err(error) = rpc_outcome
+        && client_error_is_rate_limited(error)
+    {
+        record_node_rate_limited(method);
+    }
 }
 
 const fn outcome_status<T, E>(outcome: &Result<T, E>) -> &'static str {
@@ -2216,6 +2767,7 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
     match error {
         None => "none",
         Some(SourceError::NodeUnavailable { .. }) => "node_unavailable",
+        Some(SourceError::NodeRateLimited { .. }) => "node_rate_limited",
         Some(SourceError::SourceResponseTooLarge { .. }) => "source_response_too_large",
         Some(SourceError::NodeResponseTooLarge { .. }) => "node_response_too_large",
         Some(SourceError::BlockUnavailable { .. }) => "block_unavailable",
@@ -2286,6 +2838,7 @@ fn client_error_class(error: Option<&ClientError>) -> &'static str {
         None => "none",
         Some(ClientError::Call(_)) => "json_rpc_call_error",
         Some(error) if client_error_is_response_too_large(error) => "response_too_large",
+        Some(error) if client_error_is_rate_limited(error) => "node_rate_limited",
         Some(_) => "transport_error",
     }
 }
@@ -2304,29 +2857,29 @@ fn parse_openrpc_capabilities(
 ) -> NodeCapabilities {
     let mut probed_capabilities = vec![NodeCapability::JsonRpc, NodeCapability::OpenRpcDiscovery];
 
-    if method_names.contains(&"getblock") {
+    if method_names.contains(&JsonRpcMethod::GetBlock.as_str()) {
         probed_capabilities.push(NodeCapability::BestChainBlocks);
         probed_capabilities.push(NodeCapability::BlockValuePoolBalances);
     }
-    if method_names.contains(&"getblock") {
+    if method_names.contains(&JsonRpcMethod::GetBlock.as_str()) {
         probed_capabilities.push(NodeCapability::SourceChainSegments);
     }
-    if method_names.contains(&"getbestblockheightandhash") {
+    if method_names.contains(&JsonRpcMethod::GetBestBlockHeightAndHash.as_str()) {
         probed_capabilities.push(NodeCapability::TipId);
     }
-    if method_names.contains(&"z_gettreestate") {
+    if method_names.contains(&JsonRpcMethod::ZGetTreestate.as_str()) {
         probed_capabilities.push(NodeCapability::TreeState);
     }
-    if method_names.contains(&"z_getsubtreesbyindex") {
+    if method_names.contains(&JsonRpcMethod::ZGetSubtreesByIndex.as_str()) {
         probed_capabilities.push(NodeCapability::SubtreeRoots);
     }
-    if method_names.contains(&"sendrawtransaction") {
+    if method_names.contains(&JsonRpcMethod::SendRawTransaction.as_str()) {
         probed_capabilities.push(NodeCapability::TransactionBroadcast);
     }
-    if method_names.contains(&"getblockchaininfo") {
+    if method_names.contains(&JsonRpcMethod::GetBlockchainInfo.as_str()) {
         probed_capabilities.push(NodeCapability::ChainValuePools);
     }
-    if method_names.contains(&"getstandardfee") {
+    if method_names.contains(&JsonRpcMethod::GetStandardFee.as_str()) {
         probed_capabilities.push(NodeCapability::StandardFee);
     }
     if stores_historical_block_bodies {
@@ -2554,6 +3107,30 @@ fn decode_final_note_commitment_root_hex(
     Ok(FinalNoteCommitmentRoot::from_bytes(root_bytes))
 }
 
+#[derive(Deserialize)]
+struct MinedTransactionReply<'a> {
+    txid: &'a str,
+    hex: &'a str,
+    height: Option<i64>,
+    blockhash: Option<&'a str>,
+}
+
+fn mined_transaction_block(
+    height_value: u64,
+    block_hash_hex: Option<&str>,
+) -> Result<BlockId, SourceError> {
+    let mined_height = BlockHeight::new(u32::try_from(height_value).map_err(|_| {
+        SourceError::SourceProtocolMismatch {
+            reason: "verbose getrawtransaction height does not fit u32",
+        }
+    })?);
+    let block_hash_hex = block_hash_hex.ok_or(SourceError::SourceProtocolMismatch {
+        reason: "verbose getrawtransaction reports a height without a blockhash",
+    })?;
+    let block_hash = decode_rpc_block_hash(block_hash_hex)?;
+    Ok(BlockId::new(mined_height, block_hash))
+}
+
 fn decode_display_transaction_id(
     display_transaction_id: &str,
 ) -> Result<TransactionId, SourceError> {
@@ -2725,6 +3302,15 @@ where
     }
 }
 
+/// Reply of `getaddressutxos` with `chainInfo`: the outputs and the tip they
+/// describe.
+#[derive(Deserialize)]
+struct ZebraAddressUtxosAtTip {
+    utxos: Vec<JsonObject<ZebraAddressUtxo>>,
+    hash: String,
+    height: u32,
+}
+
 /// Reply of the `getstandardfee` RPC.
 #[derive(Deserialize)]
 struct ZebraStandardFee {
@@ -2771,6 +3357,11 @@ fn map_transport_error(
     operation: &'static str,
     max_response_bytes: NonZeroU64,
 ) -> SourceError {
+    if let ClientError::Transport(source) = error
+        && let Some(SourceError::SourceProtocolMismatch { reason }) = source.downcast_ref()
+    {
+        return SourceError::SourceProtocolMismatch { reason };
+    }
     if source_response_too_large_for_operation(error, operation) {
         SourceError::SourceResponseTooLarge {
             operation,
@@ -2782,6 +3373,8 @@ fn map_transport_error(
                 "node refused the {operation} request credentials with HTTP 401; check node.auth"
             ),
         }
+    } else if client_error_is_rate_limited(error) {
+        SourceError::NodeRateLimited { operation }
     } else {
         SourceError::NodeUnavailable {
             reason: error.to_string(),
@@ -2806,6 +3399,21 @@ fn client_error_is_unauthorized(error: &ClientError) -> bool {
     )
 }
 
+/// Returns whether the node refused the request with HTTP 429.
+///
+/// Zebra answers HTTP 429 (`Too many connections`) when its JSON-RPC server
+/// holds its connection limit. jsonrpsee rejects the status before it reads
+/// the body, so the refusal arrives as a transport error.
+fn client_error_is_rate_limited(error: &ClientError) -> bool {
+    let ClientError::Transport(source) = error else {
+        return false;
+    };
+    matches!(
+        source.downcast_ref::<jsonrpsee::http_client::transport::Error>(),
+        Some(jsonrpsee::http_client::transport::Error::Rejected { status_code: 429 })
+    )
+}
+
 fn source_response_too_large(error: &SourceError) -> bool {
     matches!(error, SourceError::SourceResponseTooLarge { .. })
 }
@@ -2817,7 +3425,7 @@ fn client_error_is_response_too_large(error: &ClientError) -> bool {
 
 fn source_response_too_large_for_operation(error: &ClientError, operation: &'static str) -> bool {
     client_error_is_response_too_large(error)
-        || (operation == "batch_getblock"
+        || (operation == JsonRpcMethod::BatchGetblock.as_str()
             && matches!(error, ClientError::ParseError(_))
             && error
                 .to_string()
@@ -2827,12 +3435,8 @@ fn source_response_too_large_for_operation(error: &ClientError, operation: &'sta
 /// Bridges a raw jsonrpsee result into the transport-class signal
 /// [`ResilientClient::record_outcome`] consumes.
 ///
-/// A server-side JSON-RPC error ([`ClientError::Call`]) means the wire
-/// is fine but the server rejected the request; that must not advance
-/// the rebuild counter. Every other [`ClientError`] variant is a
-/// transport-layer failure (closed connection, deserialization on the
-/// transport layer, dispatch failure) and surfaces as
-/// [`SourceError::NodeUnavailable`] so the wrapper can react.
+/// A reply confirms the connection even when the node refuses a call or
+/// the batch fails the response size or ID checks.
 fn jsonrpsee_transport_signal<Response>(
     outcome: &Result<Response, ClientError>,
     operation: &'static str,
@@ -2840,8 +3444,14 @@ fn jsonrpsee_transport_signal<Response>(
 ) -> Result<(), SourceError> {
     match outcome {
         Ok(_) | Err(ClientError::Call(_)) => Ok(()),
-        Err(error) if source_response_too_large_for_operation(error, operation) => Ok(()),
-        Err(error) => Err(map_transport_error(error, operation, max_response_bytes)),
+        Err(error) => {
+            let source_error = map_transport_error(error, operation, max_response_bytes);
+            if crate::is_transport_failure(&source_error) {
+                Err(source_error)
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -3005,19 +3615,13 @@ mod tests {
         );
         let out_of_range = ErrorObject::owned(-8, "height out of range", None::<()>);
 
-        let unreadable_outcome =
-            next_batch_value(&mut std::iter::once(Err(unreadable)), height, "getblock");
-        let out_of_range_outcome =
-            next_batch_value(&mut std::iter::once(Err(out_of_range)), height, "getblock");
-
         assert!(matches!(
-            unreadable_outcome,
-            Err(SourceError::HistoricalBlockBodyUnavailable { height: refused, .. })
-                if refused == height
+            batch_block_error(height, &unreadable),
+            SourceError::HistoricalBlockBodyUnavailable { height: refused, .. } if refused == height
         ));
         assert!(matches!(
-            out_of_range_outcome,
-            Err(SourceError::BlockUnavailable { height: refused, .. }) if refused == height
+            batch_block_error(height, &out_of_range),
+            SourceError::BlockUnavailable { height: refused, .. } if refused == height
         ));
     }
 
@@ -3030,7 +3634,7 @@ mod tests {
 
         let source_error = map_transport_error(
             &error,
-            "batch_getblock",
+            JsonRpcMethod::BatchGetblock.as_str(),
             DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
         );
 
@@ -3399,5 +4003,151 @@ mod tests {
                 .supports(NodeCapability::ReadinessProbe)
         );
         Ok(())
+    }
+
+    #[test]
+    fn known_json_rpc_methods_are_unique_and_match_enum() {
+        let enum_methods: Vec<&str> = JsonRpcMethod::ALL
+            .into_iter()
+            .map(JsonRpcMethod::as_str)
+            .collect();
+        assert_eq!(KNOWN_JSON_RPC_METHODS, enum_methods.as_slice());
+
+        let unique: HashSet<&str> = KNOWN_JSON_RPC_METHODS.iter().copied().collect();
+        assert_eq!(unique.len(), KNOWN_JSON_RPC_METHODS.len());
+        assert!(
+            KNOWN_JSON_RPC_METHODS
+                .iter()
+                .all(|method_name| !method_name.is_empty())
+        );
+    }
+
+    fn assert_node_rate_limited_preregistered(rendered: &str) {
+        assert!(
+            rendered.contains("# HELP zinder_node_rate_limited_total "),
+            "missing # HELP for zinder_node_rate_limited_total in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("# TYPE zinder_node_rate_limited_total counter"),
+            "missing # TYPE for zinder_node_rate_limited_total in:\n{rendered}"
+        );
+        let series_lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("zinder_node_rate_limited_total{"))
+            .collect();
+        assert_eq!(
+            series_lines.len(),
+            KNOWN_JSON_RPC_METHODS.len(),
+            "expected one series per known method in:\n{rendered}"
+        );
+        for method_name in KNOWN_JSON_RPC_METHODS {
+            let source_label = format!("source=\"{ZEBRA_JSON_RPC_PEER_LABEL}\"");
+            let method_label = format!("method=\"{method_name}\"");
+            assert!(
+                series_lines.iter().any(|line| {
+                    line.contains(&source_label)
+                        && line.contains(&method_label)
+                        && line.ends_with(" 0")
+                }),
+                "missing zero sample for {method_name} in:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn constructors_preregister_node_rate_limited_counter_at_zero_with_metadata()
+    -> Result<(), SourceError> {
+        let recorder_new = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle_new = recorder_new.handle();
+        let rendered_new = metrics::with_local_recorder(&recorder_new, || {
+            ZebraJsonRpcSource::new(
+                Network::ZcashRegtest,
+                "http://127.0.0.1:18232",
+                NodeAuth::None,
+                Duration::from_secs(1),
+            )?;
+            Ok::<_, SourceError>(handle_new.render())
+        })?;
+        assert_node_rate_limited_preregistered(&rendered_new);
+
+        let recorder_with_options =
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle_with_options = recorder_with_options.handle();
+        let rendered_with_options = metrics::with_local_recorder(&recorder_with_options, || {
+            ZebraJsonRpcSource::with_options(
+                Network::ZcashRegtest,
+                "http://127.0.0.1:18232",
+                NodeAuth::None,
+                ZebraJsonRpcSourceOptions::default(),
+            )?;
+            Ok::<_, SourceError>(handle_with_options.render())
+        })?;
+        assert_node_rate_limited_preregistered(&rendered_with_options);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_getblock_entry_visitor_separates_hex_strings_from_non_strings()
+    -> Result<(), eyre::Report> {
+        let hex_entry: BatchGetblockEntry = serde_json::from_str("\"0400abcd\"")?;
+        assert!(matches!(hex_entry, BatchGetblockEntry::Hex(ref raw) if raw == "0400abcd"));
+
+        for non_string_json in [
+            "null",
+            "true",
+            "42",
+            "-7",
+            "1.5",
+            "[1, {\"a\": [2]}]",
+            "{\"h\":1}",
+        ] {
+            let parsed: BatchGetblockEntry = serde_json::from_str(non_string_json)?;
+            assert!(
+                matches!(parsed, BatchGetblockEntry::NonString),
+                "expected NonString for {non_string_json}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn decode_raw_block_hex_matches_hex_decode_across_valid_prefixes_and_errors() {
+        for sample in [
+            "",
+            "04000000",
+            "deadbeefCAFE",
+            "0x",
+            "0x00",
+            "0X00",
+            "0x1",
+            "0xdeadbeef",
+            "abc",
+            "00zz",
+            "01020g",
+        ] {
+            let expected =
+                hex::decode(sample).map_err(|source| SourceError::InvalidRawBlockHex { source });
+            let actual = decode_raw_block_hex(sample);
+            match (actual, expected) {
+                (Ok(actual_bytes), Ok(expected_bytes)) => {
+                    assert_eq!(actual_bytes, expected_bytes, "mismatch on {sample}");
+                }
+                (
+                    Err(SourceError::InvalidRawBlockHex { source: actual_err }),
+                    Err(SourceError::InvalidRawBlockHex {
+                        source: expected_err,
+                    }),
+                ) => {
+                    assert_eq!(actual_err, expected_err, "error mismatch on {sample}");
+                }
+                (actual_other, expected_other) => {
+                    assert_eq!(
+                        actual_other.is_ok(),
+                        expected_other.is_ok(),
+                        "outcome variant mismatch on {sample}: actual={actual_other:?}, expected={expected_other:?}"
+                    );
+                }
+            }
+        }
     }
 }

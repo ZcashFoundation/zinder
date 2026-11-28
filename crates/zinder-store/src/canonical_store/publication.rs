@@ -1,12 +1,13 @@
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use rust_rocksdb::{
-    BoundColumnFamily, DB, DEFAULT_COLUMN_FAMILY_NAME, FlushOptions, ReadOptions, WriteBatch,
-    WriteOptions,
+    BoundColumnFamily, DB, DEFAULT_COLUMN_FAMILY_NAME, FlushOptions, LiveFile, ReadOptions,
+    ReadTier, WriteBatch, WriteOptions,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpochId, ChainTipMetadata,
@@ -16,13 +17,13 @@ use zinder_core::{
 use crate::{BoundedRocksDbOpen, RocksDbOpenRole, open_bounded_rocksdb};
 
 use super::{
-    CanonicalEventFence, CanonicalSequenceCheckpoint, CanonicalStoreBuildState,
-    CanonicalStoreError, CanonicalStoreReadyEvidence, RocksDbCanonicalBuilder,
-    RocksDbCanonicalStore,
+    CanonicalActivationSchedule, CanonicalEventFence, CanonicalSequenceCheckpoint,
+    CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreReadyEvidence,
+    RocksDbCanonicalBuilder, RocksDbCanonicalStore,
     block_load::{
         CanonicalBlockLoadEvidence, CanonicalTrustedFreshBlockEvidence,
-        read_persisted_tip_metadata, validate_persisted_commitment_tree_families,
-        validate_source_tip_checkpoint,
+        ConstructionTreeStateCheckpointPolicy, encode_block_position, read_persisted_tip_metadata,
+        validate_persisted_commitment_tree_families, validate_source_tip_checkpoint,
     },
     block_replay::{
         PersistedBlockReplayValidation, validate_persisted_block_replays_with_checkpoints,
@@ -31,19 +32,28 @@ use super::{
         CanonicalConstructionFamilyEvidence, CanonicalConstructionManifestDraft,
         CanonicalConstructionManifestInputs,
     },
-    control::{DecodedStoreControl, decode_store_control, encode_ready_store_control},
+    control::{
+        ControlRevisions, DecodedStoreControl, decode_store_control,
+        encode_ready_store_control_with_revisions,
+    },
     displaced_archive::validate_permanent_reorg_archive,
     replay_tail::AuthenticatedReplayTail,
     rocksdb::{
-        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CANONICAL_DATA_COLUMN_FAMILIES,
-        CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-        CanonicalStoreAdmissionExpectation, DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY,
-        DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, MEMPOOL_EVENT_COLUMN_FAMILY, STORE_CONTROL_KEY,
-        TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
-        TREE_STATE_CHECKPOINT_COLUMN_FAMILY, admit_existing_store,
-        canonical_column_family_descriptors, validate_open_store_control,
+        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
+        CHAIN_EVENT_COLUMN_FAMILY, CanonicalStoreAdmissionExpectation,
+        LIVE_TAIL_BLOCK_COLUMN_FAMILY, LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY, STORE_CONTROL_KEY,
+        TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        admit_existing_store, canonical_column_family_descriptors, validate_open_store_control,
     },
+    settled_segments::{
+        cache::SettledSegmentReaderCache,
+        layout::SettledSegmentIndexEntry,
+        store_access::{
+            SegmentStoreContext, read_all_settled_segment_entries, segment_modules_for_stored_set,
+            verified_read_options, verify_cold_segments_and_manifest,
+        },
+    },
+    stored_set::{CANONICAL_DATA_COLUMN_FAMILIES, CANONICAL_PRE_PUBLICATION_EMPTY_FAMILIES},
     subtree_load::{retained_block_hash, validate_persisted_subtree_root_family},
 };
 
@@ -77,19 +87,21 @@ impl CanonicalBaselinePublication {
     }
 }
 
-/// Exclusive owner of a reopened canonical v1 build prepared for publication.
+/// Exclusive owner of a reopened canonical v2 build prepared for publication.
 ///
 /// Trusted fresh-writer preparation and explicit cold certification are
 /// separate builder APIs that both produce this publication capability.
 pub struct ValidatedRocksDbCanonicalBuild {
     bounded_open: BoundedRocksDbOpen,
-    workload: super::CanonicalStoreWorkload,
     build_plan: super::CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
+    activation_schedule: CanonicalActivationSchedule,
     ready_evidence: CanonicalStoreReadyEvidence,
     construction_manifest: CanonicalConstructionManifestDraft,
     retained_sequence_checkpoints: VecDeque<CanonicalSequenceCheckpoint>,
     tip_metadata: ChainTipMetadata,
+    sealed_segments: Vec<SettledSegmentIndexEntry>,
+    segment_cache: Arc<SettledSegmentReaderCache>,
 }
 
 /// Baseline input checked against one specific cold-validated canonical build.
@@ -111,9 +123,10 @@ struct PublicationContext {
     store_path: std::path::PathBuf,
     resource_budget: crate::RocksDbResourceBudget,
     network: zinder_core::Network,
-    workload: super::CanonicalStoreWorkload,
     build_plan: super::CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
+    activation_schedule: CanonicalActivationSchedule,
+    tree_state_checkpoint_policy: ConstructionTreeStateCheckpointPolicy,
     block_evidence: CanonicalBlockLoadEvidence,
     trusted_fresh_block_evidence: CanonicalTrustedFreshBlockEvidence,
     staged_ssts: Vec<super::block_load::CanonicalStagedSstEvidence>,
@@ -166,11 +179,6 @@ impl RocksDbCanonicalBuilder {
 
 impl PublicationContext {
     fn from_builder(builder: &RocksDbCanonicalBuilder) -> Result<Self, CanonicalStoreError> {
-        if builder.workload == super::CanonicalStoreWorkload::Explorer {
-            return Err(CanonicalStoreError::publication(
-                "explorer publication requires authenticated daily value-pool evidence",
-            ));
-        }
         let block_evidence = builder.canonical_block_evidence.ok_or_else(|| {
             CanonicalStoreError::publication("canonical block families were not loaded")
         })?;
@@ -207,13 +215,23 @@ impl PublicationContext {
                         "the fixed canonical tip was not confirmed by the node source",
                     )
                 })?;
+        let activations = builder.construction_activations.clone().ok_or_else(|| {
+            CanonicalStoreError::publication("canonical construction activation table is absent")
+        })?;
+        let activation_schedule = CanonicalActivationSchedule::first_revision(
+            activations,
+            builder.build_plan.network_upgrade_activations_fingerprint(),
+            builder.build_plan.build_tip(),
+        )
+        .map_err(|error| CanonicalStoreError::publication(error.to_string()))?;
         Ok(Self {
+            activation_schedule,
             store_path: builder.store_path.clone(),
             resource_budget: builder.resource_budget,
             network: builder.network,
-            workload: builder.workload,
             build_plan: builder.build_plan.clone(),
             cursor_auth_key: builder.cursor_auth_key,
+            tree_state_checkpoint_policy: builder.tree_state_checkpoint_policy,
             block_evidence,
             trusted_fresh_block_evidence,
             staged_ssts,
@@ -228,17 +246,34 @@ impl PublicationContext {
         built_database_identity: &[u8],
     ) -> Result<ValidatedRocksDbCanonicalBuild, CanonicalStoreError> {
         let bounded_open = self.reopen_complete_build(built_database_identity)?;
+        let stored_set = self.build_plan.stored_set();
+        let sealed_segments = read_all_settled_segment_entries(&bounded_open.db)?;
+        let expected_modules = segment_modules_for_stored_set(stored_set);
+        for entry in &sealed_segments {
+            if entry.modules != expected_modules {
+                return Err(CanonicalStoreError::publication(format!(
+                    "settled segment {}..={} modules {:?} differ from admitted modules {:?}",
+                    entry.start_height.value(),
+                    entry.end_block.height.value(),
+                    entry.modules,
+                    expected_modules,
+                )));
+            }
+        }
+        let segment_cache =
+            SettledSegmentReaderCache::with_admitted_corpus(&self.store_path, &sealed_segments)?;
+        let ctx = SegmentStoreContext {
+            db: &bounded_open.db,
+            segment_cache: Some(&segment_cache),
+            sealed_segments: Some(&sealed_segments),
+        };
         validate_source_tip_checkpoint(
             &bounded_open.db,
             &self.build_plan,
             &self.block_evidence,
             &self.source_tip_checkpoint,
         )?;
-        validate_trusted_fresh_tip_points(
-            &bounded_open.db,
-            &self.build_plan,
-            &self.block_evidence,
-        )?;
+        validate_trusted_fresh_tip_points(ctx, &self.build_plan, &self.block_evidence)?;
 
         let CanonicalTrustedFreshBlockEvidence {
             mut family_evidence,
@@ -246,13 +281,7 @@ impl PublicationContext {
             logical_replay_bytes,
         } = self.trusted_fresh_block_evidence;
         family_evidence.push(self.trusted_fresh_subtree_family_evidence);
-        for name in [
-            DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY,
-            CHAIN_EPOCH_COLUMN_FAMILY,
-            CHAIN_EVENT_COLUMN_FAMILY,
-            MEMPOOL_EVENT_COLUMN_FAMILY,
-            DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
-        ] {
+        for name in CANONICAL_PRE_PUBLICATION_EMPTY_FAMILIES {
             family_evidence.push(CanonicalConstructionFamilyEvidence::accumulator(name).finish());
         }
         validate_trusted_fresh_family_boundaries(&bounded_open.db, &family_evidence)?;
@@ -260,7 +289,7 @@ impl PublicationContext {
         let construction_manifest = CanonicalConstructionManifestDraft::new_trusted_fresh(
             CanonicalConstructionManifestInputs {
                 build_plan: self.build_plan.clone(),
-                workload: self.workload,
+                tree_state_checkpoint_policy: self.tree_state_checkpoint_policy,
                 source_checkpoint: self.source_tip_checkpoint,
                 block_evidence: self.block_evidence,
                 subtree_evidence: self.subtree_root_evidence,
@@ -276,13 +305,15 @@ impl PublicationContext {
         super::crash_point("canonical.publication.after_cold_validation");
         Ok(ValidatedRocksDbCanonicalBuild {
             bounded_open,
-            workload: self.workload,
             build_plan: self.build_plan,
             cursor_auth_key: self.cursor_auth_key,
+            activation_schedule: self.activation_schedule,
             ready_evidence,
             construction_manifest,
             retained_sequence_checkpoints,
             tip_metadata: self.block_evidence.tip_metadata,
+            sealed_segments,
+            segment_cache,
         })
     }
 
@@ -291,10 +322,22 @@ impl PublicationContext {
         built_database_identity: &[u8],
     ) -> Result<ValidatedRocksDbCanonicalBuild, CanonicalStoreError> {
         let bounded_open = self.reopen_complete_build(built_database_identity)?;
-        let cold_validation = validate_cold_block_families(
+        let stored_set = self.build_plan.stored_set();
+        let (sealed_segments, segment_cache) = verify_cold_segments_and_manifest(
+            &self.store_path,
             &bounded_open.db,
-            self.workload,
+            self.network,
+            stored_set,
+        )?;
+        let ctx = SegmentStoreContext {
+            db: &bounded_open.db,
+            segment_cache: Some(&segment_cache),
+            sealed_segments: Some(&sealed_segments),
+        };
+        let cold_validation = validate_cold_block_families(
+            ctx,
             &self.build_plan,
+            self.tree_state_checkpoint_policy,
             &self.block_evidence,
         )?;
         validate_cold_evidence_matches_writer(
@@ -331,7 +374,7 @@ impl PublicationContext {
         let construction_manifest = CanonicalConstructionManifestDraft::new_cold_certified(
             CanonicalConstructionManifestInputs {
                 build_plan: self.build_plan.clone(),
-                workload: self.workload,
+                tree_state_checkpoint_policy: self.tree_state_checkpoint_policy,
                 source_checkpoint: self.source_tip_checkpoint,
                 block_evidence: self.block_evidence,
                 subtree_evidence: self.subtree_root_evidence,
@@ -343,20 +386,21 @@ impl PublicationContext {
         super::crash_point("canonical.publication.after_cold_validation");
         Ok(ValidatedRocksDbCanonicalBuild {
             bounded_open,
-            workload: self.workload,
             build_plan: self.build_plan,
             cursor_auth_key: self.cursor_auth_key,
+            activation_schedule: self.activation_schedule,
             ready_evidence,
             construction_manifest,
             retained_sequence_checkpoints: cold_validation.replay.retained_sequence_checkpoints,
             tip_metadata: self.block_evidence.tip_metadata,
+            sealed_segments,
+            segment_cache,
         })
     }
 
     fn expected_building_control(&self) -> DecodedStoreControl {
         DecodedStoreControl {
             network: self.network,
-            workload: self.workload,
             build_plan: self.build_plan.clone(),
             cursor_auth_key: self.cursor_auth_key,
             build_state: CanonicalStoreBuildState::Building,
@@ -372,11 +416,10 @@ impl PublicationContext {
         let expected_control = self.expected_building_control();
         let expectation = CanonicalStoreAdmissionExpectation::from_build_plan(
             &self.build_plan,
-            self.workload,
             self.build_plan.reorg_policy(),
         );
         let (admitted_database_identity, admitted_control, _) =
-            admit_existing_store(&self.store_path, &expectation)?;
+            admit_existing_store(&self.store_path, &expectation, self.resource_budget)?;
         if admitted_database_identity.as_slice() != built_database_identity
             || admitted_control != expected_control
         {
@@ -419,6 +462,7 @@ fn ready_evidence_from_cold_replay(
             )
         })?;
     Ok(CanonicalStoreReadyEvidence {
+        schema_version: crate::CANONICAL_STORE_SCHEMA_VERSION,
         first_retained_block: BlockId::new(evidence.first_height, evidence.first_hash),
         visible_tip: BlockId::new(evidence.tip_height, evidence.tip_hash),
         visible_epoch: BASELINE_EPOCH_ID,
@@ -459,6 +503,7 @@ fn ready_evidence_from_trusted_fresh(
         ));
     }
     Ok(CanonicalStoreReadyEvidence {
+        schema_version: crate::CANONICAL_STORE_SCHEMA_VERSION,
         first_retained_block: BlockId::new(evidence.first_height, evidence.first_hash),
         visible_tip,
         visible_epoch: BASELINE_EPOCH_ID,
@@ -476,17 +521,17 @@ fn ready_evidence_from_trusted_fresh(
 }
 
 fn validate_trusted_fresh_tip_points(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     build_plan: &super::CanonicalStoreBuildPlan,
     evidence: &CanonicalBlockLoadEvidence,
 ) -> Result<(), CanonicalStoreError> {
     let first = BlockId::new(evidence.first_height, evidence.first_hash);
     let tip = BlockId::new(evidence.tip_height, evidence.tip_hash);
-    if first.height != build_plan.history_bounds().first_available_height()
+    if first.height != build_plan.first_retained_height()
         || tip != build_plan.build_tip()
-        || retained_block_hash(db, first.height)? != first.hash
-        || retained_block_hash(db, tip.height)? != tip.hash
-        || read_persisted_tip_metadata(db, tip)? != evidence.tip_metadata
+        || retained_block_hash(ctx.db, first.height)? != first.hash
+        || retained_block_hash(ctx.db, tip.height)? != tip.hash
+        || read_persisted_tip_metadata(ctx, tip)? != evidence.tip_metadata
     {
         return Err(CanonicalStoreError::publication(
             "trusted fresh-writer boundary points differ from the source load",
@@ -622,7 +667,7 @@ impl ValidatedRocksDbCanonicalBuild {
         })
     }
 
-    /// Atomically publishes epoch 1, event 1, and READY with a synced WAL write.
+    /// Atomically publishes epoch 1, event 1, activation schedule revision 1, and READY with a synced WAL write.
     #[allow(
         clippy::too_many_lines,
         reason = "baseline publication binds the manifest, epoch, event, and READY control in one synced write"
@@ -639,7 +684,7 @@ impl ValidatedRocksDbCanonicalBuild {
             ));
         }
 
-        let subtree_root_coverage = self.construction_manifest.subtree_root_coverage();
+        let manifest_details = self.construction_manifest.details();
         let unbound_ready_evidence = CanonicalStoreReadyEvidence {
             sequence_checkpoint: prepared.sequence_checkpoint,
             ..self.ready_evidence
@@ -661,11 +706,14 @@ impl ValidatedRocksDbCanonicalBuild {
         let encoded_publication = EncodedBaselinePublication {
             epoch: encode_baseline_epoch(&ready_evidence, prepared.publication, self.tip_metadata),
             event: encode_baseline_event(&ready_evidence),
-            control: encode_ready_store_control(
-                self.workload,
+            control: encode_ready_store_control_with_revisions(
                 &self.build_plan,
                 self.cursor_auth_key,
                 &ready_evidence,
+                ControlRevisions {
+                    activation_schedule_binding: Some(self.activation_schedule.binding()),
+                    revised_reorg_policy: None,
+                },
             )
             .map_err(|source| CanonicalStoreError::publication(source.to_string()))?,
         };
@@ -675,11 +723,9 @@ impl ValidatedRocksDbCanonicalBuild {
         batch.put_cf(&epoch_family, epoch_key, encoded_publication.epoch);
         batch.put_cf(&event_family, event_key, encoded_publication.event);
         batch.put(STORE_CONTROL_KEY, &encoded_publication.control);
-        if batch.len() != 3 {
-            return Err(CanonicalStoreError::publication(
-                "baseline publication batch must contain exactly three writes",
-            ));
-        }
+        self.activation_schedule
+            .put_into(&mut batch)
+            .map_err(CanonicalStoreError::publication)?;
         let mut write_options = WriteOptions::default();
         write_options.disable_wal(false);
         write_options.set_sync(true);
@@ -694,11 +740,17 @@ impl ValidatedRocksDbCanonicalBuild {
                 },
             )?;
         super::crash_point("canonical.publication.after_atomic_write");
+        let ctx = SegmentStoreContext {
+            db: &self.bounded_open.db,
+            segment_cache: Some(&self.segment_cache),
+            sealed_segments: Some(&self.sealed_segments),
+        };
         let replay_tail = validate_exact_publication_readback(
-            &self.bounded_open.db,
+            ctx,
             &self.build_plan,
             &ready_evidence,
             &encoded_publication,
+            &self.activation_schedule,
         )
         .map_err(
             |source| CanonicalStoreError::PublicationCommittedButUnverified {
@@ -710,12 +762,14 @@ impl ValidatedRocksDbCanonicalBuild {
         drop(event_family);
         Ok(RocksDbCanonicalStore::from_published(
             self.bounded_open,
-            self.workload,
             self.build_plan,
             self.cursor_auth_key,
             &ready_evidence,
-            subtree_root_coverage,
+            manifest_details,
+            self.activation_schedule,
             replay_tail,
+            self.sealed_segments,
+            self.segment_cache,
         ))
     }
 }
@@ -726,34 +780,47 @@ impl ValidatedRocksDbCanonicalBuild {
 /// Returns the unsettled replay tail it authenticated, which later
 /// transitions extend incrementally.
 pub(super) fn validate_ready_publication(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     build_plan: &super::CanonicalStoreBuildPlan,
     reorg_policy: super::CanonicalReorgPolicy,
     ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> Result<AuthenticatedReplayTail, CanonicalStoreError> {
+    let db = ctx.db;
     validate_first_retained_block(db, ready_evidence.first_retained_block)?;
-    let replay_tail = authenticate_ready_replay_tail(db, reorg_policy, ready_evidence)?;
+    validate_settled_live_tail_boundaries(ctx, build_plan, ready_evidence)?;
+    let replay_tail = authenticate_ready_replay_tail(ctx, reorg_policy, ready_evidence)?;
     let baseline_tip = build_plan.build_tip();
-    let baseline_epoch = decode_chain_epoch(&read_family_row(
-        db,
-        CHAIN_EPOCH_COLUMN_FAMILY,
-        &BASELINE_EPOCH_ID.value().to_be_bytes(),
-    )?)?;
-    let baseline_event = decode_chain_event(&read_family_row(
-        db,
-        CHAIN_EVENT_COLUMN_FAMILY,
-        &BASELINE_EVENT_SEQUENCE.to_be_bytes(),
-    )?)?;
+    let mut epoch_cursor = CachedSequenceCursor::open_at_start(db, CHAIN_EPOCH_COLUMN_FAMILY)?;
+    let mut event_cursor = CachedSequenceCursor::open_at_start(db, CHAIN_EVENT_COLUMN_FAMILY)?;
+    let baseline_epoch =
+        epoch_cursor.read_current_expected(BASELINE_EPOCH_ID.value(), decode_chain_epoch)?;
+    let baseline_event =
+        event_cursor.read_current_expected(BASELINE_EVENT_SEQUENCE, decode_chain_event)?;
     validate_baseline_publication(build_plan, ready_evidence, baseline_epoch, baseline_event)?;
     if ready_evidence.visible_epoch == BASELINE_EPOCH_ID {
+        epoch_cursor.advance()?;
+        epoch_cursor.ensure_exhausted(BASELINE_EPOCH_ID.value())?;
+        event_cursor.advance()?;
+        event_cursor.ensure_exhausted(BASELINE_EVENT_SEQUENCE)?;
         validate_epoch_record(
-            db,
+            ctx,
             ready_evidence.first_retained_block.height,
             baseline_tip,
             baseline_epoch,
         )?;
     } else {
-        validate_live_history(db, build_plan, reorg_policy, ready_evidence, baseline_epoch)?;
+        let context = LiveHistoryValidationContext {
+            build_plan,
+            reorg_policy,
+            ready_evidence,
+        };
+        validate_live_history(
+            ctx,
+            &context,
+            baseline_epoch,
+            &mut epoch_cursor,
+            &mut event_cursor,
+        )?;
     }
     validate_permanent_reorg_archive(
         db,
@@ -764,11 +831,178 @@ pub(super) fn validate_ready_publication(
     Ok(replay_tail)
 }
 
-pub(super) fn validate_live_append_publication(
+fn validate_settled_live_tail_boundaries(
+    ctx: SegmentStoreContext<'_>,
+    build_plan: &super::CanonicalStoreBuildPlan,
+    ready_evidence: &CanonicalStoreReadyEvidence,
+) -> Result<(), CanonicalStoreError> {
+    let settled = match ctx.sealed_segments {
+        Some(entries) => Cow::Borrowed(entries),
+        None => Cow::Owned(read_all_settled_segment_entries(ctx.db)?),
+    };
+    let settled_tip_height = ready_evidence.sequence_checkpoint.through().height;
+    let first_retained_height = ready_evidence.first_retained_block.height;
+    let first_unsealed_height = if let Some(first) = settled.first()
+        && let Some(last) = settled.last()
+    {
+        if first.start_height != first_retained_height {
+            return Err(CanonicalStoreError::publication(
+                "settled_segment_index must begin at first_retained_block",
+            ));
+        }
+        if last.end_block.height > settled_tip_height {
+            return Err(CanonicalStoreError::publication(
+                "settled_segment_index extends past READY settled_tip",
+            ));
+        }
+        if last.end_block.height == settled_tip_height
+            && last.end_sequence_checkpoint != ready_evidence.sequence_checkpoint
+        {
+            return Err(CanonicalStoreError::publication(
+                "terminal settled segment sequence checkpoint disagrees with READY settled checkpoint",
+            ));
+        }
+        last.end_block.height.next()
+    } else {
+        Some(first_retained_height)
+    };
+    let live_files =
+        ctx.db
+            .live_files()
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "live-tail admission live files",
+                source,
+            })?;
+    let bounds = TailFamilyBounds {
+        first_unsealed_height,
+        visible_tip_height: ready_evidence.visible_tip.height,
+        may_have_rows: true,
+    };
+    validate_tail_family_bounds(ctx.db, &live_files, LIVE_TAIL_BLOCK_COLUMN_FAMILY, bounds)?;
+    validate_tail_family_bounds(
+        ctx.db,
+        &live_files,
+        LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY,
+        TailFamilyBounds {
+            may_have_rows: build_plan.raw_blob_retention().full_blocks(),
+            ..bounds
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct TailFamilyBounds {
+    first_unsealed_height: Option<BlockHeight>,
+    visible_tip_height: BlockHeight,
+    may_have_rows: bool,
+}
+
+#[derive(Clone, Copy)]
+enum TailKeyBound {
+    Unbounded,
+    Lower([u8; 4]),
+    Upper([u8; 4]),
+}
+
+fn has_forbidden_tail_entry(
     db: &DB,
+    family: &Arc<BoundColumnFamily<'_>>,
+    sst_overlaps: bool,
+    bound: TailKeyBound,
+    operation: &'static str,
+) -> Result<bool, CanonicalStoreError> {
+    let mut options = verified_read_options();
+    match bound {
+        TailKeyBound::Unbounded => {}
+        TailKeyBound::Lower(lower) => options.set_iterate_lower_bound(lower),
+        TailKeyBound::Upper(upper) => options.set_iterate_upper_bound(upper),
+    }
+    if !sst_overlaps {
+        options.set_read_tier(ReadTier::Memtable);
+    }
+    let mut iter = db.raw_iterator_cf_opt(family, options);
+    iter.seek_to_first();
+    let valid = iter.valid();
+    iter.status()
+        .map_err(|source| CanonicalStoreError::RocksDbOperation { operation, source })?;
+    Ok(valid)
+}
+
+fn validate_tail_family_bounds(
+    db: &DB,
+    live_files: &[LiveFile],
+    family_name: &'static str,
+    bounds: TailFamilyBounds,
+) -> Result<(), CanonicalStoreError> {
+    let family = column_family(db, family_name)?;
+    let family_files = || {
+        live_files
+            .iter()
+            .filter(|file| file.column_family_name == family_name)
+    };
+    if !bounds.may_have_rows {
+        let has_sst = family_files().next().is_some();
+        if has_forbidden_tail_entry(
+            db,
+            &family,
+            has_sst,
+            TailKeyBound::Unbounded,
+            "tail family emptiness admission",
+        )? {
+            return Err(CanonicalStoreError::publication(format!(
+                "{family_name} must be empty when full_blocks is disabled",
+            )));
+        }
+        return Ok(());
+    }
+    let min_key = bounds.first_unsealed_height.map(encode_block_position);
+    let sst_overlaps_lower = family_files().any(|file| {
+        min_key.as_ref().is_none_or(|key| {
+            file.start_key
+                .as_deref()
+                .is_none_or(|start| start < key.as_slice())
+        })
+    });
+    let lower_bound = min_key.map_or(TailKeyBound::Unbounded, TailKeyBound::Upper);
+    if has_forbidden_tail_entry(
+        db,
+        &family,
+        sst_overlaps_lower,
+        lower_bound,
+        "tail family lower-bound admission",
+    )? {
+        return Err(CanonicalStoreError::publication(format!(
+            "{family_name} contains unpruned rows inside settled segments",
+        )));
+    }
+    if let Some(after_tip) = bounds.visible_tip_height.next() {
+        let after_tip_key = encode_block_position(after_tip);
+        let sst_overlaps_upper = family_files().any(|file| {
+            file.end_key
+                .as_deref()
+                .is_none_or(|end| end >= after_tip_key.as_slice())
+        });
+        if has_forbidden_tail_entry(
+            db,
+            &family,
+            sst_overlaps_upper,
+            TailKeyBound::Lower(after_tip_key),
+            "tail family upper-bound admission",
+        )? {
+            return Err(CanonicalStoreError::publication(format!(
+                "{family_name} contains rows beyond visible_tip",
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_live_append_publication(
+    ctx: SegmentStoreContext<'_>,
     ready_evidence: &CanonicalStoreReadyEvidence,
     previous_epoch_id: ChainEpochId,
 ) -> Result<(), CanonicalStoreError> {
+    let db = ctx.db;
     if ready_evidence.visible_event_sequence != ready_evidence.visible_epoch.value()
         || ready_evidence.visible_epoch.value() != previous_epoch_id.value().saturating_add(1)
     {
@@ -797,7 +1031,7 @@ pub(super) fn validate_live_append_publication(
         })?;
     let appended_range = BlockHeightRange::inclusive(appended_height, appended_height);
     validate_epoch_record(
-        db,
+        ctx,
         ready_evidence.first_retained_block.height,
         ready_evidence.visible_tip,
         current_epoch,
@@ -817,12 +1051,13 @@ pub(super) fn validate_live_append_publication(
 }
 
 pub(super) fn validate_live_replacement_publication(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     ready_evidence: &CanonicalStoreReadyEvidence,
     previous_epoch_id: ChainEpochId,
     reverted_range: BlockHeightRange,
     committed_range: BlockHeightRange,
 ) -> Result<(), CanonicalStoreError> {
+    let db = ctx.db;
     if ready_evidence.visible_event_sequence != ready_evidence.visible_epoch.value()
         || ready_evidence.visible_epoch.value() != previous_epoch_id.value().saturating_add(1)
     {
@@ -846,7 +1081,7 @@ pub(super) fn validate_live_replacement_publication(
         &ready_evidence.visible_event_sequence.to_be_bytes(),
     )?)?;
     validate_epoch_record(
-        db,
+        ctx,
         ready_evidence.first_retained_block.height,
         ready_evidence.visible_tip,
         current_epoch,
@@ -884,13 +1119,13 @@ fn validate_first_retained_block(
 /// Re-derives the whole unsettled replay tail from the persisted settled
 /// checkpoint and checks it against READY evidence.
 pub(super) fn authenticate_ready_replay_tail(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     reorg_policy: super::CanonicalReorgPolicy,
     ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> Result<AuthenticatedReplayTail, CanonicalStoreError> {
-    validate_ready_settlement_window(db, reorg_policy, ready_evidence)?;
+    validate_ready_settlement_window(ctx.db, reorg_policy, ready_evidence)?;
     let replay_tail = AuthenticatedReplayTail::authenticate(
-        db,
+        ctx,
         ready_evidence.sequence_checkpoint,
         ready_evidence.visible_tip.height,
         reorg_policy.reorg_window_blocks(),
@@ -906,7 +1141,7 @@ pub(super) fn authenticate_ready_replay_tail(
 /// unsettled suffix is re-derived instead, so an out-of-band change to a row
 /// no transition touched is still found within one window of blocks.
 pub(super) fn advance_ready_replay_tail(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     reorg_policy: super::CanonicalReorgPolicy,
     ready_evidence: &CanonicalStoreReadyEvidence,
     retained_height: BlockHeight,
@@ -914,12 +1149,12 @@ pub(super) fn advance_ready_replay_tail(
 ) -> Result<(), CanonicalStoreError> {
     let window = reorg_policy.reorg_window_blocks();
     if replay_tail.full_authentication_due(window) {
-        *replay_tail = authenticate_ready_replay_tail(db, reorg_policy, ready_evidence)?;
+        *replay_tail = authenticate_ready_replay_tail(ctx, reorg_policy, ready_evidence)?;
         return Ok(());
     }
-    validate_ready_settlement_window(db, reorg_policy, ready_evidence)?;
+    validate_ready_settlement_window(ctx.db, reorg_policy, ready_evidence)?;
     replay_tail.reauthenticate_above(
-        db,
+        ctx,
         retained_height,
         ready_evidence.visible_tip.height,
         window,
@@ -936,21 +1171,21 @@ pub(super) fn advance_ready_replay_tail(
 /// re-derives the whole unsettled suffix, so it accepts exactly the READY
 /// evidence a complete derivation accepts.
 pub(super) fn follow_ready_replay_tail(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     reorg_policy: super::CanonicalReorgPolicy,
     previous: &CanonicalStoreReadyEvidence,
     ready_evidence: &CanonicalStoreReadyEvidence,
     replay_tail: &mut AuthenticatedReplayTail,
 ) -> Result<(), CanonicalStoreError> {
     if let Some(retained_height) = lowest_retained_height_since(
-        db,
+        ctx.db,
         reorg_policy.reorg_window_blocks(),
         previous,
         ready_evidence,
     )? {
         let mut followed = replay_tail.clone();
         if advance_ready_replay_tail(
-            db,
+            ctx,
             reorg_policy,
             ready_evidence,
             retained_height,
@@ -962,7 +1197,7 @@ pub(super) fn follow_ready_replay_tail(
             return Ok(());
         }
     }
-    *replay_tail = authenticate_ready_replay_tail(db, reorg_policy, ready_evidence)?;
+    *replay_tail = authenticate_ready_replay_tail(ctx, reorg_policy, ready_evidence)?;
     Ok(())
 }
 
@@ -978,6 +1213,12 @@ fn lowest_retained_height_since(
     previous: &CanonicalStoreReadyEvidence,
     ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> Result<Option<BlockHeight>, CanonicalStoreError> {
+    if ready_evidence.visible_event_sequence < previous.visible_event_sequence {
+        return Ok(None);
+    }
+    if ready_evidence.visible_event_sequence == previous.visible_event_sequence {
+        return Ok(Some(previous.visible_tip.height));
+    }
     let tip_advance = ready_evidence
         .visible_tip
         .height
@@ -986,7 +1227,9 @@ fn lowest_retained_height_since(
     if tip_advance > reorg_window_blocks {
         return Ok(None);
     }
-    let first_sequence = previous.visible_event_sequence.saturating_add(1);
+    let Some(first_sequence) = previous.visible_event_sequence.checked_add(1) else {
+        return Ok(None);
+    };
     let retention_floor = super::event_lifecycle::canonical_event_retention_floor_from_db(
         db,
         ready_evidence.visible_event_sequence,
@@ -994,29 +1237,55 @@ fn lowest_retained_height_since(
     if first_sequence < retention_floor {
         return Ok(None);
     }
+    if first_sequence == ready_evidence.visible_event_sequence {
+        let encoded_event =
+            match read_family_row(db, CHAIN_EVENT_COLUMN_FAMILY, &first_sequence.to_be_bytes()) {
+                Ok(encoded) => encoded,
+                Err(CanonicalStoreError::PublicationRefused { .. }) => return Ok(None),
+                Err(other_error) => return Err(other_error),
+            };
+        let Ok(event) = decode_chain_event(&encoded_event) else {
+            return Ok(None);
+        };
+        return Ok(unchanged_height_through_event(
+            previous.visible_tip.height,
+            first_sequence,
+            &event,
+        ));
+    }
+    let mut event_cursor =
+        CachedSequenceCursor::open_from_sequence(db, CHAIN_EVENT_COLUMN_FAMILY, first_sequence)?;
     let mut retained_height = previous.visible_tip.height;
     for sequence in first_sequence..=ready_evidence.visible_event_sequence {
-        let Ok(encoded) = read_family_row(db, CHAIN_EVENT_COLUMN_FAMILY, &sequence.to_be_bytes())
+        let event = match event_cursor.read_expected_and_advance(sequence, decode_chain_event) {
+            Ok(decoded) => decoded,
+            Err(CanonicalStoreError::PublicationRefused { .. }) => return Ok(None),
+            Err(other_error) => return Err(other_error),
+        };
+        let Some(next_retained) = unchanged_height_through_event(retained_height, sequence, &event)
         else {
             return Ok(None);
         };
-        let Ok(event) = decode_chain_event(&encoded) else {
-            return Ok(None);
-        };
-        if event.resulting_epoch_id.value() != sequence {
-            return Ok(None);
-        }
-        let first_changed = event
-            .reverted_range
-            .map_or(event.committed_range.start, |reverted| {
-                reverted.start.min(event.committed_range.start)
-            });
-        let Some(unchanged_through) = first_changed.value().checked_sub(1) else {
-            return Ok(None);
-        };
-        retained_height = retained_height.min(BlockHeight::new(unchanged_through));
+        retained_height = next_retained;
     }
     Ok(Some(retained_height))
+}
+
+fn unchanged_height_through_event(
+    retained_height: BlockHeight,
+    expected_sequence: u64,
+    event: &DecodedChainEvent,
+) -> Option<BlockHeight> {
+    if event.resulting_epoch_id.value() != expected_sequence {
+        return None;
+    }
+    let first_changed = event
+        .reverted_range
+        .map_or(event.committed_range.start, |reverted| {
+            reverted.start.min(event.committed_range.start)
+        });
+    let unchanged_through = first_changed.value().checked_sub(1)?;
+    Some(retained_height.min(BlockHeight::new(unchanged_through)))
 }
 
 fn validate_ready_settlement_window(
@@ -1125,14 +1394,24 @@ fn validate_baseline_publication(
     Ok(())
 }
 
-fn validate_live_history(
-    db: &DB,
-    build_plan: &super::CanonicalStoreBuildPlan,
+struct LiveHistoryValidationContext<'ctx> {
+    build_plan: &'ctx super::CanonicalStoreBuildPlan,
     reorg_policy: super::CanonicalReorgPolicy,
-    ready_evidence: &CanonicalStoreReadyEvidence,
+    ready_evidence: &'ctx CanonicalStoreReadyEvidence,
+}
+
+fn validate_live_history(
+    ctx: SegmentStoreContext<'_>,
+    context: &LiveHistoryValidationContext<'_>,
     baseline_epoch: DecodedChainEpoch,
+    epoch_cursor: &mut CachedSequenceCursor<'_>,
+    event_cursor: &mut CachedSequenceCursor<'_>,
 ) -> Result<(), CanonicalStoreError> {
-    if ready_evidence.visible_event_sequence != ready_evidence.visible_epoch.value() {
+    let db = ctx.db;
+    let ready_evidence = context.ready_evidence;
+    if ready_evidence.visible_epoch.value() < 2
+        || ready_evidence.visible_event_sequence != ready_evidence.visible_epoch.value()
+    {
         return Err(CanonicalStoreError::publication(
             "READY live epoch and chain-event sequence must advance together",
         ));
@@ -1142,36 +1421,26 @@ fn validate_live_history(
         ready_evidence.visible_event_sequence,
     )?;
     let first_event_sequence = retention_floor.max(2);
-    let (mut previous_epoch_id, mut previous_epoch) = if first_event_sequence == 2 {
-        (BASELINE_EPOCH_ID, baseline_epoch)
-    } else {
-        let previous_epoch_id = ChainEpochId::new(first_event_sequence - 1);
-        let previous_epoch = decode_chain_epoch(&read_family_row(
-            db,
-            CHAIN_EPOCH_COLUMN_FAMILY,
-            &previous_epoch_id.value().to_be_bytes(),
-        )?)?;
-        (previous_epoch_id, previous_epoch)
-    };
+    let (mut previous_epoch_id, mut previous_epoch) = seek_live_history_cursors(
+        first_event_sequence,
+        baseline_epoch,
+        epoch_cursor,
+        event_cursor,
+    )?;
+    let mut latest_event = None;
     for epoch_value in first_event_sequence..=ready_evidence.visible_epoch.value() {
         let chain_epoch_id = ChainEpochId::new(epoch_value);
-        let chain_epoch = decode_chain_epoch(&read_family_row(
-            db,
-            CHAIN_EPOCH_COLUMN_FAMILY,
-            &epoch_value.to_be_bytes(),
-        )?)?;
-        let chain_event = decode_chain_event(&read_family_row(
-            db,
-            CHAIN_EVENT_COLUMN_FAMILY,
-            &epoch_value.to_be_bytes(),
-        )?)?;
+        let chain_epoch =
+            epoch_cursor.read_expected_and_advance(epoch_value, decode_chain_epoch)?;
+        let chain_event =
+            event_cursor.read_expected_and_advance(epoch_value, decode_chain_event)?;
         if chain_event.resulting_epoch_id != chain_epoch_id
             || chain_event.previous_epoch_id != previous_epoch_id.value()
             || chain_event.visible_tip != chain_epoch.visible_tip
             || chain_event.visible_block_count == 0
             || !live_transition_is_valid(
-                build_plan,
-                reorg_policy,
+                context.build_plan,
+                context.reorg_policy,
                 previous_epoch,
                 chain_epoch,
                 chain_event,
@@ -1183,33 +1452,61 @@ fn validate_live_history(
         }
         previous_epoch_id = chain_epoch_id;
         previous_epoch = chain_epoch;
+        latest_event = Some(chain_event);
     }
+    epoch_cursor.ensure_exhausted(ready_evidence.visible_epoch.value())?;
+    event_cursor.ensure_exhausted(ready_evidence.visible_event_sequence)?;
     validate_epoch_record(
-        db,
+        ctx,
         ready_evidence.first_retained_block.height,
         ready_evidence.visible_tip,
         previous_epoch,
     )?;
-    let current_event = decode_chain_event(&read_family_row(
-        db,
-        CHAIN_EVENT_COLUMN_FAMILY,
-        &ready_evidence.visible_event_sequence.to_be_bytes(),
-    )?)?;
-    let epoch_matches_ready = previous_epoch.visible_tip == ready_evidence.visible_tip;
-    let expected_epoch_id = ready_evidence.visible_epoch;
-    let expected_tip = ready_evidence.visible_tip;
-    let expected_block_count = ready_evidence.visible_block_count;
-    let expected_sequence_digest = ready_evidence.visible_sequence_digest;
-    let event_matches_ready = current_event.resulting_epoch_id == expected_epoch_id
-        && current_event.visible_tip == expected_tip
-        && current_event.visible_block_count == expected_block_count
-        && current_event.visible_sequence_digest == expected_sequence_digest;
-    if !(epoch_matches_ready && event_matches_ready) {
+    let current_event = latest_event.ok_or_else(|| {
+        CanonicalStoreError::publication("READY live history must contain at least one transition")
+    })?;
+    if !live_history_matches_ready_fence(previous_epoch, current_event, ready_evidence) {
         return Err(CanonicalStoreError::publication(
             "READY live history does not end at the authenticated visible fence",
         ));
     }
     Ok(())
+}
+
+fn seek_live_history_cursors(
+    first_event_sequence: u64,
+    baseline_epoch: DecodedChainEpoch,
+    epoch_cursor: &mut CachedSequenceCursor<'_>,
+    event_cursor: &mut CachedSequenceCursor<'_>,
+) -> Result<(ChainEpochId, DecodedChainEpoch), CanonicalStoreError> {
+    if first_event_sequence == 2 {
+        epoch_cursor.advance()?;
+        event_cursor.advance()?;
+        return Ok((BASELINE_EPOCH_ID, baseline_epoch));
+    }
+    let previous_epoch_id = ChainEpochId::new(first_event_sequence - 1);
+    epoch_cursor.seek_from_sequence(previous_epoch_id.value())?;
+    let previous_epoch =
+        epoch_cursor.read_expected_and_advance(previous_epoch_id.value(), decode_chain_epoch)?;
+    event_cursor.seek_from_sequence(first_event_sequence)?;
+    Ok((previous_epoch_id, previous_epoch))
+}
+
+fn live_history_matches_ready_fence(
+    final_epoch: DecodedChainEpoch,
+    final_event: DecodedChainEvent,
+    ready_evidence: &CanonicalStoreReadyEvidence,
+) -> bool {
+    let epoch_matches_ready = final_epoch.visible_tip == ready_evidence.visible_tip;
+    let expected_epoch_id = ready_evidence.visible_epoch;
+    let expected_tip = ready_evidence.visible_tip;
+    let expected_block_count = ready_evidence.visible_block_count;
+    let expected_sequence_digest = ready_evidence.visible_sequence_digest;
+    let event_matches_ready = final_event.resulting_epoch_id == expected_epoch_id
+        && final_event.visible_tip == expected_tip
+        && final_event.visible_block_count == expected_block_count
+        && final_event.visible_sequence_digest == expected_sequence_digest;
+    epoch_matches_ready && event_matches_ready
 }
 
 fn live_transition_is_valid(
@@ -1219,10 +1516,7 @@ fn live_transition_is_valid(
     chain_epoch: DecodedChainEpoch,
     chain_event: DecodedChainEvent,
 ) -> Result<bool, CanonicalStoreError> {
-    if !epoch_bounds_are_valid(
-        build_plan.history_bounds().first_available_height(),
-        chain_epoch,
-    ) {
+    if !epoch_bounds_are_valid(build_plan.first_retained_height(), chain_epoch) {
         return Ok(false);
     }
     if chain_event.kind == COMMITTED_EVENT {
@@ -1262,16 +1556,16 @@ fn live_transition_is_valid(
 }
 
 fn validate_epoch_record(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     first_height: BlockHeight,
     expected_visible_tip: BlockId,
     epoch: DecodedChainEpoch,
 ) -> Result<(), CanonicalStoreError> {
     if epoch.visible_tip != expected_visible_tip
         || !epoch_bounds_are_valid(first_height, epoch)
-        || retained_block_hash(db, expected_visible_tip.height)? != expected_visible_tip.hash
-        || retained_block_hash(db, epoch.settled_tip.height)? != epoch.settled_tip.hash
-        || epoch.tip_metadata != read_persisted_tip_metadata(db, expected_visible_tip)?
+        || retained_block_hash(ctx.db, expected_visible_tip.height)? != expected_visible_tip.hash
+        || retained_block_hash(ctx.db, epoch.settled_tip.height)? != epoch.settled_tip.hash
+        || epoch.tip_metadata != read_persisted_tip_metadata(ctx, expected_visible_tip)?
     {
         return Err(CanonicalStoreError::publication(
             "chain epoch does not match its retained canonical rows",
@@ -1319,7 +1613,6 @@ fn validate_reopened_identity_and_control(
             })?;
     let expectation = CanonicalStoreAdmissionExpectation::from_build_plan(
         &expected_control.build_plan,
-        expected_control.workload,
         expected_control.effective_reorg_policy(),
     );
     let control = validate_open_store_control(db, store_path, &expectation)?;
@@ -1331,20 +1624,37 @@ fn validate_reopened_identity_and_control(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "cold publication validates each source-derived family in one ordered readback path"
+)]
 fn validate_cold_block_families(
-    db: &DB,
-    workload: super::CanonicalStoreWorkload,
+    ctx: SegmentStoreContext<'_>,
     build_plan: &super::CanonicalStoreBuildPlan,
+    tree_state_checkpoint_policy: ConstructionTreeStateCheckpointPolicy,
     expected: &CanonicalBlockLoadEvidence,
 ) -> Result<ColdCanonicalBlockValidation, CanonicalStoreError> {
     let retained_checkpoint_count =
         usize::try_from(u64::from(build_plan.reorg_policy().reorg_window_blocks()) + 1)
             .map_err(|_| CanonicalStoreError::publication("reorg window exceeds usize"))?;
-    let replay = validate_persisted_block_replays_with_checkpoints(db, retained_checkpoint_count)?;
+    let replay = validate_persisted_block_replays_with_checkpoints(ctx, retained_checkpoint_count)?;
     if !replay.evidence.has_same_sequence(expected) {
         return Err(CanonicalStoreError::BlockLoadReadbackMismatch);
     }
-    validate_persisted_commitment_tree_families(db, workload, build_plan, expected)?;
+    validate_persisted_commitment_tree_families(
+        ctx,
+        build_plan,
+        tree_state_checkpoint_policy,
+        expected,
+    )?;
+    if !build_plan.raw_blob_retention().full_blocks() && expected.live_tail_raw_block_count != 0 {
+        return Err(CanonicalStoreError::BlockLoadReadbackMismatch);
+    }
+    if build_plan.raw_blob_retention().full_blocks()
+        && expected.live_tail_raw_block_count != expected.live_tail_block_count
+    {
+        return Err(CanonicalStoreError::BlockLoadReadbackMismatch);
+    }
     let expected_families = [
         (
             BLOCK_HEADER_COLUMN_FAMILY,
@@ -1357,9 +1667,9 @@ fn validate_cold_block_families(
             expected.block_hash_index_logical_bytes,
         ),
         (
-            COMPACT_BLOCK_COLUMN_FAMILY,
-            expected.compact_block_count,
-            expected.compact_block_logical_bytes,
+            LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY,
+            expected.live_tail_raw_block_count,
+            expected.live_tail_raw_block_logical_bytes,
         ),
         (
             TRANSACTION_LOCATION_COLUMN_FAMILY,
@@ -1367,31 +1677,26 @@ fn validate_cold_block_families(
             expected.transaction_location_logical_bytes,
         ),
         (
-            TRANSACTION_BLOB_COLUMN_FAMILY,
-            expected.transaction_blob_count,
-            expected.transaction_blob_logical_bytes,
-        ),
-        (
-            BLOCK_BLOB_COLUMN_FAMILY,
-            expected.block_blob_count,
-            expected.block_blob_logical_bytes,
-        ),
-        (
             TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
             expected.tree_state_checkpoint_count,
             expected.tree_state_checkpoint_logical_bytes,
         ),
-        (
-            BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-            expected.block_final_note_commitment_roots_count,
-            expected.block_final_note_commitment_roots_logical_bytes,
-        ),
     ];
-    let mut family_evidence = Vec::with_capacity(expected_families.len() + 5);
-    family_evidence.push(replay.evidence.family_evidence.clone());
-    record_cold_family_scan(&ColdFamilyScanEvidence::from_replay(&replay.evidence));
+    let mut family_evidence = Vec::with_capacity(
+        expected_families.len() + 2 + CANONICAL_PRE_PUBLICATION_EMPTY_FAMILIES.len(),
+    );
+    family_evidence.push(replay.evidence.settled_segment_index_evidence.clone());
+    family_evidence.push(replay.evidence.live_tail_block_evidence.clone());
+    record_cold_family_scan(&ColdFamilyScanEvidence::from_replay(
+        &replay.evidence.settled_segment_index_evidence,
+        replay.evidence.elapsed,
+    ));
+    record_cold_family_scan(&ColdFamilyScanEvidence::from_replay(
+        &replay.evidence.live_tail_block_evidence,
+        replay.evidence.elapsed,
+    ));
     for (name, expected_count, expected_logical_bytes) in expected_families {
-        let observed = scan_family(db, name)?;
+        let observed = scan_family(ctx.db, name)?;
         if !observed.matches(expected_count, expected_logical_bytes) {
             return Err(CanonicalStoreError::publication(format!(
                 "cold {name} count or logical bytes differ from the source load"
@@ -1399,17 +1704,8 @@ fn validate_cold_block_families(
         }
         family_evidence.push(observed.evidence);
     }
-    family_evidence.push(require_empty_family(
-        db,
-        DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY,
-    )?);
-    for name in [
-        CHAIN_EPOCH_COLUMN_FAMILY,
-        CHAIN_EVENT_COLUMN_FAMILY,
-        MEMPOOL_EVENT_COLUMN_FAMILY,
-        DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
-    ] {
-        family_evidence.push(require_empty_family(db, name)?);
+    for name in CANONICAL_PRE_PUBLICATION_EMPTY_FAMILIES {
+        family_evidence.push(require_empty_family(ctx.db, name)?);
     }
     Ok(ColdCanonicalBlockValidation {
         replay,
@@ -1579,11 +1875,13 @@ fn encode_event_range(
 }
 
 fn validate_exact_publication_readback(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     build_plan: &super::CanonicalStoreBuildPlan,
     ready_evidence: &CanonicalStoreReadyEvidence,
     expected: &EncodedBaselinePublication,
+    schedule: &CanonicalActivationSchedule,
 ) -> Result<AuthenticatedReplayTail, CanonicalStoreError> {
+    let db = ctx.db;
     let epoch_family = column_family(db, CHAIN_EPOCH_COLUMN_FAMILY)?;
     let event_family = column_family(db, CHAIN_EVENT_COLUMN_FAMILY)?;
     let epoch = db
@@ -1609,7 +1907,7 @@ fn validate_exact_publication_readback(
         || control.as_deref() != Some(expected.control.as_slice())
     {
         return Err(CanonicalStoreError::publication(
-            "atomic baseline publication readback differs from its three writes",
+            "atomic baseline publication readback differs from its epoch, event, or control write",
         ));
     }
     let decoded_control = decode_store_control(db.path(), &expected.control)?;
@@ -1618,7 +1916,20 @@ fn validate_exact_publication_readback(
             "READY control does not contain the validated baseline evidence",
         ));
     }
-    validate_ready_publication(db, build_plan, build_plan.reorg_policy(), ready_evidence)
+    let persisted_schedule = CanonicalActivationSchedule::read_bound(
+        db,
+        db.path(),
+        schedule.binding(),
+        build_plan
+            .network_upgrade_activations_fingerprint()
+            .as_bytes(),
+    )?;
+    if persisted_schedule != *schedule {
+        return Err(CanonicalStoreError::publication(
+            "baseline activation schedule readback differs from its write",
+        ));
+    }
+    validate_ready_publication(ctx, build_plan, build_plan.reorg_policy(), ready_evidence)
 }
 
 fn decode_chain_epoch(encoded: &[u8]) -> Result<DecodedChainEpoch, CanonicalStoreError> {
@@ -1643,18 +1954,6 @@ fn decode_chain_epoch(encoded: &[u8]) -> Result<DecodedChainEpoch, CanonicalStor
         ),
         created_at: UnixTimestampMillis::new(read_u64(encoded, 85)?),
     })
-}
-
-pub(super) fn canonical_event_created_at(
-    db: &DB,
-    event_sequence: u64,
-) -> Result<UnixTimestampMillis, CanonicalStoreError> {
-    Ok(decode_chain_epoch(&read_family_row(
-        db,
-        CHAIN_EPOCH_COLUMN_FAMILY,
-        &event_sequence.to_be_bytes(),
-    )?)?
-    .created_at)
 }
 
 pub(super) fn read_chain_epoch_tips(
@@ -1805,10 +2104,10 @@ impl ColdFamilyScanEvidence {
             && self.evidence.logical_bytes == expected_logical_bytes
     }
 
-    fn from_replay(replay: &super::block_replay::PersistedBlockReplayEvidence) -> Self {
+    fn from_replay(evidence: &CanonicalConstructionFamilyEvidence, elapsed: Duration) -> Self {
         Self {
-            evidence: replay.family_evidence.clone(),
-            elapsed: replay.elapsed,
+            evidence: evidence.clone(),
+            elapsed,
         }
     }
 }
@@ -1874,6 +2173,213 @@ fn record_cold_family_scan(evidence: &ColdFamilyScanEvidence) {
     );
 }
 
+struct CachedSequenceCursor<'db> {
+    family_name: &'static str,
+    iterator: rust_rocksdb::DBRawIteratorWithThreadMode<'db, DB>,
+    previous_key: Option<u64>,
+}
+
+impl<'db> CachedSequenceCursor<'db> {
+    fn open_at_start(db: &'db DB, family_name: &'static str) -> Result<Self, CanonicalStoreError> {
+        let family = column_family(db, family_name)?;
+        let mut read_options = ReadOptions::default();
+        read_options.fill_cache(true);
+        let mut iterator = db.raw_iterator_cf_opt(&family, read_options);
+        iterator.seek_to_first();
+        let cursor = Self {
+            family_name,
+            iterator,
+            previous_key: None,
+        };
+        cursor.check_status("READY publication history scan")?;
+        Ok(cursor)
+    }
+
+    fn open_from_sequence(
+        db: &'db DB,
+        family_name: &'static str,
+        first_sequence: u64,
+    ) -> Result<Self, CanonicalStoreError> {
+        Self::open_from_sequence_with_cache(db, family_name, first_sequence, true)
+    }
+
+    fn open_from_sequence_with_cache(
+        db: &'db DB,
+        family_name: &'static str,
+        first_sequence: u64,
+        fill_cache: bool,
+    ) -> Result<Self, CanonicalStoreError> {
+        let family = column_family(db, family_name)?;
+        let mut read_options = ReadOptions::default();
+        read_options.fill_cache(fill_cache);
+        let iterator = db.raw_iterator_cf_opt(&family, read_options);
+        let mut cursor = Self {
+            family_name,
+            iterator,
+            previous_key: None,
+        };
+        cursor.seek_from_sequence(first_sequence)?;
+        Ok(cursor)
+    }
+
+    fn seek_from_sequence(&mut self, first_sequence: u64) -> Result<(), CanonicalStoreError> {
+        if first_sequence <= 1 {
+            self.previous_key = None;
+            self.iterator.seek_to_first();
+        } else {
+            let start_key = ascending_u64_key_scan_start(first_sequence);
+            self.previous_key = Some(first_sequence - 1);
+            self.iterator.seek(start_key);
+        }
+        self.check_status("READY publication history seek")
+    }
+
+    fn read_current_expected<Decoded, Decode>(
+        &mut self,
+        expected_sequence: u64,
+        decode: Decode,
+    ) -> Result<Decoded, CanonicalStoreError>
+    where
+        Decode: FnOnce(&[u8]) -> Result<Decoded, CanonicalStoreError>,
+    {
+        if !self.iterator.valid() {
+            self.check_status("READY publication history scan")?;
+            return Err(CanonicalStoreError::publication(format!(
+                "{} row {expected_sequence} is absent",
+                self.family_name
+            )));
+        }
+        let Some((key_bytes, row_bytes)) = self.iterator.item() else {
+            self.check_status("READY publication history scan")?;
+            return Err(CanonicalStoreError::publication(format!(
+                "{} row {expected_sequence} is absent",
+                self.family_name
+            )));
+        };
+        let observed_sequence =
+            decode_u64_key_ascending(self.family_name, key_bytes, self.previous_key)?;
+        if observed_sequence != expected_sequence {
+            return Err(CanonicalStoreError::publication(format!(
+                "{} expected sequence {expected_sequence}, found {observed_sequence}",
+                self.family_name
+            )));
+        }
+        let decoded = decode(row_bytes)?;
+        self.previous_key = Some(observed_sequence);
+        Ok(decoded)
+    }
+
+    fn read_expected_and_advance<Decoded, Decode>(
+        &mut self,
+        expected_sequence: u64,
+        decode: Decode,
+    ) -> Result<Decoded, CanonicalStoreError>
+    where
+        Decode: FnOnce(&[u8]) -> Result<Decoded, CanonicalStoreError>,
+    {
+        let decoded = self.read_current_expected(expected_sequence, decode)?;
+        self.advance()?;
+        Ok(decoded)
+    }
+
+    fn advance(&mut self) -> Result<(), CanonicalStoreError> {
+        self.iterator.next();
+        if !self.iterator.valid() {
+            self.check_status("READY publication history scan")?;
+        }
+        Ok(())
+    }
+
+    fn ensure_exhausted(&self, visible_sequence: u64) -> Result<(), CanonicalStoreError> {
+        if !self.iterator.valid() {
+            return self.check_status("READY publication trailing-row check");
+        }
+        if let Some((key_bytes, _)) = self.iterator.item() {
+            let trailing_sequence =
+                decode_u64_key_ascending(self.family_name, key_bytes, self.previous_key)?;
+            return Err(CanonicalStoreError::publication(format!(
+                "{} contains unexpected row {trailing_sequence} after visible sequence {visible_sequence}",
+                self.family_name
+            )));
+        }
+        self.check_status("READY publication trailing-row check")?;
+        Err(CanonicalStoreError::publication(format!(
+            "{} contains unexpected trailing row after visible sequence {visible_sequence}",
+            self.family_name
+        )))
+    }
+
+    fn check_status(&self, operation: &'static str) -> Result<(), CanonicalStoreError> {
+        self.iterator
+            .status()
+            .map_err(|source| CanonicalStoreError::RocksDbOperation { operation, source })
+    }
+}
+
+pub(super) struct ChainEpochCreatedAtCursor<'db> {
+    cursor: CachedSequenceCursor<'db>,
+}
+
+impl<'db> ChainEpochCreatedAtCursor<'db> {
+    pub(super) fn open_from_sequence(
+        db: &'db DB,
+        first_sequence: u64,
+    ) -> Result<Self, CanonicalStoreError> {
+        Ok(Self {
+            cursor: CachedSequenceCursor::open_from_sequence_with_cache(
+                db,
+                CHAIN_EPOCH_COLUMN_FAMILY,
+                first_sequence,
+                false,
+            )?,
+        })
+    }
+
+    pub(super) fn read_expected_created_at_and_advance(
+        &mut self,
+        expected_sequence: u64,
+    ) -> Result<UnixTimestampMillis, CanonicalStoreError> {
+        Ok(self
+            .cursor
+            .read_expected_and_advance(expected_sequence, decode_chain_epoch)?
+            .created_at)
+    }
+}
+
+/// Returns the seek key immediately preceding `sequence`.
+///
+/// The 9-byte key sorts strictly after `(sequence - 1)`'s 8-byte big-endian
+/// key, skipping 8-byte point tombstones below `sequence` while still landing
+/// on any malformed 9-byte key extending `sequence - 1`.
+fn ascending_u64_key_scan_start(sequence: u64) -> [u8; 9] {
+    let predecessor = sequence.saturating_sub(1).to_be_bytes();
+    let mut start = [0_u8; 9];
+    start[..8].copy_from_slice(&predecessor);
+    start
+}
+
+fn decode_u64_key_ascending(
+    family_name: &'static str,
+    key: &[u8],
+    previous_key: Option<u64>,
+) -> Result<u64, CanonicalStoreError> {
+    let key_bytes: [u8; 8] = key.try_into().map_err(|_| {
+        CanonicalStoreError::publication(format!(
+            "{family_name} key has length {}, expected 8",
+            key.len()
+        ))
+    })?;
+    let sequence = u64::from_be_bytes(key_bytes);
+    if let Some(previous) = previous_key
+        && sequence <= previous
+    {
+        return Err(CanonicalStoreError::publication(format!(
+            "{family_name} key {sequence} is not strictly ascending after {previous}"
+        )));
+    }
+    Ok(sequence)
+}
+
 fn read_family_row(
     db: &DB,
     name: &'static str,
@@ -1881,7 +2387,7 @@ fn read_family_row(
 ) -> Result<Vec<u8>, CanonicalStoreError> {
     let family = column_family(db, name)?;
     let mut read_options = ReadOptions::default();
-    read_options.fill_cache(false);
+    read_options.fill_cache(true);
     db.get_cf_opt(&family, key, &read_options)
         .map_err(|source| CanonicalStoreError::RocksDbOperation {
             operation: "READY publication point read",
@@ -2058,8 +2564,55 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn ascending_u64_key_decoding_rejects_malformed_lengths_and_non_monotonic_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            decode_u64_key_ascending(CHAIN_EPOCH_COLUMN_FAMILY, &1_u64.to_be_bytes(), None)?,
+            1
+        );
+        assert_eq!(
+            decode_u64_key_ascending(CHAIN_EPOCH_COLUMN_FAMILY, &2_u64.to_be_bytes(), Some(1))?,
+            2
+        );
+        assert_eq!(
+            decode_u64_key_ascending(
+                CHAIN_EVENT_COLUMN_FAMILY,
+                &u64::MAX.to_be_bytes(),
+                Some(u64::MAX - 1)
+            )?,
+            u64::MAX
+        );
+        for bad_key in [
+            &[][..],
+            &[0_u8; 4][..],
+            &[0_u8; 7][..],
+            &[0_u8; 9][..],
+            &ascending_u64_key_scan_start(5)[..],
+        ] {
+            assert!(
+                decode_u64_key_ascending(CHAIN_EPOCH_COLUMN_FAMILY, bad_key, None).is_err(),
+                "expected malformed key of len {} to fail",
+                bad_key.len()
+            );
+        }
+        assert!(
+            decode_u64_key_ascending(CHAIN_EPOCH_COLUMN_FAMILY, &2_u64.to_be_bytes(), Some(2))
+                .is_err()
+        );
+        assert!(
+            decode_u64_key_ascending(CHAIN_EPOCH_COLUMN_FAMILY, &1_u64.to_be_bytes(), Some(2))
+                .is_err()
+        );
+        let scan_start = ascending_u64_key_scan_start(5);
+        assert!(scan_start.as_slice() > 4_u64.to_be_bytes().as_slice());
+        assert!(scan_start.as_slice() < 5_u64.to_be_bytes().as_slice());
+        Ok(())
+    }
+
     fn ready_evidence() -> CanonicalStoreReadyEvidence {
         CanonicalStoreReadyEvidence {
+            schema_version: crate::CANONICAL_STORE_SCHEMA_VERSION,
             first_retained_block: BlockId::new(
                 BlockHeight::new(10),
                 BlockHash::from_bytes([1; 32]),

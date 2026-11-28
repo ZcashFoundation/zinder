@@ -1,47 +1,42 @@
-//! Keeps `zinder_runtime::ENVIRONMENT_VARIABLES` aligned with the variables
-//! the `zinder-compat-cipherscan` loader accepts.
+//! Binary smoke checks for unified `ZinderConfig` environment parsing on `zinder-compat-cipherscan`.
 
-use zinder_runtime::ENVIRONMENT_VARIABLES;
-use zinder_testkit::EnvVarContractProbe;
+use std::process::Command;
 
-const BINARY: &str = "zinder-compat-cipherscan";
-
-fn probe() -> EnvVarContractProbe {
-    EnvVarContractProbe::new(zinder_testkit::bin_exe!("zinder-compat-cipherscan"))
-}
-
-fn documented_variables() -> impl Iterator<Item = &'static str> {
-    ENVIRONMENT_VARIABLES
-        .iter()
-        .filter(|env_var| env_var.is_used_by(BINARY))
-        .map(|env_var| env_var.name)
+fn print_config_with_env(pairs: &[(&str, &str)]) -> eyre::Result<std::process::Output> {
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-compat-cipherscan"));
+    command.env_clear().arg("--print-config");
+    command.env("ZINDER_NETWORK__NAME", "zcash-regtest");
+    for (name, env_val) in pairs {
+        command.env(name, env_val);
+    }
+    Ok(command.output()?)
 }
 
 #[test]
-fn every_documented_variable_is_accepted_by_the_loader() -> eyre::Result<()> {
-    probe().check_documented_variables_are_accepted(documented_variables())
-}
+fn shared_schema_env_vars_are_accepted_and_empty_or_unknown_keys_are_rejected() -> eyre::Result<()>
+{
+    let scratch = tempfile::tempdir()?;
+    let shared_data = scratch.path().join("shared-data").display().to_string();
+    let shared_canonical = scratch
+        .path()
+        .join("shared-canonical")
+        .display()
+        .to_string();
+    let ok = print_config_with_env(&[
+        ("ZINDER_STORAGE__DATA_DIR", &shared_data),
+        ("ZINDER_STORAGE__PATH", &shared_canonical),
+        ("ZINDER_INGEST__SOURCE", "zebra-json-rpc"),
+        ("ZINDER_DEPLOYMENT__PROFILE", "explorer"),
+    ])?;
+    assert!(ok.status.success(), "{ok:?}");
 
-#[test]
-fn every_variable_the_loader_accepts_is_documented() -> eyre::Result<()> {
-    probe().check_accepted_variables_are_documented(documented_variables(), &[])
-}
+    let unknown = print_config_with_env(&[("ZINDER_UNKNOWN_SECTION__PATH", "x")])?;
+    assert!(!unknown.status.success(), "{unknown:?}");
 
-#[test]
-fn a_variable_outside_the_loader_schema_is_rejected() {
-    let outcome = probe().check_documented_variables_are_accepted(["ZINDER_STORAGE__PATH"]);
-    assert!(
-        outcome.is_err(),
-        "the loader must reject a section it does not define"
-    );
-}
+    let nested = print_config_with_env(&[("ZINDER_OPS__LISTEN_ADDR__PORT", "9108")])?;
+    assert!(!nested.status.success(), "{nested:?}");
 
-#[test]
-fn a_variable_nested_below_a_leaf_field_is_rejected() {
-    let outcome =
-        probe().check_documented_variables_are_accepted(["ZINDER_OPS__LISTEN_ADDR__PORT"]);
-    assert!(
-        outcome.is_err(),
-        "the loader must reject a key nested below a leaf field"
-    );
+    let empty = print_config_with_env(&[("ZINDER_OPS__LISTEN_ADDR", "")])?;
+    assert!(!empty.status.success(), "{empty:?}");
+    Ok(())
 }

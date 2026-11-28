@@ -12,18 +12,63 @@ use zinder_core::{
 };
 
 use super::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, ServedTreeState, TreeStateLookup, TreeStateReplay,
-    TreeStateReplayOutcome,
+    CanonicalReorgPolicy, CanonicalStoreError, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    ServedTreeState, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
     block_load::encode_block_position,
     live_replacement_tests::published_store,
+    live_tail::{LiveTailBlockRecord, LiveTailEncodeOptions},
     publication::column_family,
-    rocksdb::{COMPACT_BLOCK_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY},
+    rocksdb::{LIVE_TAIL_BLOCK_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY},
     test_checkpoint_frontiers, test_network_upgrade_activations,
 };
 use crate::{RawBlobRetention, RocksDbResourceBudget};
 
 const TIP_HEIGHT: u32 = 150;
+
+#[test]
+fn cancellation_stops_replay_between_compact_blocks() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let Some(TreeStateLookup::Replay(replay)) =
+        store.tree_state_lookup(BlockHeight::new(99), &activations)?
+    else {
+        return Err("missing sparse replay".into());
+    };
+    let checks = std::cell::Cell::new(0);
+    let outcome = store.replay_tree_state_until_cancelled(&replay, &activations, || {
+        checks.set(checks.get() + 1);
+        checks.get() == 4
+    });
+    assert!(matches!(outcome, Err(CanonicalStoreError::ReplayCancelled)));
+    assert_eq!(checks.get(), 4);
+    Ok(())
+}
+
+#[test]
+fn abandoned_lookup_stops_before_reading_or_validating_the_seed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let seed = BlockHeight::new(100);
+    let height = BlockHeight::new(101);
+    replace_checkpoint_row(&store, seed, b"damaged seed")?;
+    for stop_at in [1, 2] {
+        let checks = std::cell::Cell::new(0);
+        let lookup = store.tree_state_lookup_until_cancelled(height, &activations, || {
+            checks.set(checks.get() + 1);
+            checks.get() == stop_at
+        });
+        assert!(matches!(lookup, Err(CanonicalStoreError::ReplayCancelled)));
+        assert_eq!(checks.get(), stop_at);
+    }
+    assert!(matches!(
+        store.tree_state_lookup(height, &activations),
+        Err(CanonicalStoreError::PublicationRefused { .. })
+    ));
+    Ok(())
+}
 
 #[test]
 fn every_retained_height_reads_the_checkpoint_construction_would_store()
@@ -113,7 +158,7 @@ fn reconstruction_refuses_a_missing_compact_block() -> Result<(), Box<dyn std::e
     let temporary = TempDir::new()?;
     let store = gapped_store(&temporary)?;
     let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
-    let family = column_family(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     store
         .bounded_open
         .db
@@ -201,8 +246,7 @@ fn a_secondary_reconstructs_with_a_node_table_its_writer_has_not_admitted_yet()
         temporary.path().join("canonical"),
         temporary.path().join("canonical-secondary"),
         &baseline,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -575,11 +619,19 @@ fn replace_compact_block(
     store: &RocksDbCanonicalStore,
     compact_block: &CompactBlockArtifact,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let family = column_family(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let (encoded, _) = LiveTailBlockRecord::encode_from_compact_block_v1(
+        compact_block,
+        None,
+        LiveTailEncodeOptions {
+            include_supplement: true,
+            retain_canonical_facts: false,
+        },
+    )?;
+    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     store.bounded_open.db.put_cf(
         &family,
         encode_block_position(compact_block.height()),
-        crate::encode_compact_block_artifact(compact_block),
+        encoded,
     )?;
     Ok(())
 }

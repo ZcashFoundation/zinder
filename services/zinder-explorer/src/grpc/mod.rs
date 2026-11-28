@@ -2,9 +2,15 @@
 
 mod adapter;
 mod block_activity;
+mod block_paid_fees;
+mod block_production;
+mod block_transactions;
 mod block_view;
+mod canonical_read;
 mod chain_reorg_history;
+mod commitment_root_search;
 mod conventional_fee_distribution;
+mod displaced_blocks;
 mod error;
 mod fee_summary;
 mod freshness;
@@ -27,6 +33,7 @@ mod transparent_input;
 mod value_pool_balance_history;
 mod value_pool_flow;
 mod value_pool_summary;
+mod wallet_capabilities;
 
 pub use adapter::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, describe_request_metrics};
 pub use request_limits::EXPLORER_QUERY_FIELD_LIMITS;

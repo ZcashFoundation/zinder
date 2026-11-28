@@ -2,17 +2,34 @@
 
 use tonic::Status;
 use zinder_core::{
-    CompactBlockArtifact, CompactShieldedAction, CompactTransaction, CompactTransactionData,
+    BlockHeight, CompactBlockArtifact, CompactShieldedAction, CompactTransaction,
+    CompactTransactionData, NetworkUpgradeActivations, ShieldedProtocol,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
-use zinder_proto::compat::lightwalletd;
+use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
+use zinder_store::{CompactBlockSpliceSelection, ShieldedProjectionSelection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Payload {
     FullBlock,
     SelectedPools,
+    /// Unary `GetBlockNullifiers`: retains every stored transaction (including
+    /// transparent-only shells) with only shielded nullifiers kept.
+    BlockNullifiers,
+    /// Range `GetBlockRangeNullifiers`: filters transactions by selected
+    /// shielded pools before redacting them to nullifiers only.
     Nullifiers,
     Mempool,
+}
+
+impl Payload {
+    const fn is_nullifiers_only(self) -> bool {
+        matches!(self, Self::BlockNullifiers | Self::Nullifiers)
+    }
+
+    const fn retains_all_transactions(self) -> bool {
+        matches!(self, Self::FullBlock | Self::BlockNullifiers)
+    }
 }
 
 /// The fields and transactions a lightwalletd compact-block method returns.
@@ -39,62 +56,91 @@ impl CompactBlockShape {
         payload: Payload::FullBlock,
     };
 
-    /// Every shielded pool in nullifier-only form.
-    pub(crate) const NULLIFIERS: Self = Self {
+    /// The shielded projection stored by the signed history and live tail.
+    pub(crate) const DEFAULT_RANGE: Self = Self {
         transparent: false,
-        payload: Payload::Nullifiers,
+        payload: Payload::SelectedPools,
         ..Self::FULL_BLOCK
     };
 
-    /// Selects the pools requested by `GetBlockRange`. An empty request selects
-    /// every shielded pool. Unknown pool values return `INVALID_ARGUMENT`.
+    /// The nullifier-only projection stored by the signed history's second
+    /// slab and the live tail: every stored shielded transaction reduced to
+    /// its nullifiers with an empty chain metadata envelope.
+    pub(crate) const DEFAULT_NULLIFIER_RANGE: Self = Self {
+        payload: Payload::Nullifiers,
+        ..Self::DEFAULT_RANGE
+    };
+
+    /// All shielded pools plus transparent transactions in range mode.
+    pub(crate) const DEFAULT_TRANSPARENT_RANGE: Self = Self {
+        transparent: true,
+        ..Self::DEFAULT_RANGE
+    };
+
+    /// `GetBlockNullifiers` retains every stored transaction in nullifier-only
+    /// form across every shielded pool, keeping transparent-only transactions
+    /// as `{index, txid, fee}` shells.
+    pub(crate) const BLOCK_NULLIFIERS: Self = Self {
+        transparent: false,
+        payload: Payload::BlockNullifiers,
+        ..Self::FULL_BLOCK
+    };
+
     pub(crate) fn for_range(pool_types: &[i32]) -> Result<Self, Status> {
-        if pool_types.is_empty() {
-            return Ok(Self {
-                transparent: false,
-                payload: Payload::SelectedPools,
-                ..Self::FULL_BLOCK
-            });
-        }
+        Self::select(pool_types, Payload::SelectedPools)
+    }
+
+    pub(crate) fn for_nullifier_range(pool_types: &[i32]) -> Result<Self, Status> {
+        Self::select(pool_types, Payload::Nullifiers)
+    }
+
+    pub(crate) fn for_mempool(pool_types: &[i32]) -> Result<Self, Status> {
+        Self::select(pool_types, Payload::Mempool)
+    }
+
+    fn select(pool_types: &[i32], payload: Payload) -> Result<Self, Status> {
         let mut selected = Self {
             sapling: false,
             orchard: false,
             ironwood: false,
             transparent: false,
-            payload: Payload::SelectedPools,
+            payload,
         };
+        let mut use_default = true;
         for &pool_type in pool_types {
             match lightwalletd::PoolType::try_from(pool_type) {
                 Ok(lightwalletd::PoolType::Sapling) => selected.sapling = true,
                 Ok(lightwalletd::PoolType::Orchard) => selected.orchard = true,
                 Ok(lightwalletd::PoolType::Ironwood) => selected.ironwood = true,
-                Ok(lightwalletd::PoolType::Transparent) => selected.transparent = true,
-                Ok(lightwalletd::PoolType::Invalid) | Err(_) => {
-                    return Err(Status::invalid_argument("invalid pool type requested"));
+                Ok(lightwalletd::PoolType::Transparent) if payload == Payload::Nullifiers => {
+                    continue;
                 }
+                Ok(lightwalletd::PoolType::Transparent) => selected.transparent = true,
+                Ok(lightwalletd::PoolType::Invalid) => {
+                    return Err(if payload == Payload::Mempool {
+                        Status::invalid_argument("invalid pool type requested")
+                    } else {
+                        Status::unknown("GetBlockRange: invalid pool type requested")
+                    });
+                }
+                Err(_) => {}
             }
+            // An unknown number selects no pool but still makes the selection explicit.
+            use_default = false;
+        }
+        if use_default {
+            return Ok(Self {
+                payload,
+                ..Self::DEFAULT_RANGE
+            });
         }
         Ok(selected)
     }
 
-    pub(crate) fn for_nullifier_range(pool_types: &[i32]) -> Result<Self, Status> {
-        let selected = Self::for_range(pool_types)?;
-        if !selected.sapling && !selected.orchard && !selected.ironwood {
-            // lightwalletd removes transparent first, then defaults an empty list to all shielded pools.
-            return Ok(Self::NULLIFIERS);
-        }
-        Ok(Self {
-            transparent: false,
-            payload: Payload::Nullifiers,
-            ..selected
-        })
-    }
-
-    pub(crate) fn for_mempool(pool_types: &[i32]) -> Result<Self, Status> {
-        Ok(Self {
-            payload: Payload::Mempool,
-            ..Self::for_range(pool_types)?
-        })
+    /// Converts a stored block, as [`Self::message`] does, into a gRPC-framed message.
+    pub(crate) fn encoded(self, block: CompactBlockArtifact) -> Result<EncodedBlock, Status> {
+        EncodedBlock::encode(&self.message(block)?)
+            .map_err(|error| Status::internal(error.to_string()))
     }
 
     /// Converts a stored block and preserves the original indices of selected transactions.
@@ -103,7 +149,7 @@ impl CompactBlockShape {
         block: CompactBlockArtifact,
     ) -> Result<lightwalletd::CompactBlock, Status> {
         let block = block.into_parts();
-        let mut vtx = if self.payload == Payload::FullBlock {
+        let mut vtx = if self.payload.retains_all_transactions() {
             Vec::with_capacity(block.transactions.len())
         } else {
             Vec::new()
@@ -121,13 +167,15 @@ impl CompactBlockShape {
             time: block.time,
             header: Vec::new(),
             vtx,
-            chain_metadata: (self.payload != Payload::Nullifiers).then_some(
+            chain_metadata: Some(if self.payload.is_nullifiers_only() {
+                lightwalletd::ChainMetadata::default()
+            } else {
                 lightwalletd::ChainMetadata {
                     sapling_commitment_tree_size: metadata.sapling_commitment_tree_size,
                     orchard_commitment_tree_size: metadata.orchard_commitment_tree_size,
                     ironwood_commitment_tree_size: metadata.ironwood_commitment_tree_size,
-                },
-            ),
+                }
+            }),
         })
     }
 
@@ -146,7 +194,7 @@ impl CompactBlockShape {
         if !self.includes_transaction(&scan) {
             return Ok(None);
         }
-        let nullifiers_only = self.payload == Payload::Nullifiers;
+        let nullifiers_only = self.payload.is_nullifiers_only();
         let mut message = lightwalletd::CompactTx {
             index: transaction.index,
             txid: encode_internal_transaction_id(transaction.transaction_id).to_vec(),
@@ -205,7 +253,7 @@ impl CompactBlockShape {
 
     fn includes_transaction(self, scan: &CompactTransactionData) -> bool {
         // A Sapling output selects the transaction even when the nullifier RPC omits the output.
-        self.payload == Payload::FullBlock
+        self.payload.retains_all_transactions()
             || (self.sapling
                 && (!scan.sapling_spends.is_empty() || !scan.sapling_outputs.is_empty()))
             || (self.orchard && !scan.orchard_actions.is_empty())
@@ -214,6 +262,84 @@ impl CompactBlockShape {
                 && (!scan.transparent_outputs.is_empty()
                     || (self.payload != Payload::Mempool && !scan.transparent_inputs.is_empty())))
     }
+
+    /// Classifies how canonical `ZSHRNG02` + `ZSTSUP01` settled segments and
+    /// `live_tail_block` stream a range shape directly as
+    /// `(shielded_projection, include_transparent)`, or returns `None` for
+    /// unary shapes and mempool filtering.
+    pub(crate) const fn encoded_range_selection(
+        self,
+    ) -> Option<(ShieldedProjectionSelection, bool)> {
+        if !matches!(self.payload, Payload::SelectedPools | Payload::Nullifiers) {
+            return None;
+        }
+        Some((
+            ShieldedProjectionSelection::new(
+                self.sapling,
+                self.orchard,
+                self.ironwood,
+                self.payload.is_nullifiers_only(),
+            ),
+            self.transparent,
+        ))
+    }
+
+    /// Returns the unary wire-splice selection for `GetBlock` (`FULL_BLOCK`) and
+    /// `GetBlockNullifiers` (`BLOCK_NULLIFIERS`), or `None` for range and mempool shapes.
+    pub(crate) const fn unary_splice_selection(self) -> Option<CompactBlockSpliceSelection> {
+        match self.payload {
+            Payload::FullBlock => Some(CompactBlockSpliceSelection::FULL_BLOCK),
+            Payload::BlockNullifiers => Some(CompactBlockSpliceSelection::BLOCK_NULLIFIERS),
+            Payload::SelectedPools | Payload::Nullifiers | Payload::Mempool => None,
+        }
+    }
+
+    /// Returns whether canonical `ZSHRNG02` / `live_tail_block` wire streaming
+    /// serves this shape.
+    pub(crate) const fn uses_canonical_encoded_range(self) -> bool {
+        self.encoded_range_selection().is_some()
+    }
+
+    /// Returns whether this shape is one of the two default all-pool
+    /// projections that `ZSHRNG02` serves as zero-copy wire slices.
+    pub(crate) const fn is_default_shielded_shape(self) -> bool {
+        matches!(self, Self::DEFAULT_RANGE | Self::DEFAULT_NULLIFIER_RANGE)
+    }
+
+    /// Returns the default all-pool shape whose stored frames carry the exact
+    /// same bytes this shape encodes for every block below Ironwood activation,
+    /// or `None` when this shape differs from one by more than Ironwood.
+    ///
+    /// A pool selection that skips only Ironwood still keeps every
+    /// transaction the default keeps and emits the same chain metadata, so
+    /// below activation the two encodings are byte-identical.
+    pub(crate) fn default_shielded_equivalent(self) -> Option<Self> {
+        let without_ironwood_choice = Self {
+            ironwood: true,
+            ..self
+        };
+        if without_ironwood_choice == Self::DEFAULT_RANGE {
+            Some(Self::DEFAULT_RANGE)
+        } else if without_ironwood_choice == Self::DEFAULT_NULLIFIER_RANGE {
+            Some(Self::DEFAULT_NULLIFIER_RANGE)
+        } else if without_ironwood_choice == Self::DEFAULT_TRANSPARENT_RANGE {
+            Some(Self::DEFAULT_TRANSPARENT_RANGE)
+        } else {
+            None
+        }
+    }
+}
+
+/// Returns whether Ironwood actions can appear in any block at or below
+/// `end`, which is the case exactly when the network's Ironwood upgrade has
+/// activated at or below that height.
+pub(crate) fn ironwood_active_at_or_below(
+    activations: &NetworkUpgradeActivations,
+    end: BlockHeight,
+) -> bool {
+    activations
+        .activation_height_by_name(ShieldedProtocol::Ironwood.activation_upgrade_name())
+        .is_some_and(|activation| activation <= end)
 }
 
 fn encode_actions(
@@ -294,9 +420,12 @@ mod tests {
         let block = mixed_block()?;
         let all = CompactBlockShape::FULL_BLOCK.message(block.clone())?;
         let shielded = CompactBlockShape::for_range(&[])?.message(block.clone())?;
-        let transparent =
-            CompactBlockShape::for_range(&[lightwalletd::PoolType::Transparent as i32])?
-                .message(block)?;
+        let transparent = CompactBlockShape::for_range(&[
+            99,
+            lightwalletd::PoolType::Transparent as i32,
+            lightwalletd::PoolType::Transparent as i32,
+        ])?
+        .message(block)?;
         let mut shielded_expected = all.clone();
         shielded_expected.vtx.retain(|tx| matches!(tx.index, 1 | 3));
         let mut transparent_expected = all.clone();
@@ -307,11 +436,264 @@ mod tests {
             all.vtx.iter().map(|tx| tx.index).collect::<Vec<_>>(),
             [0, 1, 2, 3, 4]
         );
-        let nullifiers = CompactBlockShape::NULLIFIERS.message(mixed_block()?)?;
-        assert!(nullifiers.chain_metadata.is_none());
+        let nullifiers = CompactBlockShape::for_nullifier_range(&[])?.message(mixed_block()?)?;
+        assert_eq!(
+            nullifiers.chain_metadata,
+            Some(lightwalletd::ChainMetadata::default())
+        );
         assert_eq!(nullifiers.vtx, shielded_expected.vtx);
+        let block_nullifiers = CompactBlockShape::BLOCK_NULLIFIERS.message(mixed_block()?)?;
+        assert_eq!(
+            block_nullifiers.chain_metadata,
+            Some(lightwalletd::ChainMetadata::default())
+        );
+        assert_eq!(
+            block_nullifiers
+                .vtx
+                .iter()
+                .map(|tx| tx.index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4]
+        );
+        for index in [0_usize, 2, 4] {
+            let expected_index = u64::try_from(index)?;
+            assert_eq!(
+                block_nullifiers.vtx[index],
+                lightwalletd::CompactTx {
+                    index: expected_index,
+                    txid: vec![1; 32],
+                    fee: 0,
+                    ..lightwalletd::CompactTx::default()
+                }
+            );
+        }
+        assert_eq!(block_nullifiers.vtx[1], nullifiers.vtx[0]);
+        assert_eq!(block_nullifiers.vtx[3], nullifiers.vtx[1]);
         assert_eq!(shielded, shielded_expected);
         assert_eq!(transparent, transparent_expected);
+        Ok(())
+    }
+
+    #[test]
+    fn default_nullifier_range_is_what_an_unspecified_request_selects() -> eyre::Result<()> {
+        assert_eq!(
+            CompactBlockShape::for_nullifier_range(&[])?,
+            CompactBlockShape::DEFAULT_NULLIFIER_RANGE
+        );
+        assert_eq!(
+            CompactBlockShape::DEFAULT_NULLIFIER_RANGE.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(true, true, true, true),
+                false
+            ))
+        );
+        assert_eq!(
+            CompactBlockShape::DEFAULT_RANGE.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(true, true, true, false),
+                false
+            ))
+        );
+        assert!(CompactBlockShape::DEFAULT_NULLIFIER_RANGE.is_default_shielded_shape());
+        assert!(CompactBlockShape::DEFAULT_RANGE.is_default_shielded_shape());
+        let orchard_nullifiers =
+            CompactBlockShape::for_nullifier_range(&[lightwalletd::PoolType::Orchard as i32])?;
+        assert!(!orchard_nullifiers.is_default_shielded_shape());
+        assert_eq!(
+            orchard_nullifiers.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(false, true, false, true),
+                false
+            ))
+        );
+        let sapling_nullifiers =
+            CompactBlockShape::for_nullifier_range(&[lightwalletd::PoolType::Sapling as i32])?;
+        assert_eq!(
+            sapling_nullifiers.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(true, false, false, true),
+                false
+            ))
+        );
+        let empty_nullifiers = CompactBlockShape::for_nullifier_range(&[99])?;
+        assert_eq!(
+            empty_nullifiers.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(false, false, false, true),
+                false
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unary_and_transparent_shapes_map_to_splice_and_range_selections() -> eyre::Result<()> {
+        assert_eq!(
+            CompactBlockShape::FULL_BLOCK.unary_splice_selection(),
+            Some(CompactBlockSpliceSelection::FULL_BLOCK)
+        );
+        assert_eq!(
+            CompactBlockShape::BLOCK_NULLIFIERS.unary_splice_selection(),
+            Some(CompactBlockSpliceSelection::BLOCK_NULLIFIERS)
+        );
+        assert!(!CompactBlockShape::BLOCK_NULLIFIERS.uses_canonical_encoded_range());
+        assert!(!CompactBlockShape::FULL_BLOCK.uses_canonical_encoded_range());
+        assert!(
+            !CompactBlockShape::for_mempool(&[lightwalletd::PoolType::Orchard as i32])?
+                .uses_canonical_encoded_range()
+        );
+        let transparent_orchard = CompactBlockShape::for_range(&[
+            lightwalletd::PoolType::Transparent as i32,
+            lightwalletd::PoolType::Orchard as i32,
+        ])?;
+        assert!(transparent_orchard.uses_canonical_encoded_range());
+        assert_eq!(
+            transparent_orchard.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(false, true, false, false),
+                true
+            ))
+        );
+        let orchard_range =
+            CompactBlockShape::for_range(&[lightwalletd::PoolType::Orchard as i32])?;
+        assert!(!orchard_range.is_default_shielded_shape());
+        assert_eq!(
+            orchard_range.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(false, true, false, false),
+                false
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_ironwood_omitting_selection_has_a_default_shielded_equivalent() -> eyre::Result<()> {
+        let sapling_orchard = &[
+            lightwalletd::PoolType::Sapling as i32,
+            lightwalletd::PoolType::Orchard as i32,
+        ];
+        for (shape, expected) in [
+            (
+                CompactBlockShape::for_range(sapling_orchard)?,
+                Some(CompactBlockShape::DEFAULT_RANGE),
+            ),
+            (
+                CompactBlockShape::for_nullifier_range(sapling_orchard)?,
+                Some(CompactBlockShape::DEFAULT_NULLIFIER_RANGE),
+            ),
+            (
+                CompactBlockShape::DEFAULT_RANGE,
+                Some(CompactBlockShape::DEFAULT_RANGE),
+            ),
+            (
+                CompactBlockShape::DEFAULT_NULLIFIER_RANGE,
+                Some(CompactBlockShape::DEFAULT_NULLIFIER_RANGE),
+            ),
+        ] {
+            assert_eq!(shape.default_shielded_equivalent(), expected);
+        }
+        for shape in [
+            CompactBlockShape::for_range(&[lightwalletd::PoolType::Orchard as i32])?,
+            CompactBlockShape::for_range(&[lightwalletd::PoolType::Ironwood as i32])?,
+            CompactBlockShape::for_nullifier_range(&[lightwalletd::PoolType::Sapling as i32])?,
+            CompactBlockShape::FULL_BLOCK,
+            CompactBlockShape::BLOCK_NULLIFIERS,
+        ] {
+            assert_eq!(shape.default_shielded_equivalent(), None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ironwood_omission_encodes_identically_below_activation() -> eyre::Result<()> {
+        let block = mixed_block()?;
+        let scan = CompactTransactionData {
+            ironwood_actions: vec![CompactShieldedAction {
+                nullifier: [0x41; 32],
+                commitment: [0x42; 32],
+                ephemeral_key: [0x43; 32],
+                ciphertext: [0x44; 52],
+            }],
+            ..CompactTransactionData::default()
+        };
+        let with_ironwood = CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(9), BlockHash::from_bytes([9; 32])),
+            BlockHash::from_bytes([8; 32]),
+            9,
+            vec![CompactTransaction {
+                index: 0,
+                transaction_id: TransactionId::from_bytes([1; 32]),
+                data: scan,
+            }],
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 1,
+                orchard_commitment_tree_size: 2,
+                ironwood_commitment_tree_size: 3,
+            },
+        )?;
+        let without_ironwood = CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(10), BlockHash::from_bytes([10; 32])),
+            BlockHash::from_bytes([9; 32]),
+            10,
+            Vec::new(),
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 1,
+                orchard_commitment_tree_size: 2,
+                ironwood_commitment_tree_size: 3,
+            },
+        )?;
+        let sapling_orchard = &[
+            lightwalletd::PoolType::Sapling as i32,
+            lightwalletd::PoolType::Orchard as i32,
+        ];
+        for (omitting, default) in [
+            (
+                CompactBlockShape::for_range(sapling_orchard)?,
+                CompactBlockShape::DEFAULT_RANGE,
+            ),
+            (
+                CompactBlockShape::for_nullifier_range(sapling_orchard)?,
+                CompactBlockShape::DEFAULT_NULLIFIER_RANGE,
+            ),
+        ] {
+            // A block without Ironwood actions encodes identically either way.
+            assert_eq!(
+                omitting.message(block.clone())?,
+                default.message(block.clone())?
+            );
+            assert_eq!(
+                omitting.message(without_ironwood.clone())?,
+                default.message(without_ironwood.clone())?
+            );
+            // A block carrying Ironwood actions differs, so the equivalence
+            // only holds below activation.
+            assert_ne!(
+                omitting.message(with_ironwood.clone())?,
+                default.message(with_ironwood.clone())?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ironwood_activation_judgement_follows_the_admitted_schedule() -> eyre::Result<()> {
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let activation = activations
+            .activation_height_by_name(ShieldedProtocol::Ironwood.activation_upgrade_name())
+            .ok_or_else(|| eyre::eyre!("fixture schedule lacks Ironwood activation"))?;
+        assert!(!ironwood_active_at_or_below(
+            &activations,
+            BlockHeight::new(activation.value() - 1)
+        ));
+        assert!(ironwood_active_at_or_below(
+            &activations,
+            BlockHeight::new(activation.value())
+        ));
+        assert!(ironwood_active_at_or_below(
+            &activations,
+            BlockHeight::new(activation.value() + 1)
+        ));
         Ok(())
     }
 
@@ -340,7 +722,7 @@ mod tests {
             ironwood_actions: vec![action(20)],
             ..CompactTransactionData::default()
         };
-        let nullifiers = CompactBlockShape::NULLIFIERS
+        let nullifiers = CompactBlockShape::for_nullifier_range(&[])?
             .encode_transaction(transaction(0, scan.clone()))?
             .ok_or_else(|| eyre::eyre!("missing nullifier transaction"))?;
         assert_eq!(
@@ -403,12 +785,6 @@ mod tests {
             }]
         );
         Ok(())
-    }
-
-    #[test]
-    fn invalid_pool_request_is_refused() {
-        let selection = CompactBlockShape::for_range(&[99]);
-        assert!(matches!(selection, Err(status) if status.code() == tonic::Code::InvalidArgument));
     }
 
     #[test]

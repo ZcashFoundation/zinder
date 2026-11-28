@@ -46,17 +46,15 @@ use zinder_core::{BlockHeight, NetworkUpgradeActivations, ShieldedProtocol};
 use zinder_proto::{v1::ops::CanonicalStoreDamagedDetail, wire::canonical_store_damaged_detail};
 use zinder_runtime::{ReadinessCause, ReadinessState};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbResourceBudget, RocksDbTreeStateVerifier, TREE_STATE_CHECKPOINT_STRIDE,
-    TreeStateCheckpointMismatch, TreeStateCheckpointMismatchKind,
-    TreeStateCheckpointRowVerification, TreeStateCheckpointVerification,
+    CanonicalReorgPolicy, CanonicalStoreError, RawBlobRetention, RocksDbResourceBudget,
+    RocksDbTreeStateVerifier, TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointMismatch,
+    TreeStateCheckpointMismatchKind, TreeStateCheckpointRowVerification,
+    TreeStateCheckpointVerification,
 };
 
 use crate::{
     background_pass::{BackgroundSecondary, write_progress_record},
-    runtime_config::{
-        HistoricalWorkGate, sleep_or_cancel, wait_until_historical_work_or_cancelled,
-    },
+    runtime_config::{HistoricalWorkGate, sleep_or_cancel, wait_for_work_or_cancelled},
 };
 
 /// Default average ceiling on stored checkpoint rows the pass verifies per
@@ -254,8 +252,6 @@ pub struct TreeStateVerificationContext {
     pub secondary_path: PathBuf,
     /// Node-observed activations that decide which pools each row carries.
     pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    /// Workload the canonical store was built for.
-    pub workload: CanonicalStoreWorkload,
     /// Raw-blob retention the canonical store was built with.
     pub raw_blob_retention: RawBlobRetention,
     /// Reorg policy the canonical store was built with.
@@ -298,13 +294,12 @@ async fn run_tree_state_verification(
         canonical_primary_path: &context.canonical_primary_path,
         secondary_path: &context.secondary_path,
         network_upgrade_activations: &context.network_upgrade_activations,
-        workload: context.workload,
         raw_blob_retention: context.raw_blob_retention,
         reorg_policy: context.reorg_policy,
         resource_budget: context.resource_budget,
     }
     .open_when_published(
-        (!rechecks_recorded_damage).then_some(&context.gate),
+        || rechecks_recorded_damage || context.gate.admits_verification(),
         &cancel,
         "tree_state_verification_secondary_unavailable",
     )
@@ -328,7 +323,7 @@ async fn run_tree_state_verification(
         return;
     }
     loop {
-        if wait_until_historical_work_or_cancelled(&context.gate, &cancel).await {
+        if wait_for_work_or_cancelled(|| context.gate.take_verification_step(), &cancel).await {
             return;
         }
         let pause = match pass.step(&cancel).await {
@@ -597,7 +592,9 @@ impl VerificationPass {
         let checked = tokio::task::spawn_blocking(move || {
             let mut verifier = verifier.lock();
             verifier.try_catch_up()?;
-            verifier.verify_tree_state_checkpoint_at(height, &activations)
+            let checked = verifier.verify_tree_state_checkpoint_at(height, &activations);
+            verifier.record_resource_gauges();
+            checked
         })
         .await
         .map_err(|error| error.to_string())
@@ -663,13 +660,14 @@ impl VerificationPass {
             verifier
                 .try_catch_up()
                 .map_err(StepFailure::before_any_row)?;
-            verifier
-                .verify_tree_state_checkpoints(from, STEP_ROWS, &activations)
-                .map_err(|error| StepFailure {
-                    verified_rows: error.verified_rows,
-                    next_from: Some(error.next_from),
-                    reason: error.to_string(),
-                })
+            let checked = verifier.verify_tree_state_checkpoints(from, STEP_ROWS, &activations);
+            verifier.record_resource_gauges();
+            drop(verifier);
+            checked.map_err(|error| StepFailure {
+                verified_rows: error.verified_rows,
+                next_from: Some(error.next_from),
+                reason: error.to_string(),
+            })
         })
         .await
         .map_err(StepFailure::before_any_row)?

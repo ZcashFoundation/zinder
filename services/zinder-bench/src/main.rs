@@ -13,6 +13,9 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use zinder_bench::{
     BenchError,
+    active_writer_publication::{
+        ActiveWriterPublicationConfig, run_active_writer_publication, validate_config,
+    },
     canonical_fixture_replay::capture_canonical_fixture_replay_plan,
     canonical_fixture_transport_server::{
         CanonicalFixtureTransportServerConfig, run_canonical_fixture_transport_server,
@@ -23,15 +26,24 @@ use zinder_bench::{
 };
 use zinder_core::{BlockHeight, Network, wire::decode_zinder_native_chain_name};
 use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
+use zinder_store::RocksDbIoMode;
 
+mod build_provenance;
 #[path = "canonical_replay_storage/command.rs"]
 mod canonical_replay_storage_command;
+mod checkpoint_policy_comparison;
+#[path = "postgres_segmented/command.rs"]
+mod postgres_segmented_command;
 mod rocksdb_canonical_fixture_replay;
 mod rocksdb_compact_block_range;
 mod rocksdb_raw_blob_retention_comparison;
+mod rocksdb_read_bench;
 mod rocksdb_storage_lifecycle;
+mod rocksdb_store_properties;
+mod rocksdb_subtree_roots;
 mod rocksdb_tip_replay;
 mod rocksdb_tree_state_replay;
+mod rocksdb_wallet_footprint;
 mod rocksdb_wallet_rebuild;
 mod wallet_load;
 
@@ -39,10 +51,11 @@ use canonical_replay_storage_command::{CanonicalReplayStorageArgs, run_canonical
 use rocksdb_canonical_fixture_replay::{
     RocksDbCanonicalFixtureReplayArgs, run_rocksdb_canonical_fixture_replay,
 };
-use rocksdb_compact_block_range::{RocksDbCompactBlockRangeArgs, run_rocksdb_compact_block_range};
+use rocksdb_compact_block_range::run_rocksdb_compact_block_range;
 use rocksdb_raw_blob_retention_comparison::{
     RocksDbRawBlobRetentionComparisonArgs, run_rocksdb_raw_blob_retention_comparison,
 };
+use rocksdb_read_bench::ReadStoreArgs;
 use rocksdb_storage_lifecycle::{RocksDbStorageLifecycleArgs, run_rocksdb_storage_lifecycle};
 use rocksdb_tip_replay::{
     CompareTipReplayReportsArgs, RocksDbTipReorgArgs, RocksDbTipReplayArgs,
@@ -50,7 +63,10 @@ use rocksdb_tip_replay::{
 };
 use rocksdb_tree_state_replay::{RocksDbTreeStateReplayArgs, run_rocksdb_tree_state_replay};
 use rocksdb_wallet_rebuild::{RocksDbWalletRebuildArgs, run_rocksdb_wallet_rebuild};
-use wallet_load::{LightwalletdWalletLoadArgs, run_lightwalletd_wallet_load};
+use wallet_load::{
+    LightwalletdWalletLoadArgs, RawRangeProbeArgs, run_lightwalletd_wallet_load,
+    run_raw_range_probe,
+};
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
@@ -85,6 +101,9 @@ enum Command {
     /// Replay an authenticated fixture into a fresh canonical `RocksDB` store.
     #[command(name = "rocksdb-canonical-fixture-replay")]
     RocksDbCanonicalFixtureReplay(RocksDbCanonicalFixtureReplayArgs),
+    /// Compare sparse, two commitment budgets, and every-block construction.
+    #[command(name = "rocksdb-checkpoint-policy-comparison")]
+    RocksDbCheckpointPolicyComparison(checkpoint_policy_comparison::CheckpointPolicyComparisonArgs),
     /// Compare transaction-only and complete raw-blob retention over one fixture.
     #[command(name = "rocksdb-raw-blob-retention-comparison")]
     RocksDbRawBlobRetentionComparison(RocksDbRawBlobRetentionComparisonArgs),
@@ -97,9 +116,18 @@ enum Command {
     /// Rebuild and cold-admit a wallet store from an existing READY canonical store.
     #[command(name = "rocksdb-wallet-rebuild")]
     RocksDbWalletRebuild(RocksDbWalletRebuildArgs),
-    /// Measure version-1 compact-block ranges through an admitted secondary.
+    /// Measure per-CF wallet `RocksDB` footprint, cold readback, and warm transparent query latency.
+    #[command(name = "rocksdb-wallet-footprint")]
+    RocksDbWalletFootprint(rocksdb_wallet_footprint::RocksDbWalletFootprintArgs),
+    /// Measure unbounded ranges and byte-bounded serving chunks on a READY store.
     #[command(name = "rocksdb-compact-block-range")]
-    RocksDbCompactBlockRange(RocksDbCompactBlockRangeArgs),
+    RocksDbCompactBlockRange(ReadStoreArgs),
+    /// Measure cold and warm reads of a subtree-root page.
+    #[command(name = "rocksdb-subtree-roots")]
+    RocksDbSubtreeRoots(rocksdb_subtree_roots::SubtreeArgs),
+    /// Inspect canonical column-family and SST properties through a READY secondary.
+    #[command(name = "rocksdb-store-properties")]
+    RocksDbStoreProperties(ReadStoreArgs),
     /// Measure tree-state reconstructions at wallet anchor heights.
     #[command(name = "rocksdb-tree-state-replay")]
     RocksDbTreeStateReplay(RocksDbTreeStateReplayArgs),
@@ -118,6 +146,70 @@ enum Command {
     /// Drive wallet-shaped sync load at a running lightwalletd-compatible endpoint.
     #[command(name = "lightwalletd-wallet-load")]
     LightwalletdWalletLoad(LightwalletdWalletLoadArgs),
+    /// Verify raw `GetBlockRange` frames against an oracle and time them.
+    #[command(name = "raw-range-probe")]
+    RawRangeProbe(RawRangeProbeArgs),
+    /// Benchmark reader publication across four matched active-writer states.
+    #[command(name = "active-writer-publication")]
+    ActiveWriterPublication(ActiveWriterPublicationArgs),
+    /// Run the segmented PostgreSQL canonical + wallet build, tip-follow, mempool churn, and pooled-reader benchmark arm.
+    #[command(name = "postgres-segmented")]
+    PostgresSegmented(postgres_segmented_command::PostgresSegmentedArgs),
+}
+
+#[derive(Args)]
+struct ActiveWriterPublicationArgs {
+    /// Number of pre-built base blocks before live commits begin.
+    #[arg(long = "base-blocks", default_value_t = 4_092)]
+    base_blocks: u32,
+    /// Number of live blocks committed while readers are active.
+    #[arg(long = "live-blocks", default_value_t = 16)]
+    live_blocks: u32,
+    /// Settlement reorg window depth in blocks.
+    #[arg(long = "reorg-window-blocks", default_value_t = 4)]
+    reorg_window_blocks: u32,
+    /// Settled shielded catalog segment size in blocks.
+    #[arg(long = "segment-blocks", default_value_t = 4_096)]
+    segment_blocks: u32,
+    /// Cadence (in blocks) for commitment-dense shielded blocks.
+    #[arg(long = "dense-block-cadence", default_value_t = 4)]
+    dense_block_cadence: u32,
+    /// Synthetic V5 Orchard transactions attached to each dense block.
+    #[arg(long = "dense-txs-per-block", default_value_t = 1)]
+    dense_txs_per_block: u32,
+    /// Number of Orchard actions embedded in each dense shielded transaction.
+    #[arg(long = "dense-orchard-actions-per-tx", default_value_t = 2)]
+    dense_orchard_actions_per_tx: u32,
+    /// Width in blocks (>= 2) of descending `GetBlockRange(tip, floor)` uncovered-tail probes.
+    #[arg(long = "tail-probe-blocks", default_value_t = 24)]
+    tail_probe_blocks: u32,
+    /// Milliseconds between consecutive live block commits.
+    #[arg(long = "commit-interval-millis", default_value_t = 8)]
+    commit_interval_millis: u64,
+    /// Milliseconds slept per frame by the slow boundary-crossing reader.
+    #[arg(long = "slow-reader-frame-delay-millis", default_value_t = 3)]
+    slow_reader_frame_delay_millis: u64,
+    /// Mempool churn transaction counts (comma-separated or repeated).
+    #[arg(long = "mempool-churn-size", value_delimiter = ',', default_values_t = vec![50, 500])]
+    mempool_churn_sizes: Vec<u32>,
+    /// Minimum request rounds for the `quiescent_control` baseline arm.
+    #[arg(long = "quiescent-rounds", default_value_t = 6)]
+    quiescent_rounds: u32,
+    /// Optional scratch directory parent for temporary benchmark stores.
+    #[arg(long = "scratch-dir")]
+    scratch_dir: Option<PathBuf>,
+    /// Requested `RocksDB` I/O mode (`direct` or `buffered`).
+    #[arg(long = "io-mode", default_value = "direct", value_parser = parse_io_mode)]
+    io_mode: RocksDbIoMode,
+    /// Optional worker count for signed-catalog publication.
+    #[arg(long = "publish-workers")]
+    publish_workers: Option<u32>,
+    /// Fail unless at least one arm triggers an `EncodedTail` `64 MiB` byte-cap eviction.
+    #[arg(long = "require-tail-eviction", default_value_t = false)]
+    require_tail_eviction: bool,
+    /// Write the JSON report to this absent path instead of stdout.
+    #[arg(long)]
+    report: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -231,10 +323,22 @@ struct CaptureTipReplayCheckpointsArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .try_init();
+    if let Err(error) = zinder_bench::recorder::install_tracing_subscriber() {
+        tracing::error!(
+            target: "zinder::bench",
+            event = "tracing_init_failed",
+            error = %error,
+            "failed to initialize benchmark tracing subscriber"
+        );
+        return ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
+    if !zinder_runtime::host_cpu_meets_compiled_baseline() {
+        return ExitCode::FAILURE;
+    }
+    if !zinder_runtime::host_cpu_meets_pasta_backend_baseline() {
+        return ExitCode::FAILURE;
+    }
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -265,30 +369,16 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             emit_report(&output.report, output.report_path.as_deref())?;
             output.report.validate()
         }
+        Command::RocksDbCheckpointPolicyComparison(args) => {
+            let report = checkpoint_policy_comparison::run(&args).await?;
+            emit_report(&report, args.report.as_deref())
+        }
         Command::RocksDbRawBlobRetentionComparison(args) => {
             let output = run_rocksdb_raw_blob_retention_comparison(args).await?;
             emit_report(&output.report, output.report_path.as_deref())
         }
         Command::ServeCanonicalFixtureTransports(args) => {
-            let max_response_bytes = u32::try_from(args.max_response_bytes).map_err(|_| {
-                BenchError::invalid_argument("--max-response-bytes must fit in u32")
-            })?;
-            let report =
-                run_canonical_fixture_transport_server(CanonicalFixtureTransportServerConfig {
-                    fixture_directory: args.fixture,
-                    json_rpc_listen_addr: args.json_rpc_listen_addr,
-                    indexer_grpc_listen_addr: args.indexer_grpc_listen_addr,
-                    response_delay: Duration::from_millis(args.response_delay_millis),
-                    max_response_bytes,
-                })
-                .await?;
-            let encoded = serde_json::to_vec_pretty(&report)?;
-            if let Some(path) = args.report.as_deref() {
-                create_report_file(path, &encoded)?;
-            } else {
-                write_report_to_stdout(&encoded);
-            }
-            Ok(())
+            run_serve_canonical_fixture_transports_command(args).await
         }
         Command::RocksDbStorageLifecycle(args) => {
             let output = run_rocksdb_storage_lifecycle(args).await?;
@@ -301,13 +391,25 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             write_report_to_stdout(&encoded);
             Ok(())
         }
+        Command::RocksDbWalletFootprint(args) => {
+            let output = rocksdb_wallet_footprint::run(&args)?;
+            emit_report(&output, args.output_json.as_deref())
+        }
         Command::RocksDbCompactBlockRange(args) => {
-            let output = run_rocksdb_compact_block_range(args).await?;
-            emit_report(&output.report, output.report_path.as_deref())
+            let report = run_rocksdb_compact_block_range(&args).await?;
+            emit_report(&report, args.report.as_deref())
+        }
+        Command::RocksDbSubtreeRoots(args) => {
+            let report = rocksdb_subtree_roots::run(&args).await?;
+            emit_report(&report, args.store.report.as_deref())
+        }
+        Command::RocksDbStoreProperties(args) => {
+            let report = rocksdb_store_properties::run(&args)?;
+            emit_report(&report, args.report.as_deref())
         }
         Command::RocksDbTreeStateReplay(args) => {
-            let output = run_rocksdb_tree_state_replay(args)?;
-            emit_report(&output.report, output.report_path.as_deref())
+            let report = run_rocksdb_tree_state_replay(&args)?;
+            emit_report(&report, args.store.report.as_deref())
         }
         Command::CaptureTipReplayCheckpoints(args) => {
             run_capture_tip_replay_checkpoints(args).await
@@ -315,11 +417,101 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         Command::RocksDbTipReplay(args) => run_rocksdb_tip_replay(args).await,
         Command::CompareTipReplayReports(args) => run_compare_tip_replay_reports(&args),
         Command::RocksDbTipReorg(args) => run_rocksdb_tip_reorg(args).await,
-        Command::LightwalletdWalletLoad(args) => {
-            let output = run_lightwalletd_wallet_load(args).await?;
+        Command::LightwalletdWalletLoad(args) => run_wallet_load_command(args).await,
+        Command::RawRangeProbe(args) => run_raw_range_probe_command(args).await,
+        Command::ActiveWriterPublication(args) => {
+            Box::pin(run_active_writer_publication_command(args)).await
+        }
+        Command::PostgresSegmented(args) => {
+            let output =
+                Box::pin(postgres_segmented_command::run_postgres_segmented_cli(args)).await?;
             emit_report(&output.report, output.report_path.as_deref())
         }
     }
+}
+
+async fn run_serve_canonical_fixture_transports_command(
+    args: ServeCanonicalFixtureTransportsArgs,
+) -> Result<(), BenchError> {
+    let max_response_bytes = u32::try_from(args.max_response_bytes)
+        .map_err(|_| BenchError::invalid_argument("--max-response-bytes must fit in u32"))?;
+    let report = run_canonical_fixture_transport_server(CanonicalFixtureTransportServerConfig {
+        fixture_directory: args.fixture,
+        json_rpc_listen_addr: args.json_rpc_listen_addr,
+        indexer_grpc_listen_addr: args.indexer_grpc_listen_addr,
+        response_delay: Duration::from_millis(args.response_delay_millis),
+        max_response_bytes,
+    })
+    .await?;
+    let encoded = serde_json::to_vec_pretty(&report)?;
+    if let Some(path) = args.report.as_deref() {
+        create_report_file(path, &encoded)?;
+    } else {
+        write_report_to_stdout(&encoded);
+    }
+    Ok(())
+}
+
+fn parse_io_mode(text: &str) -> Result<RocksDbIoMode, String> {
+    match text {
+        "direct" => Ok(RocksDbIoMode::Direct),
+        "buffered" => Ok(RocksDbIoMode::Buffered),
+        _ => Err("expected direct or buffered".to_owned()),
+    }
+}
+
+async fn run_active_writer_publication_command(
+    args: ActiveWriterPublicationArgs,
+) -> Result<(), BenchError> {
+    if let Some(path) = args.report.as_deref()
+        && path.exists()
+    {
+        return Err(BenchError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "report output path already exists",
+            ),
+        ));
+    }
+    let segment_blocks = require_nonzero_u32(args.segment_blocks, "segment-blocks")?;
+    let publish_workers = args
+        .publish_workers
+        .map(|workers| require_nonzero_u32(workers, "publish-workers"))
+        .transpose()?;
+    let config = ActiveWriterPublicationConfig {
+        base_blocks: args.base_blocks,
+        live_blocks: args.live_blocks,
+        reorg_window_blocks: args.reorg_window_blocks,
+        segment_blocks,
+        dense_block_cadence: args.dense_block_cadence,
+        dense_txs_per_block: args.dense_txs_per_block,
+        dense_orchard_actions_per_tx: args.dense_orchard_actions_per_tx,
+        tail_probe_blocks: args.tail_probe_blocks,
+        commit_interval: Duration::from_millis(args.commit_interval_millis),
+        slow_reader_frame_delay: Duration::from_millis(args.slow_reader_frame_delay_millis),
+        mempool_churn_sizes: args.mempool_churn_sizes,
+        quiescent_rounds: args.quiescent_rounds,
+        scratch_dir: args.scratch_dir,
+        io_mode: args.io_mode,
+        publish_workers,
+        require_tail_eviction: args.require_tail_eviction,
+    };
+    validate_config(&config)?;
+    let report = run_active_writer_publication(&config).await?;
+    emit_report(&report, args.report.as_deref())?;
+    report.validate(&config)
+}
+
+async fn run_wallet_load_command(args: LightwalletdWalletLoadArgs) -> Result<(), BenchError> {
+    let output = run_lightwalletd_wallet_load(args).await?;
+    emit_report(&output.report, output.report_path.as_deref())
+}
+
+async fn run_raw_range_probe_command(args: RawRangeProbeArgs) -> Result<(), BenchError> {
+    let output = run_raw_range_probe(args).await?;
+    emit_report(&output.report, output.report_path.as_deref())?;
+    output.require_verified()
 }
 
 async fn run_capture_tip_replay_checkpoints(
@@ -344,6 +536,7 @@ async fn run_capture_tip_replay_checkpoints(
             request_timeout: Duration::from_secs(args.request_timeout_secs),
             max_response_bytes: require_nonzero_u64(args.max_response_bytes, "max-response-bytes")?,
             broadcast_timeout: None,
+            ..ZebraJsonRpcSourceOptions::default()
         },
     )?;
     let activations =
@@ -382,6 +575,7 @@ async fn run_capture_canonical_fixture_checkpoints(
             request_timeout: Duration::from_secs(args.request_timeout_secs),
             max_response_bytes: require_nonzero_u64(args.max_response_bytes, "max-response-bytes")?,
             broadcast_timeout: None,
+            ..ZebraJsonRpcSourceOptions::default()
         },
     )?;
     let activations =
@@ -513,6 +707,30 @@ mod tests {
         ])?;
 
         assert!(matches!(cli.command, Command::RocksDbStorageLifecycle(_)));
+        for coverage in ["every-block", "cadence-and-tip"] {
+            assert!(matches!(
+                Cli::try_parse_from([
+                    "zinder-bench",
+                    "rocksdb-storage-lifecycle",
+                    "--network",
+                    "zcash-testnet",
+                    "--json-rpc-addr",
+                    "http://zebra:18232",
+                    "--canonical-store",
+                    "canonical",
+                    "--wallet-store",
+                    "wallet",
+                    "--cpu-limit-cores",
+                    "10",
+                    "--memory-limit-bytes",
+                    "10737418240",
+                    "--tree-state-checkpoint-coverage",
+                    coverage,
+                ])?
+                .command,
+                Command::RocksDbStorageLifecycle(_)
+            ));
+        }
         Ok(())
     }
 
@@ -531,6 +749,22 @@ mod tests {
             cli.command,
             Command::RocksDbCanonicalFixtureReplay(_)
         ));
+        for coverage in ["every-block", "cadence-and-tip"] {
+            assert!(matches!(
+                Cli::try_parse_from([
+                    "zinder-bench",
+                    "rocksdb-canonical-fixture-replay",
+                    "--fixture",
+                    "fixture",
+                    "--canonical-store",
+                    "canonical",
+                    "--tree-state-checkpoint-coverage",
+                    coverage,
+                ])?
+                .command,
+                Command::RocksDbCanonicalFixtureReplay(_)
+            ));
+        }
         Ok(())
     }
 
@@ -542,14 +776,16 @@ mod tests {
             "rocksdb-raw-blob-retention-comparison",
             "--fixture",
             "fixture",
-            "--transactions-canonical-store",
-            "transactions-canonical",
-            "--transactions-secondary-root",
-            "transactions-secondary",
+            "--none-canonical-store",
+            "none-canonical",
+            "--none-secondary-root",
+            "none-secondary",
             "--all-canonical-store",
             "all-canonical",
             "--all-secondary-root",
             "all-secondary",
+            "--tree-state-checkpoint-coverage",
+            "cadence-and-tip",
         ])?;
 
         assert!(matches!(
@@ -603,7 +839,7 @@ mod tests {
 
     #[test]
     fn rocksdb_compact_block_range_command_spelling_is_stable() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from([
+        let base = [
             "zinder-bench",
             "rocksdb-compact-block-range",
             "--fixture",
@@ -614,9 +850,29 @@ mod tests {
             "secondary",
             "--software-revision",
             "5079515",
-        ])?;
-
+        ];
+        let cli = Cli::try_parse_from(base)?;
         assert!(matches!(cli.command, Command::RocksDbCompactBlockRange(_)));
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--canonical-io-mode",
+                "direct",
+                "--evict-page-cache"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--canonical-io-mode",
+                "buffered",
+                "--evict-page-cache"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain(["--canonical-io-mode", "invalid"]))
+                .is_err()
+        );
         Ok(())
     }
 
@@ -646,6 +902,34 @@ mod tests {
     }
 
     #[test]
+    fn explicit_tree_state_heights_are_in_help_and_conflict_with_sampling()
+    -> Result<(), Box<dyn Error>> {
+        let base = [
+            "zinder-bench",
+            "rocksdb-tree-state-replay",
+            "--fixture",
+            "fixture",
+            "--canonical-store",
+            "canonical",
+            "--secondary-root",
+            "secondary",
+            "--software-revision",
+            "revision",
+            "--heights-file",
+            "frontiers.txt",
+        ];
+        assert!(Cli::try_parse_from(base).is_ok());
+        for flag in ["--from-height", "--to-height", "--max-anchors"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain([flag, "100"])).is_err());
+        }
+        let help = Cli::try_parse_from(["zinder-bench", "rocksdb-tree-state-replay", "--help"])
+            .err()
+            .ok_or("help should exit")?;
+        assert!(help.to_string().contains("--heights-file"));
+        Ok(())
+    }
+
+    #[test]
     fn lightwalletd_wallet_load_command_spelling_is_stable() -> Result<(), Box<dyn Error>> {
         let load = |workload: &str| {
             Cli::try_parse_from([
@@ -669,6 +953,63 @@ mod tests {
             ));
         }
         assert!(load("zingo").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_range_probe_command_spellings_are_stable() -> Result<(), Box<dyn Error>> {
+        let probe = |extra: &[&str]| {
+            let mut arguments = vec!["zinder-bench", "raw-range-probe", "--endpoint", "http://a"];
+            arguments.extend_from_slice(extra);
+            Cli::try_parse_from(arguments)
+        };
+        assert!(matches!(
+            probe(&[
+                "--oracle",
+                "oracle.json",
+                "--clients",
+                "4",
+                "--server-pid",
+                "7",
+                "--server-executable",
+                "reader"
+            ])?
+            .command,
+            Command::RawRangeProbe(_)
+        ));
+        assert!(matches!(
+            probe(&[
+                "--oracle-endpoint",
+                "http://b",
+                "--range",
+                "20:10",
+                "--both-directions",
+                "--write-oracle",
+                "oracle.json",
+            ])?
+            .command,
+            Command::RawRangeProbe(_)
+        ));
+        // The oracle is required, and a file excludes recording one.
+        assert!(probe(&[]).is_err());
+        assert!(probe(&["--oracle", "o.json", "--oracle-endpoint", "http://b"]).is_err());
+        assert!(probe(&["--oracle-endpoint", "http://b"]).is_err());
+        assert!(probe(&["--oracle", "o.json", "--clients", "0"]).is_err());
+        assert!(probe(&["--oracle", "o.json", "--server-counter", "x"]).is_err());
+        let metrics = [
+            "--oracle",
+            "o.json",
+            "--server-metrics-url",
+            "http://m/metrics",
+        ];
+        let with = |extra: &[&str]| probe(&[&metrics[..], extra].concat());
+        let witness = ["--server-freshness-counter", "w_total{status=ok}"];
+        assert!(with(&[&["--rocksdb-multiget-counters"][..], &witness].concat()).is_ok());
+        assert!(with(&[&["--server-counter", "a=b_total{k=v}"][..], &witness].concat()).is_ok());
+        // Counters without a freshness witness, or a witness without counters, could read as zero.
+        assert!(with(&["--rocksdb-multiget-counters"]).is_err());
+        assert!(with(&witness).is_err());
+        assert!(with(&["--server-counter", "a{b}"]).is_err());
         Ok(())
     }
 
@@ -803,6 +1144,142 @@ mod tests {
 
         assert!(create_report_file(&report_path, b"second").is_err());
         assert_eq!(std::fs::read(&report_path)?, b"first");
+        Ok(())
+    }
+
+    #[test]
+    fn active_writer_publication_command_spelling_is_stable() -> Result<(), Box<dyn Error>> {
+        let parsed = Cli::try_parse_from([
+            "zinder-bench",
+            "active-writer-publication",
+            "--base-blocks",
+            "4092",
+            "--live-blocks",
+            "16",
+            "--report",
+            "publication.json",
+        ])?;
+        assert!(matches!(
+            parsed.command,
+            Command::ActiveWriterPublication(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn active_writer_publication_parses_comma_separated_and_repeated_mempool_churn_sizes()
+    -> Result<(), Box<dyn Error>> {
+        for argv in [
+            vec![
+                "zinder-bench",
+                "active-writer-publication",
+                "--mempool-churn-size",
+                "50,500",
+            ],
+            vec![
+                "zinder-bench",
+                "active-writer-publication",
+                "--mempool-churn-size",
+                "50",
+                "--mempool-churn-size",
+                "500",
+            ],
+        ] {
+            let parsed = Cli::try_parse_from(argv)?;
+            assert!(matches!(
+                parsed.command,
+                Command::ActiveWriterPublication(ref args)
+                    if args.mempool_churn_sizes == [50, 500]
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn active_writer_publication_parses_extended_flags() -> Result<(), Box<dyn Error>> {
+        let parsed = Cli::try_parse_from([
+            "zinder-bench",
+            "active-writer-publication",
+            "--scratch-dir",
+            "/tmp/zinder-bench-scratch",
+            "--io-mode",
+            "buffered",
+            "--tail-probe-blocks",
+            "64",
+            "--dense-orchard-actions-per-tx",
+            "16",
+            "--publish-workers",
+            "2",
+            "--require-tail-eviction",
+        ])?;
+        let Command::ActiveWriterPublication(args) = parsed.command else {
+            return Err("unexpected subcommand parsed".into());
+        };
+        assert_eq!(
+            args.scratch_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/zinder-bench-scratch"))
+        );
+        assert_eq!(args.io_mode, zinder_store::RocksDbIoMode::Buffered);
+        assert_eq!(args.tail_probe_blocks, 64);
+        assert_eq!(args.dense_orchard_actions_per_tx, 16);
+        assert_eq!(args.publish_workers, Some(2));
+        assert!(args.require_tail_eviction);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_writer_publication_rejects_existing_report_before_running()
+    -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let existing_report = dir.path().join("existing.json");
+        create_report_file(&existing_report, b"preexisting")?;
+        let parsed = Cli::try_parse_from([
+            "zinder-bench",
+            "active-writer-publication",
+            "--live-blocks",
+            "0",
+            "--report",
+            existing_report
+                .to_str()
+                .ok_or("temp report path must be utf8")?,
+        ])?;
+        let Command::ActiveWriterPublication(args) = parsed.command else {
+            return Err("unexpected subcommand parsed".into());
+        };
+        let err = super::run_active_writer_publication_command(args)
+            .await
+            .err()
+            .ok_or("existing report path must reject before config validation or execution")?;
+        assert!(err.to_string().contains("already exists"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_segmented_parses_and_rejects_existing_report() -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let existing_report = dir.path().join("existing-segmented.json");
+        create_report_file(&existing_report, b"preexisting")?;
+        let parsed = Cli::try_parse_from([
+            "zinder-bench",
+            "postgres-segmented",
+            "--fixture",
+            "/tmp/nonexistent-fixture",
+            "--reader-mode",
+            "pgbouncer-transaction",
+            "--full-blocks",
+            "--report",
+            existing_report
+                .to_str()
+                .ok_or("temp report path must be utf8")?,
+        ])?;
+        let Command::PostgresSegmented(args) = parsed.command else {
+            return Err("unexpected subcommand parsed".into());
+        };
+        let err = super::postgres_segmented_command::run_postgres_segmented_cli(args)
+            .await
+            .err()
+            .ok_or("existing report path must reject before running postgres-segmented")?;
+        assert!(err.to_string().contains("already exists"));
         Ok(())
     }
 }

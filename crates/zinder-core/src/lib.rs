@@ -18,9 +18,11 @@ mod chain_epoch;
 mod chain_value_pools;
 #[cfg(feature = "commitment-tree-codec")]
 mod commitment_tree_codec;
+mod compact_scan;
 mod displaced_block;
 pub mod explorer_reasons;
 pub mod explorer_search;
+mod lthash16;
 mod mempool;
 mod network_upgrade_activations;
 mod subtree_root;
@@ -34,9 +36,10 @@ mod utxo_set_commitment;
 mod wallet_scan;
 pub mod wire;
 
+pub use lthash16::{LTHASH16_EXPANSION_LEN, expand_lthash16_element};
 pub use utxo_set_commitment::{
     TransparentUtxoSetCommitment, UTXO_SET_COMMITMENT_DIGEST_LEN, UTXO_SET_COMMITMENT_LEN,
-    UtxoSetCommitmentScheme,
+    UtxoSetCommitmentScheme, UtxoSetCommitmentSchemeMismatch,
 };
 
 pub use block_artifact::{
@@ -68,10 +71,13 @@ pub use chain_value_pools::{
 };
 #[cfg(feature = "commitment-tree-codec")]
 pub use commitment_tree_codec::{
-    CommitmentTreeAccumulator, CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
-    CommitmentTreeFrontiersError, MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES,
+    BatchAppendBlocksOutcome, BatchAppendedBlock, BatchPoolAppendDurations,
+    BlockCommitmentBatchInput, CommitmentTreeAccumulator, CommitmentTreeAccumulatorError,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontierValidationError,
+    CommitmentTreeFrontiers, CommitmentTreeFrontiersError, CommitmentTreeSnapshot,
+    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES,
 };
+pub use compact_scan::{CompactBlockNullifiers, CompactPool, CompactTransactionNullifiers};
 pub use displaced_block::{
     DisplacedBlock, DisplacedBlockArchiveCoverage, DisplacedBlockCoinbaseOutput,
     DisplacedRootArchiveCoverage, DisplacedRootCandidate,
@@ -102,7 +108,9 @@ pub use transaction_public_facts::{
     LockTime, PrivacyShape, TransactionComponentCounts, TransactionPublicFacts, TransactionVersion,
     UnsupportedSection, Wtxid, classify_privacy_shape,
 };
-pub use transparent_address_balance::TransparentAddressBalance;
+pub use transparent_address_balance::{
+    MAX_TRANSPARENT_ADDRESSES_PER_BATCH, TransparentAddressBalance,
+};
 pub use transparent_address_tx_index::TransparentAddressTxIndexArtifact;
 pub use transparent_output::{
     MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, TransparentAddressScriptHash, TransparentInputFact,

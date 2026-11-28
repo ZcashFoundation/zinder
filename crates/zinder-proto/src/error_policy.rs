@@ -89,8 +89,7 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
             ReasonPolicy::new(Code::InvalidArgument, NonRetryable)
         }
 
-        ErrorReason::BroadcastDisabled
-        | ErrorReason::ChainEventCursorExpired
+        ErrorReason::ChainEventCursorExpired
         | ErrorReason::MempoolEventCursorExpired
         | ErrorReason::SnapshotPageCursorExpired
         | ErrorReason::ChainEpochPinUnavailable
@@ -123,11 +122,14 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::UnsupportedWalletEncoding
         | ErrorReason::BlockingTaskFailed
         | ErrorReason::NodeUnavailable
+        | ErrorReason::NodeRateLimited
+        | ErrorReason::ServedTipMismatch
         | ErrorReason::StorageUnavailable
         | ErrorReason::UpstreamUnreachable
         | ErrorReason::ServiceNotReady
         | ErrorReason::NoVisibleChainEpoch
-        | ErrorReason::BroadcastBudgetExhausted => {
+        | ErrorReason::BroadcastBudgetExhausted
+        | ErrorReason::BlockRangeAdmissionRefused => {
             ReasonPolicy::new(Code::Unavailable, RetryAfterBackoff)
         }
 
@@ -137,7 +139,9 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
 
         ErrorReason::ExplorerMethodDisabled => ReasonPolicy::new(Code::Unimplemented, NonRetryable),
 
-        ErrorReason::TreeStateReplayLimitReached | ErrorReason::CompactBlockStreamLimitReached => {
+        ErrorReason::TreeStateReplayLimitReached
+        | ErrorReason::CompactBlockStreamLimitReached
+        | ErrorReason::ForwardedReadLimitReached => {
             ReasonPolicy::new(Code::ResourceExhausted, RetryAfterBackoff)
         }
     }

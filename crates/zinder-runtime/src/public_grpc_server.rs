@@ -7,11 +7,27 @@
 //! - at most [`MAX_CONCURRENT_STREAMS_PER_CONNECTION`] streams on one HTTP/2
 //!   connection;
 //! - an HTTP/2 keepalive ping after a minute without a frame, closing the
-//!   connection when the ping goes unanswered for 20 seconds; and
+//!   connection when the ping goes unanswered for 20 seconds;
+//! - a connection closed once the client's protocol errors have made the
+//!   server reset [`HTTP2_MAX_LOCAL_ERROR_RESETS`] of its streams;
 //! - a server-wide bound on requests whose message is still arriving
-//!   ([`GrpcReceiveLimitLayer`]); and
-//! - an end to any response whose client stops reading it
-//!   ([`GrpcSendStallLayer`]).
+//!   ([`GrpcReceiveLimitLayer`]);
+//! - an end to any response whose client stops reading it: the transport
+//!   held the response's data for the send stall timeout, so the listener
+//!   resets the response's HTTP/2 stream while the connection and its other
+//!   streams stay open;
+//! - an HTTP/2 response's end sent only once the client's window covers the
+//!   data before it, so a finished response cannot keep data and a stream
+//!   slot that no reset can reach; and
+//! - a connection closed once it writes less than 16 KiB within the send
+//!   stall timeout after a write blocks, because its client has stopped
+//!   reading every stream on it.
+//!
+//! Zinder serves these listeners with its own connection loop
+//! ([`PublicGrpcRouter`]) instead of tonic's, because resetting one stream
+//! needs the task hyper sends that stream from, and tonic gives no way to
+//! reach it. [`GrpcSendStallLayer`] ends a call whose client stops reading
+//! when a listener cannot reset its transport, as tonic's own server cannot.
 //!
 //! tonic reads a whole request message into memory before the handler runs,
 //! and the per-connection stream limit does not bound how many messages the
@@ -25,25 +41,32 @@
 //! a few pooled connections, so without that header every client behind it
 //! counts as the same few.
 //!
-//! A wallet listener, which [`crate::SupervisedRuntime::public_grpc_router`]
-//! assembles, serves the wallet service behind the
+//! A public gRPC listener, which [`crate::SupervisedRuntime::public_grpc_router`]
+//! assembles, serves the application service behind the
 //! [`TrafficReadinessInterceptor`], and gRPC reflection and
 //! `grpc.health.v1.Health` outside it, so both keep answering while the
-//! runtime refuses wallet calls. Reflection, built with
-//! [`public_grpc_reflection`], applies the same request size bound as every
-//! other public service. Every call on the listener also passes through
+//! runtime refuses application calls. Both reflection versions apply the public
+//! request size bound. Every call on the listener also passes through
 //! [`GrpcCallTerminationLayer`], outside every other layer, which ends the
 //! calls still open once the runtime's drain deadline passes.
 
 mod call_termination;
+mod grpc_timeout;
 mod message_boundaries;
+mod proxy_protocol;
+mod range_admission;
 mod receive_slots;
+mod release_gate;
 mod send_stall;
+mod serving;
+mod stream_reset;
+mod wallet_rpc_metrics;
 
 use std::{
     convert::Infallible,
     future::Future,
-    net::SocketAddr,
+    hash::{BuildHasher as _, RandomState},
+    net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
@@ -61,24 +84,34 @@ use tonic::{
     body::Body,
     server::NamedService,
     service::interceptor::InterceptedService,
-    transport::{
-        Server,
-        server::{Router, TcpConnectInfo, TlsConnectInfo},
-    },
+    transport::server::{TcpConnectInfo, TlsConnectInfo},
 };
-use tonic_reflection::server::v1::{ServerReflection, ServerReflectionServer};
+use tonic_reflection::server::{
+    Builder as ReflectionBuilder,
+    v1::{ServerReflection, ServerReflectionServer},
+};
 use tower::{
     Layer, Service, ServiceBuilder,
     layer::util::{Identity, Stack},
 };
+use zinder_proto::compat::lightwalletd::compact_tx_streamer_server;
 
 pub(crate) use self::call_termination::OpenGrpcCalls;
-pub use self::call_termination::{GrpcCallTermination, GrpcCallTerminationLayer};
+pub use self::call_termination::{
+    GrpcCallTermination, GrpcCallTerminationFuture, GrpcCallTerminationLayer,
+};
+pub use self::grpc_timeout::GrpcDeadline;
+pub use self::proxy_protocol::GrpcProxyProtocol;
+pub use self::range_admission::{GrpcRangeAdmission, RangeClientKey};
 use self::send_stall::ResponseCancellation;
 pub use self::send_stall::{GrpcSendStall, GrpcSendStallLayer};
+pub use self::serving::{PublicGrpcRouter, PublicGrpcServer};
+pub(crate) use self::wallet_rpc_metrics::{RANGE_BLOCKS, RANGE_DURATION, WalletRpcMethod};
+pub use self::wallet_rpc_metrics::{WalletRpcMetrics, WalletRpcMetricsLayer};
 use self::{
     message_boundaries::MessageBoundaries,
-    receive_slots::{ReceiveSlot, ReceiveSlots},
+    receive_slots::{ClientFairnessKey, ReceiveSlot, ReceiveSlots},
+    stream_reset::TransportReset,
 };
 use crate::{Readiness, TrafficReadinessInterceptor, public_grpc_health::public_grpc_health};
 
@@ -95,6 +128,26 @@ const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_mins(1);
 /// closes the connection and ends the streams on it, so a client that
 /// vanished stops holding stream slots.
 const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Streams the server may reset because of the client's protocol errors
+/// before it closes the connection with `ENHANCE_YOUR_CALM`.
+///
+/// This is h2's own default. tonic replaces it with no limit unless a
+/// server sets one, which would let a client make the server generate
+/// resets without end.
+pub const HTTP2_MAX_LOCAL_ERROR_RESETS: usize = 1024;
+
+/// Largest send buffer per HTTP/2 stream.
+///
+/// This is h2's per-stream backpressure threshold, not a hard memory cap: once
+/// a stream's queued data reaches it, h2 stops polling the producer for more.
+/// Raised from hyper's ~400 KiB default so a single `GetBlockRange` stream can
+/// fill a 100-200 ms round-trip bandwidth-delay product. A stalled stream is
+/// still reset at the send stall timeout ([`DEFAULT_GRPC_SEND_STALL_TIMEOUT`]),
+/// and the write-stall bound closes a connection that cannot write out what it
+/// holds. The queued data and its backing buffers can exceed this per stream;
+/// see [Configuration](../../../docs/reference/configuration.md#public-grpc-listeners).
+const HTTP2_MAX_SEND_BUF_SIZE: usize = 1024 * 1024;
 
 /// Requests each receive pool admits at once across every connection.
 ///
@@ -121,7 +174,8 @@ const CLIENT_STREAMING_METHOD_PATHS: &[&str] = &[
 ];
 
 /// Request header in which a trusted reverse proxy names the client
-/// connection a request arrived on, as one `ip:port` address.
+/// connection a request arrived on, as one `ip:port` address or one bare IP
+/// address.
 ///
 /// Read only when the listener uses [`ClientAddressSource::ProxyHeader`].
 pub const PROXY_CLIENT_ADDRESS_HEADER: &str = "x-zinder-client-address";
@@ -137,12 +191,10 @@ const RECEIVE_SLOT_HOLD_DURATION_METRIC: &str =
 const PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC: &str =
     "zinder_grpc_proxy_client_address_fallbacks_total";
 const SEND_STALLS_METRIC: &str = "zinder_grpc_response_send_stalls_total";
+const RELEASE_PROBES_METRIC: &str = "zinder_grpc_response_release_probes_total";
 
 /// The layers every public Zinder listener applies to its requests.
-type PublicGrpcLayers = Stack<GrpcSendStallLayer, Stack<GrpcReceiveLimitLayer, Identity>>;
-
-/// The tonic server type that [`public_grpc_server`] returns.
-pub type PublicGrpcServer = Server<PublicGrpcLayers>;
+pub type PublicGrpcLayers = Stack<GrpcSendStallLayer, Stack<GrpcReceiveLimitLayer, Identity>>;
 
 /// The layers of a supervised public listener, outermost first: call
 /// termination, the receive limit, and the send stall bound.
@@ -155,9 +207,12 @@ pub(crate) type SupervisedGrpcLayers = Stack<
 /// default receive limits and send stall timeout, telling clients apart by
 /// `client_address`.
 ///
-/// Add services and serve as with [`tonic::transport::Server::builder`].
+/// Add services with [`PublicGrpcServer::add_service`] and serve the
+/// [`PublicGrpcRouter`] it returns.
 #[must_use]
-pub fn public_grpc_server(client_address: ClientAddressSource) -> PublicGrpcServer {
+pub fn public_grpc_server(
+    client_address: ClientAddressSource,
+) -> PublicGrpcServer<PublicGrpcLayers> {
     public_grpc_server_with(
         GrpcReceiveLimits::default(),
         DEFAULT_GRPC_SEND_STALL_TIMEOUT,
@@ -175,9 +230,9 @@ pub fn public_grpc_server_with(
     limits: GrpcReceiveLimits,
     send_stall_timeout: Duration,
     client_address: ClientAddressSource,
-) -> PublicGrpcServer {
+) -> PublicGrpcServer<PublicGrpcLayers> {
     describe_limit_metrics();
-    public_grpc_transport()
+    public_grpc_transport(send_stall_timeout)
         .layer(GrpcReceiveLimitLayer::new(limits, client_address))
         .layer(GrpcSendStallLayer::new(send_stall_timeout))
 }
@@ -202,46 +257,58 @@ pub(crate) fn supervised_grpc_layers(
         .into_inner()
 }
 
-/// The HTTP/2 transport policy every public listener shares.
-pub(crate) fn public_grpc_transport() -> Server {
-    Server::builder()
-        .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
-        .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
-        .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
+/// The transport every public listener shares, with no layers yet. A
+/// connection whose writes make no progress for `send_stall_timeout` closes.
+pub(crate) fn public_grpc_transport(send_stall_timeout: Duration) -> PublicGrpcServer {
+    PublicGrpcServer::new(send_stall_timeout)
 }
 
-/// Assembles a supervised wallet listener that serves `wallet_service`
+/// Assembles a supervised listener that serves `application_service`
 /// behind the traffic gate, and reflection and health outside it.
 ///
 /// Open health `Watch` streams end once `drain` is cancelled.
-pub(crate) fn supervised_wallet_router<S, L>(
-    mut server: Server<L>,
-    wallet_service: S,
-    wallet_descriptor_set: &'static [u8],
+pub(crate) fn supervised_router<S, L, T, ResponseBody>(
+    server: PublicGrpcServer<L, T>,
+    application_service: S,
+    descriptor_set: &'static [u8],
     readiness: &Readiness,
     drain: &CancellationToken,
-) -> Result<Router<L>, tonic_reflection::server::Error>
+) -> Result<PublicGrpcRouter<L, T>, tonic_reflection::server::Error>
 where
-    L: Clone,
-    S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
+    S: Service<http::Request<Body>, Response = http::Response<ResponseBody>, Error = Infallible>
         + NamedService
         + Clone
         + Send
         + Sync
         + 'static,
     S::Future: Send + 'static,
+    ResponseBody: http_body::Body<Data = Bytes, Error: Into<axum::BoxError>> + Send + 'static,
 {
-    let reflection =
-        reflection_describing(&[wallet_descriptor_set, tonic_health::pb::FILE_DESCRIPTOR_SET])?;
     let health = public_grpc_health(readiness, drain, S::NAME);
-    let gated_wallet_service = InterceptedService::new(
-        wallet_service,
+    let gated_application_service = InterceptedService::new(
+        application_service,
         TrafficReadinessInterceptor::new(readiness.clone()),
     );
-    Ok(server
-        .add_service(gated_wallet_service)
-        .add_service(reflection)
-        .add_service(health))
+    let mut router = server
+        .add_service(gated_application_service)
+        .add_service(health);
+    let descriptors = || {
+        ReflectionBuilder::configure()
+            .register_encoded_file_descriptor_set(descriptor_set)
+            .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+    };
+    let mut v1 = descriptors();
+    if S::NAME == compact_tx_streamer_server::SERVICE_NAME {
+        let alpha = descriptors()
+            .register_encoded_file_descriptor_set(tonic_reflection::pb::v1::FILE_DESCRIPTOR_SET)
+            .build_v1alpha()?
+            .max_decoding_message_size(crate::MAX_DECODING_MESSAGE_BYTES);
+        router = router.add_service(alpha);
+        v1 = v1.register_encoded_file_descriptor_set(
+            tonic_reflection::pb::v1alpha::FILE_DESCRIPTOR_SET,
+        );
+    }
+    Ok(router.add_service(reflection_v1(v1)?))
 }
 
 /// Where a public listener learns which client sent a request, so that the
@@ -256,8 +323,8 @@ pub enum ClientAddressSource {
     /// The [`PROXY_CLIENT_ADDRESS_HEADER`] that a reverse proxy sets on every
     /// request it forwards. A request counts against the connection's remote
     /// address instead when it carries no such header, carries it more than
-    /// once or as a comma-separated list, or carries a value that is not one
-    /// `ip:port` address.
+    /// once or as a comma-separated list, or carries a value that is neither
+    /// one `ip:port` address nor one bare IP address.
     ///
     /// Any client that reaches the listener can set the header, so use this
     /// only when the listener is reachable solely through a proxy that
@@ -293,17 +360,15 @@ impl ClientAddressSource {
 pub fn public_grpc_reflection(
     encoded_file_descriptor_set: &'static [u8],
 ) -> Result<ServerReflectionServer<impl ServerReflection>, tonic_reflection::server::Error> {
-    reflection_describing(&[encoded_file_descriptor_set])
+    reflection_v1(
+        ReflectionBuilder::configure()
+            .register_encoded_file_descriptor_set(encoded_file_descriptor_set),
+    )
 }
 
-fn reflection_describing(
-    encoded_file_descriptor_sets: &[&'static [u8]],
-) -> Result<ServerReflectionServer<impl ServerReflection + use<>>, tonic_reflection::server::Error>
-{
-    let builder = encoded_file_descriptor_sets.iter().copied().fold(
-        tonic_reflection::server::Builder::configure(),
-        tonic_reflection::server::Builder::register_encoded_file_descriptor_set,
-    );
+fn reflection_v1(
+    builder: ReflectionBuilder<'static>,
+) -> Result<ServerReflectionServer<impl ServerReflection>, tonic_reflection::server::Error> {
     Ok(builder
         .build_v1()?
         .max_decoding_message_size(crate::MAX_DECODING_MESSAGE_BYTES))
@@ -349,14 +414,22 @@ fn describe_limit_metrics() {
     metrics::describe_counter!(
         PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC,
         metrics::Unit::Count,
-        "gRPC requests on a listener that trusts its proxy's client address that counted \
-         against the proxy's own connection. Label: reason (missing|repeated|invalid)."
+        "gRPC requests counted against the transport peer because the trusted proxy's address \
+         header was missing, repeated, or invalid. Excludes headerless loopback Health/Check calls."
     );
     metrics::describe_counter!(
         SEND_STALLS_METRIC,
         metrics::Unit::Count,
-        "gRPC responses ended with DEADLINE_EXCEEDED because their client stopped reading \
-         them for the send stall timeout."
+        "gRPC responses whose transport held their data for the send stall timeout. The \
+         listener abandons each one by resetting its HTTP/2 stream, or by closing its HTTP/1.1 \
+         connection."
+    );
+    metrics::describe_counter!(
+        RELEASE_PROBES_METRIC,
+        metrics::Unit::Count,
+        "Departure-probe chunks a public gRPC listener sent before ending or pausing an HTTP/2 \
+         response (either a chunk of at most 4 KiB sent whole or a larger chunk's held-back \
+         final byte), to confirm the client's flow-control window covers the data."
     );
 }
 
@@ -494,13 +567,18 @@ where
         if let Some(cancellation) = &response_cancellation {
             request.extensions_mut().insert(cancellation.clone());
         }
+        // `call` runs inside the task that carries the request.
+        let transport_reset = (pool == ReceivePool::ClientStream)
+            .then(TransportReset::current)
+            .flatten();
         let request = request.map(|body| {
             Body::new(ReceiveBoundBody {
                 inner: body,
-                state: ReceiveState::Receiving(Box::new(Receiving::new(
+                state: ReceiveState::Receiving(Receiving::new(
                     admission.slot,
                     receive_timeout,
-                ))),
+                    transport_reset,
+                )),
                 pool,
                 receive_timeout,
                 response_cancellation,
@@ -514,18 +592,31 @@ where
 fn client_address<B>(
     request: &http::Request<B>,
     source: ClientAddressSource,
-) -> Option<SocketAddr> {
+) -> Option<ClientFairnessKey> {
     match source {
-        ClientAddressSource::Connection => remote_address(request),
+        ClientAddressSource::Connection => {
+            remote_address(request).map(ClientFairnessKey::Connection)
+        }
         ClientAddressSource::ProxyHeader => match proxy_named_client(request.headers()) {
             Ok(client) => Some(client),
             Err(fallback) => {
-                metrics::counter!(
-                    PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC,
-                    "reason" => fallback.label()
-                )
-                .increment(1);
-                remote_address(request)
+                let peer = remote_address(request).map(ClientFairnessKey::Connection);
+                let direct_health_check = fallback == ProxyHeaderFallback::Missing
+                    && request.method() == http::Method::POST
+                    && request.uri().path() == "/grpc.health.v1.Health/Check"
+                    && matches!(
+                        peer,
+                        Some(ClientFairnessKey::Connection(addr))
+                            if addr.ip().to_canonical().is_loopback()
+                    );
+                if !direct_health_check {
+                    metrics::counter!(
+                        PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC,
+                        "reason" => fallback.label()
+                    )
+                    .increment(1);
+                }
+                peer
             }
         },
     }
@@ -542,7 +633,7 @@ enum ProxyHeaderFallback {
     /// proxy that appends to the header rather than replacing it forwards
     /// the client's own value first.
     Repeated,
-    /// The header is not one `ip:port` address.
+    /// The header is neither one `ip:port` address nor one bare IP address.
     Invalid,
 }
 
@@ -556,9 +647,9 @@ impl ProxyHeaderFallback {
     }
 }
 
-/// The client connection that the single [`PROXY_CLIENT_ADDRESS_HEADER`] in
-/// `headers` names.
-fn proxy_named_client(headers: &http::HeaderMap) -> Result<SocketAddr, ProxyHeaderFallback> {
+/// The client that the single [`PROXY_CLIENT_ADDRESS_HEADER`] in `headers`
+/// names: an `ip:port` connection, or a bare IP address.
+fn proxy_named_client(headers: &http::HeaderMap) -> Result<ClientFairnessKey, ProxyHeaderFallback> {
     let mut fields = headers.get_all(PROXY_CLIENT_ADDRESS_HEADER).iter();
     let field = fields.next().ok_or(ProxyHeaderFallback::Missing)?;
     if fields.next().is_some() {
@@ -568,7 +659,13 @@ fn proxy_named_client(headers: &http::HeaderMap) -> Result<SocketAddr, ProxyHead
     if address.contains(',') {
         return Err(ProxyHeaderFallback::Repeated);
     }
-    address.parse().map_err(|_| ProxyHeaderFallback::Invalid)
+    if let Ok(socket) = address.parse::<SocketAddr>() {
+        return Ok(ClientFairnessKey::Connection(socket));
+    }
+    address
+        .parse::<IpAddr>()
+        .map(ClientFairnessKey::Address)
+        .map_err(|_| ProxyHeaderFallback::Invalid)
 }
 
 /// The remote address of the connection a request arrived on, which tonic
@@ -585,8 +682,39 @@ fn remote_address<B>(request: &http::Request<B>) -> Option<SocketAddr> {
         })
 }
 
+/// Server guidance for retrying a refused gRPC call.
+#[derive(Clone, Copy, Debug)]
+pub enum RetryPushback {
+    /// Wait for a server-selected delay of 500 to 1,500 milliseconds.
+    Backoff,
+    /// Wait for this duration, rounded down to milliseconds and capped at `i32::MAX`.
+    After(Duration),
+    /// Stop retrying this call.
+    DoNotRetry,
+}
+
+impl RetryPushback {
+    /// Attaches gRPC retry pushback without changing the status code or details.
+    #[must_use]
+    pub fn apply(self, mut status: Status) -> Status {
+        let delay_ms = match self {
+            Self::Backoff => {
+                i32::try_from(500 + RandomState::new().hash_one(()) % 1_001).unwrap_or(1_000)
+            }
+            Self::After(delay) => i32::try_from(delay.as_millis()).unwrap_or(i32::MAX),
+            Self::DoNotRetry => -1,
+        };
+        status
+            .metadata_mut()
+            .insert("grpc-retry-pushback-ms", delay_ms.into());
+        status
+    }
+}
+
 fn too_many_requests() -> Status {
-    Status::unavailable("server is receiving too many requests at once; retry with backoff")
+    RetryPushback::Backoff.apply(Status::unavailable(
+        "server is receiving too many requests at once; retry with backoff",
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -642,25 +770,42 @@ struct ReceiveBoundBody {
 }
 
 enum ReceiveState {
-    Receiving(Box<Receiving>),
+    Receiving(Receiving),
     Received,
     /// The request timed out or lost its slot, and the body reported it.
     Cancelled,
 }
 
 struct Receiving {
-    _slot: ReceiveSlot,
-    deadline: Pin<Box<Sleep>>,
-    evicted: Pin<Box<WaitForCancellationFutureOwned>>,
+    slot: ReceiveSlot,
+    deadline_at: Instant,
+    /// Lazily allocated only if `inner.poll_frame` returns `Poll::Pending`,
+    /// avoiding a timer allocation and wheel registration for unary requests
+    /// whose body is already buffered.
+    deadline: Option<Pin<Box<Sleep>>>,
+    /// Lazily allocated only if `inner.poll_frame` returns `Poll::Pending`;
+    /// ready polls check [`ReceiveSlot::is_evicted`] directly.
+    evicted: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
+    /// Completes once the HTTP/2 stream or HTTP/1.1 connection that carries a
+    /// client stream is reset. A handler that keeps polling the request, such
+    /// as gRPC reflection, then sees it fail and drops it, which lets h2
+    /// finish the stream's reset.
+    transport_reset: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     boundaries: MessageBoundaries,
 }
 
 impl Receiving {
-    fn new(slot: ReceiveSlot, receive_timeout: Duration) -> Self {
+    fn new(
+        slot: ReceiveSlot,
+        receive_timeout: Duration,
+        transport_reset: Option<TransportReset>,
+    ) -> Self {
         Self {
-            deadline: Box::pin(tokio::time::sleep(receive_timeout)),
-            evicted: Box::pin(slot.evicted()),
-            _slot: slot,
+            slot,
+            deadline_at: Instant::now() + receive_timeout,
+            deadline: None,
+            evicted: None,
+            transport_reset: transport_reset.map(|reset| reset.wait_for_reset()),
             boundaries: MessageBoundaries::default(),
         }
     }
@@ -690,9 +835,17 @@ impl http_body::Body for ReceiveBoundBody {
             ReceiveState::Received => return Pin::new(&mut this.inner).poll_frame(cx),
             ReceiveState::Cancelled => return Poll::Ready(None),
         };
-        if receiving.evicted.as_mut().poll(cx).is_ready() {
+        if receiving.slot.is_evicted() {
             this.state = ReceiveState::Cancelled;
             return Poll::Ready(Some(Err(this.report(too_many_requests()))));
+        }
+        if let Some(reset) = &mut receiving.transport_reset
+            && reset.as_mut().poll(cx).is_ready()
+        {
+            this.state = ReceiveState::Cancelled;
+            return Poll::Ready(Some(Err(
+                this.report(Status::cancelled("the response's stream was reset"))
+            )));
         }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
@@ -701,12 +854,13 @@ impl http_body::Body for ReceiveBoundBody {
                 } else if this.pool == ReceivePool::ClientStream
                     && frame
                         .data_ref()
-                        .is_some_and(|chunk| receiving.boundaries.completes_a_message(chunk))
+                        .is_some_and(|chunk| receiving.boundaries.completed_messages(chunk) > 0)
                 {
-                    receiving
-                        .deadline
-                        .as_mut()
-                        .reset(Instant::now() + this.receive_timeout);
+                    let next_deadline = Instant::now() + this.receive_timeout;
+                    receiving.deadline_at = next_deadline;
+                    if let Some(deadline) = &mut receiving.deadline {
+                        deadline.as_mut().reset(next_deadline);
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -715,7 +869,17 @@ impl http_body::Body for ReceiveBoundBody {
                 Poll::Ready(ended_or_failed)
             }
             Poll::Pending => {
-                if receiving.deadline.as_mut().poll(cx).is_pending() {
+                let evicted = receiving
+                    .evicted
+                    .get_or_insert_with(|| Box::pin(receiving.slot.evicted()));
+                if evicted.as_mut().poll(cx).is_ready() {
+                    this.state = ReceiveState::Cancelled;
+                    return Poll::Ready(Some(Err(this.report(too_many_requests()))));
+                }
+                let deadline = receiving.deadline.get_or_insert_with(|| {
+                    Box::pin(tokio::time::sleep_until(receiving.deadline_at))
+                });
+                if deadline.as_mut().poll(cx).is_pending() {
                     return Poll::Pending;
                 }
                 this.state = ReceiveState::Cancelled;
@@ -760,8 +924,8 @@ mod tests {
     use tonic::transport::server::TcpConnectInfo;
 
     use super::{
-        CLIENT_STREAMING_METHOD_PATHS, ClientAddressSource, PROXY_CLIENT_ADDRESS_HEADER,
-        client_address,
+        CLIENT_STREAMING_METHOD_PATHS, ClientAddressSource, ClientFairnessKey,
+        PROXY_CLIENT_ADDRESS_HEADER, ProxyHeaderFallback, client_address, proxy_named_client,
     };
 
     const PROXY_CONNECTION: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000);
@@ -783,14 +947,30 @@ mod tests {
 
     #[test]
     fn a_trusted_proxy_header_names_the_client() -> Result<(), Box<dyn std::error::Error>> {
-        for (header, client) in [
-            ("203.0.113.7:51234", "203.0.113.7:51234"),
-            ("[2001:db8::7]:443", "[2001:db8::7]:443"),
+        for (header, expected) in [
+            // `ip:port` headers key the connection, bracketed or not.
+            (
+                "203.0.113.7:51234",
+                ClientFairnessKey::Connection("203.0.113.7:51234".parse()?),
+            ),
+            (
+                "[2001:db8::7]:443",
+                ClientFairnessKey::Connection("[2001:db8::7]:443".parse()?),
+            ),
+            // Bare IP headers key the whole address, as GCP GXLB emits.
+            (
+                "203.0.113.7",
+                ClientFairnessKey::Address("203.0.113.7".parse()?),
+            ),
+            (
+                "2001:db8::1",
+                ClientFairnessKey::Address("2001:db8::1".parse()?),
+            ),
         ] {
             let request = proxied_request(&[header])?;
             assert_eq!(
                 client_address(&request, ClientAddressSource::ProxyHeader),
-                Some(client.parse()?)
+                Some(expected)
             );
         }
         Ok(())
@@ -801,7 +981,7 @@ mod tests {
         let request = proxied_request(&["203.0.113.7:51234"])?;
         assert_eq!(
             client_address(&request, ClientAddressSource::Connection),
-            Some(PROXY_CONNECTION)
+            Some(ClientFairnessKey::Connection(PROXY_CONNECTION))
         );
         Ok(())
     }
@@ -810,7 +990,7 @@ mod tests {
     fn a_proxy_header_that_is_not_one_address_counts_the_connection() -> Result<(), http::Error> {
         let not_one_address: [&[&str]; 9] = [
             &[],
-            &["203.0.113.7"],
+            &["203.0.113.7:"],
             &["client-1"],
             &[""],
             &[" 203.0.113.7:51234"],
@@ -825,8 +1005,23 @@ mod tests {
             let request = proxied_request(fields)?;
             assert_eq!(
                 client_address(&request, ClientAddressSource::ProxyHeader),
-                Some(PROXY_CONNECTION),
+                Some(ClientFairnessKey::Connection(PROXY_CONNECTION)),
                 "{fields:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn trailing_whitespace_and_bracketed_bare_ip_fall_back_as_invalid() -> Result<(), http::Error> {
+        // Strict parsing: a bare IP with trailing whitespace, or a bracketed
+        // bare IPv6 address without a port, is neither one `ip:port` address
+        // nor one bare IP address, so it falls back to the peer as `invalid`.
+        for header in ["203.0.113.7 ", "[2001:db8::7]"] {
+            let request = proxied_request(&[header])?;
+            assert_eq!(
+                proxy_named_client(request.headers()),
+                Err(ProxyHeaderFallback::Invalid)
             );
         }
         Ok(())
@@ -841,6 +1036,8 @@ mod tests {
             proxied_request(&[])?,
             proxied_request(&["198.51.100.4:443", "203.0.113.7:51234"])?,
             proxied_request(&["203.0.113.7:51234, 198.51.100.4:443"])?,
+            proxied_request(&["203.0.113.7:"])?,
+            // A bare IP is a valid client, not a fallback.
             proxied_request(&["203.0.113.7"])?,
             proxied_request(&["203.0.113.7:51234"])?,
         ];
@@ -863,6 +1060,78 @@ mod tests {
         }
         for address in ["203.0.113.7", "198.51.100.4", "127.0.0.1"] {
             assert!(!exposition.contains(address), "{exposition}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn only_headerless_loopback_health_checks_use_the_peer_without_a_proxy_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use http::Method;
+
+        use super::PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC;
+
+        let check = "/grpc.health.v1.Health/Check";
+        let watch = "/grpc.health.v1.Health/Watch";
+        let local = Some("127.0.0.1:1234");
+        let remote = Some("192.0.2.1:5678");
+        for (method, path, peer, headers, reason) in [
+            (Method::POST, check, local, &[][..], None),
+            (Method::POST, check, Some("[::1]:1234"), &[], None),
+            (
+                Method::POST,
+                check,
+                Some("[::ffff:127.0.0.1]:1234"),
+                &[],
+                None,
+            ),
+            (Method::POST, check, remote, &[], Some("missing")),
+            (Method::POST, check, None, &[], Some("missing")),
+            (Method::GET, check, local, &[], Some("missing")),
+            (Method::POST, watch, local, &[], Some("missing")),
+            (Method::POST, check, local, &["invalid"], Some("invalid")),
+            (
+                Method::POST,
+                check,
+                local,
+                &["192.0.2.1:5678"; 2],
+                Some("repeated"),
+            ),
+            (Method::POST, check, local, &["192.0.2.1:5678"], None),
+        ] {
+            let peer = peer.map(str::parse).transpose()?;
+            let mut request = proxied_request(headers)?;
+            *request.uri_mut() = path.parse()?;
+            *request.method_mut() = method;
+            request.extensions_mut().insert(TcpConnectInfo {
+                local_addr: None,
+                remote_addr: peer,
+            });
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let client = metrics::with_local_recorder(&recorder, || {
+                client_address(&request, ClientAddressSource::ProxyHeader)
+            });
+            let expected = if let [address] = headers
+                && reason.is_none()
+            {
+                Some(ClientFairnessKey::Connection(address.parse()?))
+            } else {
+                peer.map(ClientFairnessKey::Connection)
+            };
+            assert_eq!(client, expected);
+            let scrape = recorder.handle().render();
+            let counter = scrape
+                .lines()
+                .find(|line| line.starts_with(PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC));
+            let expected = reason.map(|reason| {
+                format!("{PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC}{{reason=\"{reason}\"}} 1")
+            });
+            assert_eq!(
+                counter,
+                expected.as_deref(),
+                "{} {path} {peer:?} {headers:?}",
+                request.method()
+            );
         }
         Ok(())
     }

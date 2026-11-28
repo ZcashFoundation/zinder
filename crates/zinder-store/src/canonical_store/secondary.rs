@@ -1,8 +1,12 @@
 //! Process-local secondary access to an admitted canonical store.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use rust_rocksdb::{Cache, ColumnFamilyDescriptor, DB, DEFAULT_COLUMN_FAMILY_NAME, Options};
+use rust_rocksdb::{Cache, ColumnFamilyDescriptor, DB, Options};
+use tempfile::TempDir;
 use zinder_core::{
     BlockHeight, BlockHeightRange, CanonicalBlockFacts, CanonicalHistoryBounds, Network,
     NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
@@ -10,29 +14,39 @@ use zinder_core::{
 
 use crate::{
     BoundedRocksDbOpen, RawBlobRetention, RocksDbInstanceMemory, RocksDbIoMode,
-    RocksDbOpenResources, RocksDbOpenRole, RocksDbResourceBudget, RocksDbResourceGaugeInputs,
-    StoreRole, open_bounded_rocksdb, record_rocksdb_resource_gauges,
+    RocksDbOpenResources, RocksDbOpenRole, RocksDbResourceBudget, StoreRole, open_bounded_rocksdb,
 };
 
 use super::{
     CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalRetainedEvent,
     CanonicalSequenceCheckpoint, CanonicalStoreBuildState, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, CanonicalSubtreeRootLoadCoverage,
+    CanonicalStoreReadyEvidence, CanonicalStoreRequirements, ConstructionTreeStateCheckpointPolicy,
     activation_schedule::CanonicalActivationSchedule,
     block_replay::{
-        CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at,
-        visit_replay_facts_at_heights,
+        CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at_with_cache,
+        visit_replay_facts_at_heights_with_cache,
     },
     construction_manifest::validate_ready_construction_manifest,
-    event_lifecycle::{canonical_event_history_from_db, canonical_event_retention_floor_from_db},
+    event_lifecycle::{
+        canonical_event_history_from_db, canonical_event_retention_floor_from_db,
+        read_retained_event_from_db,
+    },
     live_commit::event_fence_from_ready,
+    live_tail_cache::LiveTailShieldedCache,
     mempool_lifecycle::validate_mempool_lifecycle_admission,
     publication::{follow_ready_replay_tail, validate_ready_publication},
     replay_tail::AuthenticatedReplayTail,
     rocksdb::{
-        CANONICAL_DATA_COLUMN_FAMILIES, CanonicalStoreAdmissionExpectation,
-        canonical_column_family_descriptors, canonical_store_path, validate_open_store_control,
+        CanonicalStoreAdmissionExpectation, StoredDataAdmission,
+        canonical_column_family_descriptors, canonical_store_path, read_admitted_schedule,
+        validate_open_store_control,
     },
+    settled_segments::{
+        cache::SettledSegmentReaderCache,
+        layout::SettledSegmentIndexEntry,
+        store_access::{self, SegmentStoreContext},
+    },
+    stored_set::{CANONICAL_DATA_COLUMN_FAMILIES, validate_exact_column_families},
 };
 
 /// Result of one explicit canonical-secondary catch-up barrier.
@@ -71,22 +85,41 @@ impl CanonicalSecondaryCatchupOutcome {
 /// from the persisted settled checkpoint before returning the new fence.
 pub struct RocksDbCanonicalSecondary {
     pub(super) bounded_open: BoundedRocksDbOpen,
-    primary_path: PathBuf,
+    open_settings: Box<SecondaryOpenSettings>,
     pub(super) expectation: CanonicalStoreAdmissionExpectation,
-    workload: CanonicalStoreWorkload,
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
+    history_predecessor_digest: [u8; 32],
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
-    pub(super) subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
+    construction_tree_state_checkpoint_policy: Option<ConstructionTreeStateCheckpointPolicy>,
+    pub(super) stored_set: super::CanonicalStoredSet,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
     reorg_policy: super::CanonicalReorgPolicy,
     pub(super) replay_tail: AuthenticatedReplayTail,
-    resource_budget: RocksDbResourceBudget,
+    read_caches: Box<SecondaryReadCaches>,
+    pub(super) sealed_segments: Vec<SettledSegmentIndexEntry>,
+}
+
+struct SecondaryOpenSettings {
+    primary_path: PathBuf,
+    secondary_path: PathBuf,
+    resources: RocksDbOpenResources,
+    column_families: fn(&Cache, RocksDbResourceBudget) -> Vec<ColumnFamilyDescriptor>,
+    recovery_directory: Option<TempDir>,
+}
+
+struct SecondaryReadCaches {
+    settled: Arc<SettledSegmentReaderCache>,
+    live_tail: Option<LiveTailShieldedCache>,
 }
 
 impl RocksDbCanonicalSecondary {
+    fn primary_path(&self) -> &Path {
+        &self.open_settings.primary_path
+    }
+
     /// Returns the writer-admitted schedule revision observed at the last
-    /// catch-up, or `None` before the writer's first admission.
+    /// catch-up.
     #[must_use]
     pub const fn network_upgrade_schedule(&self) -> Option<&CanonicalActivationSchedule> {
         self.activation_schedule.as_ref()
@@ -102,81 +135,66 @@ impl RocksDbCanonicalSecondary {
         }
     }
 
-    /// Opens one exactly admitted secondary and catches it up to the primary's current state.
+    /// Opens a secondary with explicit minimum retained data and history.
     ///
-    /// `expected_network_upgrade_activations` is a node-observed table: it
-    /// must agree with the writer-admitted schedule through the visible tip,
-    /// or equal the construction table before the writer's first admission.
-    /// A reader that has no node of its own opens with
-    /// [`Self::open_ready_adopting_writer_schedule`] instead.
-    ///
-    /// The expected raw-blob retention is an immutable store identity, not a
-    /// request to infer coverage from currently present rows. A
-    /// [`RocksDbResourceBudget`] opens the secondary on a block cache of its
-    /// own; [`RocksDbOpenResources::with_shared_block_cache`] opens it on a
-    /// cache other secondaries of the same store read through.
+    /// The node-observed activation table must agree with the writer-admitted
+    /// schedule through the visible tip.
     #[allow(
         clippy::too_many_arguments,
-        reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
+        reason = "secondary admission keeps filesystem, schedule, and reorg policy explicit"
     )]
     pub fn open_ready(
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
         expected_network_upgrade_activations: &NetworkUpgradeActivations,
-        expected_workload: CanonicalStoreWorkload,
-        expected_raw_blob_retention: RawBlobRetention,
+        requirements: CanonicalStoreRequirements,
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resources: impl Into<RocksDbOpenResources>,
     ) -> Result<Self, CanonicalStoreError> {
-        Self::open_ready_with_expectation(
+        let secondary = Self::open_ready_with_expectation(
             primary_path.as_ref(),
             secondary_path.as_ref(),
             &CanonicalStoreAdmissionExpectation::from_activations(
                 expected_network_upgrade_activations,
-                expected_workload,
-                expected_raw_blob_retention,
+                StoredDataAdmission::Minimum(requirements),
                 expected_reorg_policy,
             ),
             resources.into(),
             canonical_column_family_descriptors,
-        )
+        )?;
+        secondary.record_settled_corpus_admission(StoreRole::CanonicalSecondary);
+        Ok(secondary)
     }
 
-    /// Opens one exactly admitted secondary of a `expected_network` store and
-    /// adopts the network-upgrade schedule its canonical writer admitted.
+    /// Opens a secondary with explicit minimum retained data and history.
     ///
-    /// The reader brings no activation table of its own, so it needs no node:
-    /// the schedule it reads through is the one the writer persisted, and
-    /// each catch-up follows the writer's later revisions. A READY store whose
-    /// writer has not admitted a schedule yet is refused with
-    /// [`CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted`], which a
-    /// reader retries, because the writer admits its first revision when it
-    /// opens the store.
+    /// The reader adopts the canonical writer's admitted activation schedule
+    /// and follows later revisions on catch-up.
     #[allow(
         clippy::too_many_arguments,
-        reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
+        reason = "secondary admission keeps filesystem, schedule, and reorg policy explicit"
     )]
     pub fn open_ready_adopting_writer_schedule(
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
         expected_network: Network,
-        expected_workload: CanonicalStoreWorkload,
-        expected_raw_blob_retention: RawBlobRetention,
+        requirements: CanonicalStoreRequirements,
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resources: impl Into<RocksDbOpenResources>,
     ) -> Result<Self, CanonicalStoreError> {
-        Self::open_ready_with_expectation(
+        let secondary = Self::open_ready_with_expectation(
             primary_path.as_ref(),
             secondary_path.as_ref(),
             &CanonicalStoreAdmissionExpectation::adopting_writer_schedule(
                 expected_network,
-                expected_workload,
-                expected_raw_blob_retention,
+                StoredDataAdmission::Minimum(requirements),
                 expected_reorg_policy,
             ),
             resources.into(),
             canonical_column_family_descriptors,
-        )
+        )?;
+        secondary.record_settled_corpus_admission(StoreRole::CanonicalSecondary);
+        Ok(secondary)
     }
 
     #[allow(
@@ -193,7 +211,6 @@ impl RocksDbCanonicalSecondary {
         resources
             .validate()
             .map_err(|reason| CanonicalStoreError::InvalidResourceBudget { reason })?;
-        let resource_budget = resources.budget();
         let primary_path = canonical_store_path(primary_path)?;
         if secondary_path == primary_path {
             return Err(CanonicalStoreError::admission(
@@ -207,7 +224,7 @@ impl RocksDbCanonicalSecondary {
                 primary_path: &primary_path,
                 secondary_path,
             },
-            resources,
+            resources.clone(),
             column_families,
         )
         .map_err(|source| CanonicalStoreError::RocksDbOperation {
@@ -221,7 +238,7 @@ impl RocksDbCanonicalSecondary {
                 operation: "initial canonical secondary catch-up",
                 source,
             })?;
-        require_exact_secondary_column_families(&bounded_open, &primary_path)?;
+        validate_exact_column_families(&primary_path, &mut bounded_open.db.cf_names())?;
         let opened_control =
             validate_open_store_control(&bounded_open.db, &primary_path, expectation)?;
         validate_mempool_lifecycle_admission(
@@ -232,37 +249,55 @@ impl RocksDbCanonicalSecondary {
         let CanonicalStoreBuildState::Ready(ready_evidence) = opened_control.build_state else {
             return Err(CanonicalStoreError::StoreNotReady { path: primary_path });
         };
-        let subtree_root_coverage = validate_ready_construction_manifest(
+        let manifest_details = validate_ready_construction_manifest(
             &primary_path,
             &ready_evidence,
-            opened_control.workload,
             &opened_control.build_plan,
         )?;
+        let stored_set = opened_control
+            .build_plan
+            .admitted_stored_set(manifest_details.subtree_root_coverage);
+        expectation.validate_reader_requirements(&primary_path, stored_set)?;
         let reorg_policy = opened_control.effective_reorg_policy();
+        let sealed_segments = store_access::read_all_settled_segment_entries(&bounded_open.db)?;
+        let expected_modules = store_access::segment_modules_for_stored_set(stored_set);
+        for entry in &sealed_segments {
+            if entry.modules != expected_modules {
+                return Err(CanonicalStoreError::SettledSegment {
+                    reason: format!(
+                        "settled segment {}-{} modules {:?} do not match admitted modules {:?}",
+                        entry.start_height.value(),
+                        entry.end_block.height.value(),
+                        entry.modules,
+                        expected_modules
+                    ),
+                });
+            }
+        }
+        let segment_cache =
+            SettledSegmentReaderCache::with_admitted_corpus(&primary_path, &sealed_segments)?;
+        let ctx = SegmentStoreContext {
+            db: &bounded_open.db,
+            segment_cache: Some(&segment_cache),
+            sealed_segments: Some(&sealed_segments),
+        };
         let replay_tail = validate_ready_publication(
-            &bounded_open.db,
+            ctx,
             &opened_control.build_plan,
             reorg_policy,
             &ready_evidence,
         )?;
-        let activation_schedule = opened_control
-            .activation_schedule_binding
-            .map(|binding| {
-                CanonicalActivationSchedule::read_bound(
-                    &bounded_open.db,
-                    &primary_path,
-                    binding,
-                    opened_control
-                        .build_plan
-                        .network_upgrade_activations_fingerprint()
-                        .as_bytes(),
-                )
-            })
-            .transpose()?;
-        let workload = opened_control.workload;
+        let activation_schedule =
+            read_admitted_schedule(&bounded_open.db, &primary_path, &opened_control)?;
         Ok(Self {
             bounded_open,
-            primary_path,
+            open_settings: Box::new(SecondaryOpenSettings {
+                primary_path,
+                secondary_path: secondary_path.to_path_buf(),
+                resources,
+                column_families,
+                recovery_directory: None,
+            }),
             // An opening table is checked only at open. Catch-ups
             // authenticate the schedule journal and follow each revision the
             // writer admits, so a long-running reader never pins its startup
@@ -270,19 +305,135 @@ impl RocksDbCanonicalSecondary {
             // after open fails catch-up until the reader restarts with it.
             expectation: CanonicalStoreAdmissionExpectation::from_build_plan(
                 &opened_control.build_plan,
-                workload,
                 reorg_policy,
             ),
-            workload,
+            history_predecessor_digest: opened_control.build_plan.history_predecessor_digest(),
             build_plan: opened_control.build_plan,
             ready_evidence,
-            subtree_root_coverage,
+            construction_tree_state_checkpoint_policy: manifest_details
+                .tree_state_checkpoint_policy,
+            stored_set,
             cursor_auth_key: opened_control.cursor_auth_key,
             activation_schedule,
             reorg_policy,
             replay_tail,
-            resource_budget,
+            read_caches: Box::new(SecondaryReadCaches {
+                settled: segment_cache,
+                live_tail: Some(live_tail_cache_for(&ready_evidence)),
+            }),
+            sealed_segments,
         })
+    }
+
+    /// Reopens a live follower after an admitted replay height was missing.
+    ///
+    /// The fresh handle must admit READY for the same store and retain the
+    /// previous fence exactly, either as READY or in its event history.
+    /// After verifying any external writer attestation, the caller can retry
+    /// its original replay operation once. Any further error ends that operation.
+    pub fn reopen_after_missing_live_tail(
+        &mut self,
+        height: BlockHeight,
+    ) -> Result<(), CanonicalStoreError> {
+        let observed_ready = self.ready_evidence;
+        *self =
+            self.open_live_tail_recovery(height, &observed_ready, StoreRole::CanonicalSecondary)?;
+        Ok(())
+    }
+
+    fn open_live_tail_recovery(
+        &mut self,
+        height: BlockHeight,
+        observed_ready: &CanonicalStoreReadyEvidence,
+        role: StoreRole,
+    ) -> Result<Self, CanonicalStoreError> {
+        self.read_caches.live_tail = None;
+        let before = self.event_fence();
+        if height < observed_ready.first_retained_block.height
+            || height > observed_ready.visible_tip.height
+        {
+            return Err(CanonicalStoreError::MissingLiveTailReplay { height });
+        }
+        tracing::warn!(
+            target: "zinder::store",
+            event = "canonical_secondary_live_tail_reopen",
+            missing_height = height.value(),
+            visible_height = before.visible_tip().height.value(),
+            replay_tip_height = observed_ready.visible_tip.height.value(),
+            event_sequence = before.chain_event_sequence(),
+            "reopening canonical secondary after an admitted live-tail replay row was missing"
+        );
+        metrics::counter!("zinder_store_canonical_secondary_live_tail_reopens_total").increment(1);
+
+        let directory = tempfile::Builder::new()
+            .prefix("live-tail-recovery-")
+            .tempdir_in(&self.open_settings.secondary_path)
+            .map_err(|source| CanonicalStoreError::PathUnavailable {
+                path: self.open_settings.secondary_path.clone(),
+                source,
+            })?;
+        let mut fresh = Self::open_ready_with_expectation(
+            self.primary_path(),
+            directory.path(),
+            &self.expectation,
+            self.open_settings.resources.clone(),
+            self.open_settings.column_families,
+        )?;
+        self.validate_reopened_fence(&fresh, before)?;
+        if fresh.ready_evidence.visible_event_sequence <= observed_ready.visible_event_sequence
+            && fresh.ready_evidence != *observed_ready
+        {
+            return Err(CanonicalStoreError::admission(
+                self.primary_path(),
+                "reopened secondary did not reach the READY fence observed during replay",
+            ));
+        }
+        fresh
+            .open_settings
+            .secondary_path
+            .clone_from(&self.open_settings.secondary_path);
+        fresh.open_settings.recovery_directory = Some(directory);
+        fresh
+            .read_caches
+            .settled
+            .record_corpus_admission_transition(role, !self.read_caches.settled.constrained());
+        Ok(fresh)
+    }
+
+    fn validate_reopened_fence(
+        &self,
+        fresh: &Self,
+        before: CanonicalEventFence,
+    ) -> Result<(), CanonicalStoreError> {
+        if fresh.build_plan != self.build_plan
+            || fresh.cursor_auth_key != self.cursor_auth_key
+            || fresh.ready_evidence.construction_manifest_version
+                != self.ready_evidence.construction_manifest_version
+            || fresh.ready_evidence.construction_manifest_sha256
+                != self.ready_evidence.construction_manifest_sha256
+        {
+            return Err(CanonicalStoreError::admission(
+                self.primary_path(),
+                "canonical store identity changed during secondary reopen",
+            ));
+        }
+        let after = fresh.event_fence();
+        let continuous = if after.chain_event_sequence() > before.chain_event_sequence()
+            && after.chain_epoch_id().value() > before.chain_epoch_id().value()
+        {
+            read_retained_event_from_db(&fresh.bounded_open.db, before.chain_event_sequence())?
+                .resulting_fence()
+                == before
+        } else {
+            fresh.ready_evidence == self.ready_evidence
+        };
+        if !continuous {
+            return Err(CanonicalStoreError::admission(
+                self.primary_path(),
+                "canonical fence regressed or diverged during secondary reopen",
+            ));
+        }
+        Ok(())
     }
 
     /// Publishes this secondary's `RocksDB` cache, ticker, and per-family
@@ -292,16 +443,80 @@ impl RocksDbCanonicalSecondary {
     /// periodically, so its block-cache hit rate and device reads are
     /// observable beside the walk they serve.
     pub fn record_resource_gauges(&self) {
-        record_rocksdb_resource_gauges(&RocksDbResourceGaugeInputs {
-            db: &self.bounded_open.db,
-            store_role: StoreRole::CanonicalSecondary,
-            column_family_names: &CANONICAL_DATA_COLUMN_FAMILIES,
-            block_cache: &self.bounded_open.block_cache,
-            write_buffer_manager: &self.bounded_open.write_buffer_manager,
-            statistics: &self.bounded_open.statistics,
-            io_mode: self.bounded_open.io_mode,
-            resource_budget: self.resource_budget,
-        });
+        self.bounded_open.record_resource_gauges(
+            StoreRole::CanonicalSecondary,
+            &CANONICAL_DATA_COLUMN_FAMILIES,
+        );
+    }
+
+    /// Publishes cache composition through one serving generation.
+    pub fn record_block_cache_entry_gauges(&self) {
+        self.bounded_open
+            .record_block_cache_entry_gauges(StoreRole::CanonicalSecondary);
+    }
+
+    /// Publishes per-column-family integer properties and level file counts
+    /// for one serving generation under the `canonical_secondary` store role.
+    pub fn record_column_family_property_gauges(&self) {
+        self.bounded_open.record_column_family_property_gauges(
+            StoreRole::CanonicalSecondary,
+            &CANONICAL_DATA_COLUMN_FAMILIES,
+        );
+    }
+
+    /// Returns this secondary's cumulative ticker, or zero with statistics off.
+    #[must_use]
+    pub fn rocksdb_ticker_count(&self, ticker: rust_rocksdb::statistics::Ticker) -> u64 {
+        self.bounded_open.statistics.get_ticker_count(ticker)
+    }
+
+    /// Snapshots a cumulative histogram on this secondary. Timer histograms
+    /// collect observations when the resource budget selects full statistics.
+    #[must_use]
+    pub fn rocksdb_histogram_data(
+        &self,
+        histogram: rust_rocksdb::statistics::Histogram,
+    ) -> rust_rocksdb::statistics::HistogramData {
+        self.bounded_open.statistics.get_histogram_data(histogram)
+    }
+
+    /// Returns the admitted column families, including the default family.
+    #[must_use]
+    pub fn rocksdb_column_family_names(&self) -> Vec<String> {
+        self.bounded_open.db.cf_names()
+    }
+
+    /// Reads one engine property at this secondary's view of a column family.
+    /// An unsupported property returns `None`.
+    pub fn rocksdb_property_value_cf(
+        &self,
+        family: &str,
+        property: &str,
+    ) -> Result<Option<String>, CanonicalStoreError> {
+        let db = &self.bounded_open.db;
+        let cf = db.cf_handle(family).ok_or_else(|| {
+            CanonicalStoreError::admission(
+                self.primary_path(),
+                format!("unknown column family {family}"),
+            )
+        })?;
+        db.property_value_cf(&cf, property).map_err(|source| {
+            CanonicalStoreError::RocksDbOperation {
+                operation: "read canonical secondary column family property",
+                source,
+            }
+        })
+    }
+
+    /// Lists the live SST metadata at the secondary's current view.
+    pub fn rocksdb_live_files(&self) -> Result<Vec<rust_rocksdb::LiveFile>, CanonicalStoreError> {
+        self.bounded_open
+            .db
+            .live_files()
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "list canonical secondary live SSTs",
+                source,
+            })
     }
 
     /// Samples the memory this secondary holds outside its block cache.
@@ -324,6 +539,53 @@ impl RocksDbCanonicalSecondary {
     pub fn try_catch_up(
         &mut self,
     ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
+        self.catch_up(StoreRole::CanonicalSecondary, false)
+    }
+
+    pub(super) fn try_catch_up_for_role(
+        &mut self,
+        role: StoreRole,
+    ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
+        self.catch_up(role, false)
+    }
+
+    /// Catches up an active writer follower, reopening once if a live replay
+    /// row needed to authenticate the newly visible READY fence is absent.
+    ///
+    /// The reopen must independently admit READY at or past the observed
+    /// fence and preserve continuity with the last admitted fence.
+    pub fn try_catch_up_following(
+        &mut self,
+    ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
+        self.catch_up(StoreRole::CanonicalSecondary, true)
+    }
+
+    fn catch_up(
+        &mut self,
+        role: StoreRole,
+        recover_missing_live_tail: bool,
+    ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
+        // RocksDB can advance before admission fails. Restore cached rows
+        // only when this handle successfully admits the same READY evidence.
+        let previous_cache = self.read_caches.live_tail.take();
+        let previous_ready = self.ready_evidence;
+        let outcome = self.catch_up_inner(role, recover_missing_live_tail);
+        // A successful reopen already installed its own empty cache.
+        if outcome.is_ok() && self.read_caches.live_tail.is_none() {
+            let cache = match previous_cache {
+                Some(cache) if previous_ready == self.ready_evidence => cache,
+                _ => live_tail_cache_for(&self.ready_evidence),
+            };
+            self.read_caches.live_tail = Some(cache);
+        }
+        outcome
+    }
+
+    fn catch_up_inner(
+        &mut self,
+        role: StoreRole,
+        recover_missing_live_tail: bool,
+    ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
         let before = self.event_fence();
         self.bounded_open
             .db
@@ -332,10 +594,10 @@ impl RocksDbCanonicalSecondary {
                 operation: "canonical secondary catch-up",
                 source,
             })?;
-        require_exact_secondary_column_families(&self.bounded_open, &self.primary_path)?;
+        validate_exact_column_families(self.primary_path(), &mut self.bounded_open.db.cf_names())?;
         let opened_control = validate_open_store_control(
             &self.bounded_open.db,
-            &self.primary_path,
+            self.primary_path(),
             &self.expectation,
         )?;
         validate_mempool_lifecycle_admission(
@@ -345,70 +607,244 @@ impl RocksDbCanonicalSecondary {
         )?;
         let CanonicalStoreBuildState::Ready(ready_evidence) = opened_control.build_state else {
             return Err(CanonicalStoreError::StoreNotReady {
-                path: self.primary_path.clone(),
+                path: self.primary_path().to_path_buf(),
             });
         };
-        if opened_control.build_plan != self.build_plan {
-            return Err(CanonicalStoreError::admission(
-                &self.primary_path,
-                "canonical build identity changed during secondary catch-up",
-            ));
-        }
-        if opened_control.cursor_auth_key != self.cursor_auth_key {
-            return Err(CanonicalStoreError::admission(
-                &self.primary_path,
-                "canonical cursor authentication key changed during secondary catch-up",
-            ));
-        }
+        let ready_changed = ready_evidence != self.ready_evidence;
+        self.validate_catch_up_identity(&opened_control, &ready_evidence, ready_changed)?;
         if ready_evidence.visible_event_sequence < self.ready_evidence.visible_event_sequence {
             return Err(CanonicalStoreError::admission(
-                &self.primary_path,
+                self.primary_path(),
                 "canonical event sequence regressed during secondary catch-up",
             ));
         }
         if ready_evidence.visible_event_sequence == self.ready_evidence.visible_event_sequence
-            && ready_evidence != self.ready_evidence
+            && ready_changed
         {
             return Err(CanonicalStoreError::admission(
-                &self.primary_path,
+                self.primary_path(),
                 "canonical READY publication changed without advancing its event sequence",
             ));
         }
-        // Unchanged READY evidence is still explained by the tail this reader
-        // already authenticated; otherwise re-derive only what changed.
-        if ready_evidence != self.ready_evidence {
-            follow_ready_replay_tail(
-                &self.bounded_open.db,
-                self.reorg_policy,
-                &self.ready_evidence,
-                &ready_evidence,
-                &mut self.replay_tail,
-            )?;
-        }
-        self.ready_evidence = ready_evidence;
-        self.activation_schedule = opened_control
-            .activation_schedule_binding
-            .map(|binding| {
-                CanonicalActivationSchedule::read_bound(
-                    &self.bounded_open.db,
-                    &self.primary_path,
-                    binding,
-                    self.build_plan
-                        .network_upgrade_activations_fingerprint()
-                        .as_bytes(),
-                )
+        let updated_sealed_segments = self.sync_settled_segments_on_catch_up(&ready_evidence)?;
+        let corpus_growth = updated_sealed_segments
+            .as_ref()
+            .map(|entries| {
+                self.read_caches
+                    .settled
+                    .prepare_corpus_growth(&entries[self.sealed_segments.len()..])
             })
             .transpose()?;
+        let activation_schedule =
+            read_admitted_schedule(&self.bounded_open.db, self.primary_path(), &opened_control)?;
+        // Unchanged READY evidence is still explained by the tail this reader
+        // already authenticated; otherwise re-derive only what changed.
+        if ready_changed
+            && let Err(error) =
+                self.authenticate_catch_up_tail(&ready_evidence, updated_sealed_segments.as_deref())
+        {
+            if recover_missing_live_tail
+                && let CanonicalStoreError::MissingLiveTailReplay { height } = error
+            {
+                self.reopen_during_catch_up(height, &ready_evidence, role)?;
+                return Ok(CanonicalSecondaryCatchupOutcome {
+                    before,
+                    after: self.event_fence(),
+                });
+            }
+            return Err(error);
+        }
+        self.ready_evidence = ready_evidence;
+        if let Some((entries, growth)) = updated_sealed_segments.zip(corpus_growth) {
+            self.read_caches.settled.admit_corpus_growth(growth, role);
+            self.sealed_segments = entries;
+        }
+        self.activation_schedule = activation_schedule;
         Ok(CanonicalSecondaryCatchupOutcome {
             before,
             after: self.event_fence(),
         })
     }
 
+    fn authenticate_catch_up_tail(
+        &mut self,
+        ready_evidence: &CanonicalStoreReadyEvidence,
+        updated_sealed_segments: Option<&[SettledSegmentIndexEntry]>,
+    ) -> Result<(), CanonicalStoreError> {
+        let ctx = SegmentStoreContext {
+            db: &self.bounded_open.db,
+            segment_cache: Some(&self.read_caches.settled),
+            sealed_segments: Some(updated_sealed_segments.unwrap_or(&self.sealed_segments)),
+        };
+        follow_ready_replay_tail(
+            ctx,
+            self.reorg_policy,
+            &self.ready_evidence,
+            ready_evidence,
+            &mut self.replay_tail,
+        )
+    }
+
+    fn reopen_during_catch_up(
+        &mut self,
+        height: BlockHeight,
+        ready_evidence: &CanonicalStoreReadyEvidence,
+        role: StoreRole,
+    ) -> Result<(), CanonicalStoreError> {
+        *self = self
+            .open_live_tail_recovery(height, ready_evidence, role)
+            .map_err(|error| {
+                // Followers retry missing SSTs on ordinary catch-up. A failed
+                // recovery open must end this attempt.
+                if error.is_missing_table_file() {
+                    CanonicalStoreError::admission(self.primary_path(), error.to_string())
+                } else {
+                    error
+                }
+            })?;
+        Ok(())
+    }
+
+    fn sync_settled_segments_on_catch_up(
+        &self,
+        ready_evidence: &CanonicalStoreReadyEvidence,
+    ) -> Result<Option<Vec<SettledSegmentIndexEntry>>, CanonicalStoreError> {
+        let entries = store_access::read_all_settled_segment_entries(&self.bounded_open.db)?;
+        if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
+            if first.start_height != ready_evidence.first_retained_block.height {
+                return Err(CanonicalStoreError::admission(
+                    self.primary_path(),
+                    format!(
+                        "settled segment start {} disagrees with READY first retained height {}",
+                        first.start_height.value(),
+                        ready_evidence.first_retained_block.height.value(),
+                    ),
+                ));
+            }
+            if last.end_block.height > ready_evidence.sequence_checkpoint.through().height {
+                return Err(CanonicalStoreError::admission(
+                    self.primary_path(),
+                    format!(
+                        "settled segment tip {} exceeds READY settled checkpoint {}",
+                        last.end_block.height.value(),
+                        ready_evidence.sequence_checkpoint.through().height.value(),
+                    ),
+                ));
+            }
+        }
+        if let Some(previous) = self.sealed_segments.last() {
+            let Some(current) = entries.last() else {
+                return Err(CanonicalStoreError::admission(
+                    self.primary_path(),
+                    "settled segment index disappeared during secondary catch-up",
+                ));
+            };
+            if current.end_block.height < previous.end_block.height {
+                return Err(CanonicalStoreError::admission(
+                    self.primary_path(),
+                    "settled segment tip regressed during secondary catch-up",
+                ));
+            }
+            if current.end_block.height == previous.end_block.height
+                && (current.end_block.hash != previous.end_block.hash || current != previous)
+            {
+                return Err(CanonicalStoreError::admission(
+                    self.primary_path(),
+                    "settled segment tip changed at equal height during secondary catch-up",
+                ));
+            }
+        }
+        if entries.len() < self.sealed_segments.len() || !entries.starts_with(&self.sealed_segments)
+        {
+            return Err(CanonicalStoreError::admission(
+                self.primary_path(),
+                "retained settled segment prefix mutated during secondary catch-up",
+            ));
+        }
+        if entries.len() == self.sealed_segments.len() {
+            return Ok(None);
+        }
+        let expected_modules = store_access::segment_modules_for_stored_set(self.stored_set);
+        for entry in &entries[self.sealed_segments.len()..] {
+            if entry.modules != expected_modules {
+                return Err(CanonicalStoreError::admission(
+                    self.primary_path(),
+                    format!(
+                        "newly settled segment {}-{} modules {:?} do not match admitted modules {:?}",
+                        entry.start_height.value(),
+                        entry.end_block.height.value(),
+                        entry.modules,
+                        expected_modules
+                    ),
+                ));
+            }
+            store_access::open_replay_segment_readers(
+                &self.bounded_open.db,
+                Some(&self.read_caches.settled),
+                entry,
+            )
+            .map_err(|err| CanonicalStoreError::admission(self.primary_path(), err.to_string()))?;
+        }
+        Ok(Some(entries))
+    }
+
     /// Returns the immutable canonical network.
     #[must_use]
     pub const fn network(&self) -> Network {
         self.build_plan.network()
+    }
+
+    fn validate_catch_up_identity(
+        &self,
+        opened_control: &super::control::DecodedStoreControl,
+        ready_evidence: &CanonicalStoreReadyEvidence,
+        ready_changed: bool,
+    ) -> Result<(), CanonicalStoreError> {
+        if opened_control.build_plan != self.build_plan {
+            return Err(CanonicalStoreError::admission(
+                self.primary_path(),
+                "canonical build identity changed during secondary catch-up",
+            ));
+        }
+        if ready_changed
+            && (ready_evidence.construction_manifest_version
+                != self.ready_evidence.construction_manifest_version
+                || ready_evidence.construction_manifest_sha256
+                    != self.ready_evidence.construction_manifest_sha256)
+        {
+            return Err(CanonicalStoreError::admission(
+                self.primary_path(),
+                "canonical construction manifest changed during secondary catch-up",
+            ));
+        }
+        if opened_control.cursor_auth_key != self.cursor_auth_key {
+            return Err(CanonicalStoreError::admission(
+                self.primary_path(),
+                "canonical cursor authentication key changed during secondary catch-up",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_settled_corpus_admission(&self, role: StoreRole) {
+        self.read_caches.settled.record_corpus_admission(role);
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_settled_cache(&mut self, cache: Arc<SettledSegmentReaderCache>) {
+        self.read_caches.settled = cache;
+    }
+
+    pub(super) fn live_tail_cache(&self) -> Option<&LiveTailShieldedCache> {
+        self.read_caches.live_tail.as_ref()
+    }
+
+    pub(super) fn segment_context(&self) -> SegmentStoreContext<'_> {
+        SegmentStoreContext {
+            db: &self.bounded_open.db,
+            segment_cache: Some(&self.read_caches.settled),
+            sealed_segments: Some(&self.sealed_segments),
+        }
     }
 
     /// Returns the admitted network-upgrade activation identity.
@@ -419,17 +855,37 @@ impl RocksDbCanonicalSecondary {
         self.build_plan.network_upgrade_activations_fingerprint()
     }
 
-    /// Returns the immutable canonical workload.
-    #[must_use]
-    pub const fn workload(&self) -> CanonicalStoreWorkload {
-        self.workload
-    }
-
     /// Returns the effective maximum canonical replacement depth admitted at
     /// open: the construction policy or a writer-admitted raise.
     #[must_use]
     pub const fn reorg_policy(&self) -> super::CanonicalReorgPolicy {
         self.reorg_policy
+    }
+
+    /// Returns the retained block data and historical floor.
+    #[must_use]
+    pub const fn stored_set(&self) -> super::CanonicalStoredSet {
+        self.stored_set
+    }
+
+    /// Requires a replacement to hold the same data as the serving reader.
+    ///
+    /// # Errors
+    /// Returns an admission refusal when the stored sets differ.
+    pub fn require_stored_set(
+        &self,
+        expected: super::CanonicalStoredSet,
+    ) -> Result<(), CanonicalStoreError> {
+        if self.stored_set != expected {
+            return Err(CanonicalStoreError::admission(
+                self.primary_path(),
+                format!(
+                    "canonical stored set changed from {expected:?} to {:?}",
+                    self.stored_set
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the immutable raw-blob retention authenticated at admission.
@@ -444,6 +900,12 @@ impl RocksDbCanonicalSecondary {
         self.build_plan.history_bounds()
     }
 
+    /// Returns the digest of the complete predecessor checkpoint admitted at open.
+    #[must_use]
+    pub const fn history_predecessor_digest(&self) -> [u8; 32] {
+        self.history_predecessor_digest
+    }
+
     /// Returns the complete admitted build identity.
     #[must_use]
     pub const fn build_plan(&self) -> &super::CanonicalStoreBuildPlan {
@@ -454,6 +916,16 @@ impl RocksDbCanonicalSecondary {
     #[must_use]
     pub const fn ready_evidence(&self) -> CanonicalStoreReadyEvidence {
         self.ready_evidence
+    }
+
+    /// Returns the policy recorded in the authenticated construction manifest.
+    ///
+    /// A legacy manifest without this record returns `None`.
+    #[must_use]
+    pub const fn construction_tree_state_checkpoint_policy(
+        &self,
+    ) -> Option<ConstructionTreeStateCheckpointPolicy> {
+        self.construction_tree_state_checkpoint_policy
     }
 
     /// Returns the authenticated settled sequence checkpoint.
@@ -470,7 +942,14 @@ impl RocksDbCanonicalSecondary {
 
     /// Scans and authenticates the canonical replay visible to this secondary.
     pub fn scan_canonical_replay(&self) -> Result<CanonicalReplayScan<'_>, CanonicalStoreError> {
-        CanonicalReplayScan::new(&self.bounded_open.db, &self.ready_evidence)
+        CanonicalReplayScan::new(self.segment_context(), &self.ready_evidence)
+    }
+
+    /// Returns a `Sync` slice source for concurrent height-bounded replay scans
+    /// against this secondary's admitted READY fence.
+    #[must_use]
+    pub fn canonical_replay_slice_source(&self) -> super::CanonicalReplaySliceSource<'_> {
+        super::CanonicalReplaySliceSource::new(self.segment_context(), &self.ready_evidence)
     }
 
     /// Reads one bounded connected replay range from this admitted fence.
@@ -479,23 +958,25 @@ impl RocksDbCanonicalSecondary {
     /// row against its canonical predecessor without rescanning the historical
     /// prefix; the caller must compare its resulting source digest and event
     /// cursor with the same secondary fence before publishing derived state.
+    /// A missing live-tail row can fail scan creation or iteration with
+    /// [`CanonicalStoreError::MissingLiveTailReplay`].
     pub fn scan_canonical_replay_range(
         &self,
         range: BlockHeightRange,
     ) -> Result<CanonicalReplayRangeScan<'_>, CanonicalStoreError> {
-        CanonicalReplayRangeScan::new(&self.bounded_open.db, &self.ready_evidence, range)
+        CanonicalReplayRangeScan::new(self.segment_context(), &self.ready_evidence, range)
     }
 
     /// Reads one retained block's canonical facts by height.
     ///
     /// Heights outside the admitted retained range return `None`. A missing row
-    /// inside that range is a canonical replay-sequence error: READY admission
-    /// proves the retained range is contiguous.
+    /// inside that range is an error because READY admission proves the
+    /// retained range is contiguous.
     pub fn block_replay_facts_at(
         &self,
         height: BlockHeight,
     ) -> Result<Option<CanonicalBlockFacts>, CanonicalStoreError> {
-        read_replay_facts_at(&self.bounded_open.db, &self.ready_evidence, height)
+        read_replay_facts_at_with_cache(self.segment_context(), &self.ready_evidence, height)
     }
 
     /// Visits several retained blocks' canonical facts in height order.
@@ -514,7 +995,12 @@ impl RocksDbCanonicalSecondary {
     where
         E: From<CanonicalStoreError>,
     {
-        visit_replay_facts_at_heights(&self.bounded_open.db, &self.ready_evidence, heights, visit)
+        visit_replay_facts_at_heights_with_cache(
+            self.segment_context(),
+            &self.ready_evidence,
+            heights,
+            visit,
+        )
     }
 
     /// Reads retained canonical events from this secondary's admitted READY fence.
@@ -548,48 +1034,21 @@ impl RocksDbCanonicalSecondary {
     }
 }
 
-fn required_canonical_column_family_names() -> Vec<String> {
-    let mut expected = CANONICAL_DATA_COLUMN_FAMILIES
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    expected.push(DEFAULT_COLUMN_FAMILY_NAME.to_owned());
-    expected.sort_unstable();
-    expected
+fn live_tail_cache_for(evidence: &CanonicalStoreReadyEvidence) -> LiveTailShieldedCache {
+    LiveTailShieldedCache::new(
+        evidence.sequence_checkpoint.through().height,
+        evidence.visible_tip.height,
+    )
 }
 
 fn require_exact_primary_column_family_metadata(
     primary_path: &Path,
 ) -> Result<(), CanonicalStoreError> {
-    let observed = DB::list_cf(&Options::default(), primary_path).map_err(|source| {
+    let mut observed = DB::list_cf(&Options::default(), primary_path).map_err(|source| {
         CanonicalStoreError::admission(
             primary_path,
             format!("canonical column-family metadata discovery failed: {source}"),
         )
     })?;
-    require_exact_column_family_names(primary_path, observed)
-}
-
-fn require_exact_secondary_column_families(
-    bounded_open: &BoundedRocksDbOpen,
-    primary_path: &Path,
-) -> Result<(), CanonicalStoreError> {
-    require_exact_column_family_names(primary_path, bounded_open.db.cf_names())
-}
-
-fn require_exact_column_family_names(
-    primary_path: &Path,
-    mut observed: Vec<String>,
-) -> Result<(), CanonicalStoreError> {
-    let expected = required_canonical_column_family_names();
-    observed.sort_unstable();
-    if observed != expected {
-        return Err(CanonicalStoreError::admission(
-            primary_path,
-            format!(
-                "column families {observed:?} do not exactly match required canonical set {expected:?}"
-            ),
-        ));
-    }
-    Ok(())
+    validate_exact_column_families(primary_path, &mut observed)
 }

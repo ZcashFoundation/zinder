@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::{net::TcpListener, sync::oneshot};
-use tokio_stream::wrappers::TcpListenerStream;
 use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
@@ -55,7 +54,7 @@ async fn current_android_sdk_rpc_contract_uses_admitted_production_pair() -> eyr
     let transaction_id = TransactionId::from_bytes([0x51; 32]);
     let accepted_transaction_id = TransactionId::from_bytes([0x52; 32]);
     let base_chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(1)
         .with_tree_state_checkpoint_payload_at(BLOCK_HEIGHT, TREE_STATE_PAYLOAD.to_vec());
     let block = base_chain
@@ -136,7 +135,7 @@ async fn current_android_sdk_rpc_contract_uses_admitted_production_pair() -> eyr
     let server = tokio::spawn(async move {
         zinder_runtime::public_grpc_server(zinder_runtime::ClientAddressSource::Connection)
             .add_service(adapter.into_server())
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+            .serve_with_incoming_shutdown(listener, async move {
                 let _shutdown_result = shutdown_receiver.await;
             })
             .await

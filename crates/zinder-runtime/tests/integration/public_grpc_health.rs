@@ -6,7 +6,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use eyre::Result;
 use tokio::net::TcpListener;
-use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
+use tokio_stream::StreamExt as _;
 use tonic::{Code, Request};
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_reflection::pb::v1alpha::{
@@ -71,10 +71,7 @@ async fn serve(initial: ReadinessState) -> Result<TestListener> {
     )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listener_address = listener.local_addr()?;
-    let server = router.serve_with_incoming_shutdown(
-        TcpListenerStream::new(listener),
-        runtime.grpc_server_shutdown(),
-    );
+    let server = router.serve_with_incoming_shutdown(listener, runtime.grpc_server_shutdown());
     let shutdown = runtime.shutdown_request();
     tokio::spawn(runtime.supervise(server, SupervisedTasks::new(), || {}));
     let (ops_address, readyz) = spawn_readyz(&readiness).await?;

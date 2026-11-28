@@ -9,8 +9,9 @@ for contributors changing the `zinder-source` crate.
 authentication, node response types, capability discovery, and the parsing of
 block and transaction bytes with Zebra's consensus primitives. It returns
 Zinder types and typed `SourceError` values. The caller decides whether to
-retry, switch nodes, or exit. Query handlers and storage code never call a
-node, and a missing stored artifact never falls back to a node query. See
+retry, switch nodes, or exit. Storage code reads local stores. Light-wallet
+handlers use `zinder-source` for the node-backed methods described in
+[Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#runtime-serving-selection). See
 [ADR-0006](../adrs/0006-node-source-boundary.md).
 
 ## Node adapters
@@ -21,13 +22,31 @@ own refusal messages.
 
 | Type | Role | Selected when |
 | --- | --- | --- |
-| `ZebraJsonRpcSource` | Blocks, block batches, tip, tree states, subtree roots, value pools, health, broadcast, transparent-address lookups | Always; `ingest.source` accepts only `zebra-json-rpc` |
+| `ZebraJsonRpcSource` | Blocks, block batches, tip, tree states, subtree roots, value pools, health, broadcast, transparent-address lookups | Default (`ingest.source = "zebra-json-rpc"`); always provides the control plane |
+| `ZebraIndexerBlockSource` | Binary unary `GetBlock` raw-block reads paired with the JSON-RPC control plane | `ingest.source = "zebra-indexer-grpc"` with `node.indexer_grpc_addr` set |
 | `ZebraIndexerMempoolSource` | Streaming mempool events | `node.indexer_grpc_addr` is set |
 | `JsonRpcMempoolSource` | Polling mempool | No indexer endpoint is set |
-| `ZebraIndexerBlockSource`, `ZebraIndexerChainTipSource` | Block reads and tip notifications over indexer gRPC | Library only; no runtime selects them |
+| `ZebraIndexerChainTipSource` | Tip notifications over indexer gRPC | Library only; no runtime selects it |
 
-JSON-RPC is required. The indexer gRPC endpoint is optional and changes only
-how ingest follows the mempool.
+JSON-RPC is always required. Setting `node.indexer_grpc_addr` switches mempool
+updates to streaming and allows `ingest.source = "zebra-indexer-grpc"` to fetch
+raw blocks as binary protobuf payloads instead of JSON-RPC hex strings.
+
+The JSON-RPC library exposes no connection-pool limit, so every concurrent call
+can open another HTTP connection. `ZebraJsonRpcSource` therefore admits its
+calls through `node.max_concurrent_requests` slots, shared by every clone of
+the source. A call waits for a slot for at most its own timeout. A
+`sendrawtransaction` call counts that wait against its timeout,
+`node.broadcast_timeout_secs` or else `node.request_timeout_secs`, so a queued
+broadcast never runs longer than one timeout. Readiness probes use one slot of
+their own: the tip and `getblockchaininfo` reads, and in lightwalletd serving
+the node verification the probe runs first. Every node verification a reader
+shares with its readiness probe also uses that slot: the light-wallet schedule
+check and each broadcast endpoint's verification, whether a request or the
+probe starts it. Calls that hold every shared slot therefore never delay a
+readiness probe.
+[Configuration](../reference/configuration.md#the-node-sections) gives the
+default and the sizing rule.
 
 ## The `NodeSource` contract
 
@@ -60,15 +79,17 @@ half. It logs `source_chain_segment_split`.
 
 ## Transparent address lookups
 
-`ZebraJsonRpcSource` can forward transparent-address lookups to the node's
-own address index. No runtime calls these methods.
+The source exposes the transparent address methods below. Light-wallet
+serving queries the index for transaction IDs and unspent outputs. It
+calculates confirmed balances from the verified outputs.
 
 | Method | Node RPC | Returns |
 | --- | --- | --- |
 | `fetch_transparent_address_balance` | `getaddressbalance` | Unspent balance and total received |
 | `fetch_transparent_address_transaction_ids` | `getaddresstxids` | Transaction ids in a height range, in chain order |
-| `fetch_transparent_address_utxos` | `getaddressutxos` | Every unspent output at or above a height, in chain order |
+| `fetch_transparent_address_utxos` | `getaddressutxos` | Every unspent output at or above a height, in chain order, and the tip the node answered at |
 | `fetch_transparent_address_utxo_prefix` | `getaddressutxos` | The first `max_rows` unspent outputs at or above a height, in chain order |
+| `fetch_transparent_address_utxo_page` | `getaddressutxos` | A chain-ordered prefix, including extra rows the node supplied, whether it covers every match, and the tip the node answered at |
 
 Every method takes a `TransparentAddressLookup`: 1 to 10,000 distinct
 addresses of the source's network. TEX addresses are refused, because the
@@ -93,6 +114,12 @@ differently, and the source gives both the same result:
   refusal of the answer's size the same way, because that refusal may be for
   the new tip's range. After three attempts whose tip changed, it reports
   `ChainTipChangedDuringFetch`, classed `upstream_view_changed`.
+- **Answer chain.** Neither node reports the chain a `getaddresstxids` answer
+  describes. The caller names a block the answer's chain must hold, and the
+  source reads the node's hash at that block's height immediately before and
+  after each request. A hash read that names another block, or a tip read
+  below that block's height, reports `ChainTipChangedDuringFetch`, so a
+  rollback the node recovers from is never answered as an empty range.
 - **Complete unspent outputs.** `fetch_transparent_address_utxos` sends
   `maxEntries` zero, the only value for which Zebra refuses a lookup over the
   row limit. With a positive `maxEntries`, Zebra returns that many outputs and
@@ -103,7 +130,13 @@ differently, and the source gives both the same result:
   the rows below the start height and truncates the rest. A full prefix may
   have more outputs after it, and no later lookup resumes losslessly: the node
   pages only by height, and one block can hold more matching outputs than one
-  prefix.
+  prefix. The page method retains extra matching rows up to the same
+  100,000-row cap, so callers can use rows Zakura has already sent. A page
+  that reaches the local cap with more matching rows is incomplete.
+- **Answer tip.** Every `getaddressutxos` request sets `chainInfo`, and both
+  nodes then return the hash and height of the tip the outputs describe. The
+  source returns that tip with the outputs, so a caller can bind the answer
+  to a chain view. `getaddressbalance` has no such field on either node.
 - **Response size.** An answer above `node.max_response_bytes` is reported as
   `SourceResponseTooLarge`. Zakura's unspent-output answer counts in full,
   even for a prefix or a high start height. Either node answers JSON-RPC error
@@ -132,6 +165,11 @@ A Zakura node in pruned storage mode with checkpoint sync stops maintaining its
 transparent indexes and refuses `getaddressbalance`, `getaddresstxids`, and
 `getaddressutxos`. The source reports that refusal, and a node without the
 methods, as `TransparentAddressIndexesUnavailable`.
+
+For address history, `fetch_mined_transaction_bytes` reads the serialized bytes
+and mined block from one verbose `getrawtransaction` reply. It checks the
+returned transaction ID against the request. A missing, mempool, or side-chain
+transaction has no best-chain location.
 
 ## Capabilities
 
@@ -175,12 +213,22 @@ another network or chain. See
 | Class | Meaning |
 | --- | --- |
 | `node_unreachable` | The endpoint cannot be reached or refused the credentials |
+| `node_rate_limited` | The node refused the call with HTTP 429 because it holds its connection limit |
 | `upstream_view_changed` | The node's best chain changed during the operation |
 | `stream_disconnected` | An indexer subscription disconnected |
 | `capability_missing` | The node cannot provide a required operation |
 | `protocol_mismatch` | A response violates the expected wire contract |
 | `malformed` | Node bytes cannot be parsed |
 | `configuration` | The adapter configuration or a request limit refused the operation |
+
+Zebra refuses a connection over its JSON-RPC connection limit with HTTP 429.
+The source reports it as `NodeRateLimited`, classed `node_rate_limited`. The
+node is up and the connection works, so the refusal never counts toward the
+client rebuild described under [Authentication](#authentication): a fresh
+client would open more connections to a node that refuses them for having too
+many. Ingest retries the same node after the `node_unreachable` backoff and does
+not switch endpoints. A reader's broadcast and fee read try the next verified
+endpoint, and readers report the gRPC reason `NODE_RATE_LIMITED`.
 
 Some refusals are permanent: a fast-synced Zakura node lacks old trees and
 subtree roots, and Zebra refuses a damaged stored block. The source reports
@@ -264,14 +312,7 @@ roots. The client certificate and key, which mutual TLS needs, must be set
 together. `server_name` overrides the name checked against the certificate.
 The section is rejected without an indexer URL or with an `http://` one.
 
-The transport rereads the PEM files whenever it opens a channel, so a stream
-picks up rotated files on its next reconnect. `zinder-ingest` validates the
-files at startup and exits when one is missing or holds no certificate or key.
-Binaries accept key material only as file paths;
-[ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md) covers
-platforms that deliver secrets as environment variables.
-[Deploying on one VM](../runbooks/deploying-on-a-vm.md) shows the Compose
-overlay that mounts the files.
+When using file paths, the transport rereads the PEM files whenever it opens a channel, so a stream picks up rotated files on its next reconnect. You can alternatively supply inline certificates and keys via `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`, `CLIENT_CERT_PEM`, and `CLIENT_KEY_PEM` (mutually exclusive with each `*_PATH`). `zinder-ingest` validates the TLS inputs at startup and exits when a certificate or key is missing or invalid. See [Deploying on a VM](../runbooks/deploying-on-a-vm.md) for configuring `node.indexer_tls` in Docker Compose.
 
 ## Upstream health probe
 
@@ -280,7 +321,12 @@ endpoint on the configured cadence. Each probe waits at most two seconds, or the
 cadence if shorter, and falls back to `getblockchaininfo` in the same poll when
 it fails. A node that accepts connections but never answers therefore cannot
 stall a caller. Without `[node.health].addr`, readiness comes from JSON-RPC
-observations.
+observations. Both JSON-RPC paths apply `verification_progress_floor` and
+`estimated_gap_floor_blocks` from the active node's health settings.
+
+Ingest starts its periodic readiness probe when the primary node has a health
+address. Setting only the fallback floors changes how JSON-RPC observations
+are classified. A reader with a configured node polls it on either path.
 
 The node's readiness caps ingest's readiness. Readers use their node only to
 broadcast and, in wallet-mode compatibility, to read the recommended fee, so

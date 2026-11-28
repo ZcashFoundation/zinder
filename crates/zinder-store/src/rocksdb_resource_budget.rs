@@ -11,10 +11,9 @@
 //!   [`RocksDbResourceBudget::preferred_io_mode`], which the benchmark harness
 //!   sets to buffered to skip the direct attempt; no configuration section
 //!   exposes it.
-//! - **Bounded resource budget** lives here. The numbers below cap the
-//!   block-cache, table-cache, WAL, primary-writer background jobs,
-//!   per-column-family write buffers, and total memtable memory surfaces so a
-//!   crash-replay open or bulk write does not OOM the host. The defaults target
+//! - **Bounded resource budget** lives here. The settings govern the
+//!   block cache, table cache, WAL, primary-writer background jobs,
+//!   per-column-family write buffers, and shared memtable budget. The defaults target
 //!   a mainnet-sized store and are documented in
 //!   [the resource-tuning runbook](../../../docs/runbooks/bulk-catchup-resource-tuning.md).
 //!
@@ -26,10 +25,6 @@
 use crate::RocksDbIoMode;
 
 /// Bounded `RocksDB` resource budget applied to one DB instance at open.
-///
-/// The fields together cap the resident-memory peak at roughly
-/// `block_cache_bytes + max_wal_bytes + memtable_budget_bytes` regardless of
-/// store size. Each field has a single concrete effect:
 ///
 /// - `block_cache_bytes` is the size of the bounded LRU cache shared by
 ///   data blocks, index blocks, and the filter blocks of any column family
@@ -52,8 +47,11 @@ use crate::RocksDbIoMode;
 ///   background job pool used for flushes and compactions. `OpenAsSecondary`
 ///   disables automatic flushes and compactions, so secondary opens retain the
 ///   field in this uniform budget type but do not apply it.
-/// - `memtable_budget_bytes` caps total memtable memory across column
-///   families via `RocksDB`'s write-buffer manager.
+/// - `memtable_budget_bytes` applies to one open database across its column
+///   families. On a primary, the write-buffer manager uses it to trigger
+///   flushes. Usage can exceed the budget while flushes are pending. Secondary
+///   WAL replay can exceed the budget until catch-up sees a primary flush
+///   and releases the old read view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RocksDbResourceBudget {
     /// Bounded LRU cache size for data, index, and filter blocks.
@@ -69,14 +67,14 @@ pub struct RocksDbResourceBudget {
     pub max_write_buffer_count: i32,
     /// Primary-writer background flush and compaction job limit.
     pub max_background_jobs: i32,
-    /// Total mutable and immutable memtable memory budget across column families.
+    /// Memtable memory budget for one open database, across all its column families.
     pub memtable_budget_bytes: u64,
     /// `RocksDB` statistics collection gate.
     pub statistics_level: RocksDbStatisticsLevel,
     /// Filesystem I/O mode the open attempts first.
     ///
     /// Every profile defaults to [`RocksDbIoMode::Direct`], which falls back
-    /// to buffered I/O when the filesystem rejects direct I/O.
+    /// to buffered I/O if the direct open fails.
     /// [`RocksDbIoMode::Buffered`] skips the direct attempt. Only the
     /// benchmark harness overrides it; no configuration section exposes it.
     pub preferred_io_mode: RocksDbIoMode,
@@ -99,6 +97,21 @@ impl RocksDbResourceBudget {
     /// (`RocksDB`'s "unbounded") pin every `SST`'s metadata in resident
     /// memory.
     pub const MIN_MAX_OPEN_FILES: i32 = 32;
+
+    /// `RocksDB` `table_cache_numshardbits` applied to secondary and read-only
+    /// probe opens (`2^2 = 4` shards instead of `RocksDB`'s 64-shard default).
+    ///
+    /// `TableCache` capacity is an `SST` file count (`max_open_files - 10`),
+    /// not a byte budget. Splitting a 1,024–2,048-entry table cache across 64
+    /// shards leaves only 16–32 slots per shard, where hash skew evicts live
+    /// table readers while total capacity remains mostly unused. Four shards
+    /// keep per-shard capacity at 254–510 table readers while retaining
+    /// independent shard locks for concurrent reader threads.
+    pub const SECONDARY_TABLE_CACHE_SHARD_BITS: i32 = 2;
+
+    /// Non-table-cache file descriptors `RocksDB` reserves from
+    /// [`Self::max_open_files`] (`DBImpl` `table_cache_size = max_open_files - 10`).
+    pub const ROCKSDB_NON_TABLE_CACHE_OPEN_FILES: i32 = 10;
 
     /// Smallest accepted [`Self::write_buffer_bytes`]. Smaller values create
     /// flush churn and make high-throughput catch-up compaction-bound.
@@ -146,8 +159,8 @@ impl RocksDbResourceBudget {
     /// `512 MiB` total memtable budget. Replay writes many consumer families in
     /// every ordered dispatch; the larger shared memtable envelope lets hot
     /// families rotate while compaction catches up instead of turning flush
-    /// churn into write stalls. The write-buffer manager remains the hard
-    /// aggregate bound.
+    /// churn into write stalls. Reaching the shared budget triggers flushes.
+    /// Total memtable usage can exceed it while flushes are pending.
     #[must_use]
     pub const fn materialized_view_writer_defaults() -> Self {
         Self {
@@ -163,30 +176,45 @@ impl RocksDbResourceBudget {
         }
     }
 
-    /// Wallet-projection writer defaults.
+    /// Wallet-projection writer defaults sized for sustained multi-CF following.
     ///
-    /// The wallet projection currently has the same multi-column-family write
-    /// posture as a materialized-view consumer, but it is a distinct durable
-    /// ownership domain and therefore has its own named profile.
+    /// `256 MiB` block cache, `32 MiB` WAL ceiling, `512` open file handles,
+    /// `16 MiB x 4` write buffers per column family, `2` background jobs, and
+    /// `512 MiB` total memtable budget. Capping the primary WAL at `32 MiB`
+    /// triggers earlier flushes so inactive wallet secondaries do not accumulate
+    /// large WAL replay memtables across retained serving generations.
     #[must_use]
     pub const fn wallet_projection_writer_defaults() -> Self {
-        Self::materialized_view_writer_defaults()
+        Self {
+            block_cache_bytes: 256 * MIB,
+            max_wal_bytes: 32 * MIB,
+            max_open_files: 512,
+            write_buffer_bytes: 16 * MIB,
+            max_write_buffer_count: 4,
+            max_background_jobs: 2,
+            memtable_budget_bytes: 512 * MIB,
+            statistics_level: RocksDbStatisticsLevel::Tickers,
+            preferred_io_mode: RocksDbIoMode::Direct,
+        }
     }
 
     /// Canonical-store reader defaults for secondary processes.
     ///
-    /// `128 MiB` block cache, `32 MiB` WAL ceiling, `128` open file handles,
+    /// `128 MiB` block cache, `32 MiB` WAL ceiling, `2048` open file handles
+    /// across 4 table-cache shards (`510` table readers per shard),
     /// `8 MiB x 2` write buffers per column family, and `16 MiB` total memtable
     /// budget. The uniform budget retains the primary-only background-job value
     /// at `2`, but secondary opens do not apply it. Secondary readers replay the
     /// writer's manifest and serve public traffic; their memory posture must
-    /// stay below the writer so readers cannot starve clean sync.
+    /// stay below the writer so readers cannot starve clean sync, while the
+    /// larger open-file cap keeps Mainnet and Testnet SST table readers open as
+    /// index and filter blocks stay inside the shared block cache.
     #[must_use]
     pub const fn canonical_reader_defaults() -> Self {
         Self {
             block_cache_bytes: 128 * MIB,
             max_wal_bytes: 32 * MIB,
-            max_open_files: 128,
+            max_open_files: 2048,
             write_buffer_bytes: 8 * MIB,
             max_write_buffer_count: 2,
             max_background_jobs: 2,
@@ -220,12 +248,46 @@ impl RocksDbResourceBudget {
 
     /// Wallet-projection reader defaults for immutable serving secondaries.
     ///
-    /// The serving secondary currently uses the same resource profile as a
-    /// materialized-view reader, while retaining a distinct domain name at the
-    /// configuration boundary.
+    /// `64 MiB` block cache, `16 MiB` WAL ceiling, `1024` open file handles,
+    /// `4 MiB x 2` write buffers per column family, and `16 MiB` total memtable
+    /// budget. The uniform budget retains the primary-only background-job value
+    /// at `2`, but secondary opens do not apply it. The larger open-file cap
+    /// keeps Mainnet point-lookup SST readers open while partitioned index and
+    /// filter blocks stay inside the shared block cache.
     #[must_use]
     pub const fn wallet_projection_reader_defaults() -> Self {
-        Self::materialized_view_reader_defaults()
+        Self {
+            block_cache_bytes: 64 * MIB,
+            max_wal_bytes: 16 * MIB,
+            max_open_files: 1024,
+            write_buffer_bytes: 4 * MIB,
+            max_write_buffer_count: 2,
+            max_background_jobs: 2,
+            memtable_budget_bytes: 16 * MIB,
+            statistics_level: RocksDbStatisticsLevel::Tickers,
+            preferred_io_mode: RocksDbIoMode::Direct,
+        }
+    }
+
+    /// Minimal bounded defaults for short-lived read-only admission probes.
+    ///
+    /// `4 MiB` block cache and `32` open file handles keep admission probes
+    /// bounded independently of store size while reading only store control,
+    /// epoch-tip, or manifest metadata. Primary-only write fields stay at their
+    /// minimum valid values and are not applied to read-only opens.
+    #[must_use]
+    pub const fn read_only_probe_defaults() -> Self {
+        Self {
+            block_cache_bytes: Self::MIN_BLOCK_CACHE_BYTES,
+            max_wal_bytes: Self::MIN_MAX_WAL_BYTES,
+            max_open_files: Self::MIN_MAX_OPEN_FILES,
+            write_buffer_bytes: Self::MIN_WRITE_BUFFER_BYTES,
+            max_write_buffer_count: Self::MIN_MAX_WRITE_BUFFER_COUNT,
+            max_background_jobs: Self::MIN_MAX_BACKGROUND_JOBS,
+            memtable_budget_bytes: Self::MIN_MEMTABLE_BUDGET_BYTES,
+            statistics_level: RocksDbStatisticsLevel::Tickers,
+            preferred_io_mode: RocksDbIoMode::Direct,
+        }
     }
 
     /// Defaults for throwaway local test stores.
@@ -278,6 +340,30 @@ impl RocksDbResourceBudget {
             return Err("rocksdb_resource_budget.memtable_budget_bytes must be at least 4 MiB");
         }
         Ok(())
+    }
+
+    /// Number of `TableCache` shards configured on secondary and read-only
+    /// probe opens (`1 << SECONDARY_TABLE_CACHE_SHARD_BITS`).
+    #[must_use]
+    pub const fn secondary_table_cache_shards() -> usize {
+        1_usize << Self::SECONDARY_TABLE_CACHE_SHARD_BITS
+    }
+
+    /// Per-shard `TableCache` entry capacity (`ShardedCacheBase::ComputePerShardCapacity`)
+    /// when `self` is applied to a secondary or read-only probe open.
+    ///
+    /// Returns `usize::MAX` for negative (`-1`, unbounded) `max_open_files`.
+    #[must_use]
+    pub const fn secondary_table_cache_per_shard_capacity(self) -> usize {
+        if self.max_open_files < 0 {
+            return usize::MAX;
+        }
+        if self.max_open_files <= Self::ROCKSDB_NON_TABLE_CACHE_OPEN_FILES {
+            return 0;
+        }
+        let table_cache_entries = (self.max_open_files - Self::ROCKSDB_NON_TABLE_CACHE_OPEN_FILES)
+            .unsigned_abs() as usize;
+        table_cache_entries.div_ceil(Self::secondary_table_cache_shards())
     }
 }
 
@@ -379,17 +465,50 @@ mod tests {
             RocksDbResourceBudget::materialized_view_reader_defaults().block_cache_bytes
                 < RocksDbResourceBudget::materialized_view_writer_defaults().block_cache_bytes
         );
+        assert!(
+            RocksDbResourceBudget::wallet_projection_reader_defaults().block_cache_bytes
+                < RocksDbResourceBudget::wallet_projection_writer_defaults().block_cache_bytes
+        );
     }
 
     #[test]
-    fn wallet_projection_profiles_match_the_current_multi_family_profiles() {
+    fn wallet_projection_writer_defaults_cap_wal_at_thirty_two_mebibytes() {
+        let budget = RocksDbResourceBudget::wallet_projection_writer_defaults();
+        assert_eq!(budget.validate(), Ok(()));
+        assert_eq!(budget.max_wal_bytes, 32 * MIB);
         assert_eq!(
-            RocksDbResourceBudget::wallet_projection_writer_defaults(),
-            RocksDbResourceBudget::materialized_view_writer_defaults()
+            budget,
+            RocksDbResourceBudget {
+                max_wal_bytes: 32 * MIB,
+                ..RocksDbResourceBudget::materialized_view_writer_defaults()
+            }
         );
+    }
+
+    #[test]
+    fn canonical_reader_defaults_raise_open_files_to_2048_across_four_shards() {
+        let budget = RocksDbResourceBudget::canonical_reader_defaults();
+        assert_eq!(budget.validate(), Ok(()));
+        assert_eq!(budget.max_open_files, 2048);
+        assert_eq!(RocksDbResourceBudget::secondary_table_cache_shards(), 4);
+        assert_eq!(budget.secondary_table_cache_per_shard_capacity(), 510);
+        // Accommodates 243 Mainnet SSTs even if all 243 land in a single shard,
+        // and >2x the 6-sigma per-shard bound (247) for 710 Testnet SSTs.
+        assert!(budget.secondary_table_cache_per_shard_capacity() >= 243);
+        assert!(budget.secondary_table_cache_per_shard_capacity() >= 247);
+    }
+
+    #[test]
+    fn wallet_projection_reader_defaults_raise_open_files_to_1024() {
+        let budget = RocksDbResourceBudget::wallet_projection_reader_defaults();
+        assert_eq!(budget.validate(), Ok(()));
+        assert_eq!(budget.max_open_files, 1024);
         assert_eq!(
-            RocksDbResourceBudget::wallet_projection_reader_defaults(),
-            RocksDbResourceBudget::materialized_view_reader_defaults()
+            budget,
+            RocksDbResourceBudget {
+                max_open_files: 1024,
+                ..RocksDbResourceBudget::materialized_view_reader_defaults()
+            }
         );
     }
 
@@ -444,6 +563,21 @@ mod tests {
     }
 
     #[test]
+    fn read_only_probe_defaults_are_valid_and_use_minimum_bounds() {
+        let budget = RocksDbResourceBudget::read_only_probe_defaults();
+        assert_eq!(budget.validate(), Ok(()));
+        assert_eq!(
+            budget.block_cache_bytes,
+            RocksDbResourceBudget::MIN_BLOCK_CACHE_BYTES
+        );
+        assert_eq!(
+            budget.max_open_files,
+            RocksDbResourceBudget::MIN_MAX_OPEN_FILES
+        );
+        assert_eq!(budget.preferred_io_mode, RocksDbIoMode::Direct);
+    }
+
+    #[test]
     fn every_default_budget_preserves_two_background_jobs() {
         for budget in [
             RocksDbResourceBudget::canonical_writer_defaults(),
@@ -452,6 +586,7 @@ mod tests {
             RocksDbResourceBudget::canonical_reader_defaults(),
             RocksDbResourceBudget::materialized_view_reader_defaults(),
             RocksDbResourceBudget::wallet_projection_reader_defaults(),
+            RocksDbResourceBudget::read_only_probe_defaults(),
             RocksDbResourceBudget::for_local_tests(),
         ] {
             assert_eq!(budget.max_background_jobs, 2);
@@ -476,6 +611,7 @@ mod tests {
             RocksDbResourceBudget::canonical_reader_defaults(),
             RocksDbResourceBudget::materialized_view_reader_defaults(),
             RocksDbResourceBudget::wallet_projection_reader_defaults(),
+            RocksDbResourceBudget::read_only_probe_defaults(),
             RocksDbResourceBudget::for_local_tests(),
         ] {
             assert_eq!(budget.statistics_level, RocksDbStatisticsLevel::Tickers);

@@ -16,12 +16,14 @@ use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, Network, NetworkUpgradeActivations, ShieldedProtocol};
 use zinder_ingest::{
     CanonicalStoreDamage, CanonicalStoreDamageSignal, CanonicalStoreDamageSite, HistoricalWorkGate,
+    MaterializedViewReplayConfig, MaterializedViewTailer, ReplayPrevoutCaches,
     TREE_STATE_VERIFICATION_WATERMARK_FILE, TreeStateVerificationConfig,
-    TreeStateVerificationContext, spawn_tree_state_verification_task,
+    TreeStateVerificationContext, spawn_materialized_view_tailer_task,
+    spawn_tree_state_verification_task,
 };
-use zinder_runtime::{ComposedReadiness, Readiness, ReadinessCause, ReadinessState};
+use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness, ReadinessCause, ReadinessState};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention, RocksDbResourceBudget,
+    CanonicalReorgPolicy, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbResourceBudget,
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, WalletServingStoreFixture,
@@ -151,6 +153,129 @@ async fn a_restart_resumes_its_cycle_at_the_recorded_height() -> eyre::Result<()
         store_damage.current().is_none(),
         "the resumed cycle must start above the damaged row"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_blocked_on_a_settled_checkpoint_reports_damage_before_views_catch_up()
+-> eyre::Result<()> {
+    let store = PublishedStore::new()?;
+    store.flip_block_time_bit(DAMAGED_HEIGHT)?;
+    check_damage_during_replay(
+        &store,
+        damaged_without_a_pool(),
+        damaged_without_a_pool_record(&store),
+        "block time",
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sparse_replay_with_a_damaged_seed_reports_the_seed_height() -> eyre::Result<()> {
+    let store = PublishedStore::new()?;
+    store.flip_first_root_byte(DAMAGED_HEIGHT)?;
+    check_damage_during_replay(&store, damaged_row(), damaged_row_record(&store), "root").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_replay_reports_an_active_frontier_missing_from_its_predecessor() -> eyre::Result<()>
+{
+    let store = PublishedStore::new()?;
+    let (_directory, views) =
+        super::materialized_view_replay::view_store().map_err(|error| eyre::eyre!("{error}"))?;
+    // Stop a real replay after it persists height 200, then repair its next page.
+    store.flip_block_time_bit(300)?;
+    let tailer = store.replay_tailer(views.clone())?;
+    eyre::ensure!(matches!(
+        tailer.catch_up(),
+        Err(zinder_ingest::IngestError::CanonicalStore(_))
+    ));
+    drop(tailer);
+    eyre::ensure!(
+        views.last_materialized_height_ascending(
+            zinder_materialized_views::TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY
+        )? == Some(BlockHeight::new(DAMAGED_HEIGHT)),
+        "replay must resume above the damaged seed"
+    );
+    store.flip_block_time_bit(300)?;
+    rewrite_row(
+        &store.primary_path,
+        "tree_state_checkpoint",
+        DAMAGED_HEIGHT,
+        |row| {
+            // Keep the stored block time and replace all frontiers with an empty presence bitmap.
+            row.truncate(4);
+            row.push(0);
+            Ok(())
+        },
+    )?;
+    let resumed = store.replay_tailer(views)?;
+    check_damage_with_tailer(
+        &store,
+        resumed,
+        damaged_row(),
+        damaged_row_record(&store),
+        "pool activation/frontier mismatch",
+    )
+    .await
+}
+
+async fn check_damage_during_replay(
+    store: &PublishedStore,
+    expected: CanonicalStoreDamage,
+    expected_record: serde_json::Value,
+    reason: &str,
+) -> eyre::Result<()> {
+    let (_views_dir, views) =
+        super::materialized_view_replay::view_store().map_err(|error| eyre::eyre!("{error}"))?;
+    let tailer = store.replay_tailer(views)?;
+    check_damage_with_tailer(store, tailer, expected, expected_record, reason).await
+}
+
+async fn check_damage_with_tailer(
+    store: &PublishedStore,
+    tailer: MaterializedViewTailer,
+    expected: CanonicalStoreDamage,
+    expected_record: serde_json::Value,
+    reason: &str,
+) -> eyre::Result<()> {
+    let error = tailer
+        .catch_up()
+        .err()
+        .ok_or_else(|| eyre::eyre!("the malformed checkpoint must block replay"))?;
+    let error = eyre::Report::new(error);
+    eyre::ensure!(
+        error
+            .chain()
+            .any(|cause| cause.to_string().contains(reason)),
+        "unexpected replay error: {error:#}"
+    );
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    readiness.update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
+    let gate = HistoricalWorkGate::new(readiness);
+    let store_damage = CanonicalStoreDamageSignal::default();
+    let cancel = CancellationToken::new();
+    let mut disabled = store.verification_context(&gate, &store_damage)?;
+    disabled.config.enabled = false;
+    spawn_tree_state_verification_task(disabled, cancel.clone()).await?;
+    eyre::ensure!(store_damage.current().is_none() && !store.watermark_path().exists());
+    let verifier = store.spawn_pass(&gate, &store_damage, cancel.clone())?;
+    let replay = spawn_materialized_view_tailer_task(
+        tailer,
+        Duration::from_millis(50),
+        gate.clone(),
+        cancel.clone(),
+    );
+
+    let reported = tokio::time::timeout(Duration::from_secs(15), verifier).await;
+    cancel.cancel();
+    replay.await?;
+    reported.map_err(|_| {
+        eyre::eyre!("a stalled replay must trigger verification of its settled checkpoint")
+    })??;
+    eyre::ensure!(!gate.is_open());
+    eyre::ensure!(store_damage.current() == Some(expected));
+    eyre::ensure!(store.watermark()? == expected_record);
     Ok(())
 }
 
@@ -546,6 +671,31 @@ impl PublishedStore {
         })
     }
 
+    fn replay_tailer(
+        &self,
+        views: zinder_materialized_views::MaterializedViewStore,
+    ) -> eyre::Result<MaterializedViewTailer> {
+        let canonical = RocksDbCanonicalSecondary::open_ready(
+            &self.primary_path,
+            self.secondary_root.path().join("replay"),
+            &self.activations,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
+            CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        Ok(MaterializedViewTailer {
+            canonical: Arc::new(parking_lot::RwLock::new(canonical)),
+            materialized_view_store: views,
+            config: MaterializedViewReplayConfig::DEFAULT,
+            activations: Arc::new(self.activations.clone()),
+            reorg_window_blocks: TEST_REORG_WINDOW,
+            chain_event_retention_window: None,
+            cursor_at_risk_warning: Duration::from_hours(24),
+            prevout_caches: ReplayPrevoutCaches::default(),
+            volume_space_guard: None,
+        })
+    }
+
     fn spawn_pass(
         &self,
         gate: &HistoricalWorkGate,
@@ -553,23 +703,30 @@ impl PublishedStore {
         cancel: CancellationToken,
     ) -> eyre::Result<tokio::task::JoinHandle<()>> {
         Ok(spawn_tree_state_verification_task(
-            TreeStateVerificationContext {
-                canonical_primary_path: self.primary_path.clone(),
-                secondary_path: self.secondary_root.path().join("secondary"),
-                network_upgrade_activations: Arc::new(self.activations.clone()),
-                workload: CanonicalStoreWorkload::Wallet,
-                raw_blob_retention: RawBlobRetention::None,
-                reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
-                resource_budget: RocksDbResourceBudget::for_local_tests(),
-                gate: gate.clone(),
-                store_damage: store_damage.clone(),
-                config: TreeStateVerificationConfig {
-                    enabled: true,
-                    max_rows_per_second: std::num::NonZeroU32::MAX,
-                },
-            },
+            self.verification_context(gate, store_damage)?,
             cancel,
         ))
+    }
+
+    fn verification_context(
+        &self,
+        gate: &HistoricalWorkGate,
+        store_damage: &CanonicalStoreDamageSignal,
+    ) -> eyre::Result<TreeStateVerificationContext> {
+        Ok(TreeStateVerificationContext {
+            canonical_primary_path: self.primary_path.clone(),
+            secondary_path: self.secondary_root.path().join("secondary"),
+            network_upgrade_activations: Arc::new(self.activations.clone()),
+            raw_blob_retention: RawBlobRetention::None,
+            reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            gate: gate.clone(),
+            store_damage: store_damage.clone(),
+            config: TreeStateVerificationConfig {
+                enabled: true,
+                max_rows_per_second: std::num::NonZeroU32::MAX,
+            },
+        })
     }
 
     /// Runs the pass until it ends on its own, as it does once it finds or

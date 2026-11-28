@@ -6,7 +6,7 @@ use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -17,21 +17,21 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
     CommitmentTreeFrontier, CommitmentTreeFrontiers, FinalNoteCommitmentRoot,
     NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
-    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange, UnixTimestampMillis,
+    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootIndex, SubtreeRootRange, UnixTimestampMillis,
 };
 use zinder_ingest::{
-    CanonicalConstructionConfig, CanonicalPipelineLimits, CanonicalSourceLoadOutcome,
-    load_fresh_canonical_blocks,
+    CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalPipelineLimits,
+    CanonicalSourceLoadOutcome, load_fresh_canonical_blocks,
 };
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError, SourceSubtreeRoots,
 };
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalBlockLoadEvidence, CanonicalEventFence,
-    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, CanonicalSubtreeRootLoadEvidence, RawBlobRetention,
+    CanonicalBaselinePublication, CanonicalBlockLoadEvidence, CanonicalBuildSubtreeRoot,
+    CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
+    CanonicalStoreReadyEvidence, CanonicalSubtreeRootLoadEvidence, RawBlobRetention,
     RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 
@@ -39,6 +39,8 @@ use crate::{
     error::BenchError,
     fixture::{FixtureManifest, FixtureNodeSource, read_segment_blocks},
 };
+
+pub use crate::report::TreeStateCheckpointCoverage;
 
 /// Digest-bound checkpoint sidecar written beside a format-3 fixture manifest.
 pub const CANONICAL_FIXTURE_REPLAY_PLAN_FILE_NAME: &str = "canonical-replay-plan.json";
@@ -239,6 +241,10 @@ pub struct CanonicalFixtureRocksDbReplayConfig {
     pub supported_reorg_depth: u32,
     /// Optional fixed delay applied once per outer fixture segment response.
     pub source_segment_delay: Duration,
+    /// Tree-state checkpoint coverage persisted during canonical construction.
+    pub tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Optional threshold override for commitment-budget coverage.
+    pub tree_state_commitment_budget: Option<NonZeroU32>,
 }
 
 /// Exact load, publication, and cold-reopen evidence from canonical replay.
@@ -248,6 +254,14 @@ pub struct CanonicalFixtureRocksDbReplayOutcome {
     pub fixture_manifest_digest_sha256: String,
     /// Stable digest of the exact replay plan admitted before source work.
     pub replay_plan_digest_sha256: String,
+    /// Actual tree-state checkpoint coverage persisted during canonical construction.
+    pub tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Effective commitment threshold, when selected.
+    pub tree_state_commitment_budget: Option<NonZeroU32>,
+    /// Fresh builder open through trusted READY publication.
+    pub ready_duration: Duration,
+    /// Independent primary open through append-anchor authentication.
+    pub reopen_duration: Duration,
     /// Block-family evidence accepted by the real canonical loader.
     pub block_load_evidence: CanonicalBlockLoadEvidence,
     /// Exact completed-subtree evidence accepted by the canonical loader.
@@ -386,10 +400,12 @@ struct AdmittedCanonicalFixtureReplay {
     fixture_source: CanonicalFixtureNodeSource,
     source_tip_checkpoint: CommitmentTreeCheckpoint,
     builder: RocksDbCanonicalBuilder,
+    build_started: Instant,
 }
 
 #[derive(Clone, Copy)]
 struct PublishedCanonicalFixtureEvidence {
+    ready_duration: Duration,
     ready: CanonicalStoreReadyEvidence,
     event_fence: CanonicalEventFence,
 }
@@ -399,6 +415,7 @@ struct ReopenedCanonicalFixtureEvidence {
     ready: CanonicalStoreReadyEvidence,
     event_fence: CanonicalEventFence,
     replayed_block_count: u64,
+    reopen_duration: Duration,
 }
 
 struct CanonicalFixtureColdReopenExpectation<'a> {
@@ -460,12 +477,20 @@ fn admit_canonical_fixture_replay(
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.supported_reorg_depth)?,
     )?;
+    let selection = config
+        .tree_state_checkpoint_coverage
+        .resolve(config.tree_state_commitment_budget)?;
+    let build_started = Instant::now();
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &config.canonical_store_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         config.resource_budget,
     )?;
+    let builder = if let Some(selection) = selection {
+        builder.with_tree_state_checkpoint_selection(selection)?
+    } else {
+        builder
+    };
     Ok(AdmittedCanonicalFixtureReplay {
         manifest,
         fixture_manifest_digest_sha256,
@@ -474,6 +499,7 @@ fn admit_canonical_fixture_replay(
         fixture_source,
         source_tip_checkpoint,
         builder,
+        build_started,
     })
 }
 
@@ -496,6 +522,19 @@ fn authenticate_canonical_fixture_load(
         return Err(BenchError::fixture_format(
             "canonical fixture replay load tip differs from the admitted source checkpoint",
         ));
+    }
+    let (actual_coverage, _) = TreeStateCheckpointCoverage::from_selection(
+        canonical_load.builder.tree_state_checkpoint_selection(),
+    )?;
+    if !actual_coverage.checkpoint_count_matches(
+        canonical_load.block_evidence.first_height.value(),
+        canonical_load.block_evidence.tip_height.value(),
+        canonical_load.block_evidence.tree_state_checkpoint_count,
+    ) {
+        return Err(BenchError::fixture_format(format!(
+            "canonical fixture replay persisted {} tree-state checkpoints for {actual_coverage} coverage",
+            canonical_load.block_evidence.tree_state_checkpoint_count
+        )));
     }
     validate_block_load_evidence(&canonical_load.block_evidence, manifest)
 }
@@ -525,6 +564,7 @@ async fn derive_settled_tip(
 fn publish_canonical_fixture(
     builder: RocksDbCanonicalBuilder,
     settled_tip: BlockId,
+    build_started: Instant,
 ) -> Result<PublishedCanonicalFixtureEvidence, BenchError> {
     let validated = builder.prepare_trusted_fresh_publication()?;
     let prepared_publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
@@ -533,6 +573,7 @@ fn publish_canonical_fixture(
     ))?;
     let published_store = validated.publish_baseline(prepared_publication)?;
     Ok(PublishedCanonicalFixtureEvidence {
+        ready_duration: build_started.elapsed(),
         ready: published_store.ready_evidence(),
         event_fence: published_store.event_fence(),
     })
@@ -542,10 +583,10 @@ fn certify_reopened_canonical_fixture(
     config: &CanonicalFixtureRocksDbReplayConfig,
     expected: &CanonicalFixtureColdReopenExpectation<'_>,
 ) -> Result<ReopenedCanonicalFixtureEvidence, BenchError> {
+    let reopen_started = Instant::now();
     let reopened_store = RocksDbCanonicalStore::open_ready(
         &config.canonical_store_path,
         expected.activations,
-        CanonicalStoreWorkload::Wallet,
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.supported_reorg_depth)?,
         config.resource_budget,
@@ -575,6 +616,7 @@ fn certify_reopened_canonical_fixture(
             "canonical fixture replay cold-reopen append anchor differs from the derived settled tip",
         ));
     }
+    let reopen_duration = reopen_started.elapsed();
     let mut replayed_block_count = 0_u64;
     for replay in reopened_store.scan_canonical_replay()? {
         replay?;
@@ -594,6 +636,7 @@ fn certify_reopened_canonical_fixture(
         ready,
         event_fence,
         replayed_block_count,
+        reopen_duration,
     })
 }
 
@@ -659,9 +702,8 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
         },
     )
     .await?;
-    let mut builder = block_load.builder;
-    let subtree_root_evidence =
-        builder.load_complete_subtree_root_prefix(admitted.manifest.subtree_root_artifacts()?)?;
+    let (mut builder, block_load_evidence, subtree_root_evidence) =
+        load_authenticated_subtree_roots(block_load, &admitted.manifest)?;
     let fixed_tip = builder.build_plan().build_tip();
     let source_tip_checkpoint = tokio::time::timeout(
         config.request_timeout,
@@ -677,7 +719,7 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
     builder.confirm_source_tip_checkpoint(&source_tip_checkpoint)?;
     let canonical_load = CanonicalSourceLoadOutcome {
         builder,
-        block_evidence: block_load.evidence,
+        block_evidence: block_load_evidence,
         subtree_root_evidence,
     };
     authenticate_canonical_fixture_load(
@@ -685,6 +727,10 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
         &admitted.manifest,
         &admitted.source_tip_checkpoint,
     )?;
+    let (tree_state_checkpoint_coverage, tree_state_commitment_budget) =
+        TreeStateCheckpointCoverage::from_selection(
+            canonical_load.builder.tree_state_checkpoint_selection(),
+        )?;
     let block_load_evidence = canonical_load.block_evidence;
     let subtree_root_load_evidence = canonical_load.subtree_root_evidence;
     let settled_tip = derive_settled_tip(
@@ -693,7 +739,8 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
         config.supported_reorg_depth,
     )
     .await?;
-    let published = publish_canonical_fixture(canonical_load.builder, settled_tip)?;
+    let published =
+        publish_canonical_fixture(canonical_load.builder, settled_tip, admitted.build_started)?;
     let reopened = certify_reopened_canonical_fixture(
         &config,
         &CanonicalFixtureColdReopenExpectation {
@@ -711,6 +758,10 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
     Ok(CanonicalFixtureRocksDbReplayOutcome {
         fixture_manifest_digest_sha256: admitted.fixture_manifest_digest_sha256,
         replay_plan_digest_sha256: admitted.replay_plan_digest_sha256,
+        tree_state_checkpoint_coverage,
+        tree_state_commitment_budget,
+        ready_duration: published.ready_duration,
+        reopen_duration: reopened.reopen_duration,
         block_load_evidence,
         subtree_root_load_evidence,
         source_tip_checkpoint_authenticated: true,
@@ -720,6 +771,59 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
         published_ready_evidence: published.ready,
         reopened_ready_evidence: reopened.ready,
     })
+}
+
+/// Loads the fixture's complete subtree-root prefix after checking the roots
+/// the loaded blocks completed against it.
+fn load_authenticated_subtree_roots(
+    block_load: CanonicalBlockLoadOutcome,
+    manifest: &FixtureManifest,
+) -> Result<
+    (
+        RocksDbCanonicalBuilder,
+        CanonicalBlockLoadEvidence,
+        CanonicalSubtreeRootLoadEvidence,
+    ),
+    BenchError,
+> {
+    let CanonicalBlockLoadOutcome {
+        mut builder,
+        evidence,
+        derived_subtree_roots,
+    } = block_load;
+    let fixture_subtree_roots = manifest.subtree_root_artifacts()?;
+    authenticate_derived_subtree_roots(&derived_subtree_roots, &fixture_subtree_roots, &evidence)?;
+    let subtree_root_evidence = builder.load_complete_subtree_root_prefix(fixture_subtree_roots)?;
+    Ok((builder, evidence, subtree_root_evidence))
+}
+
+/// Requires the subtree roots derived from the loaded blocks' note commitments
+/// to be exactly the fixture's node-observed roots for the subtrees those
+/// blocks completed.
+fn authenticate_derived_subtree_roots(
+    derived: &[CanonicalBuildSubtreeRoot],
+    fixture: &[SubtreeRootArtifact],
+    block_load_evidence: &CanonicalBlockLoadEvidence,
+) -> Result<(), BenchError> {
+    let loaded_heights = block_load_evidence.first_height..=block_load_evidence.tip_height;
+    let completed_in_range = fixture
+        .iter()
+        .filter(|root| loaded_heights.contains(&root.completing_block_height))
+        .map(|root| CanonicalBuildSubtreeRoot {
+            protocol: root.protocol,
+            subtree_index: root.subtree_index,
+            root_hash: root.root_hash,
+            completing_block_height: root.completing_block_height,
+        })
+        .collect::<Vec<_>>();
+    if derived != completed_in_range.as_slice() {
+        return Err(BenchError::fixture_format(format!(
+            "canonical fixture replay derived {} subtree roots that differ from the {} roots the fixture's node reported for the loaded blocks",
+            derived.len(),
+            completed_in_range.len()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_block_load_evidence(

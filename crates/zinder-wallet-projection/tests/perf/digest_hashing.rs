@@ -3,10 +3,9 @@
 //! Creating or spending one output folds an unspent row, its by-address row,
 //! and a balance row into the wallet projection accumulator, and the output
 //! into the UTXO-set commitment. This benchmark reports nanoseconds per call
-//! for each of those folds on representative rows, together with the
-//! `blake2b_simd` batch degree the host detected. Timings depend on the host
-//! and the build profile, so it asserts nothing about them. Run it in release
-//! on an idle host:
+//! for each of those folds on representative rows. Timings depend on the host,
+//! the build profile, and the `ChaCha` backend the host selects, so it asserts
+//! nothing about them. Run it in release on an idle host:
 //!
 //! ```text
 //! cargo nextest run -p zinder-wallet-projection --profile=ci-perf \
@@ -78,12 +77,11 @@ fn row_hashing_reports_nanoseconds_per_call() -> Result<(), WalletProjectionCont
     )]
     {
         eprintln!(
-            "wallet_digest_hashing many_degree={} unspent_append_ns={unspent_append} \
+            "wallet_digest_hashing unspent_append_ns={unspent_append} \
              unspent_remove_ns={unspent_remove} by_address_append_ns={by_address_append} \
              by_address_remove_ns={by_address_remove} balance_append_ns={balance_append} \
              balance_remove_ns={balance_remove} utxo_commitment_insert_ns={utxo_insert} \
              (calls_per_round={CALLS_PER_ROUND} rounds={ROUNDS} median)",
-            blake2b_simd::many::degree(),
         );
     }
     Ok(())

@@ -1,0 +1,4 @@
+"zinder_schema_owner" "zinder_schema_owner_local_only"
+"zinder_writer" "zinder_writer_local_only"
+"zinder_reader" "zinder_reader_local_only"
+"zinder_admin" "zinder_admin_local_only"

@@ -11,6 +11,8 @@ mod builder;
 mod construction_manifest;
 mod control;
 mod displaced_archive;
+pub mod edge_snapshot;
+mod encoded_compact_range;
 mod event_lifecycle;
 #[cfg(test)]
 mod event_lifecycle_tests;
@@ -18,6 +20,8 @@ mod live_commit;
 mod live_replacement;
 #[cfg(test)]
 mod live_replacement_tests;
+pub(crate) mod live_tail;
+mod live_tail_cache;
 mod mempool_lifecycle;
 #[cfg(test)]
 mod mempool_lifecycle_tests;
@@ -31,7 +35,15 @@ mod secondary;
 #[cfg(test)]
 mod secondary_tests;
 mod served_tree_state;
+pub(crate) mod settled_segments;
+mod stored_set;
+#[cfg(test)]
+mod stored_set_tests;
+#[cfg(test)]
+mod stored_tree_state_roots_tests;
 mod subtree_load;
+#[cfg(test)]
+mod transaction_read_tests;
 mod tree_state_densification;
 #[cfg(test)]
 mod tree_state_densification_tests;
@@ -45,7 +57,7 @@ mod wallet_events;
 
 use std::{io, num::NonZeroU32, path::PathBuf};
 
-use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zinder_core::{
     ArtifactSchemaVersion, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
@@ -65,34 +77,54 @@ use zinder_testkit::process_crash::crash_point;
 const fn crash_point(_name: &str) {}
 
 pub use activation_schedule::{CanonicalActivationSchedule, InadmissibleActivationSchedule};
+pub use stored_set::{CanonicalStoreRequirements, CanonicalStoredData, CanonicalStoredSet};
+
+pub use block_load::ConstructionTreeStateCheckpointPolicy;
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
 pub use block_replay::{
-    CanonicalReplayRangeScan, CanonicalReplayScan, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
+    CanonicalReplayRangeScan, CanonicalReplayScan, CanonicalReplaySliceScan,
+    CanonicalReplaySliceSource, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
+    ObservedCanonicalReplaySequence,
 };
 pub use builder::RocksDbCanonicalBuilder;
 pub use construction_manifest::{
     CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CanonicalConstructionManifestBinding,
 };
-pub use displaced_archive::{DisplacedBlockCursor, DisplacedBlockPage};
+pub use displaced_archive::{
+    ArchivedDisplacedBlockSummary, DisplacedBlockCursor, DisplacedBlockPage,
+    DisplacedBlockSummaryPage, DisplacedFinalRootPage, DisplacedFinalRootSearch,
+    DisplacedRootCursor,
+};
+pub use encoded_compact_range::{
+    EncodedCompactBlockLink, EncodedCompactBlockOutput, EncodedCompactBlockPayload,
+    EncodedCompactBlockRange, EncodedCompactBlockRangeRequest,
+};
 pub use event_lifecycle::{
     CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind,
-    CanonicalEventRetentionReport, CanonicalRetainedEvent, ProjectionBuildAnchor,
+    CanonicalEventRetentionReport, CanonicalEventRetentionStepBudget,
+    CanonicalEventRetentionStepOutcome, CanonicalEventRetentionStepStop, CanonicalRetainedEvent,
+    DEFAULT_CANONICAL_EVENT_RETENTION_MAX_DELETED_EVENTS,
+    DEFAULT_CANONICAL_EVENT_RETENTION_MAX_INSPECTED_EVENTS, ProjectionBuildAnchor,
     ProjectionBuildLease, ProjectionBuildLeaseId,
 };
 pub use live_commit::{CanonicalAppendAnchor, CanonicalEventFence, CanonicalLiveAppend};
 pub use live_replacement::{CanonicalLiveReplacement, CanonicalReplacementBlock};
-pub use mempool_lifecycle::CanonicalMempoolSnapshotStart;
+pub use mempool_lifecycle::{
+    CanonicalMempoolEventStreamStart, CanonicalMempoolSnapshotStart, MempoolEventHeadSubscription,
+    MempoolEventReadCounts,
+};
 pub use publication::{
     CanonicalBaselinePublication, PreparedCanonicalBaselinePublication,
     ValidatedRocksDbCanonicalBuild,
 };
-pub use reader::HeightOrder;
+pub use reader::{HeightOrder, LocatedTransactionBlob};
 pub use rocksdb::RocksDbCanonicalStore;
 pub use rocksdb::{
     CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence, CanonicalReadyStoreSummary,
 };
 pub use secondary::{CanonicalSecondaryCatchupOutcome, RocksDbCanonicalSecondary};
 pub use served_tree_state::ServedTreeState;
+pub use settled_segments::DEFAULT_SETTLED_SEGMENT_BLOCKS;
 pub use subtree_load::{
     CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
 };
@@ -111,16 +143,12 @@ pub use tree_state_verification::{
 pub const CANONICAL_STORE_IDENTITY: &str = "canonical";
 /// Exact physical schema accepted by this canonical store implementation.
 ///
-/// Schema 2 adds the immutable reorg policy and authenticated settled-sequence
-/// checkpoint to the control record. Schema 3 adds the retention-floor and
-/// generation-bearing projection-build lease control records. Schema 4 makes
-/// every retained event carry its exact authenticated resulting fence. Schema 5
-/// binds a complete construction manifest into every READY control record.
-/// Schema 7 makes raw-blob retention an immutable construction and admission
-/// contract independent of the canonical workload.
-/// Earlier stores are refused and rebuilt; there is no compatibility decoder
-/// or migration path.
-pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 7;
+/// Schema 2 binds the initial activation schedule, effective reorg window, and
+/// construction manifest in the control record, persisting settled history in
+/// external segment files (`settled_segment_index`) and unsealed tail blocks in
+/// `live_tail_block` and `live_tail_raw_block`. Store admission requires this
+/// exact layout.
+pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 2;
 /// Durable artifact schema version written by this binary.
 ///
 /// The current artifact contract includes structured compact blocks and shared
@@ -128,7 +156,7 @@ pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 7;
 /// complete semantic replay envelopes and projection facts.
 /// Hash-shaped protobuf fields use RPC byte order as defined by
 /// [ADR-0002](../../../docs/adrs/0002-serialization-and-byte-order.md).
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(20);
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(1);
 /// Global block-height cadence for typed commitment-tree checkpoints.
 ///
 /// A checkpoint at least every 100 blocks keeps wallet rewind anchors within the
@@ -179,6 +207,9 @@ impl CanonicalReorgPolicy {
 /// where it is the network's height-zero block. The fixed tip prevents an
 /// exhausted or failed source stream from publishing a contiguous prefix as a
 /// complete build.
+///
+/// The builder applies the tree-state checkpoint policy to this range and
+/// records the selection in the construction manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalStoreBuildPlan {
     network: zinder_core::Network,
@@ -285,7 +316,7 @@ impl CanonicalStoreBuildPlan {
                 });
             }
         }
-        let first_available_height = self.history_bounds.first_available_height();
+        let first_available_height = self.first_retained_height();
         if self.build_tip.height.value() < first_available_height.value() {
             return Err(CanonicalStoreBuildPlanError::BuildTipPrecedesHistory {
                 build_tip: self.build_tip.height.value(),
@@ -333,6 +364,39 @@ impl CanonicalStoreBuildPlan {
         &self.history_predecessor
     }
 
+    /// Returns a 32-byte digest covering the full admitted predecessor
+    /// checkpoint (block identity, timestamp, and every shielded seed frontier).
+    #[must_use]
+    pub fn history_predecessor_digest(&self) -> [u8; 32] {
+        let checkpoint = &self.history_predecessor;
+        let mut digest = Sha256::new();
+        digest.update(b"zinder.canonical.history-predecessor.v1");
+        digest.update(checkpoint.block_id.height.value().to_le_bytes());
+        digest.update(checkpoint.block_id.hash.as_bytes());
+        digest.update(checkpoint.block_time_seconds.to_le_bytes());
+        for (tag, protocol) in [
+            (1_u8, ShieldedProtocol::Sapling),
+            (2_u8, ShieldedProtocol::Orchard),
+            (3_u8, ShieldedProtocol::Ironwood),
+        ] {
+            digest.update([tag]);
+            if let Some(frontier) = checkpoint.frontiers.get(protocol) {
+                digest.update([1]);
+                digest.update(frontier.tree_size().to_le_bytes());
+                digest.update(frontier.final_root().as_bytes());
+                digest.update(
+                    u64::try_from(frontier.final_state_bytes().len())
+                        .unwrap_or(u64::MAX)
+                        .to_le_bytes(),
+                );
+                digest.update(frontier.final_state_bytes());
+            } else {
+                digest.update([0]);
+            }
+        }
+        digest.finalize().into()
+    }
+
     /// Returns the exact source tip this build must reach.
     #[must_use]
     pub const fn build_tip(&self) -> BlockId {
@@ -346,6 +410,9 @@ pub enum CanonicalStoreBuildPlanError {
     /// Canonical replacement must retain at least one displaced block.
     #[error("canonical build reorg window must be greater than zero")]
     ZeroReorgWindowBlocks,
+    /// READY control has no admitted schedule binding.
+    #[error("READY control requires an activation schedule binding")]
+    MissingActivationScheduleBinding,
     /// A persisted reorg-policy revision must raise the construction window.
     #[error(
         "reorg policy revision {revised_window_blocks} does not raise the construction window {construction_window_blocks}"
@@ -476,6 +543,18 @@ pub(super) fn frontier_presence_mismatch(
     height: BlockHeight,
     frontiers: &CommitmentTreeFrontiers,
 ) -> Option<FrontierPresenceMismatch> {
+    pool_presence_mismatch(network_upgrade_activations, height, |protocol| {
+        frontiers.get(protocol).is_some()
+    })
+}
+
+/// Returns the first pool whose presence reported by `is_present` disagrees
+/// with its activation at `height`.
+pub(super) fn pool_presence_mismatch(
+    network_upgrade_activations: &NetworkUpgradeActivations,
+    height: BlockHeight,
+    is_present: impl Fn(ShieldedProtocol) -> bool,
+) -> Option<FrontierPresenceMismatch> {
     [
         ShieldedProtocol::Sapling,
         ShieldedProtocol::Orchard,
@@ -486,7 +565,7 @@ pub(super) fn frontier_presence_mismatch(
         let is_active = network_upgrade_activations
             .activation_height_by_name(protocol.activation_upgrade_name())
             .is_some_and(|activation_height| activation_height <= height);
-        let frontier_present = frontiers.get(protocol).is_some();
+        let frontier_present = is_present(protocol);
         (frontier_present != is_active).then_some(FrontierPresenceMismatch {
             protocol,
             frontier_present,
@@ -507,37 +586,6 @@ pub enum CanonicalStoreBuildError<SourceError> {
     /// Canonical storage construction failed.
     #[error(transparent)]
     Store(#[from] CanonicalStoreError),
-}
-
-/// Closed canonical data workload persisted before any data family is built.
-///
-/// Both workloads retain the semantic replay needed by projections. The
-/// selected workload fixes which optional explorer source artifacts must be
-/// complete. Raw block and transaction retention is an independent persisted
-/// [`RawBlobRetention`] contract.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CanonicalStoreWorkload {
-    /// Wallet APIs, including typed tree-state checkpoints and continuous
-    /// subtree roots.
-    ///
-    /// This workload omits per-block final roots, daily value-pool balances,
-    /// and other explorer-only source facts.
-    Wallet,
-    /// Wallet APIs plus per-block final roots, daily value-pool balances, and
-    /// other explorer-only source facts.
-    Explorer,
-}
-
-impl CanonicalStoreWorkload {
-    /// Returns the persisted configuration spelling.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Wallet => "wallet",
-            Self::Explorer => "explorer",
-        }
-    }
 }
 
 /// Durable construction state of a canonical store.
@@ -609,6 +657,8 @@ impl CanonicalSequenceCheckpoint {
 /// Validation evidence that makes a constructed canonical store visible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalStoreReadyEvidence {
+    /// Storage schema version admitted from canonical control.
+    pub schema_version: u16,
     /// First retained canonical block.
     pub first_retained_block: BlockId,
     /// Current visible canonical tip.
@@ -643,6 +693,19 @@ pub struct CanonicalStoreReadyEvidence {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CanonicalStoreError {
+    /// The caller cancelled a commitment-tree reconstruction.
+    #[error("tree-state replay cancelled")]
+    ReplayCancelled,
+
+    /// An admitted canonical artifact failed integrity or wire verification on read.
+    #[error("corrupt {family:?} artifact: {reason}")]
+    ArtifactCorrupt {
+        /// Corrupt artifact family.
+        family: crate::ArtifactFamily,
+        /// Exact integrity or wire failure reason.
+        reason: String,
+    },
+
     /// The supplied `RocksDB` resource budget violates a hard bound.
     #[error("invalid canonical store resource budget: {reason}")]
     InvalidResourceBudget {
@@ -710,23 +773,32 @@ pub enum CanonicalStoreError {
         reason: String,
     },
 
+    /// The admitted store lacks data or history required by a reader.
+    #[error(
+        "canonical store at {path:?} lacks required {kind:?} coverage (required from {required_from:?}, available from {available_from:?})"
+    )]
+    MissingStoredData {
+        /// Canonical primary path.
+        path: PathBuf,
+        /// Required block data.
+        kind: CanonicalStoredData,
+        /// Earliest height requested, if specified.
+        required_from: Option<BlockHeight>,
+        /// Earliest retained height, or `None` if the data is absent.
+        available_from: Option<BlockHeight>,
+    },
+
+    /// The admitted store omits completed subtree roots below its retained history.
+    #[error("canonical store at {path:?} lacks the required complete subtree-root prefix")]
+    IncompleteSubtreeRootPrefix {
+        /// Canonical primary path.
+        path: PathBuf,
+    },
+
     /// A serving store open encountered an unpublished BUILDING store.
     #[error("canonical store is not READY: {path:?}")]
     StoreNotReady {
         /// Exact store path that remains unpublished.
-        path: PathBuf,
-    },
-
-    /// A reader that adopts the writer-admitted network-upgrade schedule
-    /// opened a READY store whose writer has not admitted one yet.
-    ///
-    /// The canonical writer admits its first schedule revision when it opens
-    /// the store, so a reader retries until that admission is visible.
-    #[error(
-        "canonical store {path:?} has no writer-admitted network-upgrade schedule yet; the canonical writer admits one when it opens the store"
-    )]
-    NetworkUpgradeScheduleNotAdmitted {
-        /// Exact READY store path without an admitted schedule.
         path: PathBuf,
     },
 
@@ -745,6 +817,13 @@ pub enum CanonicalStoreError {
     BlockReplaySequenceInvalid {
         /// Exact sequence invariant that failed.
         reason: String,
+    },
+
+    /// The replay height has neither a settled segment nor a live-tail row.
+    #[error("canonical block replay at height {} is absent", .height.value())]
+    MissingLiveTailReplay {
+        /// Height whose live-tail replay row was absent.
+        height: BlockHeight,
     },
 
     /// A persisted canonical block replay row is malformed or mis-keyed.
@@ -1036,6 +1115,13 @@ pub enum CanonicalStoreError {
     /// A projection-build lease was used after its durable expiry.
     #[error("projection build lease has expired")]
     ProjectionBuildLeaseExpired,
+
+    /// A settled-segment or live-tail storage contract failed.
+    #[error("canonical settled-segment operation failed: {reason}")]
+    SettledSegment {
+        /// Exact invariant or I/O failure.
+        reason: String,
+    },
 }
 
 impl CanonicalStoreError {
@@ -1063,13 +1149,6 @@ impl CanonicalStoreError {
 
     fn block_replay_sequence(reason: impl Into<String>) -> Self {
         Self::BlockReplaySequenceInvalid {
-            reason: reason.into(),
-        }
-    }
-
-    fn block_replay_invalid(height: BlockHeight, reason: impl Into<String>) -> Self {
-        Self::BlockReplayInvalid {
-            height: height.value(),
             reason: reason.into(),
         }
     }
@@ -1206,7 +1285,7 @@ mod tests {
 
     #[test]
     fn reported_artifact_schema_version_is_stable() {
-        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 20);
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 1);
     }
 
     #[test]
@@ -1219,7 +1298,7 @@ mod tests {
             &activations,
             1_234,
             build_tip,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )?;
         assert_eq!(plan.network(), network);
@@ -1261,7 +1340,7 @@ mod tests {
             &NetworkUpgradeActivations::empty(Network::ZcashRegtest),
             0,
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )
         .err();
@@ -1288,7 +1367,7 @@ mod tests {
             &canopy_only_activations,
             0,
             build_tip,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )?;
 
@@ -1303,7 +1382,7 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(0), BlockHash::from_bytes([0; 32])),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )
         .err();
@@ -1328,7 +1407,7 @@ mod tests {
                 CommitmentTreeFrontiers::default(),
             ),
             BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )
         .err();
@@ -1348,7 +1427,7 @@ mod tests {
             &activations,
             CommitmentTreeCheckpoint::new(checkpoint, 1_234, checkpoint_frontiers.clone()),
             BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )?;
 
@@ -1367,7 +1446,7 @@ mod tests {
             network,
             network_upgrade_activations_fingerprint: activations
                 .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::All,
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             history_bounds: zinder_core::CanonicalHistoryBounds::complete(),
             history_predecessor: CommitmentTreeCheckpoint::new(
@@ -1401,7 +1480,7 @@ mod tests {
                 &activations,
                 CommitmentTreeCheckpoint::new(genesis, 0, CommitmentTreeFrontiers::default(),),
                 BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-                RawBlobRetention::Transactions,
+                RawBlobRetention::All,
                 CanonicalReorgPolicy::new(100)?,
             )
             .err(),
@@ -1414,7 +1493,7 @@ mod tests {
                 &activations,
                 CommitmentTreeCheckpoint::new(checkpoint, 0, CommitmentTreeFrontiers::default(),),
                 BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32])),
-                RawBlobRetention::Transactions,
+                RawBlobRetention::All,
                 CanonicalReorgPolicy::new(100)?,
             )
             .err(),

@@ -1,17 +1,25 @@
 //! gRPC implementation for the vendored lightwalletd protocol.
 
+pub(crate) mod light_wallet;
+
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashSet},
+    collections::{BinaryHeap, HashSet, binary_heap::PeekMut},
     num::{NonZeroU16, NonZeroU32},
     pin::Pin,
     time::{Duration, Instant},
 };
 
+use prost::Message as _;
 use thiserror::Error;
 use tokio_stream as stream;
 use tokio_stream::StreamExt as _;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, codec::CompressionEncoding};
+use tonic_types::{ErrorDetails, StatusExt as _};
 use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHeight, BlockSelector, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
@@ -21,36 +29,42 @@ use zinder_core::{
     SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentUnspentOutput, TxStatus,
     wire::{
-        decode_internal_transaction_id, encode_bip70_chain_name, encode_internal_transaction_id,
-        encode_rpc_block_hash_bytes, encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex,
+        decode_internal_transaction_id, decode_rpc_block_hash_bytes, encode_bip70_chain_name,
+        encode_internal_transaction_id, encode_rpc_block_hash_bytes, encode_rpc_block_hash_hex,
+        encode_rpc_transaction_id_hex,
     },
 };
-use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
+use zinder_proto::compat::lightwalletd::{self, EncodedBlock, compact_tx_streamer_server};
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    ArtifactKey, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, QueryError, SubtreeRoots,
-    TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
-    WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
+    ArtifactKey, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, PendingTransaction, QueryError,
+    StorageReadError, SubtreeRoots, TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransactionsInOrder,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
+    address_lookup_to_script_hash, status_from_query_error,
 };
-use zinder_runtime::RepeatedFieldGuard;
+use zinder_runtime::{RepeatedFieldGuard, RetryPushback};
 use zinder_source::{NodeCapability, SourceError};
 use zinder_source::{parse_transparent_address, transparent_address_matches_network};
-use zinder_store::{ArtifactFamily, MempoolEvent, RawBlobRetention};
+use zinder_store::{
+    ArtifactFamily, CompactBlockSpliceSelection, EncodedCompactBlockRangeRequest, MempoolEvent,
+    RawBlobRetention,
+};
 
 use crate::block_methods::{
-    self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
-    CompactBlockReads, RequestedBlock, requested_block, view_reaches,
+    BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView, CompactBlockReads,
+    EncodedChunkReadOutcome, RequestedBlock, TipCapture, requested_block, view_reaches,
 };
 use crate::compact_block_messages::CompactBlockShape;
 use crate::mempool::{
-    MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface,
-    SharedTipChangeWatcher, TipChangeWatcherError,
+    MempoolExclusions, MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup,
+    SharedMempoolSurface, SharedTipChangeWatcher, TipChangeWatcherError,
 };
 use crate::node_tip_witness::NodeTipWitness;
 use crate::ping::LightwalletdPing;
 use crate::request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;
 use crate::stale_tip::StaleTipLimit;
+use crate::tip_wait::TipWait;
 
 /// A server-streaming response of the `CompactTxStreamer` adapters.
 pub(crate) type GrpcStream<T> =
@@ -58,12 +72,11 @@ pub(crate) type GrpcStream<T> =
 
 /// Default number of subtree roots one native read returns while `GetSubtreeRoots` streams.
 pub const DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
-/// Default maximum transparent UTXOs one `GetAddressUtxos` response returns.
-///
-/// It equals Zebra's `getaddressutxos` result cap, which bounds lightwalletd
-/// on Zebra the same way.
+/// Default maximum transparent UTXOs in one compatibility response.
 pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 =
     NonZeroU32::MIN.saturating_add(99_999);
+/// Maximum encoded reply-list size, applied to both UTXO methods.
+const ADDRESS_UTXO_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Native per-request subtree-root cap expressed as a `NonZeroU32`.
 const MAX_SUBTREE_ROOT_PAGE_SIZE: NonZeroU32 =
     NonZeroU32::MIN.saturating_add(MAX_SUBTREE_ROOTS_PER_REQUEST - 1);
@@ -81,8 +94,6 @@ const ADDRESS_UTXO_STREAM_CHANNEL_CAPACITY: usize = 64;
 const ADDRESS_UTXO_FIRST_PAGE_BUDGET: usize = 8 * 1_024;
 /// Fewest outputs the first page of one address's UTXO stream reads.
 const ADDRESS_UTXO_MIN_FIRST_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.saturating_add(15);
-/// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
-pub(crate) const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
 /// Most distinct transactions one `GetMempoolStream` sends between tip changes.
 ///
 /// The stream remembers each id it sent so it can skip repeats, and that set
@@ -90,6 +101,12 @@ pub(crate) const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
 /// stalled tip from growing it without limit; it is far above what a Zcash
 /// mempool turns over in one block interval.
 const MAX_MEMPOOL_STREAM_TRANSACTIONS: usize = 100_000;
+/// Outbound `RawTransaction` messages one `GetMempoolStream` task buffers ahead
+/// of its gRPC transport before backpressuring its upstream subscription.
+const MEMPOOL_STREAM_CHANNEL_CAPACITY: usize = 16;
+/// Entries a mempool snapshot walk buffers ahead of its consumer before
+/// backpressuring the next snapshot page read.
+const MEMPOOL_SNAPSHOT_ENTRY_CHANNEL_CAPACITY: usize = 16;
 
 /// Response bounds for [`LightwalletdGrpcAdapter`].
 ///
@@ -108,10 +125,9 @@ pub struct LightwalletdResponseLimits {
     /// Most UTXOs one `GetAddressUtxos` or `GetAddressUtxosStream` response
     /// returns.
     ///
-    /// `maxEntries = 0` means every matching UTXO, as in lightwalletd. A
-    /// request that would return more than this bound fails with
-    /// `RESOURCE_EXHAUSTED` instead of dropping rows, so a wallet never sums
-    /// a partial UTXO set as its balance.
+    /// With a positive `maxEntries`, a page omits a subsequent height that
+    /// would exceed the bound. If the first height or an unpaginated response
+    /// exceeds the bound, the call fails with `RESOURCE_EXHAUSTED`.
     pub max_address_utxos: NonZeroU32,
 }
 
@@ -127,9 +143,9 @@ impl Default for LightwalletdResponseLimits {
 /// Structural failure while composing the compatibility transparent-address claim.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum LightwalletdAdmissionError {
-    /// The admitted canonical store does not retain transaction bytes.
+    /// The admitted query has neither retained transaction bytes nor a verified node byte source.
     #[error(
-        "lightwalletd transparent compatibility requires transaction retention, but the admitted canonical store retains {retention}"
+        "lightwalletd wallet compatibility requires retained transaction bytes or a verified node byte source; admitted retention is {retention}"
     )]
     TransactionRetentionUnavailable {
         /// Retention authenticated by the admitted canonical serving pair.
@@ -163,7 +179,7 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             .field("mempool_surface", &self.mempool_surface.is_some())
             .field("tip_change_watcher", &self.tip_change_watcher.is_some())
             .field("ping_enabled", &self.ping.is_enabled())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -249,6 +265,22 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         self
     }
 
+    /// Lets a block read that names a height just past the visible tip wait
+    /// briefly for that height instead of failing at once.
+    ///
+    /// Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`,
+    /// `GetBlockRangeNullifiers`, the encoded range methods, and, where this
+    /// adapter serves it, `GetTreeState`, when they select by height. In
+    /// light-wallet serving, it also bounds the wait when forwarded UTXO and
+    /// transparent balance reads observe a node tip ahead of the served tip.
+    /// The adapter defaults to [`TipWait::disabled`]; the
+    /// `zinder-compat-lightwalletd` binary sets the configured wait.
+    #[must_use]
+    pub fn with_tip_wait(mut self, tip_wait: TipWait) -> Self {
+        self.block_methods = self.block_methods.with_tip_wait(tip_wait);
+        self
+    }
+
     /// Wires a mempool read surface into the adapter.
     #[must_use]
     pub fn with_mempool_surface(mut self, mempool_surface: SharedMempoolSurface) -> Self {
@@ -274,10 +306,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         self
     }
 
-    /// Wraps this adapter in the generated tonic server type, behind the
-    /// pre-decode bounds of [`COMPACT_TX_STREAMER_FIELD_LIMITS`].
-    #[must_use]
-    pub fn into_server(
+    fn into_field_guarded_server(
         self,
     ) -> RepeatedFieldGuard<compact_tx_streamer_server::CompactTxStreamerServer<Self>>
     where
@@ -285,9 +314,28 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     {
         RepeatedFieldGuard::new(
             compact_tx_streamer_server::CompactTxStreamerServer::new(self)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .send_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Zstd)
                 .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES),
             COMPACT_TX_STREAMER_FIELD_LIMITS,
         )
+        .with_request_compression()
+    }
+}
+
+impl<QueryApi> LightwalletdGrpcAdapter<QueryApi>
+where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    /// Wraps this adapter in the generated tonic server type, behind the
+    /// pre-decode bounds of [`COMPACT_TX_STREAMER_FIELD_LIMITS`].
+    #[must_use]
+    pub fn into_server(
+        self,
+    ) -> RepeatedFieldGuard<compact_tx_streamer_server::CompactTxStreamerServer<Self>> {
+        self.into_field_guarded_server()
     }
 }
 
@@ -296,7 +344,7 @@ where
     Broadcaster: zinder_source::TransactionBroadcaster + Clone,
 {
     /// Creates a compatibility adapter from an admitted canonical and wallet
-    /// serving pair with retained transaction bytes.
+    /// serving pair with retained transaction bytes or a verified node byte source.
     ///
     /// The resulting `taddrSupport` claim is fixed for this process. Later
     /// serving-pair lag or node outage is represented by the runtime readiness
@@ -305,7 +353,9 @@ where
         query_api: WalletServingQuery<Broadcaster>,
     ) -> Result<Self, LightwalletdAdmissionError> {
         let raw_blob_retention = query_api.admitted_raw_blob_retention();
-        if !raw_blob_retention.retains_transaction_blobs() {
+        if !raw_blob_retention.retains_transaction_blobs()
+            && !query_api.has_verified_cold_tx_source()
+        {
             return Err(
                 LightwalletdAdmissionError::TransactionRetentionUnavailable {
                     retention: raw_blob_retention,
@@ -319,205 +369,7 @@ where
     }
 }
 
-/// Wallet serving reads through its query at the serving pair the query
-/// captures.
-///
-/// A view is the chain epoch of the visible tip, and every read of a view is
-/// pinned to it, except the read of a later block-range chunk, which reads
-/// unpinned at the pair current when it runs.
-impl<QueryApi> CompactBlockReads for QueryApi
-where
-    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
-{
-    type View = ChainEpoch;
-
-    async fn capture_view(&self) -> Result<ChainEpoch, Status> {
-        self.visible_tip_block(None)
-            .await
-            .map(|visible_tip_block| visible_tip_block.chain_epoch)
-            .map_err(|error| status_from_query_error(&error))
-    }
-
-    fn view_chain_epoch(view: &ChainEpoch) -> ChainEpoch {
-        *view
-    }
-
-    async fn view_activations(
-        &self,
-        _view: &ChainEpoch,
-    ) -> Result<NetworkUpgradeActivations, Status> {
-        self.network_upgrade_activations()
-            .await
-            .map_err(|error| status_from_query_error(&error))
-    }
-
-    async fn tip_block_time(&self, view: &ChainEpoch) -> Result<i64, Status> {
-        self.block_header_by_selector(
-            BlockSelector::Height(view.visible_tip_height),
-            Some(view.id),
-        )
-        .await
-        .map(|tip_header| tip_header.block_header.block_time)
-        .map_err(|error| status_from_query_error(&error))
-    }
-
-    async fn read_compact_block(
-        &self,
-        view: &ChainEpoch,
-        block: RequestedBlock,
-    ) -> Result<CompactBlockArtifact, Status> {
-        let height = resolve_block_height(self, view, block).await?;
-        self.compact_block_at(height, Some(view.id))
-            .await
-            .map(|compact_block| compact_block.compact_block)
-            .map_err(|error| status_from_query_error(&error))
-    }
-
-    async fn read_compact_block_chunk<Output, Convert>(
-        &self,
-        read: ChunkRead<ChainEpoch>,
-        convert: Convert,
-    ) -> ChunkReadOutcome<Output>
-    where
-        Output: Send + 'static,
-        Convert: FnOnce(ChainEpoch, Vec<CompactBlockArtifact>) -> Output + Send + 'static,
-    {
-        let at_epoch_id = match read.view {
-            ChunkView::Captured(view) => Some(view.id),
-            ChunkView::Current => {
-                let view = match self.capture_view().await {
-                    Ok(view) => view,
-                    Err(status) => {
-                        return ChunkReadOutcome::unread(ChunkReadFailure::Failed(status));
-                    }
-                };
-                if !view_reaches(&view, read.chunk) {
-                    return ChunkReadOutcome::unread(ChunkReadFailure::TipBelowChunk(view));
-                }
-                // The read is unpinned, so it answers at the pair current
-                // when it runs.
-                None
-            }
-        };
-        let started_at = Instant::now();
-        let compact_block_range = self
-            .compact_blocks_in_range_up_to(read.chunk, read.order, read.max_bytes, at_epoch_id)
-            .await;
-        // The read stage ends when the query returns, so it leaves out the
-        // conversion's wait for a blocking thread.
-        let read_duration = Some(started_at.elapsed());
-        let compact_block_range = match compact_block_range {
-            Ok(compact_block_range) => compact_block_range,
-            Err(error) => {
-                return ChunkReadOutcome {
-                    read_duration,
-                    converted: Err(ChunkReadFailure::Failed(status_from_query_error(&error))),
-                };
-            }
-        };
-        // The query hands the blocks back on this task, so the conversion
-        // moves to the blocking pool, inside the caller's span.
-        let span = tracing::Span::current();
-        let converted = tokio::task::spawn_blocking(move || {
-            span.in_scope(|| {
-                convert(
-                    compact_block_range.chain_epoch,
-                    compact_block_range.compact_blocks,
-                )
-            })
-        })
-        .await
-        .map_err(|error| {
-            ChunkReadFailure::Failed(status_from_query_error(&QueryError::BlockingTaskFailed {
-                reason: error.to_string(),
-            }))
-        });
-        ChunkReadOutcome {
-            read_duration,
-            converted,
-        }
-    }
-}
-
-/// Resolves `block` to a height at `view`, which a hash takes one read for.
-async fn resolve_block_height<QueryApi>(
-    query_api: &QueryApi,
-    view: &ChainEpoch,
-    block: RequestedBlock,
-) -> Result<BlockHeight, Status>
-where
-    QueryApi: WalletQueryApi + Sync,
-{
-    match block {
-        RequestedBlock::Height(height) => Ok(height),
-        RequestedBlock::Hash(block_hash) => query_api
-            .block_id_by_selector(BlockSelector::Hash(block_hash), Some(view.id))
-            .await
-            .map(|resolved| resolved.block_id.height)
-            .map_err(|error| status_from_query_error(&error)),
-    }
-}
-
-impl<QueryApi> LightwalletdGrpcAdapter<QueryApi>
-where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
-{
-    /// Opens the merge of every requested address's unspent outputs at the
-    /// visible chain epoch, and reads the first output of each, so a request
-    /// that cannot be served fails before any row is sent.
-    ///
-    /// Each distinct address is read once and its rows are sent once, however
-    /// often the request lists it, as lightwalletd drops a repeated address
-    /// before it queries the node.
-    async fn address_utxo_merge(
-        &self,
-        request: lightwalletd::GetAddressUtxosArg,
-    ) -> Result<AddressUtxoMerge, Status> {
-        let response_limit = u32_to_usize(self.response_limits.max_address_utxos.get());
-        let max_entries =
-            NonZeroU32::new(request.max_entries).map(|max_entries| u32_to_usize(max_entries.get()));
-        let mut merge = AddressUtxoMerge::new(max_entries, response_limit);
-        if request.addresses.is_empty() {
-            return Ok(merge);
-        }
-
-        let start_height = u32::try_from(request.start_height)
-            .map_err(|_| Status::invalid_argument("startHeight exceeds u32"))?;
-        let visible_tip_block = self
-            .query_api
-            .visible_tip_block(None)
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
-        let mut seen_addresses = HashSet::new();
-        let distinct_addresses = request
-            .addresses
-            .into_iter()
-            .filter(|address| seen_addresses.insert(address.clone()))
-            .map(|address| {
-                transparent_address_unspent_outputs_request(
-                    &address,
-                    visible_tip_block.chain_epoch.network,
-                    BlockHeight::new(start_height),
-                )
-                .map(|query_request| (address, query_request))
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-        let first_page_size = address_utxo_first_page_size(distinct_addresses.len(), max_entries);
-        for (address, query_request) in distinct_addresses {
-            let outputs = self
-                .query_api
-                .transparent_address_unspent_outputs_on_demand(
-                    query_request,
-                    first_page_size,
-                    Some(visible_tip_block.chain_epoch.id),
-                )
-                .await
-                .map_err(|error| status_from_query_error(&error))?;
-            merge.add_address(address, outputs).await?;
-        }
-        Ok(merge)
-    }
-
+impl<QueryApi: Sync> LightwalletdGrpcAdapter<QueryApi> {
     /// Answers a `GetTransaction` whose canonical read missed from the live
     /// mempool, as lightwalletd does through Zebra's `getrawtransaction`.
     ///
@@ -564,6 +416,444 @@ where
         }
     }
 
+    async fn mempool_transactions(
+        &self,
+        request: Request<lightwalletd::GetMempoolTxRequest>,
+    ) -> Result<Response<GrpcStream<lightwalletd::CompactTx>>, Status> {
+        let request = request.into_inner();
+        let exclusions = MempoolExclusions::from_suffixes(request.exclude_txid_suffixes)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let shape = CompactBlockShape::for_mempool(&request.pool_types)?;
+        let mempool_surface = self
+            .mempool_surface
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?
+            .clone();
+        let first_page = mempool_surface
+            .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
+            .await
+            .map_err(status_from_mempool_surface_error)?;
+        if exclusions.is_empty() {
+            return Ok(Response::new(stream_mempool_compact_transactions(
+                mempool_surface,
+                first_page,
+                shape,
+            )));
+        }
+        buffered_mempool_transactions(mempool_surface, first_page, shape, exclusions)
+            .await
+            .map(Response::new)
+    }
+
+    async fn mempool_stream(
+        &self,
+    ) -> Result<Response<GrpcStream<lightwalletd::RawTransaction>>, Status> {
+        let mempool_surface = self
+            .mempool_surface
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?
+            .clone();
+        // Deliver the current mempool contents from the snapshot walk, then
+        // continue with events strictly after the walk's resume anchor. The
+        // anchor hands off at-least-once: a transaction admitted mid-walk may
+        // appear both in a later page and as an event, and an evicted
+        // transaction may be added again. lightwalletd sends each txid once
+        // per block interval, so the stream drops txids it already sent.
+        let first_page = mempool_surface
+            .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
+            .await
+            .map_err(status_from_mempool_surface_error)?;
+        let snapshot_chain_epoch_id = first_page.chain_epoch_id;
+        let event_stream = mempool_surface
+            .mempool_events(first_page.events_resume_cursor.clone())
+            .await
+            .map_err(status_from_mempool_surface_error)?;
+        let entry_stream = mempool_snapshot_entries(mempool_surface, first_page).chain(
+            stream::StreamExt::filter_map(event_stream, added_mempool_entry),
+        );
+        let raw_transaction_stream = each_once_up_to(
+            entry_stream,
+            zinder_core::MempoolEntry::transaction_id,
+            MAX_MEMPOOL_STREAM_TRANSACTIONS,
+        )
+        .map(|entry_outcome| entry_outcome.map(|entry| mempool_raw_transaction(&entry)));
+
+        let bounded_stream: GrpcStream<lightwalletd::RawTransaction> =
+            if let Some(watcher) = self.tip_change_watcher.clone() {
+                Box::pin(close_mempool_stream_on_tip_change(
+                    raw_transaction_stream,
+                    watcher,
+                    snapshot_chain_epoch_id,
+                ))
+            } else {
+                Box::pin(raw_transaction_stream)
+            };
+        Ok(Response::new(bounded_stream))
+    }
+}
+
+/// Wallet serving reads through its query at the serving pair the query
+/// captures.
+///
+/// A view is the chain epoch of the visible tip, and every read of a view is
+/// pinned to it, except the read of a later block-range chunk, which reads
+/// unpinned at the pair current when it runs.
+impl<QueryApi> CompactBlockReads for QueryApi
+where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    type View = ChainEpoch;
+
+    fn subscribe_publications(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        WalletQueryApi::subscribe_publications(self)
+    }
+
+    async fn peek_visible_tip_height(&self) -> Result<zinder_core::BlockHeight, Status> {
+        match self.current_visible_tip_height() {
+            Some(height) => Ok(height),
+            None => self
+                .capture_view()
+                .await
+                .map(|view| view.visible_tip_height),
+        }
+    }
+
+    async fn capture_ephemeral_view(&self) -> Result<ChainEpoch, Status> {
+        match self.current_chain_epoch() {
+            Some(chain_epoch) => Ok(chain_epoch),
+            None => self.capture_view().await,
+        }
+    }
+
+    async fn capture_view(&self) -> Result<ChainEpoch, Status> {
+        self.visible_tip_block(None)
+            .await
+            .map(|visible_tip_block| visible_tip_block.chain_epoch)
+            .map_err(|error| status_from_query_error(&error))
+    }
+
+    async fn capture_tip(&self) -> Result<TipCapture<ChainEpoch>, Status> {
+        self.served_tip_snapshot()
+            .await
+            .map(|snapshot| TipCapture {
+                view: snapshot.chain_epoch,
+                block_time_unix_seconds: Some(snapshot.block_time_unix_seconds),
+            })
+            .map_err(|error| status_from_query_error(&error))
+    }
+
+    fn view_chain_epoch(view: &ChainEpoch) -> ChainEpoch {
+        *view
+    }
+
+    async fn view_activations(
+        &self,
+        _view: &ChainEpoch,
+    ) -> Result<NetworkUpgradeActivations, Status> {
+        self.network_upgrade_activations()
+            .await
+            .map_err(|error| status_from_query_error(&error))
+    }
+
+    async fn tip_block_time(&self, view: &ChainEpoch) -> Result<i64, Status> {
+        self.block_header_by_selector(
+            BlockSelector::Height(view.visible_tip_height),
+            Some(view.id),
+        )
+        .await
+        .map(|tip_header| tip_header.block_header.block_time)
+        .map_err(|error| status_from_query_error(&error))
+    }
+
+    async fn read_compact_block(
+        &self,
+        view: &ChainEpoch,
+        block: RequestedBlock,
+    ) -> Result<CompactBlockArtifact, Status> {
+        let height = resolve_block_height(self, view, block)
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        self.compact_block_at(height, Some(view.id))
+            .await
+            .map(|compact_block| compact_block.compact_block)
+            .map_err(|error| status_from_query_error(&error))
+    }
+
+    async fn read_encoded_compact_block(
+        &self,
+        view: &ChainEpoch,
+        block: RequestedBlock,
+        selection: CompactBlockSpliceSelection,
+    ) -> Result<Option<EncodedBlock>, Status> {
+        let height = resolve_block_height(self, view, block)
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        self.encoded_compact_block_at(height, selection, Some(view.id))
+            .await
+            .map(|encoded| encoded.map(|response| response.compact_block))
+            .map_err(|error| status_from_query_error(&error))
+    }
+
+    async fn read_encoded_compact_block_chunk(
+        &self,
+        view: ChunkView<Self::View>,
+        request: EncodedCompactBlockRangeRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> EncodedChunkReadOutcome<Self::View> {
+        if cancel.load(Ordering::Acquire) {
+            return EncodedChunkReadOutcome::Failed {
+                read_duration: None,
+                failure: ChunkReadFailure::Failed(Status::cancelled(
+                    "block-range stream cancelled",
+                )),
+            };
+        }
+        let (read_at, at_epoch_id, fallback_view) = match view {
+            ChunkView::Captured(epoch) => (epoch, Some(epoch.id), ChunkView::Captured(epoch)),
+            ChunkView::Current => {
+                let epoch = match self.capture_ephemeral_view().await {
+                    Ok(epoch) => epoch,
+                    Err(status) => {
+                        return EncodedChunkReadOutcome::Failed {
+                            read_duration: None,
+                            failure: ChunkReadFailure::Failed(status),
+                        };
+                    }
+                };
+                if !view_reaches(&epoch, request.range) {
+                    return EncodedChunkReadOutcome::Failed {
+                        read_duration: None,
+                        failure: ChunkReadFailure::TipBelowChunk(epoch),
+                    };
+                }
+                (epoch, None, ChunkView::Current)
+            }
+        };
+        let started_at = Instant::now();
+        let outcome = self
+            .encoded_compact_block_range_up_to(request, at_epoch_id, Some(Arc::clone(&cancel)))
+            .await;
+        let read_duration = started_at.elapsed();
+        match outcome {
+            Ok(Some(range)) => {
+                if cancel.load(Ordering::Acquire) {
+                    EncodedChunkReadOutcome::Failed {
+                        read_duration: Some(read_duration),
+                        failure: ChunkReadFailure::Failed(Status::cancelled(
+                            "block-range stream cancelled",
+                        )),
+                    }
+                } else {
+                    EncodedChunkReadOutcome::Direct {
+                        read_at,
+                        range,
+                        read_duration,
+                    }
+                }
+            }
+            Ok(None) => EncodedChunkReadOutcome::Fallback(fallback_view),
+            Err(error) => {
+                let status = if matches!(
+                    error,
+                    QueryError::CanonicalStore(StorageReadError::Cancelled)
+                ) {
+                    Status::cancelled("block-range stream cancelled")
+                } else {
+                    status_from_query_error(&error)
+                };
+                EncodedChunkReadOutcome::Failed {
+                    read_duration: Some(read_duration),
+                    failure: ChunkReadFailure::Failed(status),
+                }
+            }
+        }
+    }
+
+    async fn read_compact_block_chunk<Output, Convert>(
+        &self,
+        read: ChunkRead<ChainEpoch>,
+        convert: Convert,
+    ) -> ChunkReadOutcome<Output>
+    where
+        Output: Send + 'static,
+        Convert: FnOnce(ChainEpoch, Vec<CompactBlockArtifact>) -> Output + Send + 'static,
+    {
+        if read.cancel.is_cancelled() {
+            return ChunkReadOutcome::unread(ChunkReadFailure::Failed(Status::cancelled(
+                "block-range stream cancelled",
+            )));
+        }
+        let at_epoch_id = match read.view {
+            ChunkView::Captured(view) => Some(view.id),
+            ChunkView::Current => {
+                let view = match self.capture_ephemeral_view().await {
+                    Ok(view) => view,
+                    Err(status) => {
+                        return ChunkReadOutcome::unread(ChunkReadFailure::Failed(status));
+                    }
+                };
+                if !view_reaches(&view, read.chunk) {
+                    return ChunkReadOutcome::unread(ChunkReadFailure::TipBelowChunk(view));
+                }
+                // The read is unpinned, so it answers at the pair current
+                // when it runs.
+                None
+            }
+        };
+        let started_at = Instant::now();
+        let compact_block_range = self
+            .compact_blocks_in_range_up_to(read.chunk, read.order, read.max_bytes, at_epoch_id)
+            .await;
+        // The read stage ends when the query returns, so it leaves out the
+        // conversion's wait for a blocking thread.
+        let read_duration = Some(started_at.elapsed());
+        let compact_block_range = match compact_block_range {
+            Ok(compact_block_range) => compact_block_range,
+            Err(error) => {
+                return ChunkReadOutcome {
+                    read_duration,
+                    converted: Err(ChunkReadFailure::Failed(status_from_query_error(&error))),
+                };
+            }
+        };
+        let cancel = read.cancel;
+        if cancel.is_cancelled() {
+            return ChunkReadOutcome {
+                read_duration,
+                converted: Err(ChunkReadFailure::Failed(Status::cancelled(
+                    "block-range stream cancelled",
+                ))),
+            };
+        }
+        // The query hands the blocks back on this task, so the conversion
+        // moves to the blocking pool, inside the caller's span.
+        let span = tracing::Span::current();
+        let converted = tokio::task::spawn_blocking(move || {
+            if cancel.is_cancelled() {
+                return Err(ChunkReadFailure::Failed(Status::cancelled(
+                    "block-range stream cancelled",
+                )));
+            }
+            span.in_scope(|| {
+                Ok(convert(
+                    compact_block_range.chain_epoch,
+                    compact_block_range.compact_blocks,
+                ))
+            })
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(ChunkReadFailure::Failed(status_from_query_error(
+                &QueryError::BlockingTaskFailed {
+                    reason: error.to_string(),
+                },
+            )))
+        });
+        ChunkReadOutcome {
+            read_duration,
+            converted,
+        }
+    }
+}
+
+/// Resolves `block` to a height at `view`, which a hash takes one read for.
+async fn resolve_block_height<QueryApi>(
+    query_api: &QueryApi,
+    view: &ChainEpoch,
+    block: RequestedBlock,
+) -> Result<BlockHeight, QueryError>
+where
+    QueryApi: WalletQueryApi + Sync,
+{
+    match block {
+        RequestedBlock::Height(height) => Ok(height),
+        RequestedBlock::Hash(block_hash) => query_api
+            .block_id_by_selector(BlockSelector::Hash(block_hash), Some(view.id))
+            .await
+            .map(|resolved| resolved.block_id.height),
+    }
+}
+
+fn reject_genesis_tree_state(
+    block: RequestedBlock,
+    network: zinder_core::Network,
+) -> Result<(), Status> {
+    if block == RequestedBlock::Hash(network.genesis_hash()) {
+        return Err(pre_sapling_tree_state());
+    }
+    Ok(())
+}
+
+fn tree_state_block_lookup_status(error: &QueryError) -> Status {
+    if matches!(error, QueryError::BlockNotInBestChain) {
+        return Status::invalid_argument("block hash is not in the best chain");
+    }
+    status_from_query_error(error)
+}
+
+impl<QueryApi> LightwalletdGrpcAdapter<QueryApi>
+where
+    QueryApi: WalletQueryApi + Send + Sync + 'static,
+{
+    /// Opens the merge of every requested address's unspent outputs at the
+    /// visible chain epoch, and reads the first output of each, so a request
+    /// that cannot be served fails before any row is sent.
+    ///
+    /// Each distinct address is read once and its rows are sent once, however
+    /// often the request lists it, as lightwalletd drops a repeated address
+    /// before it queries the node.
+    async fn address_utxo_merge(
+        &self,
+        request: lightwalletd::GetAddressUtxosArg,
+    ) -> Result<AddressUtxoMerge, Status> {
+        let response_limit = u32_to_usize(self.response_limits.max_address_utxos.get());
+        let max_entries =
+            NonZeroU32::new(request.max_entries).map(|max_entries| u32_to_usize(max_entries.get()));
+        let mut merge = AddressUtxoMerge::new(max_entries, response_limit);
+        if request.addresses.is_empty() {
+            return Ok(merge);
+        }
+
+        let start_height = u32::try_from(request.start_height)
+            .map_err(|_| Status::invalid_argument("startHeight exceeds u32"))?;
+        let visible_tip_block = self
+            .query_api
+            .visible_tip_block(None)
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        let mut seen_addresses = HashSet::new();
+        let distinct_addresses = request
+            .addresses
+            .into_iter()
+            .filter(|address| seen_addresses.insert(address.clone()))
+            .map(|address| {
+                transparent_address_unspent_outputs_request(
+                    &address,
+                    visible_tip_block.chain_epoch.network,
+                    BlockHeight::new(start_height),
+                )
+                .map(|query_request| (address, query_request))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let first_page_size = address_utxo_first_page_size(
+            distinct_addresses.len(),
+            max_entries.map(|target| target.min(response_limit)),
+        );
+        for (address, query_request) in distinct_addresses {
+            let outputs = self
+                .query_api
+                .transparent_address_unspent_outputs_on_demand(
+                    query_request,
+                    first_page_size,
+                    Some(visible_tip_block.chain_epoch.id),
+                )
+                .await
+                .map_err(|error| status_from_query_error(&error))?;
+            merge.add_address(address, outputs).await?;
+        }
+        Ok(merge)
+    }
+
     /// Starts reading the mined history `filter` selects at the visible
     /// chain epoch, and reads its first page, so a request that cannot be
     /// served fails before any transaction is sent.
@@ -603,7 +893,7 @@ where
         script_hashes: Vec<TransparentAddressScriptHash>,
     ) -> Result<Response<lightwalletd::Balance>, Status> {
         if script_hashes.is_empty() {
-            return Err(Status::invalid_argument("addresses list must not be empty"));
+            return Err(Status::invalid_argument(EMPTY_BALANCE_ADDRESSES));
         }
         let visible_tip_block = self.compat_visible_tip_block().await?;
         let balance = self
@@ -621,7 +911,46 @@ where
             .await
             .map_err(|error| status_from_query_error(&error))
     }
+
+    async fn tree_state_hex_for_height(
+        &self,
+        height: BlockHeight,
+    ) -> Result<zinder_query::ServedTreeStateHex, Status>
+    where
+        QueryApi: Clone,
+    {
+        self.block_methods
+            .await_tip(&self.query_api, "get_tree_state", height)
+            .await?;
+        let view = self.query_api.capture_ephemeral_view().await?;
+        reject_future_tree_state_height(height, view.visible_tip_height)?;
+        match self.query_api.tree_state_hex_at(height, None).await {
+            Ok(tree_state) => Ok(tree_state),
+            Err(QueryError::BlockNotInBestChain) => {
+                if self
+                    .query_api
+                    .canonical_history_bounds()
+                    .and_then(zinder_core::CanonicalHistoryBounds::preceding_checkpoint)
+                    .is_some_and(|checkpoint| height < checkpoint.height)
+                {
+                    return Err(tree_state_status(&QueryError::BlockNotInBestChain));
+                }
+                let latest_view = self.query_api.capture_ephemeral_view().await?;
+                reject_future_tree_state_height(height, latest_view.visible_tip_height)?;
+                let pinned_view = self.query_api.capture_view().await?;
+                reject_future_tree_state_height(height, pinned_view.visible_tip_height)?;
+                self.query_api
+                    .tree_state_hex_at(height, Some(pinned_view.id))
+                    .await
+                    .map_err(|error| tree_state_status(&error))
+            }
+            Err(error) => Err(tree_state_status(&error)),
+        }
+    }
 }
+
+const EMPTY_BALANCE_ADDRESSES: &str = "addresses list must not be empty";
+const UNRECEIVABLE_ADDRESS: &str = "transparent address does not produce a receivable script";
 
 /// The distinct script hashes of one balance request, in request order.
 ///
@@ -680,10 +1009,154 @@ fn lightwalletd_balance_value_zat(
 }
 
 #[tonic::async_trait]
+impl<QueryApi> lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<QueryApi>
+where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    async fn get_encoded_block_range(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.query_api, "get_encoded_block_range", &request)
+            .await?;
+        self.block_methods
+            .encoded_block_range(&self.query_api, &request, CompactBlockShape::for_range)
+            .await
+            .map(Response::new)
+    }
+
+    fn supports_encoded_frames(&self) -> bool {
+        true
+    }
+
+    async fn get_encoded_block_range_frames(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockFrameStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.query_api, "get_encoded_block_range", &request)
+            .await?;
+        self.block_methods
+            .encoded_block_range_frames(&self.query_api, &request, CompactBlockShape::for_range)
+            .await
+            .map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
+impl<QueryApi> lightwalletd::EncodedBlockRangeNullifiers for LightwalletdGrpcAdapter<QueryApi>
+where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    async fn get_encoded_block_range_nullifiers(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(
+                &self.query_api,
+                "get_encoded_block_range_nullifiers",
+                &request,
+            )
+            .await?;
+        self.block_methods
+            .encoded_block_range(
+                &self.query_api,
+                &request,
+                CompactBlockShape::for_nullifier_range,
+            )
+            .await
+            .map(Response::new)
+    }
+
+    fn supports_encoded_frames(&self) -> bool {
+        true
+    }
+
+    async fn get_encoded_block_range_nullifier_frames(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockFrameStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(
+                &self.query_api,
+                "get_encoded_block_range_nullifiers",
+                &request,
+            )
+            .await?;
+        self.block_methods
+            .encoded_block_range_frames(
+                &self.query_api,
+                &request,
+                CompactBlockShape::for_nullifier_range,
+            )
+            .await
+            .map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
+impl<QueryApi> lightwalletd::EncodedUnaryBlocks for LightwalletdGrpcAdapter<QueryApi>
+where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    async fn get_encoded_block(
+        &self,
+        request: Request<lightwalletd::BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status> {
+        self.block_methods
+            .unary_block(
+                &self.query_api,
+                "get_block",
+                request.get_ref(),
+                CompactBlockShape::FULL_BLOCK,
+            )
+            .await?
+            .into_encoded()
+            .map(Response::new)
+    }
+
+    async fn get_encoded_block_nullifiers(
+        &self,
+        request: Request<lightwalletd::BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status> {
+        self.block_methods
+            .unary_block(
+                &self.query_api,
+                "get_block_nullifiers",
+                request.get_ref(),
+                CompactBlockShape::BLOCK_NULLIFIERS,
+            )
+            .await?
+            .into_encoded()
+            .map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
 impl<QueryApi> compact_tx_streamer_server::CompactTxStreamer for LightwalletdGrpcAdapter<QueryApi>
 where
     QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
+    fn encoded_unary_blocks(&self) -> Option<&dyn lightwalletd::EncodedUnaryBlocks> {
+        Some(self)
+    }
+
+    fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
+        Some(self)
+    }
+
+    fn encoded_block_range_nullifiers(
+        &self,
+    ) -> Option<&dyn lightwalletd::EncodedBlockRangeNullifiers> {
+        Some(self)
+    }
+
     async fn get_latest_block(
         &self,
         _request: Request<lightwalletd::ChainSpec>,
@@ -698,26 +1171,32 @@ where
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        block_methods::compact_block(
-            &self.query_api,
-            &request.into_inner(),
-            CompactBlockShape::FULL_BLOCK,
-        )
-        .await
-        .map(Response::new)
+        self.block_methods
+            .unary_block(
+                &self.query_api,
+                "get_block",
+                request.get_ref(),
+                CompactBlockShape::FULL_BLOCK,
+            )
+            .await?
+            .into_message()
+            .map(Response::new)
     }
 
     async fn get_block_nullifiers(
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        block_methods::compact_block(
-            &self.query_api,
-            &request.into_inner(),
-            CompactBlockShape::NULLIFIERS,
-        )
-        .await
-        .map(Response::new)
+        self.block_methods
+            .unary_block(
+                &self.query_api,
+                "get_block_nullifiers",
+                request.get_ref(),
+                CompactBlockShape::BLOCK_NULLIFIERS,
+            )
+            .await?
+            .into_message()
+            .map(Response::new)
     }
 
     type GetBlockRangeStream = GrpcStream<lightwalletd::CompactBlock>;
@@ -727,9 +1206,11 @@ where
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
         let request = request.into_inner();
-        let shape = CompactBlockShape::for_range(&request.pool_types)?;
         self.block_methods
-            .block_range(&self.query_api, &request, shape)
+            .await_range_tip(&self.query_api, "get_block_range", &request)
+            .await?;
+        self.block_methods
+            .block_range(&self.query_api, &request, CompactBlockShape::for_range)
             .await
             .map(Response::new)
     }
@@ -741,9 +1222,15 @@ where
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeNullifiersStream>, Status> {
         let request = request.into_inner();
-        let shape = CompactBlockShape::for_nullifier_range(&request.pool_types)?;
         self.block_methods
-            .block_range(&self.query_api, &request, shape)
+            .await_range_tip(&self.query_api, "get_block_range_nullifiers", &request)
+            .await?;
+        self.block_methods
+            .block_range(
+                &self.query_api,
+                &request,
+                CompactBlockShape::for_nullifier_range,
+            )
             .await
             .map(Response::new)
     }
@@ -781,9 +1268,16 @@ where
             Err(error @ QueryError::CanonicalHistoryUnavailable { .. }) => {
                 CanonicalTransactionMiss::BelowHistoryFloor(status_from_query_error(&error))
             }
-            Err(error) => return Err(status_from_query_error(&error)),
+            Err(error) => return Err(forwarded_read_status(&error)),
         };
 
+        // A store without transaction bodies verifies its forwarding node
+        // against the captured tip before the mempool answers or an absence
+        // is reported.
+        self.query_api
+            .verify_forwarding_node(Some(at_epoch_id))
+            .await
+            .map_err(|error| forwarded_read_status(&error))?;
         self.pending_transaction(transaction_id, canonical_miss)
             .await
             .map(Response::new)
@@ -811,10 +1305,7 @@ where
         request: Request<lightwalletd::TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTxidsStream>, Status> {
         let history = self.transparent_history(&request.into_inner()).await?;
-        Ok(Response::new(spawn_response_stream(
-            history,
-            TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY,
-        )))
+        Ok(Response::new(history.into_stream()))
     }
 
     type GetTaddressTransactionsStream = GrpcStream<lightwalletd::RawTransaction>;
@@ -824,10 +1315,7 @@ where
         request: Request<lightwalletd::TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTransactionsStream>, Status> {
         let history = self.transparent_history(&request.into_inner()).await?;
-        Ok(Response::new(spawn_response_stream(
-            history,
-            TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY,
-        )))
+        Ok(Response::new(history.into_stream()))
     }
 
     async fn get_taddress_balance(
@@ -866,53 +1354,7 @@ where
         &self,
         request: Request<lightwalletd::GetMempoolTxRequest>,
     ) -> Result<Response<Self::GetMempoolTxStream>, Status> {
-        let request = request.into_inner();
-        validate_excluded_txid_suffixes(&request.exclude_txid_suffixes)?;
-        let shape = CompactBlockShape::for_mempool(&request.pool_types)?;
-        let exclude_txid_suffixes = request.exclude_txid_suffixes;
-        let mempool_surface = self
-            .mempool_surface
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?
-            .clone();
-        let first_page = mempool_surface
-            .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
-            .await
-            .map_err(status_from_mempool_surface_error)?;
-        let mut entries = mempool_snapshot_entries(mempool_surface, first_page);
-        let mut exclude_suffix_match_counts = vec![0_usize; exclude_txid_suffixes.len()];
-        let mut compact_messages = Vec::new();
-        while let Some(entry_outcome) = entries.next().await {
-            let entry = entry_outcome?.into_parts();
-            let Some(compact_message) = shape.encode_transaction(CompactTransaction {
-                index: 0,
-                transaction_id: entry.transaction_id,
-                data: entry.compact_transaction_data,
-            })?
-            else {
-                continue;
-            };
-            for (exclude_suffix, match_count) in exclude_txid_suffixes
-                .iter()
-                .zip(&mut exclude_suffix_match_counts)
-            {
-                if !exclude_suffix.is_empty() && compact_message.txid.ends_with(exclude_suffix) {
-                    *match_count = match_count.saturating_add(1);
-                }
-            }
-            compact_messages.push(compact_message);
-        }
-        let filtered_messages = compact_messages
-            .into_iter()
-            .filter_map(move |compact_message| {
-                (!transaction_id_is_uniquely_excluded(
-                    &compact_message.txid,
-                    &exclude_txid_suffixes,
-                    &exclude_suffix_match_counts,
-                ))
-                .then_some(Ok(compact_message))
-            });
-        Ok(Response::new(Box::pin(stream::iter(filtered_messages))))
+        self.mempool_transactions(request).await
     }
 
     type GetMempoolStreamStream = GrpcStream<lightwalletd::RawTransaction>;
@@ -921,64 +1363,31 @@ where
         &self,
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<Self::GetMempoolStreamStream>, Status> {
-        let mempool_surface = self
-            .mempool_surface
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("mempool surface is not configured"))?
-            .clone();
-        // Deliver the current mempool contents from the snapshot walk, then
-        // continue with events strictly after the walk's resume anchor. The
-        // anchor hands off at-least-once: a transaction admitted mid-walk may
-        // appear both in a later page and as an event, and an evicted
-        // transaction may be added again. lightwalletd sends each txid once
-        // per block interval, so the stream drops txids it already sent.
-        let first_page = mempool_surface
-            .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
-            .await
-            .map_err(status_from_mempool_surface_error)?;
-        let snapshot_chain_epoch_id = first_page.chain_epoch_id;
-        let event_stream = mempool_surface
-            .mempool_events(first_page.events_resume_cursor.clone())
-            .await
-            .map_err(status_from_mempool_surface_error)?;
-        let entry_stream = mempool_snapshot_entries(mempool_surface, first_page).chain(
-            stream::StreamExt::filter_map(event_stream, added_mempool_entry),
-        );
-        let raw_transaction_stream = each_once_up_to(
-            entry_stream,
-            zinder_core::MempoolEntry::transaction_id,
-            MAX_MEMPOOL_STREAM_TRANSACTIONS,
-        )
-        .map(|entry_outcome| entry_outcome.map(|entry| mempool_raw_transaction(&entry)));
-
-        let bounded_stream: GrpcStream<lightwalletd::RawTransaction> =
-            if let Some(watcher) = self.tip_change_watcher.clone() {
-                Box::pin(close_mempool_stream_on_tip_change(
-                    raw_transaction_stream,
-                    watcher,
-                    snapshot_chain_epoch_id,
-                ))
-            } else {
-                Box::pin(raw_transaction_stream)
-            };
-        Ok(Response::new(bounded_stream))
+        self.mempool_stream().await
     }
 
     async fn get_tree_state(
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
-        let block = requested_block(&request.into_inner())?;
-        let view = self.query_api.capture_view().await?;
-        let height = resolve_block_height(&self.query_api, &view, block).await?;
-        reject_future_tree_state_height(height, view.visible_tip_height)?;
-        let tree_state = self
-            .query_api
-            .tree_state_at(height, Some(view.id))
-            .await
-            .map_err(|error| tree_state_status(&error))?;
+        let block = requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)?;
+        let tree_state = match block {
+            RequestedBlock::Height(height) => self.tree_state_hex_for_height(height).await?,
+            RequestedBlock::Hash(_) => {
+                let view = self.query_api.capture_view().await?;
+                reject_genesis_tree_state(block, view.network)?;
+                let height = resolve_block_height(&self.query_api, &view, block)
+                    .await
+                    .map_err(|error| tree_state_block_lookup_status(&error))?;
+                reject_future_tree_state_height(height, view.visible_tip_height)?;
+                self.query_api
+                    .tree_state_hex_at(height, Some(view.id))
+                    .await
+                    .map_err(|error| tree_state_status(&error))?
+            }
+        };
 
-        Ok(Response::new(lightwalletd_tree_state(&tree_state)))
+        lightwalletd_tree_state_from_hex(tree_state).map(Response::new)
     }
 
     async fn get_latest_tree_state(
@@ -987,11 +1396,11 @@ where
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let tree_state = self
             .query_api
-            .latest_tree_state_checkpoint(None)
+            .latest_tree_state_checkpoint_hex(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
-        Ok(Response::new(lightwalletd_tree_state(&tree_state)))
+        lightwalletd_tree_state_from_hex(tree_state).map(Response::new)
     }
 
     type GetSubtreeRootsStream = GrpcStream<lightwalletd::SubtreeRoot>;
@@ -1000,7 +1409,7 @@ where
         &self,
         request: Request<lightwalletd::GetSubtreeRootsArg>,
     ) -> Result<Response<Self::GetSubtreeRootsStream>, Status> {
-        let at_epoch_id = self.query_api.capture_view().await?.id;
+        let epoch = self.query_api.capture_view().await?;
         let request = request.into_inner();
         let protocol = shielded_protocol_from_request(request.shielded_protocol)?;
         let source = SubtreeRootsStream::start(
@@ -1008,7 +1417,7 @@ where
             protocol,
             &request,
             self.response_limits.max_subtree_roots,
-            at_epoch_id,
+            epoch,
         )
         .await?;
 
@@ -1059,26 +1468,7 @@ where
         &self,
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<lightwalletd::StandardFee>, Status> {
-        match self.query_api.standard_fee().await {
-            Ok(fee) => Ok(Response::new(lightwalletd::StandardFee {
-                fee_zat: fee.fee_zat(),
-                estimator_version: fee.estimator_version(),
-            })),
-            Err(QueryError::Node(
-                SourceError::NodeCapabilityMissing {
-                    capability: NodeCapability::StandardFee,
-                }
-                | SourceError::TransactionBroadcastDisabled,
-            )) => Err(Status::unimplemented(
-                "GetStandardFee is not implemented: no configured node implements the getstandardfee RPC",
-            )),
-            Err(QueryError::Node(error @ SourceError::SourceProtocolMismatch { .. })) => {
-                Err(Status::internal(format!(
-                    "GetStandardFee: the node's getstandardfee reply is unusable: {error}"
-                )))
-            }
-            Err(error) => Err(status_from_query_error(&error)),
-        }
+        standard_fee_response(self.query_api.standard_fee().await)
     }
 
     async fn ping(
@@ -1137,19 +1527,66 @@ fn spawn_response_stream<Source: ResponseSource>(
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(queued_messages))
 }
 
-/// One transparent address's mined transactions at one chain epoch, read a
-/// page of history entries at a time and one transaction at a time.
+/// One transparent address's mined transactions at one chain epoch.
+///
+/// Pages of history entries are read one at a time, with up to
+/// [`TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY`] transaction reads in flight
+/// or buffered ahead of the client.
 struct TransparentHistory<QueryApi> {
     query_api: QueryApi,
     request: TransparentAddressTxIdsInRangeRequest,
     at_epoch_id: ChainEpochId,
-    page: std::vec::IntoIter<TransparentAddressTxIndexArtifact>,
+    transactions: TransactionsInOrder,
     has_later_pages: bool,
+}
+
+type HistoryPermit = tokio::sync::mpsc::OwnedPermit<Result<lightwalletd::RawTransaction, Status>>;
+
+struct HistoryPipeline {
+    in_flight: futures_util::stream::FuturesOrdered<PendingHistoryRow>,
+    refill: Option<zinder_query::CanonicalRefill>,
+    permits: Vec<HistoryPermit>,
+}
+
+struct PendingHistoryRow {
+    permit: Option<HistoryPermit>,
+    pending: PendingTransaction,
+}
+
+impl PendingHistoryRow {
+    const fn new(permit: HistoryPermit, pending: PendingTransaction) -> Self {
+        Self {
+            permit: Some(permit),
+            pending,
+        }
+    }
+}
+
+impl Future for PendingHistoryRow {
+    type Output = (HistoryPermit, Result<lightwalletd::RawTransaction, Status>);
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let std::task::Poll::Ready(outcome) = Pin::new(&mut self.pending).poll(cx) else {
+            return std::task::Poll::Pending;
+        };
+        let message = outcome
+            .map_err(|error| forwarded_read_status(&error))
+            .and_then(|response| {
+                raw_transaction_from_mined(mined_transaction_from_status(response.status)?)
+            });
+        let Some(permit) = self.permit.take() else {
+            return std::task::Poll::Pending;
+        };
+        std::task::Poll::Ready((permit, message))
+    }
 }
 
 impl<QueryApi> TransparentHistory<QueryApi>
 where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
     async fn start(
         query_api: QueryApi,
@@ -1160,7 +1597,7 @@ where
             query_api,
             request,
             at_epoch_id,
-            page: Vec::new().into_iter(),
+            transactions: TransactionsInOrder::empty(),
             has_later_pages: true,
         };
         history.read_page().await?;
@@ -1173,44 +1610,193 @@ where
             .transparent_address_tx_ids_in_range(self.request.clone(), Some(self.at_epoch_id))
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        self.page = response.artifacts.into_iter();
         self.has_later_pages = response.next_cursor.is_some();
         self.request.from_cursor = response.next_cursor;
+        if response.artifacts.is_empty() {
+            self.transactions = TransactionsInOrder::empty();
+            return Ok(());
+        }
+        let transaction_ids: Vec<TransactionId> = response
+            .artifacts
+            .into_iter()
+            .map(|artifact: TransparentAddressTxIndexArtifact| artifact.transaction_id)
+            .collect();
+        self.transactions = self
+            .query_api
+            .transactions_in_order(transaction_ids, Some(self.at_epoch_id))
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
         Ok(())
     }
 
-    async fn read_transaction(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Result<lightwalletd::RawTransaction, Status> {
-        let response = self
-            .query_api
-            .transaction(transaction_id, Some(self.at_epoch_id))
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
-        raw_transaction_from_mined(mined_transaction_from_status(response.status)?)
+    fn into_stream(mut self) -> GrpcStream<lightwalletd::RawTransaction> {
+        if !self.transactions.has_remaining() && !self.has_later_pages {
+            return Box::pin(stream::empty());
+        }
+        let (messages, queued_messages) =
+            tokio::sync::mpsc::channel(TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            self.stream_into(messages).await;
+        });
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(queued_messages))
+    }
+
+    async fn stream_into(
+        &mut self,
+        messages: tokio::sync::mpsc::Sender<Result<lightwalletd::RawTransaction, Status>>,
+    ) {
+        let mut pipeline = HistoryPipeline {
+            in_flight: futures_util::stream::FuturesOrdered::new(),
+            refill: None,
+            permits: Vec::with_capacity(TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY),
+        };
+        loop {
+            let window_cap = self.max_window();
+            self.fill_window(&messages, window_cap, &mut pipeline);
+            if pipeline.in_flight.is_empty()
+                && pipeline.refill.is_none()
+                && !self.transactions.has_remaining()
+            {
+                if !self.has_later_pages {
+                    return;
+                }
+                if !self.advance_page(&messages, &mut pipeline.permits).await {
+                    return;
+                }
+                continue;
+            }
+            let need_permit = pipeline.in_flight.len() + pipeline.permits.len() < window_cap
+                && pipeline.permits.is_empty()
+                && (self.transactions.can_take_ready()
+                    || (pipeline.refill.is_none() && self.transactions.needs_refill()));
+            tokio::select! {
+                biased;
+                () = messages.closed() => return,
+                completed = pipeline.in_flight.next(), if !pipeline.in_flight.is_empty() => {
+                    if let Some((permit, message)) = completed {
+                        let is_terminal = message.is_err();
+                        permit.send(message);
+                        if is_terminal {
+                            return;
+                        }
+                    }
+                }
+                completed_refill = poll_optional_refill(&mut pipeline.refill), if pipeline.refill.is_some() => {
+                    self.transactions.apply_refill(completed_refill);
+                }
+                reserved = messages.clone().reserve_owned(), if need_permit => {
+                    let Ok(permit) = reserved else {
+                        return;
+                    };
+                    pipeline.permits.push(permit);
+                }
+            }
+        }
+    }
+
+    fn max_window(&self) -> usize {
+        if !self.transactions.has_remaining() {
+            return 0;
+        }
+        self.transactions
+            .max_in_flight()
+            .clamp(1, TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY)
+    }
+
+    fn fill_window(
+        &mut self,
+        messages: &tokio::sync::mpsc::Sender<Result<lightwalletd::RawTransaction, Status>>,
+        window_cap: usize,
+        pipeline: &mut HistoryPipeline,
+    ) {
+        while pipeline.in_flight.len() < window_cap && self.transactions.has_remaining() {
+            while pipeline.in_flight.len() + pipeline.permits.len() < window_cap {
+                let Ok(permit) = messages.clone().try_reserve_owned() else {
+                    break;
+                };
+                pipeline.permits.push(permit);
+            }
+            if pipeline.permits.is_empty() {
+                break;
+            }
+            let ready = self.transactions.take_ready(pipeline.permits.len());
+            if !ready.is_empty() {
+                let started = ready.len();
+                for (permit, pending) in pipeline.permits.drain(..started).zip(ready) {
+                    pipeline
+                        .in_flight
+                        .push_back(PendingHistoryRow::new(permit, pending));
+                }
+                continue;
+            }
+            if pipeline.refill.is_none() && self.transactions.needs_refill() {
+                pipeline.refill = self.transactions.start_refill(pipeline.permits.len());
+            }
+            break;
+        }
+        if !self.transactions.has_remaining() {
+            pipeline.permits.truncate(usize::from(self.has_later_pages));
+        }
+    }
+
+    async fn advance_page(
+        &mut self,
+        messages: &tokio::sync::mpsc::Sender<Result<lightwalletd::RawTransaction, Status>>,
+        permits: &mut Vec<HistoryPermit>,
+    ) -> bool {
+        let permit = if let Some(permit) = permits.pop() {
+            permit
+        } else {
+            let Ok(permit) = messages.clone().reserve_owned().await else {
+                return false;
+            };
+            permit
+        };
+        let page_outcome = tokio::select! {
+            biased;
+            () = messages.closed() => return false,
+            outcome = self.read_page() => outcome,
+        };
+        match page_outcome {
+            Ok(()) => {
+                permits.push(permit);
+                true
+            }
+            Err(status) => {
+                self.has_later_pages = false;
+                permit.send(Err(status));
+                false
+            }
+        }
     }
 }
 
-impl<QueryApi> ResponseSource for TransparentHistory<QueryApi>
-where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
-{
-    type Message = lightwalletd::RawTransaction;
+async fn poll_optional_refill(
+    refill: &mut Option<zinder_query::CanonicalRefill>,
+) -> zinder_query::CompletedCanonicalRefill {
+    let Some(active) = refill.as_mut() else {
+        return std::future::pending().await;
+    };
+    let completed = active.await;
+    *refill = None;
+    completed
+}
 
-    async fn next(&mut self) -> Option<Result<Self::Message, Status>> {
-        loop {
-            if let Some(artifact) = self.page.next() {
-                return Some(self.read_transaction(artifact.transaction_id).await);
-            }
-            if !self.has_later_pages {
-                return None;
-            }
-            if let Err(status) = self.read_page().await {
-                self.has_later_pages = false;
-                return Some(Err(status));
-            }
-        }
+trait SubtreeRootReads: Send + Sync + 'static {
+    fn read_subtree_roots(
+        &self,
+        range: SubtreeRootRange,
+        epoch: ChainEpoch,
+    ) -> impl Future<Output = Result<SubtreeRoots, QueryError>> + Send;
+}
+
+impl<Query: WalletQueryApi> SubtreeRootReads for Query {
+    async fn read_subtree_roots(
+        &self,
+        range: SubtreeRootRange,
+        epoch: ChainEpoch,
+    ) -> Result<SubtreeRoots, QueryError> {
+        self.subtree_roots(range, Some(epoch.id)).await
     }
 }
 
@@ -1222,7 +1808,7 @@ where
 struct SubtreeRootsStream<QueryApi> {
     query_api: QueryApi,
     protocol: ShieldedProtocol,
-    at_epoch_id: ChainEpochId,
+    epoch: ChainEpoch,
     /// Index of the next root to read, or `None` once the stream is complete.
     next_index: Option<u32>,
     /// Roots still to return. `maxEntries = 0` ("all") starts at `u32::MAX`,
@@ -1234,19 +1820,19 @@ struct SubtreeRootsStream<QueryApi> {
 
 impl<QueryApi> SubtreeRootsStream<QueryApi>
 where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
+    QueryApi: SubtreeRootReads,
 {
     async fn start(
         query_api: QueryApi,
         protocol: ShieldedProtocol,
         request: &lightwalletd::GetSubtreeRootsArg,
         page_limit: NonZeroU32,
-        at_epoch_id: ChainEpochId,
+        epoch: ChainEpoch,
     ) -> Result<Self, Status> {
         let mut stream = Self {
             query_api,
             protocol,
-            at_epoch_id,
+            epoch,
             next_index: Some(request.start_index),
             remaining: if request.max_entries == 0 {
                 u32::MAX
@@ -1270,13 +1856,13 @@ where
         let page_entries = remaining.min(self.page_limit);
         let subtree_roots = self
             .query_api
-            .subtree_roots(
+            .read_subtree_roots(
                 SubtreeRootRange::new(
                     self.protocol,
                     SubtreeRootIndex::new(start_index),
                     page_entries,
                 ),
-                Some(self.at_epoch_id),
+                self.epoch,
             )
             .await
             .map_err(|error| subtree_roots_status(&error))?;
@@ -1302,7 +1888,7 @@ where
 
 impl<QueryApi> ResponseSource for SubtreeRootsStream<QueryApi>
 where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
+    QueryApi: SubtreeRootReads,
 {
     type Message = lightwalletd::SubtreeRoot;
 
@@ -1321,8 +1907,7 @@ where
 }
 
 /// The first page size of every address stream of a UTXO request that lists
-/// `distinct_addresses` distinct addresses and returns at most `max_entries`
-/// rows.
+/// `distinct_addresses` distinct addresses and targets `max_entries` rows.
 ///
 /// Each address gets an even share of [`ADDRESS_UTXO_FIRST_PAGE_BUDGET`],
 /// capped at the 1,024-output page and at `max_entries`, but never fewer than
@@ -1343,28 +1928,16 @@ fn address_utxo_first_page_size(
         )
 }
 
-/// The unspent outputs of several addresses, merged into the order of one
-/// lightwalletd UTXO response: height, txid, output index, then address.
+/// An epoch-bound merge of on-demand address streams.
 ///
-/// Each address's stream is already in that order for its own outputs, so
-/// the merge holds only the next output of each address. The streams read
-/// on demand at the one chain epoch the request resolved, starting at the
-/// first page [`address_utxo_first_page_size`] chooses. A later page holds at
-/// most the outputs the merge has taken from that address plus one first
-/// page, and every output the merge takes is sent as one row. So the outputs
-/// read stay within about twice the rows sent, plus 2 outputs and one first
-/// page for each distinct address, and the first pages together hold at most
-/// 8,192 outputs, or 16 for each distinct address past 512.
+/// The storage index orders by height and outpoint. The merge stages one
+/// height within the response budget and sorts it by transaction position.
 struct AddressUtxoMerge {
     addresses: Vec<MergedAddress>,
     next_outputs: BinaryHeap<Reverse<NextAddressUtxo>>,
-    /// The address whose last row was taken and whose next output is read
-    /// only when the response needs another row, so a response never reads
-    /// past the last row it sends.
-    awaiting_next_output: Option<usize>,
-    max_entries: Option<usize>,
-    response_limit: usize,
-    sent: usize,
+    current_height: std::vec::IntoIter<NextAddressUtxo>,
+    page_entry_limit: Option<usize>,
+    budget: AddressUtxoResponseBudget,
     ended: bool,
 }
 
@@ -1378,23 +1951,22 @@ struct MergedAddress {
 struct NextAddressUtxo {
     reply: lightwalletd::GetAddressUtxosReply,
     address_position: usize,
+    tx_index: u32,
 }
 
 impl NextAddressUtxo {
-    fn order_key(&self) -> (u64, &[u8], i32, &str, usize) {
-        (
-            self.reply.height,
-            self.reply.txid.as_slice(),
-            self.reply.index,
-            self.reply.address.as_str(),
-            self.address_position,
-        )
+    const fn merge_key(&self) -> (u64, usize) {
+        (self.reply.height, self.address_position)
+    }
+
+    fn block_order_key(&self) -> (u32, i32, &[u8]) {
+        (self.tx_index, self.reply.index, self.reply.txid.as_slice())
     }
 }
 
 impl PartialEq for NextAddressUtxo {
     fn eq(&self, other: &Self) -> bool {
-        self.order_key() == other.order_key()
+        self.merge_key() == other.merge_key()
     }
 }
 
@@ -1408,19 +1980,18 @@ impl PartialOrd for NextAddressUtxo {
 
 impl Ord for NextAddressUtxo {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.order_key().cmp(&other.order_key())
+        self.merge_key().cmp(&other.merge_key())
     }
 }
 
 impl AddressUtxoMerge {
-    const fn new(max_entries: Option<usize>, response_limit: usize) -> Self {
+    fn new(max_entries: Option<usize>, response_limit: usize) -> Self {
         Self {
             addresses: Vec::new(),
             next_outputs: BinaryHeap::new(),
-            awaiting_next_output: None,
-            max_entries,
-            response_limit,
-            sent: 0,
+            current_height: Vec::new().into_iter(),
+            page_entry_limit: max_entries.map(|limit| limit.min(response_limit)),
+            budget: AddressUtxoResponseBudget::new(response_limit),
             ended: false,
         }
     }
@@ -1439,12 +2010,13 @@ impl AddressUtxoMerge {
         let Some(merged) = self.addresses.get_mut(address_position) else {
             return Ok(());
         };
-        match merged.outputs.next().await {
-            Some(Ok(utxo)) => {
-                let reply = lightwalletd_address_utxo(&merged.address, &utxo)?;
+        match merged.outputs.next_with_tx_index().await {
+            Some(Ok((tx_index, utxo))) => {
+                let reply = lightwalletd_address_utxo(&merged.address, utxo)?;
                 self.next_outputs.push(Reverse(NextAddressUtxo {
                     reply,
                     address_position,
+                    tx_index,
                 }));
                 Ok(())
             }
@@ -1453,50 +2025,129 @@ impl AddressUtxoMerge {
         }
     }
 
-    /// Reads the next output of the address whose last row was taken.
-    async fn read_awaited_output(&mut self) -> Result<(), Status> {
-        match self.awaiting_next_output.take() {
-            Some(address_position) => self.read_next_output(address_position).await,
-            None => Ok(()),
+    async fn read_height(&mut self) -> Result<Vec<NextAddressUtxo>, Status> {
+        let Some(Reverse(first)) = self.next_outputs.peek() else {
+            return Ok(Vec::new());
+        };
+        let height = first.reply.height;
+        let first_height = self.budget.entries == 0;
+        let mut outputs = Vec::new();
+        while let Some(Reverse(next_output)) = self
+            .next_outputs
+            .peek_mut()
+            .filter(|next_output| next_output.0.reply.height == height)
+            .map(PeekMut::pop)
+        {
+            if !first_height && self.page_entry_limit == Some(self.budget.entries) {
+                self.ended = true;
+                return Ok(Vec::new());
+            }
+            if let Err(status) = self.budget.record(&next_output.reply) {
+                if first_height || self.page_entry_limit.is_none() {
+                    return Err(status);
+                }
+                self.ended = true;
+                return Ok(Vec::new());
+            }
+            self.read_next_output(next_output.address_position).await?;
+            outputs.push(next_output);
         }
-    }
-
-    /// Takes the lowest next output as the next row to send.
-    fn take_next_row(&mut self) -> Option<lightwalletd::GetAddressUtxosReply> {
-        let Reverse(next_output) = self.next_outputs.pop()?;
-        self.awaiting_next_output = Some(next_output.address_position);
-        Some(next_output.reply)
+        if first_height
+            && self
+                .page_entry_limit
+                .is_some_and(|limit| outputs.len() > limit)
+        {
+            return Err(address_utxo_height_limit_exceeded(height, outputs.len()));
+        }
+        outputs
+            .sort_unstable_by(|left, right| left.block_order_key().cmp(&right.block_order_key()));
+        Ok(outputs)
     }
 }
 
 impl ResponseSource for AddressUtxoMerge {
     type Message = lightwalletd::GetAddressUtxosReply;
 
-    /// Sends at most `maxEntries` rows. Without a `maxEntries` within the
-    /// response limit, a row past the limit fails the response with
-    /// `RESOURCE_EXHAUSTED` instead of ending it as if it were complete.
     async fn next(&mut self) -> Option<Result<Self::Message, Status>> {
+        if let Some(output) = self.current_height.next() {
+            return Some(Ok(output.reply));
+        }
         if self.ended
             || self
-                .max_entries
-                .is_some_and(|max_entries| self.sent >= max_entries)
+                .page_entry_limit
+                .is_some_and(|target| self.budget.entries >= target)
         {
             return None;
         }
-        if let Err(status) = self.read_awaited_output().await {
-            self.ended = true;
-            return Some(Err(status));
+        match self.read_height().await {
+            Ok(outputs) => {
+                self.current_height = outputs.into_iter();
+                self.current_height.next().map(|output| Ok(output.reply))
+            }
+            Err(status) => {
+                self.ended = true;
+                Some(Err(status))
+            }
         }
-        if self.next_outputs.is_empty() {
-            return None;
+    }
+}
+
+/// Builds the wallet RPC error for a first matching height that exceeds `maxEntries`.
+///
+/// The error details include the height and full output count so clients can size a retry.
+#[must_use]
+pub fn address_utxo_height_limit_exceeded(height: u64, count: usize) -> Status {
+    let mut details = ErrorDetails::new();
+    details.set_error_info(
+        "MAX_ENTRIES_EXCEEDED_AT_HEIGHT",
+        "cash.z.wallet.sdk.rpc",
+        [
+            ("height".to_owned(), height.to_string()),
+            ("count".to_owned(), count.to_string()),
+        ],
+    );
+    Status::with_error_details(
+        tonic::Code::FailedPrecondition,
+        format!("height {height} has {count} unspent outputs, exceeding maxEntries"),
+        details,
+    )
+}
+
+/// Counts each row as a field of the unary reply, including its protobuf
+/// tag and length prefix, so the same byte bound applies to both RPCs.
+struct AddressUtxoResponseBudget {
+    entry_limit: usize,
+    entries: usize,
+    bytes: usize,
+}
+
+impl AddressUtxoResponseBudget {
+    const fn new(entry_limit: usize) -> Self {
+        Self {
+            entry_limit,
+            entries: 0,
+            bytes: 0,
         }
-        if self.sent >= self.response_limit {
-            self.ended = true;
-            return Some(Err(address_utxo_limit_exceeded(self.response_limit)));
+    }
+
+    fn record(&mut self, reply: &lightwalletd::GetAddressUtxosReply) -> Result<(), Status> {
+        if self.entries == self.entry_limit {
+            return Err(Status::resource_exhausted(format!(
+                "more unspent outputs match than the {} one response returns",
+                self.entry_limit
+            )));
         }
-        let row = self.take_next_row()?;
-        self.sent += 1;
-        Some(Ok(row))
+        let bytes = reply.encoded_len();
+        self.bytes = self
+            .bytes
+            .saturating_add(1 + prost::length_delimiter_len(bytes) + bytes);
+        if self.bytes > ADDRESS_UTXO_RESPONSE_MAX_BYTES {
+            return Err(Status::resource_exhausted(format!(
+                "unspent-output response exceeds {ADDRESS_UTXO_RESPONSE_MAX_BYTES} encoded bytes"
+            )));
+        }
+        self.entries += 1;
+        Ok(())
     }
 }
 
@@ -1588,9 +2239,7 @@ fn transparent_address_tx_history_request(
     }
     let script_pub_key = zebra_address.script().as_raw_bytes().to_vec();
     if script_pub_key.is_empty() {
-        return Err(Status::invalid_argument(
-            "transparent address does not produce a receivable script",
-        ));
+        return Err(Status::invalid_argument(UNRECEIVABLE_ADDRESS));
     }
     let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
     let range = filter
@@ -1641,9 +2290,7 @@ fn transparent_address_unspent_outputs_request(
 
     let script_pub_key = transparent_address.script().as_raw_bytes().to_vec();
     if script_pub_key.is_empty() {
-        return Err(Status::invalid_argument(
-            "transparent address does not produce a receivable script",
-        ));
+        return Err(Status::invalid_argument(UNRECEIVABLE_ADDRESS));
     }
 
     Ok(TransparentAddressUnspentOutputsRequest {
@@ -1654,24 +2301,43 @@ fn transparent_address_unspent_outputs_request(
 
 fn lightwalletd_address_utxo(
     address: &str,
-    utxo: &TransparentUnspentOutput,
+    utxo: TransparentUnspentOutput,
 ) -> Result<lightwalletd::GetAddressUtxosReply, Status> {
     Ok(lightwalletd::GetAddressUtxosReply {
         address: address.to_owned(),
         txid: encode_internal_transaction_id(utxo.outpoint.transaction_id).to_vec(),
         index: i32::try_from(utxo.outpoint.output_index)
             .map_err(|_| Status::data_loss("transparent output index exceeds i32"))?,
-        script: utxo.script_pub_key.clone(),
+        script: utxo.script_pub_key,
         value_zat: i64::try_from(utxo.value_zat)
             .map_err(|_| Status::data_loss("transparent output value exceeds i64"))?,
         height: u64::from(utxo.block_height.value()),
     })
 }
 
-fn address_utxo_limit_exceeded(response_limit: usize) -> Status {
-    Status::resource_exhausted(format!(
-        "more unspent outputs match than the {response_limit} one response returns"
-    ))
+fn standard_fee_response(
+    fee: Result<zinder_core::StandardFee, QueryError>,
+) -> Result<Response<lightwalletd::StandardFee>, Status> {
+    match fee {
+        Ok(fee) => Ok(Response::new(lightwalletd::StandardFee {
+            fee_zat: fee.fee_zat(),
+            estimator_version: fee.estimator_version(),
+        })),
+        Err(QueryError::Node(
+            SourceError::NodeCapabilityMissing {
+                capability: NodeCapability::StandardFee,
+            }
+            | SourceError::TransactionBroadcastDisabled,
+        )) => Err(Status::unimplemented(
+            "GetStandardFee is not implemented: no configured node implements the getstandardfee RPC",
+        )),
+        Err(QueryError::Node(error @ SourceError::SourceProtocolMismatch { .. })) => {
+            Err(Status::internal(format!(
+                "GetStandardFee: the node's getstandardfee reply is unusable: {error}"
+            )))
+        }
+        Err(error) => Err(status_from_query_error(&error)),
+    }
 }
 
 /// Maps a tree-state read failure to the lightwalletd status.
@@ -1682,7 +2348,21 @@ fn address_utxo_limit_exceeded(response_limit: usize) -> Status {
 /// reason.
 fn tree_state_status(error: &QueryError) -> Status {
     if matches!(error, QueryError::TreeStateReplayLimitReached { .. }) {
-        return Status::unavailable(format!("{error}; retry shortly"));
+        return RetryPushback::Backoff
+            .apply(Status::unavailable(format!("{error}; retry shortly")));
+    }
+    status_from_query_error(error)
+}
+
+/// Maps a read that may be forwarded to the node to the lightwalletd status.
+///
+/// A read refused for want of a forwarded-read slot is `UNAVAILABLE`, as a
+/// full block-range or tree-state rebuild limit is, so a wallet retries every
+/// admission limit the same way. Native `WalletQuery` keeps
+/// `RESOURCE_EXHAUSTED` with its typed reason.
+fn forwarded_read_status(error: &QueryError) -> Status {
+    if matches!(error, QueryError::ForwardedReadLimitReached { .. }) {
+        return RetryPushback::Backoff.apply(Status::unavailable(error.to_string()));
     }
     status_from_query_error(error)
 }
@@ -1694,9 +2374,21 @@ fn tree_state_status(error: &QueryError) -> Status {
 /// permanent precondition failure.
 fn subtree_roots_status(error: &QueryError) -> Status {
     if matches!(error, QueryError::ChainEpochPinUnavailable { .. }) {
-        return Status::unavailable(format!("{error}; retry shortly"));
+        return RetryPushback::Backoff
+            .apply(Status::unavailable(format!("{error}; retry shortly")));
     }
     status_from_query_error(error)
+}
+
+fn pre_sapling_tree_state() -> Status {
+    Status::invalid_argument("GetTreeState: z_gettreestate did not return treestate")
+}
+
+fn require_sapling_tree_state(tree_state: &TreeState) -> Result<(), Status> {
+    if tree_state.frontiers.sapling_final_state.is_none() {
+        return Err(pre_sapling_tree_state());
+    }
+    Ok(())
 }
 
 fn lightwalletd_tree_state(tree_state: &TreeState) -> lightwalletd::TreeState {
@@ -1721,6 +2413,23 @@ fn lightwalletd_tree_state(tree_state: &TreeState) -> lightwalletd::TreeState {
             .as_deref()
             .map_or_default(hex::encode),
     }
+}
+
+fn lightwalletd_tree_state_from_hex(
+    tree_state: zinder_query::ServedTreeStateHex,
+) -> Result<lightwalletd::TreeState, Status> {
+    if !tree_state.has_sapling {
+        return Err(pre_sapling_tree_state());
+    }
+    Ok(lightwalletd::TreeState {
+        network: encode_bip70_chain_name(tree_state.network).to_owned(),
+        height: u64::from(tree_state.height.value()),
+        hash: tree_state.hash,
+        time: tree_state.block_time_seconds,
+        sapling_tree: tree_state.sapling_tree,
+        orchard_tree: tree_state.orchard_tree,
+        ironwood_tree: tree_state.ironwood_tree,
+    })
 }
 
 fn lightwalletd_subtree_roots(subtree_roots: &SubtreeRoots) -> Vec<lightwalletd::SubtreeRoot> {
@@ -1829,10 +2538,6 @@ pub(crate) const fn u32_to_usize(count: u32) -> usize {
     count as usize
 }
 
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "non-exhaustive core networks must fail closed until lightwalletd mapping exists"
-)]
 fn close_mempool_stream_on_tip_change<S>(
     raw_transaction_stream: S,
     watcher: SharedTipChangeWatcher,
@@ -1843,20 +2548,45 @@ where
         + Send
         + 'static,
 {
-    let (output_sender, output_receiver) = tokio::sync::mpsc::channel(16);
+    let (output_sender, output_receiver) =
+        tokio::sync::mpsc::channel(MEMPOOL_STREAM_CHANNEL_CAPACITY);
     tokio::spawn(async move {
-        tokio::pin!(raw_transaction_stream);
+        let mut raw_transaction_stream = Box::pin(raw_transaction_stream);
         let mut tip_change_signal =
             Box::pin(watcher.await_tip_change_after(snapshot_chain_epoch_id));
         loop {
+            let permit = tokio::select! {
+                biased;
+                () = output_sender.closed() => return,
+                tip_change_outcome = &mut tip_change_signal => {
+                    drop(raw_transaction_stream);
+                    if let Err(error) = record_mempool_stream_tip_signal(tip_change_outcome) {
+                        // Ending with OK would tell the client a new block
+                        // arrived when no tip change was observed.
+                        let _ = output_sender
+                            .send(Err(Status::unavailable(error.to_string())))
+                            .await;
+                    }
+                    return;
+                }
+                permit_outcome = output_sender.reserve() => match permit_outcome {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                },
+            };
             tokio::select! {
+                biased;
+                () = output_sender.closed() => return,
+                tip_change_outcome = &mut tip_change_signal => {
+                    drop(raw_transaction_stream);
+                    if let Err(error) = record_mempool_stream_tip_signal(tip_change_outcome) {
+                        permit.send(Err(Status::unavailable(error.to_string())));
+                    }
+                    return;
+                }
                 outcome = tonic::codegen::tokio_stream::StreamExt::next(&mut raw_transaction_stream) => {
                     match outcome {
-                        Some(raw_transaction_outcome) => {
-                            if output_sender.send(raw_transaction_outcome).await.is_err() {
-                                return;
-                            }
-                        }
+                        Some(raw_transaction_outcome) => permit.send(raw_transaction_outcome),
                         None => {
                             // Underlying mempool source ended; let the
                             // gRPC stream end naturally.
@@ -1864,35 +2594,34 @@ where
                         }
                     }
                 }
-                tip_change_outcome = &mut tip_change_signal => {
-                    match tip_change_outcome {
-                        Ok(()) => {
-                            tracing::debug!(
-                                target: "zinder::compat_lightwalletd",
-                                event = "mempool_stream_close_on_tip_change",
-                                "GetMempoolStream closing on observed best-chain tip change"
-                            );
-                        }
-                        Err(error @ TipChangeWatcherError::SignalClosed) => {
-                            tracing::warn!(
-                                target: "zinder::compat_lightwalletd",
-                                event = "mempool_stream_tip_signal_closed",
-                                error = %error,
-                                "tip-change signal source closed; GetMempoolStream will end"
-                            );
-                            // Ending with OK would tell the client a new block
-                            // arrived when no tip change was observed.
-                            let _ = output_sender
-                                .send(Err(Status::unavailable(error.to_string())))
-                                .await;
-                        }
-                    }
-                    return;
-                }
             }
         }
     });
     tokio_stream::wrappers::ReceiverStream::new(output_receiver)
+}
+
+fn record_mempool_stream_tip_signal(
+    tip_change_outcome: Result<(), TipChangeWatcherError>,
+) -> Result<(), TipChangeWatcherError> {
+    match tip_change_outcome {
+        Ok(()) => {
+            tracing::debug!(
+                target: "zinder::compat_lightwalletd",
+                event = "mempool_stream_close_on_tip_change",
+                "GetMempoolStream closing on observed best-chain tip change"
+            );
+            Ok(())
+        }
+        Err(error @ TipChangeWatcherError::SignalClosed) => {
+            tracing::warn!(
+                target: "zinder::compat_lightwalletd",
+                event = "mempool_stream_tip_signal_closed",
+                error = %error,
+                "tip-change signal source closed; GetMempoolStream will end"
+            );
+            Err(error)
+        }
+    }
 }
 
 /// Passes each item whose `key` it has not yielded before, and errors are
@@ -1961,15 +2690,145 @@ where
             if this.seen.len() >= this.max_distinct {
                 this.upstream = None;
                 this.seen = HashSet::new();
-                return std::task::Poll::Ready(Some(Err(Status::unavailable(format!(
-                    "stream sent {} distinct transactions without a tip change; reconnect",
-                    this.max_distinct
-                )))));
+                return std::task::Poll::Ready(Some(Err(RetryPushback::Backoff.apply(
+                    Status::unavailable(format!(
+                        "stream sent {} distinct transactions without a tip change; reconnect",
+                        this.max_distinct
+                    )),
+                ))));
             }
             this.seen.insert(streamed_key);
             return std::task::Poll::Ready(Some(Ok(streamed)));
         }
     }
+}
+
+fn stream_mempool_compact_transactions(
+    mempool_surface: SharedMempoolSurface,
+    first_page: MempoolSnapshotPage,
+    shape: CompactBlockShape,
+) -> GrpcStream<lightwalletd::CompactTx> {
+    if first_page.entries.is_empty() && first_page.next_cursor.is_none() {
+        return Box::pin(stream::empty());
+    }
+    if first_page.next_cursor.is_none() {
+        return Box::pin(MempoolCompactTxStream::new(
+            stream::iter(first_page.entries.into_iter().map(Ok)),
+            shape,
+        ));
+    }
+    Box::pin(MempoolCompactTxStream::new(
+        mempool_snapshot_entries(mempool_surface, first_page),
+        shape,
+    ))
+}
+
+async fn buffered_mempool_transactions(
+    mempool_surface: SharedMempoolSurface,
+    first_page: MempoolSnapshotPage,
+    shape: CompactBlockShape,
+    mut exclusions: MempoolExclusions,
+) -> Result<GrpcStream<lightwalletd::CompactTx>, Status> {
+    let mut entries = mempool_snapshot_entries(mempool_surface, first_page);
+    let mut compact_messages = Vec::new();
+    while let Some(entry_outcome) = entries.next().await {
+        let entry = entry_outcome?;
+        exclusions.observe(entry.transaction_id());
+        if let Some(message) = encode_mempool_transaction(shape, entry)? {
+            compact_messages.push(message);
+        }
+    }
+    let messages = compact_messages
+        .into_iter()
+        .filter(move |message| !exclusions.uniquely_matches(&message.txid))
+        .map(Ok);
+    Ok(Box::pin(stream::iter(messages)))
+}
+
+fn encode_mempool_transaction(
+    shape: CompactBlockShape,
+    entry: zinder_core::MempoolEntry,
+) -> Result<Option<lightwalletd::CompactTx>, Status> {
+    let entry = entry.into_parts();
+    shape.encode_transaction(CompactTransaction {
+        index: 0,
+        transaction_id: entry.transaction_id,
+        data: entry.compact_transaction_data,
+    })
+}
+
+/// Streams `CompactTx` messages encoded lazily from a mempool snapshot walk.
+///
+/// Entries excluded by `shape` are skipped. On the first upstream or encoding
+/// error, the upstream entry stream is dropped before yielding the error so
+/// subsequent polls end the stream without reading further pages.
+struct MempoolCompactTxStream<S> {
+    entries: Option<S>,
+    shape: CompactBlockShape,
+}
+
+impl<S> MempoolCompactTxStream<S> {
+    const fn new(entries: S, shape: CompactBlockShape) -> Self {
+        Self {
+            entries: Some(entries),
+            shape,
+        }
+    }
+}
+
+impl<S> tonic::codegen::tokio_stream::Stream for MempoolCompactTxStream<S>
+where
+    S: tonic::codegen::tokio_stream::Stream<Item = Result<zinder_core::MempoolEntry, Status>>
+        + Unpin,
+{
+    type Item = Result<lightwalletd::CompactTx, Status>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            let Some(entries) = this.entries.as_mut() else {
+                return std::task::Poll::Ready(None);
+            };
+            let outcome = match Pin::new(entries).poll_next(context) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(None) => {
+                    this.entries = None;
+                    return std::task::Poll::Ready(None);
+                }
+                std::task::Poll::Ready(Some(outcome)) => outcome,
+            };
+            let entry = match outcome {
+                Ok(entry) => entry,
+                Err(status) => {
+                    this.entries = None;
+                    return std::task::Poll::Ready(Some(Err(status)));
+                }
+            };
+            match encode_mempool_transaction(this.shape, entry) {
+                Ok(Some(message)) => return std::task::Poll::Ready(Some(Ok(message))),
+                Ok(None) => {}
+                Err(status) => {
+                    this.entries = None;
+                    return std::task::Poll::Ready(Some(Err(status)));
+                }
+            }
+        }
+    }
+}
+
+async fn take_or_reserve_mempool_entry_slot<'a>(
+    reserved_slot: &mut Option<
+        tokio::sync::mpsc::Permit<'a, Result<zinder_core::MempoolEntry, Status>>,
+    >,
+    entry_sender: &'a tokio::sync::mpsc::Sender<Result<zinder_core::MempoolEntry, Status>>,
+) -> Option<tokio::sync::mpsc::Permit<'a, Result<zinder_core::MempoolEntry, Status>>> {
+    if let Some(slot) = reserved_slot.take() {
+        return Some(slot);
+    }
+    entry_sender.reserve().await.ok()
 }
 
 /// Streams live-mempool entries page by page, starting with the
@@ -1979,27 +2838,46 @@ fn mempool_snapshot_entries(
     mempool_surface: SharedMempoolSurface,
     first_page: MempoolSnapshotPage,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<zinder_core::MempoolEntry, Status>> {
-    let (entry_sender, entry_receiver) = tokio::sync::mpsc::channel(16);
+    let (entry_sender, entry_receiver) =
+        tokio::sync::mpsc::channel(MEMPOOL_SNAPSHOT_ENTRY_CHANNEL_CAPACITY);
     tokio::spawn(async move {
         let mut page = first_page;
+        let mut reserved_slot = None;
         loop {
             for entry in page.entries {
-                if entry_sender.send(Ok(entry)).await.is_err() {
+                let Some(slot) =
+                    take_or_reserve_mempool_entry_slot(&mut reserved_slot, &entry_sender).await
+                else {
                     return;
-                }
+                };
+                slot.send(Ok(entry));
             }
             let Some(cursor) = page.next_cursor else {
                 return;
             };
-            page = match mempool_surface
-                .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, Some(cursor))
-                .await
-            {
-                Ok(next_page) => next_page,
+            let Some(slot) =
+                take_or_reserve_mempool_entry_slot(&mut reserved_slot, &entry_sender).await
+            else {
+                return;
+            };
+            if entry_sender.is_closed() {
+                return;
+            }
+            let next_page = tokio::select! {
+                biased;
+                () = entry_sender.closed() => return,
+                outcome = mempool_surface.mempool_snapshot_page(
+                    LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE,
+                    Some(cursor),
+                ) => outcome,
+            };
+            page = match next_page {
+                Ok(next_page) => {
+                    reserved_slot = Some(slot);
+                    next_page
+                }
                 Err(error) => {
-                    let _ = entry_sender
-                        .send(Err(status_from_mempool_surface_error(error)))
-                        .await;
+                    slot.send(Err(status_from_mempool_surface_error(error)));
                     return;
                 }
             };
@@ -2010,40 +2888,16 @@ fn mempool_snapshot_entries(
 
 fn status_from_mempool_surface_error(error: MempoolSurfaceError) -> Status {
     match error {
-        MempoolSurfaceError::Unavailable { reason } => Status::unavailable(reason),
+        MempoolSurfaceError::Unavailable { reason } => {
+            RetryPushback::Backoff.apply(Status::unavailable(reason))
+        }
+        MempoolSurfaceError::UnsupportedEncoding { reason } => zinder_proto::status_for_reason(
+            zinder_proto::v1::ops::ErrorReason::UnsupportedWalletEncoding,
+            reason,
+        ),
         MempoolSurfaceError::CursorInvalid => Status::invalid_argument("mempool cursor is invalid"),
         MempoolSurfaceError::CursorExpired => Status::failed_precondition("mempool cursor expired"),
     }
-}
-
-fn validate_excluded_txid_suffixes(exclude_suffixes: &[Vec<u8>]) -> Result<(), Status> {
-    if exclude_suffixes.len() > MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST {
-        return Err(Status::invalid_argument(format!(
-            "exclude_txid_suffixes contains {} entries; at most {MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST} are allowed",
-            exclude_suffixes.len(),
-        )));
-    }
-    for (index, suffix) in exclude_suffixes.iter().enumerate() {
-        if suffix.len() > 32 {
-            return Err(Status::invalid_argument(format!(
-                "exclude txid {index} is larger than 32 bytes",
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn transaction_id_is_uniquely_excluded(
-    transaction_id: &[u8],
-    exclude_suffixes: &[Vec<u8>],
-    exclude_suffix_match_counts: &[usize],
-) -> bool {
-    exclude_suffixes
-        .iter()
-        .zip(exclude_suffix_match_counts)
-        .any(|(suffix, match_count)| {
-            *match_count == 1 && !suffix.is_empty() && transaction_id.ends_with(suffix)
-        })
 }
 
 #[allow(
@@ -2106,6 +2960,21 @@ mod tests {
         ArtifactSchemaVersion, ChainTipMetadata, TransparentAddressBalance, UnixTimestampMillis,
     };
 
+    #[test]
+    fn a_forwarded_read_refusal_is_unavailable_and_other_errors_keep_their_status() {
+        let refused = forwarded_read_status(&QueryError::ForwardedReadLimitReached {
+            kind: "transaction",
+            max_concurrent: 24,
+        });
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert!(refused.message().contains("retry with backoff"));
+        let corrupt = forwarded_read_status(&QueryError::ArtifactCorrupt {
+            family: zinder_store::ArtifactFamily::TransactionLocation,
+            reason: "probe".to_owned(),
+        });
+        assert_eq!(corrupt.code(), tonic::Code::DataLoss);
+    }
+
     fn test_chain_epoch() -> ChainEpoch {
         ChainEpoch {
             id: ChainEpochId::new(1),
@@ -2126,6 +2995,61 @@ mod tests {
             address_count: 1,
             chain_epoch: test_chain_epoch(),
         }
+    }
+
+    #[tokio::test]
+    async fn address_utxo_byte_cap_omits_a_later_height_on_paginated_reads() {
+        let reply = lightwalletd::GetAddressUtxosReply {
+            height: 2,
+            ..Default::default()
+        };
+        let encoded_bytes = lightwalletd::GetAddressUtxosReplyList {
+            address_utxos: vec![reply.clone()],
+        }
+        .encoded_len();
+        for max_entries in [Some(3), None] {
+            let mut merge = AddressUtxoMerge::new(max_entries, 100_000);
+            merge.budget.entries = 1;
+            merge.budget.bytes = ADDRESS_UTXO_RESPONSE_MAX_BYTES - encoded_bytes;
+            for address_position in [0, 1] {
+                merge.next_outputs.push(Reverse(NextAddressUtxo {
+                    reply: reply.clone(),
+                    address_position,
+                    tx_index: 0,
+                }));
+            }
+            let next = merge.next().await;
+            if max_entries.is_some() {
+                assert!(next.is_none());
+            } else {
+                assert!(matches!(
+                    next,
+                    Some(Err(status)) if status.code() == tonic::Code::ResourceExhausted
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn address_utxo_budget_counts_the_reply_list_encoding() -> Result<(), Status> {
+        let reply = lightwalletd::GetAddressUtxosReply {
+            script: vec![0; 128],
+            height: 1,
+            ..Default::default()
+        };
+        let encoded_bytes = lightwalletd::GetAddressUtxosReplyList {
+            address_utxos: vec![reply.clone()],
+        }
+        .encoded_len();
+        let mut budget = AddressUtxoResponseBudget::new(2);
+        budget.bytes = ADDRESS_UTXO_RESPONSE_MAX_BYTES - encoded_bytes;
+        budget.record(&reply)?;
+        assert_eq!(budget.bytes, ADDRESS_UTXO_RESPONSE_MAX_BYTES);
+        assert!(matches!(
+            budget.record(&reply),
+            Err(status) if status.code() == tonic::Code::ResourceExhausted
+        ));
+        Ok(())
     }
 
     /// Up to eight addresses read full first pages, more addresses share the
@@ -2329,5 +3253,280 @@ mod tests {
             outcome,
             Err(status) if status.code() == tonic::Code::OutOfRange
         ));
+    }
+
+    struct PendingDropStream {
+        remaining_messages: u8,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl PendingDropStream {
+        fn new(remaining_messages: u8) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (dropped, on_drop) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    remaining_messages,
+                    dropped: Some(dropped),
+                },
+                on_drop,
+            )
+        }
+    }
+
+    impl tonic::codegen::tokio_stream::Stream for PendingDropStream {
+        type Item = Result<lightwalletd::RawTransaction, Status>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if self.remaining_messages == 0 {
+                return std::task::Poll::Pending;
+            }
+            let next_byte = self.remaining_messages;
+            self.remaining_messages -= 1;
+            std::task::Poll::Ready(Some(Ok(lightwalletd::RawTransaction {
+                data: vec![next_byte],
+                height: 0,
+            })))
+        }
+    }
+
+    impl Drop for PendingDropStream {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mempool_stream_wrapper_drops_idle_upstream_when_receiver_drops() -> Result<(), Status>
+    {
+        let (_tip_sender, tip_receiver) = tokio::sync::watch::channel(7_u64);
+        let watcher: SharedTipChangeWatcher =
+            Arc::new(crate::mempool::WatchTipChangeWatcher::new(tip_receiver));
+        let (upstream, on_drop) = PendingDropStream::new(0);
+        let response = close_mempool_stream_on_tip_change(upstream, watcher, ChainEpochId::new(7));
+        tokio::task::yield_now().await;
+
+        drop(response);
+
+        tokio::time::timeout(Duration::from_millis(500), on_drop)
+            .await
+            .map_err(|_| Status::deadline_exceeded("idle upstream outlived dropped receiver"))?
+            .map_err(|_| Status::internal("upstream drop sender disappeared"))
+    }
+
+    #[tokio::test]
+    async fn mempool_stream_wrapper_releases_upstream_on_closed_tip_signal_with_full_queue()
+    -> Result<(), Status> {
+        let (tip_sender, tip_receiver) = tokio::sync::watch::channel(7_u64);
+        let watcher: SharedTipChangeWatcher =
+            Arc::new(crate::mempool::WatchTipChangeWatcher::new(tip_receiver));
+        let (upstream, on_drop) = PendingDropStream::new(17);
+        let mut response =
+            close_mempool_stream_on_tip_change(upstream, watcher, ChainEpochId::new(7));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        drop(tip_sender);
+
+        tokio::time::timeout(Duration::from_millis(500), on_drop)
+            .await
+            .map_err(|_| Status::deadline_exceeded("upstream stayed open on closed tip signal"))?
+            .map_err(|_| Status::internal("upstream drop sender disappeared"))?;
+        for _ in 0..16 {
+            let buffered = response
+                .next()
+                .await
+                .ok_or_else(|| Status::internal("missing buffered message"))?;
+            assert!(buffered.is_ok());
+        }
+        let terminal = response
+            .next()
+            .await
+            .ok_or_else(|| Status::internal("missing UNAVAILABLE status"))?;
+        let Err(status) = terminal else {
+            return Err(Status::internal("expected UNAVAILABLE status after queue"));
+        };
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        Ok(())
+    }
+
+    fn unit_mempool_entry(
+        txid_byte: u8,
+        fee_zat: Option<u64>,
+    ) -> Result<zinder_core::MempoolEntry, zinder_core::MempoolEntryBuildError> {
+        let compact_transaction_data = zinder_core::CompactTransactionData {
+            fee_zat,
+            sapling_outputs: vec![zinder_core::CompactSaplingOutput {
+                commitment: [txid_byte; 32],
+                ephemeral_key: [txid_byte; 32],
+                ciphertext: [txid_byte; 52],
+            }],
+            ..zinder_core::CompactTransactionData::default()
+        };
+        zinder_core::MempoolEntry::new(
+            TransactionId::from_bytes([txid_byte; 32]),
+            None,
+            RawTransactionBytes::new(vec![txid_byte; 16]),
+            compact_transaction_data,
+            zinder_core::MempoolObservation {
+                first_seen_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
+                first_seen_chain_epoch: test_chain_epoch(),
+            },
+        )
+    }
+
+    struct DelayedUnitMempoolSurface {
+        fetched_pages: Arc<AtomicUsize>,
+        page_two_reached: Arc<tokio::sync::Notify>,
+        page_two_dropped: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    struct UnitDropGuard(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for UnitDropGuard {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mempool::MempoolSurface for DelayedUnitMempoolSurface {
+        async fn mempool_snapshot_page(
+            &self,
+            _max_entries: u32,
+            _from_cursor: Option<Vec<u8>>,
+        ) -> Result<MempoolSnapshotPage, MempoolSurfaceError> {
+            self.fetched_pages.fetch_add(1, Ordering::SeqCst);
+            let _drop_guard = UnitDropGuard(self.page_two_dropped.lock().take());
+            self.page_two_reached.notify_waiters();
+            std::future::pending::<()>().await;
+            Err(MempoolSurfaceError::Unavailable {
+                reason: "unreachable".to_owned(),
+            })
+        }
+
+        async fn mempool_events(
+            &self,
+            _from_cursor: Option<zinder_store::StreamCursorTokenV1>,
+        ) -> Result<crate::mempool::MempoolEventEnvelopeStream, MempoolSurfaceError> {
+            Err(MempoolSurfaceError::Unavailable {
+                reason: "unused in unit test".to_owned(),
+            })
+        }
+
+        async fn mempool_transaction(
+            &self,
+            _transaction_id: TransactionId,
+        ) -> Result<MempoolTransactionLookup, MempoolSurfaceError> {
+            Err(MempoolSurfaceError::Unavailable {
+                reason: "unused in unit test".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mempool_snapshot_entries_waits_for_channel_capacity_before_fetching_next_page()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fetched_pages = Arc::new(AtomicUsize::new(0));
+        let page_two_reached = Arc::new(tokio::sync::Notify::new());
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let surface: SharedMempoolSurface = Arc::new(DelayedUnitMempoolSurface {
+            fetched_pages: Arc::clone(&fetched_pages),
+            page_two_reached: Arc::clone(&page_two_reached),
+            page_two_dropped: parking_lot::Mutex::new(Some(dropped_tx)),
+        });
+        let first_entries = (0..MEMPOOL_SNAPSHOT_ENTRY_CHANNEL_CAPACITY)
+            .map(|idx| unit_mempool_entry(u8::try_from(idx + 1).unwrap_or(u8::MAX), Some(10)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let first_page = MempoolSnapshotPage {
+            chain_epoch_id: ChainEpochId::new(1),
+            events_resume_cursor: None,
+            entries: first_entries,
+            next_cursor: Some(vec![1]),
+        };
+
+        let mut entry_stream = mempool_snapshot_entries(surface, first_page);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(fetched_pages.load(Ordering::SeqCst), 0);
+
+        let page_two_wait = page_two_reached.notified();
+        let first_entry = entry_stream
+            .next()
+            .await
+            .ok_or_else(|| Status::internal("missing first entry"))??;
+        assert_eq!(
+            first_entry.transaction_id(),
+            TransactionId::from_bytes([1; 32])
+        );
+        tokio::time::timeout(Duration::from_secs(2), page_two_wait).await?;
+        assert_eq!(fetched_pages.load(Ordering::SeqCst), 1);
+
+        drop(entry_stream);
+        tokio::time::timeout(Duration::from_secs(2), dropped_rx).await??;
+        Ok(())
+    }
+
+    struct CountingEntryStream {
+        entries: std::vec::IntoIter<Result<zinder_core::MempoolEntry, Status>>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl tonic::codegen::tokio_stream::Stream for CountingEntryStream {
+        type Item = Result<zinder_core::MempoolEntry, Status>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(self.entries.next())
+        }
+    }
+
+    impl Drop for CountingEntryStream {
+        fn drop(&mut self) {
+            if let Some(sender) = self.dropped.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mempool_compact_tx_stream_drops_upstream_and_terminates_on_encode_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let upstream = CountingEntryStream {
+            entries: vec![
+                Ok(unit_mempool_entry(0x11, Some(10))?),
+                Ok(unit_mempool_entry(0x22, Some(u64::from(u32::MAX) + 1))?),
+                Ok(unit_mempool_entry(0x33, Some(10))?),
+            ]
+            .into_iter(),
+            dropped: Some(dropped_tx),
+        };
+        let shape = CompactBlockShape::for_mempool(&[])?;
+        let mut tx_stream = MempoolCompactTxStream::new(upstream, shape);
+
+        let first = tx_stream
+            .next()
+            .await
+            .ok_or_else(|| Status::internal("missing first compact tx"))??;
+        assert_eq!(first.txid, vec![0x11; 32]);
+
+        let second = tx_stream
+            .next()
+            .await
+            .ok_or_else(|| Status::internal("missing encode error"))?;
+        let Err(status) = second else {
+            return Err("expected DataLoss error on oversized fee".into());
+        };
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        tokio::time::timeout(Duration::from_secs(2), dropped_rx).await??;
+        assert!(tx_stream.next().await.is_none());
+        Ok(())
     }
 }

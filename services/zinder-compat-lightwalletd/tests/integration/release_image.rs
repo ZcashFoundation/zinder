@@ -10,7 +10,6 @@ fn healthcheck_subcommand_probes_the_operational_endpoint() -> eyre::Result<()> 
 fn image_default_config_holds_only_the_container_listeners() -> eyre::Result<()> {
     zinder_testkit::check_release_image_config(
         zinder_testkit::bin_exe!("zinder-compat-lightwalletd"),
-        "compat-lightwalletd.toml",
         &[("ops", "[::]:9107"), ("compat", "[::]:9067")],
         &[
             ("ZINDER_NETWORK__NAME", "zcash-regtest"),

@@ -19,6 +19,7 @@ use zinder_core::{
     BlockHeightRange, ChainEpoch, ShieldedProtocol, UnixTimestampMillis,
     wire::encode_zinder_native_chain_name,
 };
+use zinder_proto::status_for_reason;
 use zinder_proto::v1::ingest::{
     AcquireCanonicalProjectionBuildLeaseRequest, CanonicalCheckpointBlockId,
     CanonicalCheckpointFrontier, CanonicalCheckpointHistoryPredecessor,
@@ -36,12 +37,13 @@ use zinder_proto::v1::ops;
 use zinder_runtime::{BearerToken, BearerTokenServerInterceptor, ReadinessCause, not_ready_status};
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind,
-    CanonicalMempoolSnapshotStart, CanonicalOwnerCheckpointAdmission,
-    CanonicalOwnerCheckpointEvidence, CanonicalStoreError, EventStreamStartPosition, MempoolEvent,
-    MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventPosition,
-    MempoolEventRetentionConfig, MempoolEventRetentionStepBudget, MempoolEventRetentionStepOutcome,
-    ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalStore,
-    RocksDbResourceBudget, StreamCursorTokenV1, TreeStateStrideCommit,
+    CanonicalMempoolEventStreamStart, CanonicalMempoolSnapshotStart,
+    CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence, CanonicalStoreError,
+    EventStreamStartPosition, MempoolEvent, MempoolEventEnvelope, MempoolEventHistoryRequest,
+    MempoolEventPosition, MempoolEventRetentionConfig, MempoolEventRetentionStepBudget,
+    MempoolEventRetentionStepOutcome, ProjectionBuildAnchor, ProjectionBuildLease,
+    ProjectionBuildLeaseId, RocksDbCanonicalStore, RocksDbResourceBudget, StreamCursorTokenV1,
+    TreeStateStrideCommit,
 };
 
 use crate::tree_state_verification::{CanonicalStoreDamage, CanonicalStoreDamageSignal};
@@ -63,6 +65,73 @@ const CANONICAL_CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// Covers one bounded upstream request plus a command handoff without making
 /// projectors reopen the primary during a transient follower busy period.
 const CANONICAL_CONTROL_REPLY_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Absolute bound shared by all owner and mutation-gate waits for one RPC.
+#[derive(Clone, Copy)]
+pub(super) struct CanonicalReadDeadline(tokio::time::Instant);
+
+impl CanonicalReadDeadline {
+    pub(super) fn from_request<T>(request: &Request<T>) -> Self {
+        Self::from_timeouts(grpc_timeout(request), None)
+    }
+
+    pub(super) fn for_mempool_events(
+        request: &Request<zinder_proto::v1::wallet::MempoolEventsRequest>,
+    ) -> Self {
+        let open_timeout = request
+            .metadata()
+            .get(zinder_proto::MEMPOOL_EVENTS_OPEN_TIMEOUT_MS_HEADER)
+            .and_then(|header| header.to_str().ok()?.parse().ok())
+            .map(Duration::from_millis);
+        Self::from_timeouts(grpc_timeout(request), open_timeout)
+    }
+
+    fn from_timeouts(grpc: Option<Duration>, open: Option<Duration>) -> Self {
+        // Reserve time for encoding, transport, and scheduling at the caller.
+        const MAX_REPLY_MARGIN: Duration = Duration::from_secs(1);
+        let budget =
+            grpc.into_iter()
+                .chain(open)
+                .min()
+                .map_or(CANONICAL_CONTROL_REPLY_TIMEOUT, |timeout| {
+                    let margin = MAX_REPLY_MARGIN.min(timeout / 10);
+                    timeout
+                        .saturating_sub(margin)
+                        .min(CANONICAL_CONTROL_REPLY_TIMEOUT)
+                });
+        Self(tokio::time::Instant::now() + budget)
+    }
+
+    pub(super) async fn wait<T>(
+        self,
+        read: impl Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        tokio::time::timeout_at(self.0, read).await.map_err(|_| {
+            canonical_owner_unavailable(
+                "canonical writer did not service the request before the read deadline",
+            )
+        })?
+    }
+}
+
+// Tonic exposes Request::set_timeout but keeps its HTTP/2 timeout parser private.
+fn grpc_timeout<T>(request: &Request<T>) -> Option<Duration> {
+    let header = request.metadata().get("grpc-timeout")?.as_encoded_bytes();
+    let (unit, digits) = header.split_last()?;
+    if digits.is_empty() || digits.len() > 8 || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let count: u64 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    match unit {
+        b'H' => Some(Duration::from_hours(count)),
+        b'M' => Some(Duration::from_mins(count)),
+        b'S' => Some(Duration::from_secs(count)),
+        b'm' => Some(Duration::from_millis(count)),
+        b'u' => Some(Duration::from_micros(count)),
+        b'n' => Some(Duration::from_nanos(count)),
+        _ => None,
+    }
+}
 
 /// One configured directory below which the canonical owner may stage
 /// checkpoint candidates.
@@ -358,11 +427,12 @@ impl CanonicalControlHandle {
         .await
     }
 
-    /// Resolves a public mempool-event stream start through the durable log.
+    /// Resolves a public mempool-event stream start and head subscription
+    /// through the durable log.
     pub(crate) async fn resolve_mempool_event_start(
         &self,
         start: EventStreamStartPosition,
-    ) -> Result<Option<StreamCursorTokenV1>, Status> {
+    ) -> Result<CanonicalMempoolEventStreamStart, Status> {
         self.request(|reply| CanonicalControlCommand::ResolveMempoolEventStart { start, reply })
             .await
     }
@@ -582,12 +652,13 @@ pub enum CanonicalControlCommand {
         /// One-shot response carrying retained event envelopes.
         reply: oneshot::Sender<Result<Vec<MempoolEventEnvelope>, Status>>,
     },
-    /// Resolve one public mempool-event stream start position.
+    /// Resolve one public mempool-event stream start position and live head
+    /// subscription.
     ResolveMempoolEventStart {
         /// Typed stream selector decoded at the authenticated gRPC boundary.
         start: EventStreamStartPosition,
-        /// One-shot response carrying the strict-after cursor.
-        reply: oneshot::Sender<Result<Option<StreamCursorTokenV1>, Status>>,
+        /// One-shot response carrying the strict-after cursor and live head subscription.
+        reply: oneshot::Sender<Result<CanonicalMempoolEventStreamStart, Status>>,
     },
     /// Decode or capture the durable event anchor for a mempool snapshot walk.
     BeginMempoolSnapshot {
@@ -789,9 +860,11 @@ pub(crate) enum CanonicalControlRead {
 /// nothing observes a write before its reply: every caller awaits the reply
 /// before it acts, and the live mempool owner publishes an index change only
 /// after its durable append replies. The owner also sends each mempool read
-/// and write under one gate, so a snapshot anchor or stream start never
-/// overtakes the owner's own pending append. A read answered first therefore
-/// sees the state before the pending write, which no caller has seen past.
+/// and write under one gate, and mempool appends whose caller already dropped
+/// its reply receiver are skipped before touching the store, so a snapshot
+/// anchor, stream start, or rebuild replay never overtakes an append that can
+/// still commit later. A read answered first therefore sees the state before
+/// the pending write, which no caller has seen past.
 pub(crate) fn answer_canonical_control_read(
     store: &RocksDbCanonicalStore,
     command: CanonicalControlCommand,
@@ -966,6 +1039,9 @@ fn append_mempool_event(
     observed_at: UnixTimestampMillis,
     reply: oneshot::Sender<Result<MempoolEventEnvelope, Status>>,
 ) {
+    if reply.is_closed() {
+        return;
+    }
     send_control_response(
         reply,
         store
@@ -979,6 +1055,9 @@ fn append_mempool_events(
     events: Vec<(MempoolEvent, UnixTimestampMillis)>,
     reply: oneshot::Sender<Result<Vec<MempoolEventEnvelope>, Status>>,
 ) {
+    if reply.is_closed() {
+        return;
+    }
     send_control_response(
         reply,
         store
@@ -1002,12 +1081,12 @@ fn read_mempool_event_page(
 fn resolve_mempool_event_start(
     store: &RocksDbCanonicalStore,
     start: &EventStreamStartPosition,
-    reply: oneshot::Sender<Result<Option<StreamCursorTokenV1>, Status>>,
+    reply: oneshot::Sender<Result<CanonicalMempoolEventStreamStart, Status>>,
 ) {
     send_control_response(
         reply,
         store
-            .resolve_mempool_event_stream_start(start)
+            .open_mempool_event_stream(start)
             .map_err(|error| map_store_error(&error)),
     );
 }
@@ -1061,13 +1140,16 @@ fn commit_tree_state_stride(
 ) {
     send_control_response(
         reply,
-        store.commit_tree_state_stride(stride).map_err(|error| {
-            if matches!(error, CanonicalStoreError::TreeStateStrideMismatch { .. }) {
-                Status::data_loss(error.to_string())
-            } else {
-                map_store_error(&error)
-            }
-        }),
+        store
+            .commit_tree_state_stride(stride)
+            .inspect(|_| store.record_resource_gauges())
+            .map_err(|error| {
+                if matches!(error, CanonicalStoreError::TreeStateStrideMismatch { .. }) {
+                    Status::data_loss(error.to_string())
+                } else {
+                    map_store_error(&error)
+                }
+            }),
     );
 }
 
@@ -1142,9 +1224,11 @@ impl CanonicalControlGrpcAdapter {
 impl CanonicalControl for CanonicalControlGrpcAdapter {
     async fn writer_status(
         &self,
-        _request: Request<CanonicalWriterStatusRequest>,
+        request: Request<CanonicalWriterStatusRequest>,
     ) -> Result<Response<CanonicalWriterStatusResponse>, Status> {
-        let mut status = self.handle.writer_status().await?;
+        let mut status = CanonicalReadDeadline::from_request(&request)
+            .wait(self.handle.writer_status())
+            .await?;
         // Read after the writer answers, so damage reported before the answer
         // is never left out of it.
         status.canonical_store_damaged = self
@@ -1158,8 +1242,8 @@ impl CanonicalControl for CanonicalControlGrpcAdapter {
         &self,
         request: Request<CanonicalEventPageRequest>,
     ) -> Result<Response<CanonicalEventPageResponse>, Status> {
-        self.handle
-            .event_page(request.into_inner())
+        CanonicalReadDeadline::from_request(&request)
+            .wait(self.handle.event_page(request.into_inner()))
             .await
             .map(Response::new)
     }
@@ -1435,7 +1519,7 @@ fn owner_checkpoint_response(
         candidate_id,
         store_identity: evidence.store_identity.to_owned(),
         schema_version: u32::from(evidence.schema_version),
-        workload: evidence.workload.as_str().to_owned(),
+        workload: String::new(),
         network_name: encode_zinder_native_chain_name(evidence.build_plan.network()).to_owned(),
         ready_evidence: Some(checkpoint_ready_evidence_message(&evidence.ready_evidence)),
         build_plan: Some(checkpoint_build_plan_message(&evidence.build_plan)),
@@ -1697,18 +1781,21 @@ fn map_store_error(error: &CanonicalStoreError) -> Status {
         CanonicalStoreError::CanonicalEpochNotRetained { .. } => {
             Status::failed_precondition("canonical retained event epoch is unavailable")
         }
-        CanonicalStoreError::MempoolEventCursorExpired { .. } => {
-            Status::failed_precondition("mempool event cursor has expired")
-        }
-        CanonicalStoreError::MempoolSnapshotCursorExpired { .. } => {
-            Status::failed_precondition("mempool snapshot page cursor has expired")
-        }
+        CanonicalStoreError::MempoolEventCursorExpired { .. } => status_for_reason(
+            ops::ErrorReason::MempoolEventCursorExpired,
+            "mempool event cursor has expired",
+        ),
+        CanonicalStoreError::MempoolSnapshotCursorExpired { .. } => status_for_reason(
+            ops::ErrorReason::SnapshotPageCursorExpired,
+            "mempool snapshot page cursor has expired",
+        ),
         CanonicalStoreError::MempoolEventCursorInvalid { .. } => {
             Status::invalid_argument("mempool event cursor is invalid")
         }
-        CanonicalStoreError::MempoolSnapshotCursorInvalid { .. } => {
-            Status::invalid_argument("mempool snapshot page cursor is invalid")
-        }
+        CanonicalStoreError::MempoolSnapshotCursorInvalid { .. } => status_for_reason(
+            ops::ErrorReason::SnapshotPageCursorInvalid,
+            "mempool snapshot page cursor is invalid",
+        ),
         CanonicalStoreError::MempoolEventSequenceOverflow => {
             Status::resource_exhausted("mempool event sequence is exhausted")
         }
@@ -1749,10 +1836,10 @@ pub(crate) mod test_support {
         CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion,
         CanonicalTransactionFacts, ChainTipMetadata, CompactBlockArtifact, CompactChainMetadata,
         CompactTransactionData, LockTime, MempoolEntry, MempoolEvictionReason, MempoolObservation,
-        Network, PrivacyShape, RawTransactionBytes, SerializedBytesDigest, TransactionBlobArtifact,
+        Network, PrivacyShape, RawTransactionBytes, SerializedBytesDigest,
         TransactionComponentCounts, TransactionId, TransactionIntrinsicValueBalances,
-        TransactionLocation, TransactionPublicFacts, TransactionVersion, UnixTimestampMillis,
-        UnsupportedSection, encode_canonical_block_replay,
+        TransactionPublicFacts, TransactionVersion, UnixTimestampMillis, UnsupportedSection,
+        encode_canonical_block_replay,
     };
     use zinder_proto::v1::ingest::{
         AcquireCanonicalProjectionBuildLeaseRequest, CanonicalEventPageRequest,
@@ -1763,13 +1850,32 @@ pub(crate) mod test_support {
     };
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
-        CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, MempoolEvent,
-        MempoolEventHistoryRequest, MempoolEventRetentionConfig, MempoolEventRetentionReport,
-        MempoolEventRetentionStepStop, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
-        RocksDbResourceBudget,
+        CanonicalStoreBuildPlan, CanonicalStoreError, MempoolEvent, MempoolEventHistoryRequest,
+        MempoolEventRetentionConfig, MempoolEventRetentionReport, MempoolEventRetentionStepStop,
+        RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
     };
 
     use super::*;
+
+    #[test]
+    fn malformed_snapshot_cursor_carries_the_invalid_page_reason() {
+        use tonic_types::StatusExt as _;
+
+        let status = map_store_error(&CanonicalStoreError::MempoolSnapshotCursorInvalid {
+            reason: "cursor authentication failed",
+        });
+        let details = status.get_error_details();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            details
+                .error_info()
+                .map(|detail| (detail.domain.as_str(), detail.reason.as_str())),
+            Some((
+                zinder_proto::ZINDER_ERROR_DOMAIN,
+                ops::ErrorReason::SnapshotPageCursorInvalid.as_str_name()
+            )),
+        );
+    }
 
     /// A request the owner of the canonical primary never services fails with
     /// the writer's typed `STORAGE_UNAVAILABLE`, whether the owner is gone,
@@ -1816,6 +1922,76 @@ pub(crate) mod test_support {
         });
         assert_eq!(storage_unavailable(stalled.chain_epoch().await), expected);
         stalled_owner.abort();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unbounded_reads_and_owner_writes_keep_the_full_reply_timeout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (handle, _commands) = canonical_control_channel();
+        let adapter = CanonicalControlGrpcAdapter::new(
+            handle,
+            CanonicalCheckpointStagingRoot::new(PathBuf::new()),
+            RocksDbResourceBudget::for_local_tests(),
+            CanonicalStoreDamageSignal::default(),
+        );
+        let mut write = Request::new(AcquireCanonicalProjectionBuildLeaseRequest {
+            lease: Some(CanonicalProjectionBuildLease::default()),
+        });
+        write.set_timeout(Duration::from_secs(15));
+        let start = tokio::time::Instant::now();
+        let read = adapter.writer_status(Request::new(CanonicalWriterStatusRequest {}));
+        let write = adapter.acquire_projection_build_lease(write);
+        tokio::pin!(read, write);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        assert!(futures_util::poll!(&mut write).is_pending());
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(futures_util::poll!(&mut read).is_pending());
+        assert!(futures_util::poll!(&mut write).is_pending());
+        let (read, write) = tokio::join!(read, write);
+        assert_eq!(start.elapsed(), Duration::from_secs(60));
+        for status in [read.err(), write.err()] {
+            assert_eq!(
+                status.ok_or("stalled owner answered")?.code(),
+                tonic::Code::Unavailable
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn short_rpc_deadlines_leave_time_for_the_owner() {
+        let mut request = Request::new(());
+        request.set_timeout(Duration::from_millis(100));
+        let deadline = CanonicalReadDeadline::from_request(&request);
+        assert_eq!(
+            deadline.0 - tokio::time::Instant::now(),
+            Duration::from_millis(90)
+        );
+    }
+
+    #[test]
+    fn grpc_read_timeout_accepts_all_six_wire_units_and_ignores_malformed_headers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (header, expected) in [
+            ("2H", Some(Duration::from_hours(2))),
+            ("3M", Some(Duration::from_mins(3))),
+            ("15S", Some(Duration::from_secs(15))),
+            ("15000m", Some(Duration::from_secs(15))),
+            ("15000000u", Some(Duration::from_secs(15))),
+            ("0n", Some(Duration::ZERO)),
+            ("150000000n", None),
+            ("+1S", None),
+            ("1s", None),
+            ("S", None),
+            ("", None),
+        ] {
+            let mut request = Request::new(());
+            request
+                .metadata_mut()
+                .insert("grpc-timeout", header.parse()?);
+            assert_eq!(grpc_timeout(&request), expected, "{header}");
+        }
         Ok(())
     }
 
@@ -2107,7 +2283,7 @@ pub(crate) mod test_support {
             checkpoint.schema_version,
             u32::from(zinder_store::CANONICAL_STORE_SCHEMA_VERSION)
         );
-        assert_eq!(checkpoint.workload, "wallet");
+        assert_eq!(checkpoint.workload, "");
         assert_eq!(checkpoint.network_name, "zcash-testnet");
         assert_ne!(checkpoint.database_identity, [] as [u8; 0]);
         let ready_evidence = checkpoint
@@ -2132,7 +2308,7 @@ pub(crate) mod test_support {
             .build_plan
             .ok_or("checkpoint response omitted build-plan identity")?;
         assert_eq!(build_plan.activation_fingerprint_version, 1);
-        assert_eq!(build_plan.raw_blob_retention, "transactions");
+        assert_eq!(build_plan.raw_blob_retention, "none");
         assert_eq!(build_plan.reorg_window_blocks, 1);
         assert_eq!(
             build_plan
@@ -2491,8 +2667,7 @@ pub(crate) mod test_support {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2643,8 +2818,7 @@ pub(crate) mod test_support {
         let corrupted = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2673,8 +2847,7 @@ pub(crate) mod test_support {
         let repaired = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2724,8 +2897,7 @@ pub(crate) mod test_support {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3078,12 +3250,11 @@ pub(crate) mod test_support {
             &activations,
             0,
             tip,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             path,
-            CanonicalStoreWorkload::Wallet,
             plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3176,11 +3347,7 @@ pub(crate) mod test_support {
                 1,
                 zinder_core::CommitmentTreeFrontiers::default(),
             )),
-            block_final_note_commitment_roots: None,
-            transaction_blobs: vec![TransactionBlobArtifact::new(
-                TransactionLocation::new(transaction_id, height, facts.block_header.block_hash, 0),
-                raw_transaction_bytes,
-            )],
+            transaction_blobs: Vec::new(),
             block_blob: None,
             facts,
         }

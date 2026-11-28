@@ -18,13 +18,8 @@
 
 use std::collections::HashMap;
 
-use zinder_core::wire::{
-    WireDecodeError, decode_internal_transaction_id, decode_rpc_transaction_id_hex,
-    encode_internal_transaction_id,
-};
-use zinder_core::{
-    TransactionId, TransparentAddressScriptHash, TransparentOutPoint, TransparentSpendFact,
-};
+use zinder_core::wire::encode_internal_transaction_id;
+use zinder_core::{TransparentAddressScriptHash, TransparentOutPoint, TransparentSpendFact};
 use zinder_proto::wire::{TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE};
 
 use crate::consumer::BlockCommitContext;
@@ -150,21 +145,6 @@ pub(crate) fn internal_transaction_ids_by_position(block: &BlockCommitContext) -
         }
     }
     transaction_ids
-}
-
-/// Decodes the transaction id a delta or activity row stores.
-///
-/// A row written by this release carries 32 internal-order bytes. A row an
-/// earlier release wrote carries only the RPC hex form, which still decodes.
-pub(crate) fn decode_stored_transaction_id(
-    internal_transaction_id: &[u8],
-    rpc_transaction_id_hex: &str,
-) -> Result<TransactionId, WireDecodeError> {
-    if internal_transaction_id.is_empty() {
-        decode_rpc_transaction_id_hex(rpc_transaction_id_hex)
-    } else {
-        decode_internal_transaction_id(internal_transaction_id)
-    }
 }
 
 #[cfg(test)]

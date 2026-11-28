@@ -27,10 +27,11 @@
 //! contract.
 //!
 //! A stream holds one slot of a process-wide [`BlockRangeStreamLimit`] from
-//! its admission until its response is dropped and every chunk read of the
-//! stream has finished, so the number of slots bounds how many streams hold chunks
-//! at once. A request that finds every slot taken waits in a bounded queue
-//! for a bounded time, then fails with `UNAVAILABLE`, as lightwalletd does.
+//! its admission until the stream ends, fails, or its response is dropped, and
+//! every chunk read of the stream has finished, so the number of slots bounds
+//! how many streams hold chunks at once. A request that finds every slot taken
+//! waits in a bounded queue for a bounded time, then fails with `UNAVAILABLE`,
+//! as lightwalletd does.
 
 use std::{
     num::NonZeroU32,
@@ -45,11 +46,14 @@ use std::{
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::Stream;
+use tokio_util::sync::CancellationToken;
 use tonic::Status;
+use tracing::Instrument as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
 };
 use zinder_query::DEFAULT_MAX_COMPACT_BLOCK_RANGE;
+use zinder_runtime::RetryPushback;
 use zinder_store::HeightOrder;
 
 /// Stored compact-block bytes one block-range chunk keeps at most.
@@ -79,6 +83,10 @@ pub const DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS: NonZeroU32 =
 /// Default for how long a block-range request waits for a stream slot before
 /// it fails with `UNAVAILABLE`, as in lightwalletd.
 pub const DEFAULT_BLOCK_RANGE_ADMISSION_WAIT: Duration = Duration::from_secs(10);
+
+/// Number of requests that may wait for a block-range stream slot for each
+/// configured stream slot.
+const BLOCK_RANGE_WAITERS_PER_SLOT: usize = 3;
 
 /// Plans the chunk reads of one block-range stream in wire order.
 ///
@@ -299,17 +307,42 @@ impl BlockRangeStage {
 /// goes away, and no chunk read of the stream is still running.
 ///
 /// A request that finds every slot taken waits for one, first come first
-/// served, for at most [`Self::max_wait`]. At most as many requests wait as
-/// the limit has slots, so a request that finds the queue full fails at once.
+/// served, for at most [`Self::max_wait`]. At most three times as many
+/// requests wait as the limit has slots, so a request that finds the queue
+/// full fails at once.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockRangeStreamLimit {
+    encoded_range_reads: Arc<Semaphore>,
     slots: Arc<Semaphore>,
     waiters: Arc<AtomicUsize>,
     max_streams: NonZeroU32,
     max_wait: Duration,
 }
 
+const ENCODED_RANGE_READERS: usize = 16;
+
 impl BlockRangeStreamLimit {
+    pub(crate) fn encoded_range_chunk_budget(&self, offered: usize) -> usize {
+        let capacity = (self.max_streams.get() as usize).min(Semaphore::MAX_PERMITS);
+        let active = capacity.saturating_sub(self.slots.available_permits());
+        offered.min(
+            (ENCODED_RANGE_READERS * BLOCK_RANGE_CHUNK_MAX_BYTES)
+                / active.max(ENCODED_RANGE_READERS),
+        )
+    }
+
+    pub(crate) fn try_encoded_range_read_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.encoded_range_reads.clone().try_acquire_owned().ok()
+    }
+
+    pub(crate) async fn encoded_range_read_permit(&self) -> Result<OwnedSemaphorePermit, Status> {
+        self.encoded_range_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("encoded range reader closed"))
+    }
+
     /// Creates a limit that admits at most `max_streams` streams at once and
     /// lets a request wait [`DEFAULT_BLOCK_RANGE_ADMISSION_WAIT`] for a slot.
     #[must_use]
@@ -320,7 +353,9 @@ impl BlockRangeStreamLimit {
         // Publishes the gauge before the first stream opens. Setting it to
         // zero would discard the slots that other limits in the process hold.
         metrics::gauge!(OPEN_STREAMS_GAUGE).increment(0.0);
+        register_refusal_counter();
         Self {
+            encoded_range_reads: Arc::new(Semaphore::new(ENCODED_RANGE_READERS)),
             slots: Arc::new(Semaphore::new(permits)),
             waiters: Arc::new(AtomicUsize::new(0)),
             max_streams,
@@ -358,8 +393,8 @@ impl BlockRangeStreamLimit {
     /// # Errors
     ///
     /// Returns `UNAVAILABLE` when no slot returns within
-    /// [`Self::max_wait`], or at once when as many requests already wait as
-    /// the limit has slots. Each refusal is counted in
+    /// [`Self::max_wait`], or at once when three times as many requests
+    /// already wait as the limit has slots. Each refusal is counted in
     /// `zinder_compat_block_range_stream_refusals_total{reason}`.
     pub(crate) async fn open(&self) -> Result<BlockRangeStreamSlot, Status> {
         let started_at = Instant::now();
@@ -392,19 +427,21 @@ impl BlockRangeStreamLimit {
         Err(self.refusal())
     }
 
-    /// Requests that may wait for a slot at once: one for each slot.
+    /// Requests that may wait for a slot at once: three for each slot.
     fn max_waiters(&self) -> usize {
-        usize::try_from(self.max_streams.get()).unwrap_or(usize::MAX)
+        usize::try_from(self.max_streams.get())
+            .unwrap_or(usize::MAX)
+            .saturating_mul(BLOCK_RANGE_WAITERS_PER_SLOT)
     }
 
     /// `UNAVAILABLE`, which wallets retry, rather than `RESOURCE_EXHAUSTED`,
     /// as lightwalletd returns for its own block-range limit.
     fn refusal(&self) -> Status {
-        Status::unavailable(format!(
+        RetryPushback::Backoff.apply(Status::unavailable(format!(
             "this server already serves its limit of {} concurrent block-range streams; retry \
              shortly",
             self.max_streams
-        ))
+        )))
     }
 }
 
@@ -456,18 +493,35 @@ enum AdmissionOutcome {
 /// Why a block-range request was refused a slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RefusalReason {
-    /// As many requests already waited as the limit has slots.
+    /// Three times as many requests already waited as the limit has slots.
     WaitersFull,
     /// No slot returned within the limit's wait.
     WaitTimeout,
 }
 
 impl RefusalReason {
+    const ALL: [Self; 2] = [Self::WaitTimeout, Self::WaitersFull];
+
     const fn label(self) -> &'static str {
         match self {
             Self::WaitersFull => "waiters_full",
             Self::WaitTimeout => "wait_timeout",
         }
+    }
+}
+
+/// Describes and pre-registers `zinder_compat_block_range_stream_refusals_total`
+/// at zero for every finite refusal reason.
+fn register_refusal_counter() {
+    metrics::describe_counter!(
+        REFUSED_STREAMS_COUNTER,
+        metrics::Unit::Count,
+        "Block-range stream requests refused with UNAVAILABLE, by reason: `wait_timeout` \
+         when no slot returned within the admission wait, and `waiters_full` when every \
+         waiting place was taken."
+    );
+    for reason in RefusalReason::ALL {
+        metrics::counter!(REFUSED_STREAMS_COUNTER, "reason" => reason.label()).increment(0);
     }
 }
 
@@ -481,11 +535,64 @@ fn record_admission(outcome: AdmissionOutcome, waited: Duration) {
         }
         AdmissionOutcome::Refused(reason) => {
             metrics::counter!(REFUSED_STREAMS_COUNTER, "reason" => reason.label()).increment(1);
+            if reason == RefusalReason::WaitTimeout {
+                maybe_warn_cgroup_memory_pressure();
+            }
             "refused"
         }
         AdmissionOutcome::Cancelled => "cancelled",
     };
     metrics::histogram!(SLOT_WAIT_HISTOGRAM, "outcome" => outcome_label).record(waited);
+}
+
+const CGROUP_PRESSURE_WARN_INTERVAL_SECS: u64 = 30;
+
+fn maybe_warn_cgroup_memory_pressure() {
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    };
+
+    static START: OnceLock<Instant> = OnceLock::new();
+    static LAST_SAMPLE_SECS: AtomicU64 = AtomicU64::new(0);
+
+    // Reserve the sampling interval atomically before touching cgroup files so
+    // bursts of concurrent timeouts cannot hammer synchronous reads on Tokio
+    // workers.
+    let elapsed_secs = START.get_or_init(Instant::now).elapsed().as_secs().max(1);
+    let previous = LAST_SAMPLE_SECS.load(AtomicOrdering::Relaxed);
+    if previous != 0 && elapsed_secs.saturating_sub(previous) < CGROUP_PRESSURE_WARN_INTERVAL_SECS {
+        return;
+    }
+    if LAST_SAMPLE_SECS
+        .compare_exchange(
+            previous,
+            elapsed_secs,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+
+    let Some(snapshot) = zinder_runtime::container_memory_snapshot() else {
+        return;
+    };
+    if snapshot.limit_bytes == 0
+        || u128::from(snapshot.current_bytes) * 10 < u128::from(snapshot.limit_bytes) * 8
+    {
+        return;
+    }
+    tracing::warn!(
+        target: "zinder::compat::lightwalletd",
+        event = "block_range_wait_timeout_under_cgroup_memory_pressure",
+        memory_current_bytes = snapshot.current_bytes,
+        memory_limit_bytes = snapshot.limit_bytes,
+        memory_file_cache_bytes = snapshot.file_cache_bytes,
+        "block-range admission timed out while cgroup v2 memory usage is near its limit; \
+         canonical settled-segment reads charge OS page cache to MemoryMax/mem_limit outside RocksDB"
+    );
 }
 
 /// A taken slot, counted in `zinder_compat_block_range_streams_open` until it
@@ -551,19 +658,21 @@ impl BlockRangeStreamSlot {
         Read: Future<Output = Result<Output, Status>> + Send + 'static,
     {
         let stream_slot = self.clone();
-        let (outcome, _stream_slot) = tokio::spawn(async move { (read.await, stream_slot) })
-            .await
-            .map_err(|error| Status::unavailable(format!("block-range read failed: {error}")))?;
+        let (outcome, _stream_slot) = tokio::spawn(
+            async move { (read.await, stream_slot) }.instrument(tracing::Span::current()),
+        )
+        .await
+        .map_err(|error| Status::unavailable(format!("block-range read failed: {error}")))?;
         outcome
     }
 
-    /// Returns a response that sends `messages` and holds this slot until it
-    /// is dropped.
-    pub(crate) fn hold_for<Message: Send + 'static>(
-        self,
-        messages: Vec<Message>,
-    ) -> BlockRangeResponse<Message> {
-        self.hold_for_stream(Box::pin(tokio_stream::iter(messages)))
+    /// Returns a response that sends `messages` and holds this slot until the
+    /// stream ends, yields a terminal error, or is dropped.
+    pub(crate) fn hold_for<Message>(self, messages: Vec<Message>) -> BlockRangeResponse<Message>
+    where
+        Message: StreamItemEndsStream + Send + 'static,
+    {
+        self.hold_for_stream(Box::pin(ChunkIter::new(messages)))
     }
 
     /// Returns a response that sends `first_messages` and then each chunk
@@ -577,33 +686,44 @@ impl BlockRangeStreamSlot {
     ///
     /// The response and the reader's sink each hold this slot, so the reader
     /// keeps the slot while a read runs, even after the client has gone away.
+    /// The response releases its clone as soon as the stream ends, yields a
+    /// terminal error, or is dropped.
     pub(crate) fn hold_with_reader<Message, Reader>(
         self,
         first_messages: Vec<Message>,
         reader: impl FnOnce(BlockRangeSink<Message>) -> Reader,
     ) -> BlockRangeResponse<Message>
     where
-        Message: Send + 'static,
+        Message: StreamItemEndsStream + Send + 'static,
         Reader: Future<Output = ()> + Send + 'static,
     {
         let (next_chunk, next_chunks) = mpsc::channel(1);
-        tokio::spawn(reader(BlockRangeSink {
-            next_chunk,
-            _stream_slot: self.clone(),
-        }));
+        let cancel = CancellationToken::new();
+        tokio::spawn(
+            reader(BlockRangeSink {
+                next_chunk,
+                cancel: cancel.clone(),
+                _stream_slot: self.clone(),
+            })
+            .instrument(tracing::Span::current()),
+        );
         self.hold_for_stream(Box::pin(ChunkedMessages {
-            current: Some(tokio_stream::iter(first_messages)),
+            current: Some(ChunkIter::new(first_messages)),
             next_chunks,
+            cancel,
         }))
     }
 
-    fn hold_for_stream<Message: 'static>(
+    fn hold_for_stream<Message>(
         self,
         stream: BlockRangeResponse<Message>,
-    ) -> BlockRangeResponse<Message> {
+    ) -> BlockRangeResponse<Message>
+    where
+        Message: StreamItemEndsStream + 'static,
+    {
         Box::pin(SlotHoldingStream {
             stream,
-            _slot: self,
+            slot: Some(self),
         })
     }
 }
@@ -614,10 +734,16 @@ impl BlockRangeStreamSlot {
 #[derive(Debug)]
 pub(crate) struct BlockRangeSink<Message> {
     next_chunk: mpsc::Sender<Vec<Message>>,
+    cancel: CancellationToken,
     _stream_slot: BlockRangeStreamSlot,
 }
 
 impl<Message> BlockRangeSink<Message> {
+    /// Returns a cooperative cancellation token signaled when the client drops
+    /// the response stream.
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
     /// Waits until the response has room for one more chunk and returns
     /// that room.
     ///
@@ -631,6 +757,10 @@ impl<Message> BlockRangeSink<Message> {
     pub(crate) async fn room_for_chunk(&self) -> Option<ChunkRoom<'_, Message>> {
         let permit = self.next_chunk.reserve().await.ok()?;
         Some(ChunkRoom { permit })
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.next_chunk.closed().await;
     }
 
     /// Returns whether the client has dropped the response, so a reader
@@ -655,15 +785,70 @@ impl<Message> ChunkRoom<'_, Message> {
     }
 }
 
+/// Items yielded from one chunk before returning `Poll::Pending` once to let
+/// sibling tasks run.
+///
+/// `tokio_stream::iter` yields every 32 items (~2.5 KiB of empty blocks), which
+/// breaks 32 KiB gRPC batches into tiny HTTP/2 DATA frames and forces a task
+/// reschedule every 32 blocks. 768 items covers two full 32 KiB frames of
+/// minimum-size blocks (current + `ReleaseGate` lookahead) while still yielding
+/// inside a 1,000-block typed chunk.
+const CHUNK_YIELD_EVERY: usize = 768;
+
+struct ChunkIter<Message> {
+    messages: std::vec::IntoIter<Message>,
+    polled_since_yield: usize,
+}
+
+impl<Message> ChunkIter<Message> {
+    fn new(messages: Vec<Message>) -> Self {
+        Self {
+            messages: messages.into_iter(),
+            polled_since_yield: 0,
+        }
+    }
+}
+
+impl<Message> Unpin for ChunkIter<Message> {}
+
+impl<Message> Stream for ChunkIter<Message> {
+    type Item = Message;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Message>> {
+        if self.messages.len() == 0 {
+            return Poll::Ready(None);
+        }
+        if self.polled_since_yield >= CHUNK_YIELD_EVERY {
+            self.polled_since_yield = 0;
+            context.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        self.polled_since_yield += 1;
+        Poll::Ready(self.messages.next())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.messages.size_hint()
+    }
+}
+
 /// The messages of a stream with later chunks, sent from one chunk at a
 /// time.
 struct ChunkedMessages<Message> {
     /// The messages of the chunk being sent that the client has not taken,
     /// which yield to the runtime as a one-chunk response does, or `None`
     /// once they have all been taken.
-    current: Option<tokio_stream::Iter<std::vec::IntoIter<Message>>>,
+    current: Option<ChunkIter<Message>>,
     /// The chunks the stream's reader hands on, at most one ahead.
     next_chunks: mpsc::Receiver<Vec<Message>>,
+    /// Cooperative cancellation token signaled when this stream drops.
+    cancel: CancellationToken,
+}
+
+impl<Message> Drop for ChunkedMessages<Message> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 // No field is pinned: the stream moves its messages out by value.
@@ -684,7 +869,7 @@ impl<Message> Stream for ChunkedMessages<Message> {
             let Some(next_chunk) = std::task::ready!(self.next_chunks.poll_recv(context)) else {
                 return Poll::Ready(None);
             };
-            self.current = Some(tokio_stream::iter(next_chunk));
+            self.current = Some(ChunkIter::new(next_chunk));
         }
     }
 
@@ -697,20 +882,64 @@ impl<Message> Stream for ChunkedMessages<Message> {
     }
 }
 
-struct SlotHoldingStream<S> {
-    stream: S,
-    _slot: BlockRangeStreamSlot,
+/// Reports whether yielding a message terminates a block-range response stream.
+///
+/// Both tonic's server encoder and `EncodedBlockBody` stop polling a response
+/// stream as soon as it yields `Some(Err(_))` rather than polling again for
+/// `None`. Releasing the slot on a terminal error item matches that behavior.
+pub(crate) trait StreamItemEndsStream {
+    /// Returns `true` when yielding `self` ends the response stream.
+    fn ends_stream(&self) -> bool;
 }
 
-impl<S: Stream + Unpin> Stream for SlotHoldingStream<S> {
+impl<Message, Error> StreamItemEndsStream for Result<Message, Error> {
+    fn ends_stream(&self) -> bool {
+        self.is_err()
+    }
+}
+
+#[cfg(test)]
+impl StreamItemEndsStream for u32 {
+    fn ends_stream(&self) -> bool {
+        false
+    }
+}
+
+struct SlotHoldingStream<S> {
+    stream: S,
+    slot: Option<BlockRangeStreamSlot>,
+}
+
+impl<S> Stream for SlotHoldingStream<S>
+where
+    S: Stream + Unpin,
+    S::Item: StreamItemEndsStream,
+{
     type Item = S::Item;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<S::Item>> {
-        Pin::new(&mut self.stream).poll_next(context)
+        if self.slot.is_none() {
+            return Poll::Ready(None);
+        }
+        let next_message = Pin::new(&mut self.stream).poll_next(context);
+        match &next_message {
+            Poll::Ready(None) => {
+                drop(self.slot.take());
+            }
+            Poll::Ready(Some(message)) if message.ends_stream() => {
+                drop(self.slot.take());
+            }
+            Poll::Ready(Some(_)) | Poll::Pending => {}
+        }
+        next_message
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.stream.size_hint()
+        if self.slot.is_none() {
+            (0, Some(0))
+        } else {
+            self.stream.size_hint()
+        }
     }
 }
 
@@ -767,6 +996,36 @@ impl ReorgEndingCause {
     }
 }
 
+pub(crate) trait RangeBlock {
+    fn height(&self) -> BlockHeight;
+    fn block_hash(&self) -> BlockHash;
+    fn previous_block_hash(&self) -> BlockHash;
+}
+
+impl RangeBlock for CompactBlockArtifact {
+    fn height(&self) -> BlockHeight {
+        self.height()
+    }
+    fn block_hash(&self) -> BlockHash {
+        self.block_hash()
+    }
+    fn previous_block_hash(&self) -> BlockHash {
+        self.previous_block_hash()
+    }
+}
+
+impl RangeBlock for zinder_store::EncodedCompactBlockLink {
+    fn height(&self) -> BlockHeight {
+        self.height
+    }
+    fn block_hash(&self) -> BlockHash {
+        self.block_hash
+    }
+    fn previous_block_hash(&self) -> BlockHash {
+        self.previous_block_hash
+    }
+}
+
 impl BlockRangeContinuity {
     /// Returns the continuity after the stream's first chunk.
     ///
@@ -781,7 +1040,7 @@ impl BlockRangeContinuity {
     /// least one block or fails, so an empty chunk means the store broke that
     /// contract.
     pub(crate) fn after_first_chunk(
-        blocks: &[CompactBlockArtifact],
+        blocks: &[impl RangeBlock],
         chain_epoch_id: ChainEpochId,
         is_descending: bool,
     ) -> Result<Self, Status> {
@@ -832,7 +1091,7 @@ impl BlockRangeContinuity {
         &self,
         next_chunk: BlockHeightRange,
         read_at: ChainEpochId,
-        blocks: &[CompactBlockArtifact],
+        blocks: &[impl RangeBlock],
     ) -> ChunkLink {
         let continued = if self.is_continued_by(blocks) {
             Self::after_first_chunk(blocks, read_at, self.is_descending).ok()
@@ -879,7 +1138,7 @@ impl BlockRangeContinuity {
         Ok(())
     }
 
-    fn is_continued_by(&self, blocks: &[CompactBlockArtifact]) -> bool {
+    fn is_continued_by(&self, blocks: &[impl RangeBlock]) -> bool {
         if self.is_descending {
             blocks.last().is_some_and(|next| {
                 next.height().next() == Some(self.last_sent_height)
@@ -950,9 +1209,10 @@ mod tests {
     use zinder_store::HeightOrder;
 
     use super::{
-        BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES, BlockRangeChunks,
-        BlockRangeContinuity, BlockRangeStreamLimit, ChunkedMessages,
-        DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+        BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES,
+        BLOCK_RANGE_WAITERS_PER_SLOT, BlockRangeChunks, BlockRangeContinuity,
+        BlockRangeStreamLimit, ChunkedMessages, DEFAULT_BLOCK_RANGE_ADMISSION_WAIT,
+        DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
     };
 
     const SENT_EPOCH: ChainEpochId = ChainEpochId::new(4);
@@ -1158,7 +1418,11 @@ mod tests {
 
     #[test]
     fn an_empty_first_chunk_is_unavailable() {
-        let outcome = BlockRangeContinuity::after_first_chunk(&[], SENT_EPOCH, false);
+        let outcome = BlockRangeContinuity::after_first_chunk(
+            &[] as &[CompactBlockArtifact],
+            SENT_EPOCH,
+            false,
+        );
         assert_eq!(
             outcome.err().map(|status| status.code()),
             Some(Code::Unavailable)
@@ -1520,13 +1784,20 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_request_past_the_waiter_cap_is_unavailable_at_once() -> Result<(), Status> {
-        // One slot admits one waiter.
+        let default_limit = BlockRangeStreamLimit::new(DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS);
+        assert_eq!(default_limit.max_waiters(), 300);
+
+        // One slot admits 3x waiters.
         let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+        assert_eq!(limit.max_waiters(), BLOCK_RANGE_WAITERS_PER_SLOT);
         let open_stream = limit.open().await?;
-        let waiting = tokio::spawn({
-            let limit = limit.clone();
-            async move { limit.open().await }
-        });
+        let mut waiting = Vec::with_capacity(BLOCK_RANGE_WAITERS_PER_SLOT);
+        for _ in 0..BLOCK_RANGE_WAITERS_PER_SLOT {
+            waiting.push(tokio::spawn({
+                let limit = limit.clone();
+                async move { limit.open().await }
+            }));
+        }
         let_waiters_queue().await;
 
         let started_at = Instant::now();
@@ -1534,7 +1805,9 @@ mod tests {
         assert_eq!(started_at.elapsed(), Duration::ZERO);
 
         drop(open_stream);
-        drop(waiting.await.map_err(|error| join_failed(&error))??);
+        for queued in waiting {
+            drop(queued.await.map_err(|error| join_failed(&error))??);
+        }
         Ok(())
     }
 
@@ -1542,6 +1815,13 @@ mod tests {
     async fn a_cancelled_waiter_gives_back_its_place_in_the_queue() -> Result<(), Status> {
         let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
         let open_stream = limit.open().await?;
+        let mut staying = Vec::with_capacity(BLOCK_RANGE_WAITERS_PER_SLOT - 1);
+        for _ in 0..(BLOCK_RANGE_WAITERS_PER_SLOT - 1) {
+            staying.push(tokio::spawn({
+                let limit = limit.clone();
+                async move { limit.open().await }
+            }));
+        }
         let cancelled = tokio::spawn({
             let limit = limit.clone();
             async move { limit.open().await }
@@ -1561,7 +1841,12 @@ mod tests {
             !waiting.is_finished(),
             "the request must wait, not be refused"
         );
+        // The queue is now full again, so one more request fails immediately.
+        assert_unavailable(limit.open().await);
         drop(open_stream);
+        for queued in staying {
+            drop(queued.await.map_err(|error| join_failed(&error))??);
+        }
         drop(waiting.await.map_err(|error| join_failed(&error))??);
         Ok(())
     }
@@ -1601,6 +1886,37 @@ mod tests {
         })
     }
 
+    #[test]
+    fn stream_limit_preregisters_refusal_counters_at_zero_with_metadata() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+        let _limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("# HELP zinder_compat_block_range_stream_refusals_total "),
+            "missing # HELP for block-range refusals in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("# TYPE zinder_compat_block_range_stream_refusals_total counter"),
+            "missing # TYPE for block-range refusals in:\n{rendered}"
+        );
+        for reason in ["wait_timeout", "waiters_full"] {
+            assert_eq!(
+                rendered_sample(
+                    &rendered,
+                    &format!(
+                        "zinder_compat_block_range_stream_refusals_total{{reason=\"{reason}\"}}"
+                    ),
+                ),
+                Some(0.0),
+                "expected 0 sample for reason={reason} in:\n{rendered}"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn admission_counts_each_outcome_and_samples_its_slot_wait() -> Result<(), Status> {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -1609,14 +1925,20 @@ mod tests {
         let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
         let open_stream = limit.open().await?;
 
-        // One request waits out the limit while another finds the queue full.
-        let timed_out = tokio::spawn({
-            let limit = limit.clone();
-            async move { limit.open().await }
-        });
+        // Fill all waiter places so one more request finds the queue full,
+        // while the queued requests wait out the admission timeout.
+        let mut timed_out = Vec::with_capacity(BLOCK_RANGE_WAITERS_PER_SLOT);
+        for _ in 0..BLOCK_RANGE_WAITERS_PER_SLOT {
+            timed_out.push(tokio::spawn({
+                let limit = limit.clone();
+                async move { limit.open().await }
+            }));
+        }
         let_waiters_queue().await;
         assert_unavailable(limit.open().await);
-        assert_unavailable(timed_out.await.map_err(|error| join_failed(&error))?);
+        for waiter in timed_out {
+            assert_unavailable(waiter.await.map_err(|error| join_failed(&error))?);
+        }
 
         // One request gives up while it waits.
         let cancelled = tokio::spawn({
@@ -1634,16 +1956,16 @@ mod tests {
             sample("zinder_compat_block_range_streams_admitted_total"),
             Some(1.0)
         );
-        for reason in ["waiters_full", "wait_timeout"] {
+        for (reason, expected) in [("waiters_full", 1.0), ("wait_timeout", 3.0)] {
             assert_eq!(
                 sample(&format!(
                     "zinder_compat_block_range_stream_refusals_total{{reason=\"{reason}\"}}"
                 )),
-                Some(1.0),
-                "one request must be refused for {reason}"
+                Some(expected),
+                "unexpected refusal count for {reason}"
             );
         }
-        for (outcome, count) in [("admitted", 1.0), ("refused", 2.0), ("cancelled", 1.0)] {
+        for (outcome, count) in [("admitted", 1.0), ("refused", 4.0), ("cancelled", 1.0)] {
             assert_eq!(
                 sample(&format!(
                     "zinder_compat_block_range_slot_wait_duration_seconds_count{{outcome=\"{outcome}\"}}"
@@ -1652,6 +1974,141 @@ mod tests {
                 "{outcome} requests must each record one slot-wait sample"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_single_chunk_stream_releases_its_slot_when_it_ends_before_drop() -> Result<(), Status>
+    {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let open_streams =
+            || rendered_sample(&handle.render(), "zinder_compat_block_range_streams_open");
+
+        let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN).with_max_wait(Duration::ZERO);
+        let mut response = limit
+            .open()
+            .await?
+            .hold_for(vec![Ok::<u32, Status>(1), Ok(2)]);
+        assert_eq!(open_streams(), Some(1.0));
+        assert!(matches!(response.next().await, Some(Ok(1))));
+        assert!(matches!(response.next().await, Some(Ok(2))));
+        assert_eq!(open_streams(), Some(1.0));
+        assert_unavailable(limit.open().await);
+
+        assert!(response.next().await.is_none());
+        assert_eq!(
+            open_streams(),
+            Some(0.0),
+            "slot must release as soon as the stream yields None"
+        );
+        let reopened = limit.open().await?;
+        assert_eq!(open_streams(), Some(1.0));
+        // Polling again and dropping the finished wrapper must not touch the
+        // new slot or double-decrement the gauge.
+        assert!(response.next().await.is_none());
+        drop(response);
+        assert_eq!(open_streams(), Some(1.0));
+        drop(reopened);
+        assert_eq!(open_streams(), Some(0.0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_multi_chunk_stream_releases_its_slot_when_it_ends_before_drop() -> Result<(), Status>
+    {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let open_streams =
+            || rendered_sample(&handle.render(), "zinder_compat_block_range_streams_open");
+
+        let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN).with_max_wait(Duration::ZERO);
+        let mut response =
+            limit
+                .open()
+                .await?
+                .hold_with_reader(vec![Ok::<u32, Status>(1)], |sink| async move {
+                    if let Some(room) = sink.room_for_chunk().await {
+                        room.fill(vec![Ok(2)]);
+                    }
+                });
+        assert_eq!(open_streams(), Some(1.0));
+        assert!(matches!(response.next().await, Some(Ok(1))));
+        assert!(matches!(response.next().await, Some(Ok(2))));
+        assert!(response.next().await.is_none());
+
+        assert_eq!(
+            open_streams(),
+            Some(0.0),
+            "slot must release once the multi-chunk stream ends before drop"
+        );
+        let reopened = limit.open().await?;
+        assert_eq!(open_streams(), Some(1.0));
+        drop(response);
+        assert_eq!(open_streams(), Some(1.0));
+        drop(reopened);
+        assert_eq!(open_streams(), Some(0.0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stream_releases_its_slot_on_a_terminal_error_before_drop() -> Result<(), Status> {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let open_streams =
+            || rendered_sample(&handle.render(), "zinder_compat_block_range_streams_open");
+        let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN).with_max_wait(Duration::ZERO);
+
+        // Single-chunk stream ending in an error item (never polled to None).
+        let mut single = limit.open().await?.hold_for(vec![
+            Ok::<u32, Status>(1),
+            Err(Status::aborted("reorg")),
+            Ok(2),
+        ]);
+        assert!(matches!(single.next().await, Some(Ok(1))));
+        assert_eq!(open_streams(), Some(1.0));
+        assert_eq!(
+            single.next().await.and_then(Result::err).map(|s| s.code()),
+            Some(Code::Aborted)
+        );
+        assert_eq!(
+            open_streams(),
+            Some(0.0),
+            "slot must release on Err without polling to None or dropping"
+        );
+        let reopened = limit.open().await?;
+        assert!(single.next().await.is_none());
+        drop(single);
+        assert_eq!(open_streams(), Some(1.0));
+        drop(reopened);
+        assert_eq!(open_streams(), Some(0.0));
+
+        // Multi-chunk stream whose reader sends a terminal error and exits.
+        let mut chunked =
+            limit
+                .open()
+                .await?
+                .hold_with_reader(vec![Ok::<u32, Status>(1)], |sink| async move {
+                    if let Some(room) = sink.room_for_chunk().await {
+                        room.fill(vec![Err(Status::aborted("reorg"))]);
+                    }
+                });
+        assert!(matches!(chunked.next().await, Some(Ok(1))));
+        assert_eq!(
+            chunked.next().await.and_then(Result::err).map(|s| s.code()),
+            Some(Code::Aborted)
+        );
+        let_tasks_run().await;
+        assert_eq!(open_streams(), Some(0.0));
+        let reopened = limit.open().await?;
+        assert!(chunked.next().await.is_none());
+        drop(chunked);
+        assert_eq!(open_streams(), Some(1.0));
+        drop(reopened);
+        assert_eq!(open_streams(), Some(0.0));
         Ok(())
     }
 
@@ -1685,8 +2142,9 @@ mod tests {
         let first_messages = (0..FIRST_CHUNK_MESSAGES).collect::<Vec<_>>();
         let (next_chunk, next_chunks) = mpsc::channel(1);
         let mut chunked_messages = ChunkedMessages {
-            current: Some(tokio_stream::iter(first_messages.clone())),
+            current: Some(super::ChunkIter::new(first_messages.clone())),
             next_chunks,
+            cancel: super::CancellationToken::new(),
         };
 
         let mut sent = Vec::new();

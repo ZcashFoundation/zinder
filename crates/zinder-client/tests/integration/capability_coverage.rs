@@ -64,6 +64,10 @@ fn assert_wallet_chain_index_methods_compile<T: ChainIndex>() {
     let _ = T::block_header_by_selector;
     let _ = T::compact_block_at;
     let _ = T::compact_blocks_in_range;
+    let _ = T::scan_compact_blocks;
+    let _ = T::scan_compact_nullifiers;
+    let _ = T::transparent_address_balances;
+    let _ = T::transparent_addresses_unspent_outputs;
     let _ = T::full_block_at;
     let _ = T::full_blocks_in_range;
     let _ = T::tree_state_at;
@@ -87,6 +91,10 @@ fn assert_chain_snapshot_methods_compile<T: ChainIndex>() {
     let _ = ChainSnapshot::<T>::block_header_by_selector;
     let _ = ChainSnapshot::<T>::compact_block_at;
     let _ = ChainSnapshot::<T>::compact_blocks_in_range;
+    let _ = ChainSnapshot::<T>::scan_compact_blocks;
+    let _ = ChainSnapshot::<T>::scan_compact_nullifiers;
+    let _ = ChainSnapshot::<T>::transparent_address_balances;
+    let _ = ChainSnapshot::<T>::transparent_addresses_unspent_outputs;
     let _ = ChainSnapshot::<T>::full_block_at;
     let _ = ChainSnapshot::<T>::full_blocks_in_range;
     let _ = ChainSnapshot::<T>::tree_state_at;
@@ -109,6 +117,10 @@ fn assert_owned_chain_snapshot_methods_compile<T: ChainIndex>() {
     let _ = OwnedChainSnapshot::<T>::block_header_by_selector;
     let _ = OwnedChainSnapshot::<T>::compact_block_at;
     let _ = OwnedChainSnapshot::<T>::compact_blocks_in_range;
+    let _ = OwnedChainSnapshot::<T>::scan_compact_blocks;
+    let _ = OwnedChainSnapshot::<T>::scan_compact_nullifiers;
+    let _ = OwnedChainSnapshot::<T>::transparent_address_balances;
+    let _ = OwnedChainSnapshot::<T>::transparent_addresses_unspent_outputs;
     let _ = OwnedChainSnapshot::<T>::full_block_at;
     let _ = OwnedChainSnapshot::<T>::full_blocks_in_range;
     let _ = OwnedChainSnapshot::<T>::tree_state_at;
@@ -131,6 +143,7 @@ fn assert_owned_chain_snapshot_methods_compile<T: ChainIndex>() {
 )]
 fn assert_wallet_endpoint_methods_compile<T: EndpointBackedIndex>() {
     let _ = T::server_info;
+    let _ = T::standard_fee;
     let _ = T::broadcast_transaction;
     let _ = T::chain_events;
     let _ = T::mempool_snapshot;
@@ -148,6 +161,11 @@ fn typed_capability_variants_match_table_strings() {
         CAPABILITIES.iter().map(|spec| spec.string).collect();
     for capability in [
         Capability::Broadcast,
+        Capability::StandardFee,
+        Capability::CompactBlockScan,
+        Capability::CompactNullifierRange,
+        Capability::TransparentAddressBalances,
+        Capability::TransparentAddressesUnspentOutputs,
         Capability::ChainEvents,
         Capability::MempoolSnapshot,
         Capability::MempoolEvents,
@@ -201,6 +219,26 @@ fn typed_chain_index_covers_every_advertised_wallet_capability() {
     assert_owned_chain_snapshot_methods_compile::<RemoteChainIndex>();
 
     let coverage_rows = [
+        (
+            WALLET_READ_STANDARD_FEE_V1,
+            "EndpointBackedIndex::standard_fee",
+        ),
+        (
+            WALLET_READ_COMPACT_BLOCK_RANGE_V3,
+            "ChainIndex::scan_compact_blocks",
+        ),
+        (
+            WALLET_READ_COMPACT_NULLIFIER_RANGE_V1,
+            "ChainIndex::scan_compact_nullifiers",
+        ),
+        (
+            WALLET_ADDRESS_TRANSPARENT_BALANCES_V1,
+            "ChainIndex::transparent_address_balances",
+        ),
+        (
+            WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1,
+            "ChainIndex::transparent_addresses_unspent_outputs",
+        ),
         (
             WALLET_READ_VISIBLE_TIP_BLOCK_V1,
             "ChainIndex::visible_tip_block",

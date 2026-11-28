@@ -28,9 +28,15 @@ are optional explorer aggregates. Use `canonical`, `wallet projection`, and
 | `CanonicalEventFence` | Proof of one writer position: chain epoch, event sequence, visible tip, and sequence digest. A reader compares fences to prove it sees exactly what the writer committed. | `zinder-store` |
 | `CanonicalWriterFence` | The wire form of the writer's fence, returned by `CanonicalControl.WriterStatus`. Writer and readers both encode it with `zinder_proto::wire::canonical_writer_fence_message`. | `zinder.v1.ingest` |
 | `CanonicalActivationSchedule` | The network-upgrade activation table the writer admitted, with its revision and admission tip. | `zinder-store` |
+| `EdgeSnapshotManifest` | Signed checkpoint inventory and consensus commitments for initializing a canonical writer. [ADR-0024](../adrs/0024-verified-edge-snapshot-bootstrap.md) defines the artifact. | `zinder-store` |
 | `CanonicalBlockFacts` | Everything about one block that replay and materialized views need. | `zinder-core` |
 | `ChainEvent` | A durable canonical append or replacement. | `zinder-store`, `zinder-client` |
 | `MempoolEvent` | A live-pool change: added, invalidated, or mined. | `zinder-store`, `zinder-client` |
+
+Native services advertise network contract revision 16. Store admission checks
+the on-disk persistence schema independently (`CANONICAL_STORE_SCHEMA_VERSION = 2`).
+Schema cutovers require fresh canonical, wallet, and materialized-view stores;
+state bundles and recovery archives must be captured again from the rebuilt stores.
 
 ### Serving
 
@@ -45,7 +51,7 @@ are optional explorer aggregates. Use `canonical`, `wallet projection`, and
 | `SupervisedRuntime` | The supervision that stops a wallet-serving runtime's gRPC listener and background tasks together, and ends the calls still open at its drain deadline. | `zinder-runtime` |
 | `WalletQueryApi` | The wallet read and broadcast trait that the gRPC adapters call. | `zinder-query` |
 | `WalletServingQuery` | The `WalletQueryApi` implementation over a replaceable serving pair. The native and lightwalletd-compatible runtimes share it. | `zinder-query` |
-| `TreeState` | A tree-state read bound to one chain epoch. It carries typed per-pool `finalState` frontier bytes, `None` for a pool not active at that height. Native gRPC encodes them as the `z_gettreestate`-shaped JSON payload, and the lightwalletd adapter hex-encodes each pool, so neither parses the other's encoding. | `zinder-query` |
+| `TreeState` | A tree-state read bound to one chain epoch. It carries typed per-pool `finalState` frontier bytes, `None` for a pool not active at that height. Native gRPC encodes them as the `z_gettreestate`-shaped JSON payload. The lightwalletd adapter hex-encodes each pool and rejects `GetTreeState` before Sapling activation with `INVALID_ARGUMENT`, matching Go lightwalletd. Native WalletQuery reads still return inactive pools as `None`. | `zinder-query` |
 | `NativeWalletEndpointCapabilities` | The immutable capability set a native query derives once storage and providers are admitted. | `zinder-query` |
 | `MaterializedViewConsumer` | An explorer view builder that applies retained chain events. | `zinder-materialized-views` |
 | `MaterializedViewStore` | The separate store for materialized-view rows, cursors, coverage, and schemas. | `zinder-materialized-views` |
@@ -115,6 +121,7 @@ above, and brevity.
 
 | Runtime | Role |
 | --- | --- |
+| `zinder` (`services/zinder`) | Unified CLI (`serve`, `index`, `run`, `snapshot`, `backup`, `config`, `healthcheck`) and preset supervisor shipped as the single release binary and OCI image |
 | `zinder-ingest` | Only canonical writer and owner of the live mempool |
 | `zinder-projector` | Only wallet projection writer |
 | `zinder-query` | Native `WalletQuery` gRPC server |
@@ -122,7 +129,7 @@ above, and brevity.
 | `zinder-explorer` | Optional `ExplorerQuery` server |
 | `zinder-compat-cipherscan` | Optional Cipherscan-compatible REST and WebSocket adapter |
 
-[Architecture overview](overview.md) explains how they fit together.
+[Architecture overview](overview.md) explains how they fit together and which roles each `--preset` (`light-wallet`, `wallet`, `explorer`) activates.
 
 Three crates are published: `zinder-core` (domain values), `zinder-proto`
 (generated protocol modules), and `zinder-client` (the typed Rust client).
@@ -132,6 +139,21 @@ Every other crate is internal: `zinder-store`, `zinder-source`,
 `zinder-testkit`.
 
 ## Rust API shape
+
+On a public gRPC listener, register application middleware with
+`PublicGrpcServer::layer`. The client's `grpc-timeout` covers the work
+those layers do after readiness and before the response starts. Register
+the shared gRPC-Web and CORS policy with
+`PublicGrpcServer::with_browser_transport`. It translates requests before
+the receive limits inspect their frames and formats deadline responses for
+browser clients. The configured application RPC service can accept gRPC-Web.
+Health and reflection use native HTTP/2 gRPC.
+
+On a listener reserved for an allowlisted TCP proxy, pass the resolved
+`GrpcProxyProtocol` to `PublicGrpcServer::with_proxy_protocol` and use
+`ClientAddressSource::Connection` to identify the forwarded client.
+On wallet routes, attach `WalletRpcMetricsLayer::with_range_admission` with
+the resolved `GrpcRangeAdmission` policy and the listener's address source.
 
 - Public operations accept and return domain types, not RocksDB handles,
   column families, or untyped byte maps.
@@ -205,6 +227,7 @@ crates use their own types and convert at the service adapter.
 | Private control APIs | `zinder_proto::v1::ingest` | `CanonicalControl`, `ProjectorControl`, `IngestControl` | `zinder-ingest`, `zinder-projector` |
 | Shared operations messages | `zinder_proto::v1::ops` | `ServerInfo`, `ErrorReason`, readiness messages | Embedded in the surfaces above |
 | Lightwalletd compatibility | `zinder_proto::compat::lightwalletd` | `CompactTxStreamer` | `zinder-compat-lightwalletd` |
+| Darkside test control | `zinder_proto::compat::lightwalletd` | `DarksideStreamer` | Standalone test servers |
 | Zebra indexer client | `zinder_proto::external::zebra_indexer_rpc` | `Indexer` (client only) | Called by `zinder-source` |
 
 - `WalletQuery` is the native contract for wallets and applications.
@@ -220,9 +243,16 @@ crates use their own types and convert at the service adapter.
   `zcash/lightwallet-protocol`. The pin is in
   `crates/zinder-proto/proto/compat/lightwalletd/COMMIT`, with provenance in
   `UPSTREAM.md` beside it. Compatibility names stay identical to the external
-  contract even where native names differ.
+  contract even where native names differ. All three serving modes expose those
+  schemas through native gRPC reflection v1 and v1alpha.
   [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md)
   covers method behavior.
+- Darkside control bindings share the wallet protobuf package so clients can
+  reuse its messages. The independent pin in
+  [Darkside provenance](../../crates/zinder-proto/proto/compat/darkside/UPSTREAM.md)
+  tracks `zcash/lightwalletd`. `zinder_proto::DARKSIDE_FILE_DESCRIPTOR_SET`
+  includes the control schema and its wallet message imports for test-server
+  reflection.
 - Upstream node protocols belong to
   [Node source boundary](node-source-boundary.md), and storage encodings to
   [Storage backend](storage-backend.md).
@@ -245,10 +275,12 @@ crates never expose generated types in their public APIs.
 - A new `ErrorReason` gets a new scalar value, a policy entry, a client
   variant, and a round-trip test. Renaming, removing, or repurposing a reason
   is a breaking change.
-- Vendored lightwalletd and external Zebra schemas change only with an
-  explicit update to their pinned source and provenance record.
+- Vendored wallet, Darkside, and Zebra schemas change only with an explicit
+  update to their pinned source and provenance record.
 
 ## Wire conventions
+
+The generated lightwalletd server accepts optional `EncodedBlockRange` and `EncodedBlockRangeNullifiers` implementations for `GetBlockRange` and `GetBlockRangeNullifiers`. Each single-message stream element is an `EncodedBlock` (one complete `CompactBlock` protobuf message in gRPC's length-prefixed form), and uncompressed range producers may also emit pre-batched `EncodedBlockFrame` chunks assembled by `EncodedBlockBatcher`. The public request guard bounds decompression and scans repeated fields before tonic decodes the protobuf. When the client negotiates compression, tonic compresses and frames each `EncodedBlock`. On the identity path, a message of 32 KiB or more leaves the generated server as its own buffer, without tonic's encode-buffer copy, and shorter messages are batched into 8 KiB opening and 32 KiB subsequent frames (either during the chunk read via `EncodedBlockBatcher` or in the response body). Both uncompressed bodies keep at most 512 KiB, and at most twice the chunk, alive behind each data chunk, copying a message whose allocation is larger, sparser, or unknown into 64 KiB pieces, and mark the response with `BoundedChunkRetention`. Only `zinder-proto` can create that marker. The public listener's send-stall bound hands slices of a marked response to HTTP/2 instead of copies. A producer declares a message's allocation with `EncodedBlock::from_length_prefixed_in`. Existing server implementations and generated clients use their ordinary typed interfaces.
 
 These rules apply at every protocol boundary.
 [ADR-0002](../adrs/0002-serialization-and-byte-order.md) records why.
@@ -256,8 +288,9 @@ These rules apply at every protocol boundary.
 - Native hash strings use RPC byte order as 64 lowercase hex characters.
 - Inside Zinder, hashes are typed values in internal byte order. Each protocol
   adapter converts at its boundary. Lightwalletd-compatible `bytes` hash
-  fields carry internal byte order, except `SubtreeRoot.completingBlockHash`,
-  which reference lightwalletd fills in RPC byte order.
+  fields carry internal byte order except for the hash in a
+  `GetTreeState(BlockID { height: 0, hash })` request and the
+  `SubtreeRoot.completingBlockHash` response field. Both use RPC byte order.
 - Protobuf bytes are checked for exact length before they become typed hashes,
   outpoints, or commitments.
 - Wire translations of an identifier live in one place:

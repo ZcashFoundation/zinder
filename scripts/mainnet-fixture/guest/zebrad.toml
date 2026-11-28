@@ -1,0 +1,28 @@
+# Frozen Mainnet node: no peers, loopback RPC with cookie auth.
+[consensus]
+checkpoint_sync = true
+[network]
+network = "Mainnet"
+listen_addr = "127.0.0.1:0"
+initial_mainnet_peers = []
+initial_testnet_peers = []
+cache_dir = false
+[state]
+cache_dir = "/srv/node"
+ephemeral = false
+should_backup_non_finalized_state = true
+delete_old_database = false
+[rpc]
+listen_addr = "127.0.0.1:8232"
+enable_cookie_auth = true
+cookie_dir = "/run/zebra-cookie"
+parallel_cpu_threads = 2
+max_response_body_size = 52428800
+[sync]
+parallel_cpu_threads = 1
+[mempool]
+[tracing]
+use_color = false
+[health]
+min_connected_peers = 0
+enforce_on_test_networks = false

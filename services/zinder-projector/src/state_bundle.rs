@@ -1,12 +1,12 @@
 //! Coherent single-host canonical and wallet checkpoint bundles.
 //!
-//! The module deliberately stops at capture and admission primitives. The
-//! canonical owner must create its checkpoint at the returned fixed path and
-//! pass the cold-opened evidence back to the projector. The projector then
-//! verifies that its wallet owner represents the exact same canonical fence,
-//! creates the wallet checkpoint, and publishes the manifest last. Restore,
-//! archive extraction, cross-process transport, and cursor rekeying are
-//! separate production boundaries and are not implied by a valid manifest.
+//! The canonical owner captures its checkpoint and sends its evidence to the
+//! projector. The projector captures the wallet checkpoint at the same chain
+//! position and publishes the bundle manifest last. During recovery, this
+//! module compares evidence from both reopened databases with that manifest.
+//! [`crate::recovery_archive`] owns backup publication and installation.
+
+mod recovery;
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -20,7 +20,7 @@ use thiserror::Error;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestVersion, ChainEpochId,
-    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, Network,
+    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, Network, UtxoSetCommitmentScheme,
     wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name},
 };
 use zinder_proto::{
@@ -29,8 +29,7 @@ use zinder_proto::{
 };
 use zinder_store::{
     CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CANONICAL_STORE_IDENTITY,
-    CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbResourceBudget,
+    CANONICAL_STORE_SCHEMA_VERSION, RawBlobRetention, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_STORE_IDENTITY, WalletCanonicalSourceIdentity,
@@ -43,9 +42,9 @@ use zinder_wallet_rocksdb::{
 /// Exact bundle identity admitted by this release.
 pub const STATE_BUNDLE_IDENTITY: &str = "state-bundle";
 /// Exact state-bundle manifest format admitted by this release.
-pub const STATE_BUNDLE_FORMAT_VERSION: u16 = 3;
+pub const STATE_BUNDLE_FORMAT_VERSION: u16 = 2;
 /// Only certified physical topology represented by a state bundle.
-pub const STATE_BUNDLE_TOPOLOGY: &str = "rocksdb-single-host";
+pub const STATE_BUNDLE_TOPOLOGY: &str = "rocksdb";
 /// Fixed canonical checkpoint directory within a bundle.
 pub const CANONICAL_CHECKPOINT_DIRECTORY_NAME: &str = "canonical.rocksdb";
 /// Fixed wallet checkpoint directory within a bundle.
@@ -182,8 +181,7 @@ pub struct StateBundleFence {
     visible_tip: BlockManifest,
     settled_tip: BlockManifest,
     sequence_digest: SequenceDigestManifest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    network_upgrade_schedule: Option<NetworkUpgradeScheduleManifest>,
+    network_upgrade_schedule: NetworkUpgradeScheduleManifest,
 }
 
 impl StateBundleFence {
@@ -206,11 +204,9 @@ impl StateBundleFence {
     }
 
     /// Writer-admitted network-upgrade schedule identity at this fence.
-    ///
-    /// Legacy format-2 bundles predate this identity and return `None`.
     #[must_use]
-    pub const fn network_upgrade_schedule(&self) -> Option<&NetworkUpgradeScheduleManifest> {
-        self.network_upgrade_schedule.as_ref()
+    pub const fn network_upgrade_schedule(&self) -> &NetworkUpgradeScheduleManifest {
+        &self.network_upgrade_schedule
     }
 }
 
@@ -281,18 +277,26 @@ impl StateBundleManifest {
         root: impl AsRef<Path>,
         expected_network: Network,
     ) -> Result<Self, StateBundleError> {
-        Self::read_with_additional_root_entries(root.as_ref(), expected_network, &[])
+        Self::read_with_sha256(root, expected_network).map(|(manifest, _)| manifest)
+    }
+
+    /// Admits a completed capture and returns SHA-256 of the exact manifest bytes read.
+    pub fn read_with_sha256(
+        root: impl AsRef<Path>,
+        expected_network: Network,
+    ) -> Result<(Self, [u8; 32]), StateBundleError> {
+        Self::admit_manifest(root.as_ref(), expected_network, &[])
     }
 
     /// Reads a state-bundle nested inside a crate-owned fixed outer layout.
     ///
     /// The additional entries are compile-time names supplied by another
     /// projector boundary, never caller-selected paths.
-    pub(crate) fn read_with_additional_root_entries(
+    pub(crate) fn admit_manifest(
         root: &Path,
         expected_network: Network,
         additional_root_entries: &[&str],
-    ) -> Result<Self, StateBundleError> {
+    ) -> Result<(Self, [u8; 32]), StateBundleError> {
         let root = resolve_existing_directory(root, "state-bundle root")?;
         let manifest_path = root.join(STATE_BUNDLE_MANIFEST_FILE_NAME);
         require_regular_file(&manifest_path, "state-bundle manifest")?;
@@ -335,7 +339,7 @@ impl StateBundleManifest {
         })?;
         manifest.validate(expected_network)?;
         validate_complete_layout(&root, additional_root_entries)?;
-        Ok(manifest)
+        Ok((manifest, Sha256::digest(&encoded).into()))
     }
 
     /// Exact shared canonical-wallet fence admitted from this manifest.
@@ -427,20 +431,13 @@ impl StateBundleManifest {
             self.identity == STATE_BUNDLE_IDENTITY,
             "identity must be exactly state-bundle",
         )?;
-        let supported_format = matches!(
-            (
-                self.format_version,
-                self.fence.network_upgrade_schedule.is_some()
-            ),
-            (2, false) | (STATE_BUNDLE_FORMAT_VERSION, true)
-        );
         require_manifest_value(
-            supported_format,
-            "format version and activation-schedule evidence are incompatible; format 2 omits schedule identity and format 3 requires it",
+            self.format_version == STATE_BUNDLE_FORMAT_VERSION,
+            "state bundle format version must be 2",
         )?;
         require_manifest_value(
             self.topology == STATE_BUNDLE_TOPOLOGY,
-            "topology must be exactly rocksdb-single-host",
+            "topology must be exactly rocksdb",
         )?;
         validate_candidate_id(&self.candidate_id)?;
         let network = parse_network(&self.network).ok_or_else(|| {
@@ -476,7 +473,10 @@ pub fn prepare_state_bundle_capture(
         "configured state-bundle staging root",
     )?;
     let paths = StateBundleCapturePaths::for_candidate(&staging_root, candidate_id.to_owned());
-    match fs::create_dir(&paths.root) {
+    let mut directory = fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut directory, 0o700);
+    match directory.create(&paths.root) {
         Ok(()) => Ok(paths),
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
             Err(StateBundleError::TargetExists { path: paths.root })
@@ -587,6 +587,14 @@ pub enum StateBundleError {
         #[source]
         source: zinder_wallet_rocksdb::RocksDbWalletError,
     },
+    /// Recovery could not admit the canonical checkpoint read-only.
+    #[error("canonical recovery checkpoint admission failed: {0}")]
+    CanonicalRecovery(#[source] zinder_store::CanonicalStoreError),
+
+    /// Recovery could not admit the wallet checkpoint read-only.
+    #[error("wallet recovery checkpoint admission failed: {0}")]
+    WalletRecovery(#[source] zinder_wallet_rocksdb::RocksDbWalletError),
+
     /// Filesystem operation failed.
     #[error("state-bundle filesystem operation failed at {path}: {source}")]
     Io {
@@ -621,7 +629,6 @@ struct CanonicalAdmission {
     store_identity: String,
     schema_version: u16,
     network: Network,
-    workload: CanonicalStoreWorkload,
     build_plan: CanonicalBuildPlanAdmission,
     effective_reorg_window_blocks: Option<u32>,
     admitted_schedule: AdmittedScheduleIdentity,
@@ -796,8 +803,8 @@ fn decode_checkpoint_response(
         "canonical checkpoint schema is unsupported",
     )?;
     require_manifest_value(
-        response.workload == CanonicalStoreWorkload::Wallet.as_str(),
-        "canonical checkpoint workload must be wallet",
+        response.workload.is_empty(),
+        "canonical checkpoint workload field must be empty in schema v2",
     )?;
     require_manifest_value(
         !response.database_identity.is_empty() && response.database_identity.len() <= 256,
@@ -990,7 +997,6 @@ fn assemble_canonical_admission(
         store_identity,
         schema_version,
         network,
-        workload: CanonicalStoreWorkload::Wallet,
         build_plan,
         effective_reorg_window_blocks: None,
         admitted_schedule,
@@ -1040,10 +1046,7 @@ impl WalletAdmission {
             store_identity == WALLET_PROJECTION_STORE_IDENTITY,
             "wallet checkpoint identity must be exactly wallet",
         )?;
-        require_manifest_value(
-            schema_version == WALLET_ROCKSDB_SCHEMA_VERSION,
-            "wallet checkpoint schema must be exactly 1",
-        )?;
+        require_wallet_checkpoint_schema(schema_version)?;
         if let Some(database_identity) = checkpoint_database_identity {
             require_manifest_value(
                 !database_identity.is_empty(),
@@ -1136,9 +1139,9 @@ impl StateBundleFence {
             visible_tip: BlockManifest::from_block(canonical.visible_tip),
             settled_tip: BlockManifest::from_block(canonical.settled_tip),
             sequence_digest: SequenceDigestManifest::from_digest(canonical.visible_sequence_digest),
-            network_upgrade_schedule: Some(NetworkUpgradeScheduleManifest::from_admitted(
+            network_upgrade_schedule: NetworkUpgradeScheduleManifest::from_admitted(
                 &canonical.admitted_schedule,
-            )),
+            ),
         }
     }
 
@@ -1155,10 +1158,7 @@ impl StateBundleFence {
             "fence settled tip must not exceed visible tip",
         )?;
         self.sequence_digest.validate("fence sequence digest")?;
-        if let Some(schedule) = &self.network_upgrade_schedule {
-            schedule.validate()?;
-        }
-        Ok(())
+        self.network_upgrade_schedule.validate()
     }
 }
 
@@ -1171,7 +1171,6 @@ struct CanonicalCheckpointManifest {
     database_identity_sha256: String,
     construction_manifest_version: u16,
     construction_manifest_sha256: String,
-    workload: String,
     cold_admitted: bool,
     build_plan: CanonicalBuildPlanManifest,
     /// Reorg window the checkpoint enforces when a canonical writer raised it
@@ -1198,7 +1197,6 @@ impl CanonicalCheckpointManifest {
             database_identity_sha256: canonical.database_identity_sha256.clone(),
             construction_manifest_version: canonical.construction_manifest_version,
             construction_manifest_sha256: hex::encode(canonical.construction_manifest_sha256),
-            workload: canonical.workload.as_str().to_owned(),
             cold_admitted: true,
             build_plan: CanonicalBuildPlanManifest::from_admitted(&canonical.build_plan),
             effective_reorg_window_blocks: canonical.effective_reorg_window_blocks,
@@ -1243,10 +1241,6 @@ impl CanonicalCheckpointManifest {
         validate_lower_hex_32(
             &self.construction_manifest_sha256,
             "canonical construction-manifest SHA-256",
-        )?;
-        require_manifest_value(
-            self.workload == CanonicalStoreWorkload::Wallet.as_str(),
-            "canonical checkpoint workload must be wallet",
         )?;
         require_manifest_value(
             self.cold_admitted,
@@ -1553,10 +1547,7 @@ impl WalletCheckpointManifest {
             self.store_identity == "wallet",
             "wallet checkpoint identity must be exactly wallet",
         )?;
-        require_manifest_value(
-            self.schema_version == WALLET_ROCKSDB_SCHEMA_VERSION,
-            "wallet checkpoint schema must be exactly 1",
-        )?;
+        require_wallet_checkpoint_schema(self.schema_version)?;
         require_manifest_value(
             self.cold_admitted,
             "wallet checkpoint was not cold-admitted",
@@ -1599,10 +1590,15 @@ impl WalletCheckpointManifest {
             &self.utxo_commitment_sha256,
             "wallet UTXO commitment SHA-256",
         )?;
-        require_manifest_value(
-            self.utxo_commitment_scheme == 1,
-            "wallet UTXO commitment scheme must be 1",
-        )?;
+        let supported_scheme = UtxoSetCommitmentScheme::LtHash16ChaCha12.id();
+        if self.utxo_commitment_scheme != supported_scheme {
+            return Err(StateBundleError::manifest_contract(format!(
+                "wallet checkpoint uses UTXO commitment scheme {}, and this release reads only \
+                 scheme {supported_scheme}; rebuild the wallet store from the canonical store \
+                 and capture a new state bundle",
+                self.utxo_commitment_scheme
+            )));
+        }
         self.row_counts.validate()
     }
 }
@@ -1616,6 +1612,8 @@ struct WalletRowCountsManifest {
     transparent_address_transaction: u64,
     transparent_address_balance: u64,
     reorg_undo: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    block_hash_by_height: Option<u64>,
 }
 
 impl WalletRowCountsManifest {
@@ -1628,10 +1626,15 @@ impl WalletRowCountsManifest {
             transparent_address_transaction: counts.transparent_address_transaction_count,
             transparent_address_balance: counts.transparent_address_balance_count,
             reorg_undo: counts.reorg_undo_count,
+            block_hash_by_height: Some(counts.block_hash_by_height_count),
         }
     }
 
     fn validate(&self) -> Result<(), StateBundleError> {
+        require_manifest_value(
+            self.block_hash_by_height.is_some(),
+            "wallet checkpoint row_counts must include block_hash_by_height for schema version 2",
+        )?;
         require_manifest_value(
             self.transparent_unspent_output == self.transparent_unspent_output_by_address,
             "wallet unspent primary and address-index row counts differ",
@@ -1698,6 +1701,19 @@ fn validate_capture_candidate(
         "temporary state-bundle manifest",
     )?;
     validate_root_entries(&root, &[CANONICAL_CHECKPOINT_DIRECTORY_NAME])
+}
+
+/// Refuses a wallet checkpoint written under a wallet schema this release does
+/// not read, naming the observed and supported versions and the rebuild.
+fn require_wallet_checkpoint_schema(schema_version: u16) -> Result<(), StateBundleError> {
+    if schema_version == WALLET_ROCKSDB_SCHEMA_VERSION {
+        return Ok(());
+    }
+    Err(StateBundleError::manifest_contract(format!(
+        "wallet checkpoint uses wallet schema version {schema_version}, and this release reads \
+         only version {WALLET_ROCKSDB_SCHEMA_VERSION}; rebuild the wallet store from the \
+         canonical store and capture a new state bundle"
+    )))
 }
 
 fn validate_complete_layout(
@@ -1778,9 +1794,11 @@ fn validate_complete_checkpoint_pair(
 }
 
 fn open_new_file(path: &Path) -> Result<File, StateBundleError> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
         .open(path)
         .map_err(|source| StateBundleError::io(path, source))
 }
@@ -2133,7 +2151,7 @@ fn parse_network(network: &str) -> Option<Network> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs;
 
     use serde_json::Value;
@@ -2148,7 +2166,6 @@ mod tests {
         CanonicalOwnerCheckpointBuildPlanEvidence, CanonicalOwnerCheckpointReadyEvidence,
         CanonicalWriterFence, CreateCanonicalOwnerCheckpointResponse,
     };
-    use zinder_store::CanonicalStoreWorkload;
     use zinder_wallet_projection::{
         WalletCanonicalSourceIdentity, WalletProjectionAccumulator, WalletProjectionDigest,
         WalletProjectionEventCursor, WalletProjectionFamilyRowCounts,
@@ -2191,38 +2208,28 @@ mod tests {
         let wallet = sample_wallet_admission(7)?;
         let manifest = StateBundleManifest::from_admitted("bundle-a", &canonical, &wallet)?;
         publish_manifest_last(&paths, &manifest)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [paths.root(), paths.manifest()] {
+                assert!(fs::metadata(path)?.permissions().mode().trailing_zeros() >= 6);
+            }
+        }
 
-        let admitted = StateBundleManifest::read(paths.root(), Network::ZcashRegtest)?;
+        let (admitted, manifest_sha256) =
+            StateBundleManifest::read_with_sha256(paths.root(), Network::ZcashRegtest)?;
+        assert_eq!(
+            manifest_sha256,
+            <[u8; 32]>::from(Sha256::digest(fs::read(paths.manifest())?))
+        );
         assert_eq!(admitted, manifest);
         assert_eq!(admitted.identity, STATE_BUNDLE_IDENTITY);
         assert_eq!(admitted.format_version, STATE_BUNDLE_FORMAT_VERSION);
+        assert_eq!(admitted.format_version, 2);
         assert_eq!(admitted.topology, STATE_BUNDLE_TOPOLOGY);
+        assert_eq!(admitted.topology, "rocksdb");
         assert_eq!(admitted.fence.chain_epoch_id(), 7);
         assert_eq!(admitted.fence.chain_event_sequence(), 7);
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_format_two_manifest_without_schedule_identity_remains_readable()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let manifest = StateBundleManifest::from_admitted(
-            "bundle-a",
-            &sample_canonical_admission(7),
-            &sample_wallet_admission(7)?,
-        )?;
-        let mut legacy = serde_json::to_value(manifest)?;
-        legacy["format_version"] = Value::from(2);
-        legacy
-            .as_object_mut()
-            .and_then(|object| object.get_mut("fence"))
-            .and_then(Value::as_object_mut)
-            .ok_or("manifest fence must be an object")?
-            .remove("network_upgrade_schedule");
-
-        let decoded: StateBundleManifest = serde_json::from_value(legacy)?;
-        decoded.validate(Network::ZcashRegtest)?;
-        assert_eq!(decoded.format_version(), 2);
-        assert!(decoded.fence().network_upgrade_schedule().is_none());
         Ok(())
     }
 
@@ -2271,6 +2278,151 @@ mod tests {
     }
 
     #[test]
+    fn manifest_admission_names_the_unsupported_wallet_schema_and_the_rebuild()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = StateBundleManifest::from_admitted(
+            "bundle-a",
+            &sample_canonical_admission(7),
+            &sample_wallet_admission(7)?,
+        )?;
+        let valid = serde_json::to_value(manifest)?;
+        for (pointer, unsupported, observed) in [
+            (
+                "/wallet_checkpoint/schema_version",
+                1_u16,
+                "wallet schema version 1",
+            ),
+            (
+                "/wallet_checkpoint/schema_version",
+                3_u16,
+                "wallet schema version 3",
+            ),
+            (
+                "/wallet_checkpoint/utxo_commitment_scheme",
+                2_u16,
+                "UTXO commitment scheme 2",
+            ),
+        ] {
+            let mut stale = valid.clone();
+            *stale
+                .pointer_mut(pointer)
+                .ok_or("test mutation pointer must resolve")? = Value::from(unsupported);
+            let decoded = serde_json::from_value::<StateBundleManifest>(stale)?;
+            let message = decoded
+                .validate(Network::ZcashRegtest)
+                .err()
+                .ok_or("a incompatible wallet checkpoint was admitted")?
+                .to_string();
+            assert!(message.contains(observed), "{message}");
+            assert!(message.contains("this release reads only"), "{message}");
+            assert!(message.contains("rebuild the wallet store"), "{message}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn genuine_v1_manifest_without_block_hash_row_count_reports_schema_mismatch_and_v2_requires_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = StateBundleManifest::from_admitted(
+            "bundle-a",
+            &sample_canonical_admission(7),
+            &sample_wallet_admission(7)?,
+        )?;
+        let valid = serde_json::to_value(manifest)?;
+
+        let temporary = TempDir::new()?;
+        let paths = prepare_state_bundle_capture(temporary.path(), "bundle-a")?;
+        fs::create_dir(paths.canonical_checkpoint())?;
+        fs::create_dir(paths.wallet_checkpoint())?;
+        let mut v1_manifest = valid.clone();
+        *v1_manifest
+            .pointer_mut("/wallet_checkpoint/schema_version")
+            .ok_or("wallet schema_version pointer must resolve")? = Value::from(1_u16);
+        v1_manifest
+            .pointer_mut("/wallet_checkpoint/row_counts")
+            .and_then(Value::as_object_mut)
+            .ok_or("wallet row_counts pointer must resolve")?
+            .remove("block_hash_by_height");
+        fs::write(paths.manifest(), serde_json::to_vec_pretty(&v1_manifest)?)?;
+
+        let v1_error = StateBundleManifest::read(paths.root(), Network::ZcashRegtest)
+            .err()
+            .ok_or("genuine v1 manifest without block_hash_by_height was admitted")?;
+        assert!(
+            matches!(v1_error, StateBundleError::ManifestContract { .. }),
+            "{v1_error}"
+        );
+        let v1_message = v1_error.to_string();
+        assert!(
+            v1_message.contains("wallet schema version 1"),
+            "{v1_message}"
+        );
+        assert!(
+            v1_message.contains("this release reads only"),
+            "{v1_message}"
+        );
+        assert!(
+            v1_message.contains("rebuild the wallet store"),
+            "{v1_message}"
+        );
+
+        let mut v2_missing = valid.clone();
+        v2_missing
+            .pointer_mut("/wallet_checkpoint/row_counts")
+            .and_then(Value::as_object_mut)
+            .ok_or("wallet row_counts pointer must resolve")?
+            .remove("block_hash_by_height");
+        let mut v2_null = valid;
+        *v2_null
+            .pointer_mut("/wallet_checkpoint/row_counts/block_hash_by_height")
+            .ok_or("wallet block_hash_by_height pointer must resolve")? = Value::Null;
+        for invalid_v2 in [v2_missing, v2_null] {
+            let decoded = serde_json::from_value::<StateBundleManifest>(invalid_v2)?;
+            let error = decoded
+                .validate(Network::ZcashRegtest)
+                .err()
+                .ok_or("v2 manifest without block_hash_by_height was admitted")?;
+            assert!(
+                matches!(error, StateBundleError::ManifestContract { .. }),
+                "{error}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("block_hash_by_height"), "{message}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_evidence_names_the_unsupported_wallet_schema_and_the_rebuild()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let admitted = sample_wallet_admission(7)?;
+        for unsupported_schema in [1_u16, 3_u16] {
+            let message = WalletAdmission::from_ready(
+                Network::ZcashRegtest,
+                &admitted.ready,
+                WALLET_PROJECTION_STORE_IDENTITY,
+                unsupported_schema,
+                None,
+            )
+            .err()
+            .ok_or("a incompatible wallet checkpoint was admitted")?
+            .to_string();
+            assert!(
+                message.contains(&format!("wallet schema version {unsupported_schema}")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!(
+                    "this release reads only version {WALLET_ROCKSDB_SCHEMA_VERSION}"
+                )),
+                "{message}"
+            );
+            assert!(message.contains("rebuild the wallet store"), "{message}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn manifest_admission_rejects_identity_version_topology_schema_network_and_fence_corruption()
     -> Result<(), Box<dyn std::error::Error>> {
         let manifest = StateBundleManifest::from_admitted(
@@ -2279,18 +2431,26 @@ mod tests {
             &sample_wallet_admission(7)?,
         )?;
         let valid = serde_json::to_value(manifest)?;
+        let unsupported_canonical_schema_version = CANONICAL_STORE_SCHEMA_VERSION
+            .checked_add(1)
+            .ok_or("canonical schema test version overflow")?;
         let unsupported_construction_manifest_version =
             CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
                 .checked_add(1)
                 .ok_or("construction manifest test version overflow")?;
-        let mutations: [(&str, Value); 20] = [
+        let mutations: [(&str, Value); 24] = [
             ("/identity", Value::String("state_bundle".to_owned())),
+            ("/format_version", Value::from(0)),
             ("/format_version", Value::from(1)),
-            ("/format_version", Value::from(2)),
+            ("/format_version", Value::from(3)),
             ("/topology", Value::String("mixed-runtime".to_owned())),
+            ("/topology", Value::String("rocksdb-single-host".to_owned())),
             ("/candidate_id", Value::String("../outside".to_owned())),
             ("/network", Value::String("mainnet".to_owned())),
-            ("/canonical_checkpoint/schema_version", Value::from(3)),
+            (
+                "/canonical_checkpoint/schema_version",
+                Value::from(unsupported_canonical_schema_version),
+            ),
             (
                 "/canonical_checkpoint/database_identity_sha256",
                 Value::String("not-a-sha256".to_owned()),
@@ -2319,7 +2479,9 @@ mod tests {
                 "/canonical_checkpoint/build_plan/history_predecessor/block_id/hash",
                 Value::String(hex::encode([0x99; 32])),
             ),
-            ("/wallet_checkpoint/schema_version", Value::from(2)),
+            ("/wallet_checkpoint/schema_version", Value::from(1)),
+            ("/wallet_checkpoint/schema_version", Value::from(3)),
+            ("/wallet_checkpoint/utxo_commitment_scheme", Value::from(2)),
             (
                 "/wallet_checkpoint/database_identity_sha256",
                 Value::String("not-a-sha256".to_owned()),
@@ -2336,18 +2498,62 @@ mod tests {
             ),
         ];
 
+        assert_manifest_mutations_rejected(&valid, &mutations)
+    }
+
+    fn assert_manifest_mutations_rejected(
+        valid: &Value,
+        mutations: &[(&str, Value)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         for (pointer, replacement) in mutations {
             let mut corrupted = valid.clone();
             let field = corrupted
                 .pointer_mut(pointer)
                 .ok_or("test mutation pointer must resolve")?;
-            *field = replacement;
+            *field = replacement.clone();
             let rejected = serde_json::from_value::<StateBundleManifest>(corrupted)
                 .map_or(true, |decoded| {
                     decoded.validate(Network::ZcashRegtest).is_err()
                 });
             assert!(rejected, "corruption at {pointer} was admitted");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn v1_format_and_legacy_topology_are_rejected_with_v2_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = sample_manifest()?;
+        let valid = serde_json::to_value(manifest)?;
+
+        let mut legacy_format = valid.clone();
+        *legacy_format
+            .pointer_mut("/format_version")
+            .ok_or("format_version pointer must resolve")? = Value::from(1);
+        let format_error = serde_json::from_value::<StateBundleManifest>(legacy_format)?
+            .validate(Network::ZcashRegtest)
+            .err()
+            .ok_or("v1 state bundle format was admitted")?
+            .to_string();
+        assert!(
+            format_error.contains("format version must be 2"),
+            "{format_error}"
+        );
+
+        let mut legacy_topology = valid;
+        *legacy_topology
+            .pointer_mut("/topology")
+            .ok_or("topology pointer must resolve")? =
+            Value::String("rocksdb-single-host".to_owned());
+        let topology_error = serde_json::from_value::<StateBundleManifest>(legacy_topology)?
+            .validate(Network::ZcashRegtest)
+            .err()
+            .ok_or("legacy topology was admitted")?
+            .to_string();
+        assert!(
+            topology_error.contains("topology must be exactly rocksdb"),
+            "{topology_error}"
+        );
         Ok(())
     }
 
@@ -2430,7 +2636,7 @@ mod tests {
         response: &CreateCanonicalOwnerCheckpointResponse,
     ) {
         let mut wrong_schema = response.clone();
-        wrong_schema.schema_version = 3;
+        wrong_schema.schema_version = u32::from(CANONICAL_STORE_SCHEMA_VERSION).saturating_add(1);
         assert!(CanonicalCheckpointAdmissionEvidence::try_from(wrong_schema).is_err());
 
         let mut missing_ready = response.clone();
@@ -2609,41 +2815,6 @@ mod tests {
     }
 
     #[test]
-    fn recovery_archive_refuses_a_source_without_a_valid_construction_manifest_sidecar()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = TempDir::new()?;
-        let staging_root = temporary.path().join("staging");
-        let archive_root = temporary.path().join("archives");
-        fs::create_dir(&staging_root)?;
-        fs::create_dir(&archive_root)?;
-        let paths = prepare_state_bundle_capture(&staging_root, "bundle-a")?;
-        fs::create_dir(paths.canonical_checkpoint())?;
-        fs::create_dir(paths.wallet_checkpoint())?;
-        fs::write(
-            paths.canonical_checkpoint().join("000001.sst"),
-            b"canonical",
-        )?;
-        fs::write(paths.wallet_checkpoint().join("000001.sst"), b"wallet")?;
-        let manifest = StateBundleManifest::from_admitted(
-            "bundle-a",
-            &sample_canonical_admission(7),
-            &sample_wallet_admission(7)?,
-        )?;
-        publish_manifest_last(&paths, &manifest)?;
-
-        assert!(
-            crate::recovery_archive::package_recovery_archive(
-                &archive_root,
-                &paths,
-                Network::ZcashRegtest,
-            )
-            .is_err()
-        );
-        assert!(!archive_root.join("bundle-a").exists());
-        Ok(())
-    }
-
-    #[test]
     fn wallet_checkpoint_is_refused_when_its_exact_fence_differs()
     -> Result<(), Box<dyn std::error::Error>> {
         let canonical = sample_canonical_admission(7);
@@ -2653,6 +2824,15 @@ mod tests {
             Err(StateBundleError::ManifestContract { .. })
         ));
         Ok(())
+    }
+
+    /// A valid Regtest state-bundle manifest for tests outside this module.
+    pub(crate) fn sample_manifest() -> Result<StateBundleManifest, Box<dyn std::error::Error>> {
+        Ok(StateBundleManifest::from_admitted(
+            "bundle-a",
+            &sample_canonical_admission(7),
+            &sample_wallet_admission(7)?,
+        )?)
     }
 
     fn sample_canonical_admission(sequence: u64) -> CanonicalAdmission {
@@ -2669,12 +2849,11 @@ mod tests {
             store_identity: CANONICAL_STORE_IDENTITY.to_owned(),
             schema_version: CANONICAL_STORE_SCHEMA_VERSION,
             network: Network::ZcashRegtest,
-            workload: CanonicalStoreWorkload::Wallet,
             effective_reorg_window_blocks: None,
             build_plan: CanonicalBuildPlanAdmission {
                 activation_fingerprint_version: 1,
                 activation_fingerprint: activation_fingerprint.as_bytes(),
-                raw_blob_retention: RawBlobRetention::Transactions,
+                raw_blob_retention: RawBlobRetention::None,
                 reorg_window_blocks: 100,
                 history_preceding_checkpoint: None,
                 history_predecessor: CanonicalHistoryPredecessorAdmission {
@@ -2716,7 +2895,7 @@ mod tests {
             database_identity: b"sample-canonical-database-identity".to_vec(),
             store_identity: canonical.store_identity.clone(),
             schema_version: u32::from(canonical.schema_version),
-            workload: canonical.workload.as_str().to_owned(),
+            workload: String::new(),
             network_name: network_name(canonical.network).to_owned(),
             effective_reorg_window_blocks: None,
             network_upgrade_schedule: Some(
@@ -2809,7 +2988,10 @@ mod tests {
             settled_tip: source.settled_tip(),
             projection_digest: WalletProjectionDigest::from_bytes([0x55; 32]),
             projection_accumulator: WalletProjectionAccumulator::empty(),
-            row_counts: WalletProjectionFamilyRowCounts::default(),
+            row_counts: WalletProjectionFamilyRowCounts {
+                block_hash_by_height_count: sequence,
+                ..WalletProjectionFamilyRowCounts::default()
+            },
             utxo_summary: WalletUtxoSetSummary {
                 utxo_count: 0,
                 total_value_zat: 0,

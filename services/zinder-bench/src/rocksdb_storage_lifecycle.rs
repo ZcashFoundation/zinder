@@ -12,14 +12,16 @@ use zinder_bench::{
     BenchError,
     report::{
         AcceptanceThresholds, BenchmarkReport, BenchmarkRunProvenance,
-        CanonicalBlockFactsSequenceDigestSummary, CanonicalStorageReadySummary, ReportProvenance,
-        RocksDbResourceBudgetSummary, RocksDbStorageLifecycleMeasurements, RunnerProvenance,
-        StorageLifecycleBlockId, StorageLifecycleContractSummary, StorageLifecyclePhaseDurations,
-        StorageLifecycleResourceLimits, StorageLifecycleSourceSummary,
-        WalletStorageConstructionEvidence, WalletStoragePhaseDurations, WalletStorageReadySummary,
-        WalletStorageRowCounts, WalletStorageUtxoSummary, WalletVariableValueSortEvidence,
-        build_rocksdb_storage_lifecycle_report, is_immutable_image_reference,
-        is_valid_benchmark_trial_id, summarize_rocksdb_storage_lifecycle_acceptance,
+        CanonicalBlockFactsSequenceDigestSummary, CanonicalPublicationMode,
+        CanonicalStorageReadySummary, ReportProvenance, RocksDbResourceBudgetSummary,
+        RocksDbStorageLifecycleMeasurements, RunnerProvenance, StorageLifecycleBlockId,
+        StorageLifecycleContractSummary, StorageLifecyclePhaseDurations,
+        StorageLifecycleResourceLimits, StorageLifecycleSourceSummary, TreeStateCheckpointCoverage,
+        WalletBuildStageSeconds, WalletStorageConstructionEvidence, WalletStoragePhaseDurations,
+        WalletStorageReadySummary, WalletStorageRowCounts, WalletStorageUtxoSummary,
+        WalletVariableValueSortEvidence, build_rocksdb_storage_lifecycle_report,
+        is_immutable_image_reference, is_valid_benchmark_trial_id,
+        summarize_rocksdb_storage_lifecycle_acceptance,
     },
     rss::peak_rss,
 };
@@ -34,9 +36,8 @@ use zinder_source::{
 };
 use zinder_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
-    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_SCHEMA_VERSION, WALLET_PROJECTION_VALUE_ENCODING_VERSION,
@@ -55,9 +56,27 @@ const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = zinder_store::DEFAULT_REORG_WINDOW_BL
 // cold validator runs after sorting has released its memory.
 const WALLET_OUTPOINT_SORT_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER: u64 = 1024 * 1024 * 1024;
-const WALLET_TEMPORARY_FILE_BYTES_PER_SORTER: u64 = 64 * 1024 * 1024 * 1024;
+const WALLET_TEMPORARY_FILE_BYTES_PER_SORTER: u64 = 192 * 1024 * 1024 * 1024;
 const WALLET_SST_TARGET_LOGICAL_BYTES: u64 = 128 * 1024 * 1024;
 const WALLET_ACCOUNTED_REORG_UNDO_BYTES: u64 = 512 * 1024 * 1024;
+
+fn lifecycle_canonical_resource_budget() -> RocksDbResourceBudget {
+    RocksDbResourceBudget::canonical_writer_defaults()
+}
+
+fn lifecycle_wallet_build_options(supported_reorg_depth: u32) -> RocksDbWalletBuildOptions {
+    RocksDbWalletBuildOptions {
+        resource_budget: RocksDbResourceBudget::wallet_projection_writer_defaults(),
+        max_outpoint_sort_memory_bytes: WALLET_OUTPOINT_SORT_MEMORY_BYTES,
+        max_secondary_sort_memory_bytes_per_sorter: WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER,
+        max_temporary_file_bytes_per_sorter: WALLET_TEMPORARY_FILE_BYTES_PER_SORTER,
+        sst_target_logical_bytes: WALLET_SST_TARGET_LOGICAL_BYTES,
+        max_accounted_reorg_undo_bytes: WALLET_ACCOUNTED_REORG_UNDO_BYTES,
+        supported_reorg_depth,
+        accumulator_hashing_workers:
+            RocksDbWalletBuildOptions::automatic_accumulator_hashing_workers(),
+    }
+}
 
 /// CLI contract for a clean complete-history `RocksDB` storage lifecycle.
 #[derive(Args)]
@@ -122,6 +141,15 @@ pub(crate) struct RocksDbStorageLifecycleArgs {
     /// Maximum accepted wallet derivation and storage-ready time after canonical readiness.
     #[arg(long = "wallet-storage-ready-hard-limit-secs")]
     wallet_storage_ready_hard_limit_seconds: Option<f64>,
+    /// Tree-state checkpoint coverage persisted during canonical construction.
+    #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Commitment threshold for commitment-budget coverage. Defaults to the ingest threshold.
+    #[arg(long)]
+    tree_state_commitment_budget: Option<NonZeroU32>,
+    /// Canonical publication checks to include before READY.
+    #[arg(long, value_enum, default_value = "trusted-fresh")]
+    canonical_publication_mode: CanonicalPublicationMode,
     /// Write the JSON report to this path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -141,6 +169,9 @@ struct ValidatedLifecycleArgs {
     request_timeout: Duration,
     pipeline_limits: CanonicalPipelineLimits,
     supported_reorg_depth: u32,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    tree_state_commitment_budget: Option<NonZeroU32>,
+    canonical_publication_mode: CanonicalPublicationMode,
     canonical_storage_ready_thresholds: Option<AcceptanceThresholds>,
     wallet_storage_ready_thresholds: Option<AcceptanceThresholds>,
 }
@@ -158,8 +189,9 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let run_started_at_unix_millis = UnixTimestampMillis::now().value();
     let total_started = Instant::now();
     let validated = args.validate()?;
-    let canonical_resource_budget = RocksDbResourceBudget::canonical_writer_defaults();
-    let wallet_resource_budget = RocksDbResourceBudget::materialized_view_writer_defaults();
+    let canonical_resource_budget = lifecycle_canonical_resource_budget();
+    let wallet_build_options = lifecycle_wallet_build_options(validated.supported_reorg_depth);
+    let wallet_resource_budget = wallet_build_options.resource_budget;
 
     let source_discovery_started = Instant::now();
     let node_auth = args
@@ -176,6 +208,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
             request_timeout: validated.request_timeout,
             max_response_bytes: validated.pipeline_limits.max_response_bytes,
             broadcast_timeout: None,
+            ..ZebraJsonRpcSourceOptions::default()
         },
     )?;
     let network_upgrade_activations =
@@ -216,16 +249,23 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         &network_upgrade_activations,
         genesis.block_time_seconds,
         fixed_build_tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
     )?;
     let canonical_store_initialization_started = Instant::now();
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &validated.canonical_store,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         canonical_resource_budget,
     )?;
+    let selection = validated
+        .tree_state_checkpoint_coverage
+        .resolve(validated.tree_state_commitment_budget)?;
+    let builder = if let Some(selection) = selection {
+        builder.with_tree_state_checkpoint_selection(selection)?
+    } else {
+        builder
+    };
     let database_io_mode = builder.io_mode().as_str().to_owned();
     let canonical_store_initialization = canonical_store_initialization_started.elapsed();
 
@@ -244,16 +284,33 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let source_tip_after_canonical_load = source.tip_id().await?;
     let canonical_block_evidence = canonical_load.block_evidence;
     let canonical_subtree_evidence = canonical_load.subtree_root_evidence;
+    let (actual_tree_state_checkpoint_coverage, tree_state_commitment_budget) =
+        TreeStateCheckpointCoverage::from_selection(
+            canonical_load.builder.tree_state_checkpoint_selection(),
+        )?;
     let source_tip_checkpoint_authenticated =
         canonical_load.builder.is_source_tip_checkpoint_confirmed();
 
-    let canonical_cold_validation_started = Instant::now();
-    let validated_canonical = canonical_load
-        .builder
-        .prepare_cold_certified_publication()?;
-    let canonical_cold_validation = canonical_cold_validation_started.elapsed();
-
-    let canonical_ready_publication_started = Instant::now();
+    let preparation_started = Instant::now();
+    let (validated_canonical, canonical_cold_validation, canonical_ready_publication_started) =
+        match validated.canonical_publication_mode {
+            CanonicalPublicationMode::TrustedFresh => (
+                canonical_load.builder.prepare_trusted_fresh_publication()?,
+                Duration::ZERO,
+                preparation_started,
+            ),
+            CanonicalPublicationMode::ColdCertified => {
+                let certified = canonical_load
+                    .builder
+                    .prepare_cold_certified_publication()?;
+                let publication_started = Instant::now();
+                (
+                    certified,
+                    publication_started - preparation_started,
+                    publication_started,
+                )
+            }
+        };
     let prepared_publication = validated_canonical.prepare_baseline(
         CanonicalBaselinePublication::new(settled_tip, UnixTimestampMillis::now()),
     )?;
@@ -266,8 +323,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let canonical_store = RocksDbCanonicalStore::open_ready(
         &validated.canonical_store,
         &network_upgrade_activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
         canonical_resource_budget,
     )?;
@@ -281,16 +337,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let wallet_outcome = build_wallet_from_canonical(
         &canonical_store,
         &validated.wallet_store,
-        RocksDbWalletBuildOptions {
-            resource_budget: wallet_resource_budget,
-            max_outpoint_sort_memory_bytes: WALLET_OUTPOINT_SORT_MEMORY_BYTES,
-            max_secondary_sort_memory_bytes_per_sorter:
-                WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER,
-            max_temporary_file_bytes_per_sorter: WALLET_TEMPORARY_FILE_BYTES_PER_SORTER,
-            sst_target_logical_bytes: WALLET_SST_TARGET_LOGICAL_BYTES,
-            max_accounted_reorg_undo_bytes: WALLET_ACCOUNTED_REORG_UNDO_BYTES,
-            supported_reorg_depth: validated.supported_reorg_depth,
-        },
+        wallet_build_options,
     )?;
     let wallet_build = wallet_outcome.report.phase_durations.total;
     let expected_wallet_source = wallet_outcome.report.canonical_source_identity();
@@ -303,8 +350,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let canonical_store = RocksDbCanonicalStore::open_ready(
         &validated.canonical_store,
         &network_upgrade_activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
         canonical_resource_budget,
     )?;
@@ -405,6 +451,9 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
                 .block_prepare_memory_watermark_bytes
                 .get(),
             canonical_rocksdb: RocksDbResourceBudgetSummary::from(canonical_resource_budget),
+            tree_state_checkpoint_coverage: actual_tree_state_checkpoint_coverage,
+            tree_state_commitment_budget,
+            canonical_publication_mode: validated.canonical_publication_mode,
             wallet_rocksdb: RocksDbResourceBudgetSummary::from(wallet_resource_budget),
             supported_reorg_depth: validated.supported_reorg_depth,
             wallet_max_outpoint_sort_memory_bytes: WALLET_OUTPOINT_SORT_MEMORY_BYTES,
@@ -510,6 +559,13 @@ impl RocksDbStorageLifecycleArgs {
             ),
             pipeline_limits,
             supported_reorg_depth: self.supported_reorg_depth,
+            tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
+            tree_state_commitment_budget: TreeStateCheckpointCoverage::from_selection(
+                self.tree_state_checkpoint_coverage
+                    .resolve(self.tree_state_commitment_budget)?,
+            )?
+            .1,
+            canonical_publication_mode: self.canonical_publication_mode,
             canonical_storage_ready_thresholds: acceptance_thresholds(
                 self.canonical_storage_ready_target_seconds,
                 self.canonical_storage_ready_hard_limit_seconds,
@@ -586,13 +642,13 @@ fn canonical_ready_summary(
     );
     CanonicalStorageReadySummary {
         scope: "canonical-storage-ready",
-        workload: CanonicalStoreWorkload::Wallet.as_str(),
         first_retained_block: block_id_summary(ready.first_retained_block),
         visible_tip: block_id_summary(ready.visible_tip),
         visible_epoch_id: ready.visible_epoch.value(),
         visible_event_sequence: ready.visible_event_sequence,
         block_count: ready.visible_block_count,
         transaction_count: block_load.transaction_count,
+        tree_state_checkpoint_count: block_load.tree_state_checkpoint_count,
         subtree_root_count: subtree_load.subtree_root_count,
         replay_format_version: ready.replay_format_version.value(),
         sequence_digest: CanonicalBlockFactsSequenceDigestSummary::from_digest(
@@ -636,12 +692,13 @@ fn wallet_ready_summary(
             transparent_address_transaction_count: row_counts.transparent_address_transaction_count,
             transparent_address_balance_count: row_counts.transparent_address_balance_count,
             reorg_undo_count: row_counts.reorg_undo_count,
+            block_hash_by_height_count: row_counts.block_hash_by_height_count,
         },
         utxo_summary: WalletStorageUtxoSummary {
             utxo_count: utxo_summary.utxo_count,
             total_value_zat: utxo_summary.total_value_zat,
             commitment_scheme: match utxo_summary.commitment.scheme() {
-                zinder_core::UtxoSetCommitmentScheme::LtHash16 => "lthash16",
+                zinder_core::UtxoSetCommitmentScheme::LtHash16ChaCha12 => "lthash16-chacha12",
                 zinder_core::UtxoSetCommitmentScheme::Unspecified => "unspecified",
                 _ => "unknown",
             },
@@ -667,6 +724,7 @@ fn wallet_ready_summary(
             sst_file_count: report.sst_file_count,
         },
         phase_durations: wallet_phase_durations(report),
+        build_stages: WalletBuildStageSeconds::from_report(report),
         physical_store_bytes,
         cold_reopen_evidence_match,
         canonical_fence_match,
@@ -892,6 +950,45 @@ mod tests {
             validated.pipeline_limits.block_prepare_concurrency.get(),
             10
         );
+        assert_eq!(
+            validated.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::CadenceAndTip
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_state_checkpoint_coverage_accepts_every_block_and_rejects_unknown()
+    -> Result<(), Box<dyn Error>> {
+        let mut argv = required_args();
+        argv.extend(["--tree-state-checkpoint-coverage", "every-block"]);
+        let cli = TestCli::try_parse_from(argv)?;
+        assert_eq!(
+            cli.args.validate()?.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::EveryBlock
+        );
+
+        let mut invalid = required_args();
+        invalid.extend(["--tree-state-checkpoint-coverage", "sparse"]);
+        assert!(TestCli::try_parse_from(invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_publication_defaults_to_ingest_and_accepts_cold_certification()
+    -> Result<(), Box<dyn Error>> {
+        let cli = TestCli::try_parse_from(required_args())?;
+        assert_eq!(
+            cli.args.validate()?.canonical_publication_mode,
+            super::CanonicalPublicationMode::TrustedFresh
+        );
+        let mut argv = required_args();
+        argv.extend(["--canonical-publication-mode", "cold-certified"]);
+        let cli = TestCli::try_parse_from(argv)?;
+        assert_eq!(
+            cli.args.validate()?.canonical_publication_mode,
+            super::CanonicalPublicationMode::ColdCertified
+        );
         Ok(())
     }
 
@@ -921,5 +1018,38 @@ mod tests {
 
         assert!(cli.args.validate().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn lifecycle_defaults_match_production_writer_and_sorter_budgets() {
+        const TEN_GIB: u64 = 10 * 1024 * 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        assert_eq!(
+            super::lifecycle_canonical_resource_budget(),
+            zinder_store::RocksDbResourceBudget::canonical_writer_defaults()
+        );
+
+        let wallet = super::lifecycle_wallet_build_options(super::DEFAULT_SUPPORTED_REORG_DEPTH);
+        assert_eq!(
+            wallet.resource_budget,
+            zinder_store::RocksDbResourceBudget::wallet_projection_writer_defaults()
+        );
+        assert_eq!(wallet.resource_budget.max_wal_bytes, 32 * MIB);
+        assert_eq!(
+            wallet.max_outpoint_sort_memory_bytes,
+            zinder_runtime::wallet_build_outpoint_sort_memory_bytes_for(Some(TEN_GIB))
+        );
+        assert_eq!(
+            wallet.max_secondary_sort_memory_bytes_per_sorter,
+            zinder_runtime::wallet_build_secondary_sort_memory_bytes_per_sorter_for(Some(TEN_GIB))
+        );
+        assert_eq!(
+            wallet.max_accounted_reorg_undo_bytes,
+            zinder_runtime::wallet_build_reorg_undo_memory_bytes_for(Some(TEN_GIB))
+        );
+        assert_eq!(wallet.max_temporary_file_bytes_per_sorter, 192 * GIB);
+        assert_eq!(wallet.sst_target_logical_bytes, 128 * MIB);
     }
 }

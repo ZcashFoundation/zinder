@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use eyre::{Result, eyre};
 use tokio::net::TcpListener;
-use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
+use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use tonic::Code;
 use tonic_types::StatusExt as _;
@@ -82,6 +82,7 @@ async fn dropping_compact_block_range_stream_does_not_break_subsequent_requests(
             start_height: 1,
             end_height: COMMITTED_BLOCK_COUNT,
             at_epoch_id: None,
+            pool_types: Vec::new(),
         })
         .await?
         .into_inner();
@@ -106,6 +107,7 @@ async fn dropping_compact_block_range_stream_does_not_break_subsequent_requests(
             start_height: 1,
             end_height: COMMITTED_BLOCK_COUNT,
             at_epoch_id: None,
+            pool_types: Vec::new(),
         })
         .await?
         .into_inner();
@@ -194,6 +196,7 @@ async fn parallel_compact_block_range_readers_all_drain_to_completion() -> Resul
                         start_height: 1,
                         end_height: COMMITTED_BLOCK_COUNT,
                         at_epoch_id: None,
+                        pool_types: Vec::new(),
                     })
                     .await?
                     .into_inner();
@@ -252,10 +255,7 @@ async fn shutdown_ends_an_open_chain_events_stream_and_drains_the_server() -> Re
     let server = tokio::spawn(async move {
         zinder_runtime::public_grpc_server(zinder_runtime::ClientAddressSource::Connection)
             .add_service(grpc_adapter.into_server())
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                server_shutdown.cancelled_owned(),
-            )
+            .serve_with_incoming_shutdown(listener, server_shutdown.cancelled_owned())
             .await
     });
     let mut client = WalletQueryClient::connect(server_addr).await?;
@@ -543,7 +543,7 @@ async fn spawn_wallet_query_server(
         let server_result =
             zinder_runtime::public_grpc_server(zinder_runtime::ClientAddressSource::Connection)
                 .add_service(grpc_adapter.into_server())
-                .serve_with_incoming(TcpListenerStream::new(listener))
+                .serve_with_incoming(listener)
                 .await;
         drop(store_fixture);
         server_result

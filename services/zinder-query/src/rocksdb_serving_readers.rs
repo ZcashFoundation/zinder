@@ -13,7 +13,7 @@
 
 use std::{
     num::{NonZeroU16, NonZeroU32},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use async_trait::async_trait;
@@ -26,7 +26,8 @@ use zinder_core::{
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence,
     CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily,
-    ChainEventStreamResume, EventStreamStartPosition, HeightOrder, RawBlobRetention,
+    ChainEventStreamResume, CompactBlockSpliceSelection, EncodedCompactBlockRange,
+    EncodedCompactBlockRangeRequest, EventStreamStartPosition, HeightOrder, RawBlobRetention,
     RocksDbCanonicalSecondary, ServedTreeState, StreamCursorTokenV1, TreeStateLookup,
     TreeStateReplay, TreeStateReplayOutcome,
 };
@@ -37,8 +38,9 @@ use zinder_wallet_projection::{
 use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
 
 use crate::{
-    ArtifactKey, CanonicalReader, IndexedTransaction, SpendStatusReadEnd, StorageReadError,
-    WalletProjectionReader, serving_readers::drives_blocking_read,
+    ArtifactKey, CanonicalReader, EncodedCompactBlockLookup, IndexedTransaction,
+    SpendStatusReadEnd, StorageReadError, WalletProjectionReader,
+    serving_readers::drives_blocking_read,
 };
 
 /// A [`CanonicalReader`] over one admitted `RocksDB` canonical secondary.
@@ -110,6 +112,88 @@ impl RocksDbCanonicalReader {
         let secondary = Arc::clone(&self.secondary);
         off_reactor(move || read(&secondary).map_err(canonical_read_error)).await
     }
+
+    /// Reads where the served chain mines `transaction_id`, answering `None`
+    /// only for a proven absence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageReadError::CanonicalHistoryUnavailable`] for a miss
+    /// below a checkpointed store's history floor.
+    pub async fn mined_transaction_location(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<zinder_core::TransactionLocation>, StorageReadError> {
+        self.read(move |secondary| secondary.transaction_location_or_proven_absence(transaction_id))
+            .await
+    }
+}
+
+/// Where the served chain mines a transaction and the digest of the bytes
+/// ingest committed for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MinedTransactionDigest {
+    /// The transaction's canonical location.
+    pub location: zinder_core::TransactionLocation,
+    /// The digest of the transaction's serialized bytes.
+    pub serialized_bytes_digest: zinder_core::SerializedBytesDigest,
+}
+
+impl MinedTransactionDigest {
+    /// Reads the exact byte commitment from the indexed transaction location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact corruption error when the location has no digest.
+    pub fn from_location(
+        location: zinder_core::TransactionLocation,
+    ) -> Result<Self, crate::QueryError> {
+        let serialized_bytes_digest = location
+            .serialized_bytes_sha256
+            .map(zinder_core::SerializedBytesDigest::from_bytes)
+            .ok_or_else(|| crate::QueryError::ArtifactCorrupt {
+                family: ArtifactFamily::TransactionLocation,
+                reason: "canonical transaction location has no serialized byte digest".to_owned(),
+            })?;
+        Ok(Self {
+            location,
+            serialized_bytes_digest,
+        })
+    }
+
+    /// Checks the node's containing block and the exact serialized bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a node availability error for a different block and an artifact
+    /// corruption error for a byte digest mismatch.
+    pub fn verify_node_bytes(
+        self,
+        block: zinder_core::BlockId,
+        bytes: &[u8],
+    ) -> Result<(), crate::QueryError> {
+        if block != zinder_core::BlockId::new(self.location.block_height, self.location.block_hash)
+        {
+            return Err(crate::QueryError::Node(
+                zinder_source::SourceError::NodeUnavailable {
+                    reason:
+                        "node does not mine the transaction in the served block; retry with backoff"
+                            .to_owned(),
+                },
+            ));
+        }
+        if zinder_core::SerializedBytesDigest::from_serialized_bytes(bytes)
+            != self.serialized_bytes_digest
+        {
+            return Err(crate::QueryError::ArtifactCorrupt {
+                family: ArtifactFamily::TransactionLocation,
+                reason:
+                    "node transaction bytes differ from the bytes committed to the served chain"
+                        .to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -136,6 +220,10 @@ impl CanonicalReader for RocksDbCanonicalReader {
 
     fn history_bounds(&self) -> CanonicalHistoryBounds {
         self.secondary.history_bounds()
+    }
+
+    fn history_predecessor_digest(&self) -> Option<[u8; 32]> {
+        Some(self.secondary.history_predecessor_digest())
     }
 
     async fn block_header_at(
@@ -194,6 +282,44 @@ impl CanonicalReader for RocksDbCanonicalReader {
             .await
     }
 
+    async fn encoded_compact_block_at(
+        &self,
+        height: BlockHeight,
+        selection: CompactBlockSpliceSelection,
+    ) -> Result<EncodedCompactBlockLookup, StorageReadError> {
+        self.read(move |secondary| {
+            Ok(secondary
+                .encoded_compact_block_at(height, selection)?
+                .map_or(
+                    EncodedCompactBlockLookup::NotFound,
+                    EncodedCompactBlockLookup::Block,
+                ))
+        })
+        .await
+    }
+
+    async fn encoded_compact_block_by_hash(
+        &self,
+        block_hash: BlockHash,
+        selection: CompactBlockSpliceSelection,
+    ) -> Result<EncodedCompactBlockLookup, StorageReadError> {
+        self.read(
+            move |secondary| match secondary.block_hash_lookup(block_hash)? {
+                BlockHashLookup::Resolved(block_id) => secondary
+                    .encoded_compact_block_at(block_id.height, selection)?
+                    .map(EncodedCompactBlockLookup::Block)
+                    .ok_or(CanonicalStoreError::ArtifactUnavailable {
+                        family: ArtifactFamily::CompactBlock,
+                        height: block_id.height,
+                    }),
+                BlockHashLookup::NotInBestChain | BlockHashLookup::NotIndexed => {
+                    Ok(EncodedCompactBlockLookup::NotFound)
+                }
+            },
+        )
+        .await
+    }
+
     async fn compact_blocks_in_range(
         &self,
         range: BlockHeightRange,
@@ -210,6 +336,17 @@ impl CanonicalReader for RocksDbCanonicalReader {
     ) -> Result<Vec<CompactBlockArtifact>, StorageReadError> {
         self.read(move |secondary| secondary.compact_blocks_in_range_up_to(range, order, max_bytes))
             .await
+    }
+
+    async fn encoded_compact_block_range_up_to(
+        &self,
+        request: EncodedCompactBlockRangeRequest,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<EncodedCompactBlockRange>, StorageReadError> {
+        self.read(move |secondary| {
+            secondary.encoded_compact_block_range_up_to(request, cancel.as_deref())
+        })
+        .await
     }
 
     async fn block_blob_at(
@@ -237,16 +374,45 @@ impl CanonicalReader for RocksDbCanonicalReader {
             // the authenticated source count for every retention mode, and
             // live append and replacement update every retained family in
             // one batch, so a miss over complete history is a proven absence.
-            let Some(location) =
-                secondary.transaction_location_or_proven_absence(transaction_id)?
+            let Some((location, transaction_blob)) =
+                secondary.transaction_location_and_blob_or_proven_absence(transaction_id)?
             else {
                 return Ok(None);
             };
             Ok(Some(IndexedTransaction {
                 location,
                 block_header: secondary.block_header_at(location.block_height)?,
-                transaction_blob: secondary.transaction_blob(location)?,
+                transaction_blob,
             }))
+        })
+        .await
+    }
+
+    async fn mined_transactions(
+        &self,
+        transaction_ids: &[TransactionId],
+    ) -> Result<Vec<Option<IndexedTransaction>>, StorageReadError> {
+        if transaction_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = transaction_ids.to_vec();
+        self.read(move |secondary| {
+            let located = secondary.transaction_locations_and_blobs(&ids)?;
+            let heights: Vec<BlockHeight> = located
+                .iter()
+                .filter_map(|entry| entry.as_ref().map(|(location, _)| location.block_height))
+                .collect();
+            let mut headers = secondary.block_headers_at(&heights)?.into_iter();
+            Ok(located
+                .into_iter()
+                .map(|entry| {
+                    entry.map(|(location, transaction_blob)| IndexedTransaction {
+                        location,
+                        block_header: headers.next().flatten(),
+                        transaction_blob,
+                    })
+                })
+                .collect())
         })
         .await
     }
@@ -261,12 +427,11 @@ impl CanonicalReader for RocksDbCanonicalReader {
         };
         let blob = self
             .read(move |secondary| {
-                let Some(location) = secondary.transaction_location(transaction_id)? else {
+                let Some((_, blob)) = secondary.transaction_location_and_blob(transaction_id)?
+                else {
                     return Ok(Err(ArtifactFamily::TransactionLocation));
                 };
-                Ok(secondary
-                    .transaction_blob(location)?
-                    .ok_or(ArtifactFamily::TransactionBlob))
+                Ok(blob.ok_or(ArtifactFamily::TransactionBlob))
             })
             .await?;
         blob.map_err(unavailable)
@@ -277,6 +442,15 @@ impl CanonicalReader for RocksDbCanonicalReader {
         height: BlockHeight,
     ) -> Result<Option<ServedTreeState>, StorageReadError> {
         self.read(move |secondary| secondary.tree_state_checkpoint_at_or_before(height))
+            .await
+    }
+
+    async fn stored_tree_state_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<ServedTreeState>, StorageReadError> {
+        admitted_activations(&self.secondary)?;
+        self.read(move |secondary| secondary.stored_tree_state_at(height))
             .await
     }
 
@@ -293,6 +467,24 @@ impl CanonicalReader for RocksDbCanonicalReader {
         .await
     }
 
+    async fn tree_state_lookup_until_cancelled(
+        &self,
+        height: BlockHeight,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateLookup>, StorageReadError> {
+        let secondary = Arc::clone(&self.secondary);
+        off_reactor(move || {
+            secondary
+                .tree_state_lookup_until_cancelled(
+                    height,
+                    admitted_activations(&secondary)?,
+                    || cancelled.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .map_err(canonical_read_error)
+        })
+        .await
+    }
+
     async fn replay_tree_state(
         &self,
         replay: TreeStateReplay,
@@ -301,6 +493,24 @@ impl CanonicalReader for RocksDbCanonicalReader {
         off_reactor(move || {
             secondary
                 .replay_tree_state(&replay, admitted_activations(&secondary)?)
+                .map_err(canonical_read_error)
+        })
+        .await
+    }
+
+    async fn replay_tree_state_until_cancelled(
+        &self,
+        replay: TreeStateReplay,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<TreeStateReplayOutcome>, StorageReadError> {
+        let secondary = Arc::clone(&self.secondary);
+        off_reactor(move || {
+            secondary
+                .replay_tree_state_until_cancelled(
+                    &replay,
+                    admitted_activations(&secondary)?,
+                    || cancelled.load(std::sync::atomic::Ordering::Relaxed),
+                )
                 .map_err(canonical_read_error)
         })
         .await
@@ -563,6 +773,10 @@ fn canonical_read_error(error: CanonicalStoreError) -> StorageReadError {
                 reason: "cursor version is unsupported",
             }
         }
+        CanonicalStoreError::ArtifactCorrupt { family, reason } => {
+            StorageReadError::ArtifactCorrupt { family, reason }
+        }
+        CanonicalStoreError::ReplayCancelled => StorageReadError::Cancelled,
         other => StorageReadError::Unavailable {
             source: Box::new(other),
         },

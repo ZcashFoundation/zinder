@@ -1,3 +1,5 @@
+mod canonical_range;
+
 use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -247,16 +249,28 @@ async fn read_web_response(
         .get("grpc-status")
         .map(|code| code.to_str()?.parse::<i32>().map_err(eyre::Report::from))
         .transpose()?;
-    let mut body = response.bytes().await?;
-    if encoding == TEXT_CONTENT_TYPE {
+    let body = response.bytes().await?;
+    decode_web_frames(&body, encoding, header_status, expected_status)
+}
+
+fn decode_web_frames(
+    body: &[u8],
+    encoding: &str,
+    header_status: Option<i32>,
+    expected_status: i32,
+) -> Result<Vec<Vec<u8>>> {
+    let decoded;
+    let mut remaining = if encoding == TEXT_CONTENT_TYPE {
         // A flush can introduce base64 padding before the end of the stream.
-        let mut decoded = Vec::new();
+        let mut buf = Vec::new();
         for quartet in body.chunks(4) {
-            STANDARD.decode_vec(quartet, &mut decoded)?;
+            STANDARD.decode_vec(quartet, &mut buf)?;
         }
-        body = decoded.into();
-    }
-    let mut remaining = body.as_ref();
+        decoded = buf;
+        decoded.as_slice()
+    } else {
+        body
+    };
     let mut trailer_status = None;
     let mut messages = Vec::new();
     while !remaining.is_empty() {
@@ -295,8 +309,8 @@ struct CompatProcess {
     addr: SocketAddr,
     _child: tokio::process::Child,
     control: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
-    _storage: tempfile::TempDir,
-    _writer: CanonicalWriterFixture,
+    storage: tempfile::TempDir,
+    writer: CanonicalWriterFixture,
 }
 
 impl Drop for CompatProcess {
@@ -308,14 +322,29 @@ impl Drop for CompatProcess {
 impl CompatProcess {
     async fn start(serving: &str, origin: Option<&str>) -> Result<Self> {
         let network = Network::ZcashRegtest;
-        let storage = tempfile::tempdir()?;
+        let retention = if serving == "wallet" {
+            RawBlobRetention::All
+        } else {
+            RawBlobRetention::None
+        };
         let chain = ChainFixture::new(network)
             .extend_blocks(3)
-            .with_raw_blob_retention(RawBlobRetention::Transactions);
+            .with_raw_blob_retention(retention);
         let writer = CanonicalWriterFixture::publish(
             &CanonicalBaseline::new(&chain),
             &sample_regtest_upgrade_activations(),
         )?;
+        Self::start_with_writer(serving, origin, writer, retention).await
+    }
+
+    async fn start_with_writer(
+        serving: &str,
+        origin: Option<&str>,
+        writer: CanonicalWriterFixture,
+        retention: RawBlobRetention,
+    ) -> Result<Self> {
+        let storage = tempfile::tempdir()?;
+        let network = Network::ZcashRegtest;
         let primary = writer.canonical_primary()?;
         let wallet_config = if serving == "wallet" {
             build_wallet_config(primary, storage.path())?
@@ -329,44 +358,32 @@ impl CompatProcess {
         );
         let control_listener = TcpListener::bind("127.0.0.1:0").await?;
         let control_addr = control_listener.local_addr()?;
+        let control_service = MutableCanonicalControl {
+            status: Arc::new(Mutex::new(status)),
+        };
         let control = tokio::spawn(async move {
             Server::builder()
                 .add_service(IngestControlServer::new(IngestControlFixtureService::new(
                     network,
                 )))
-                .add_service(CanonicalControlServer::new(MutableCanonicalControl {
-                    status: Arc::new(Mutex::new(status)),
-                }))
+                .add_service(CanonicalControlServer::new(control_service))
                 .serve_with_incoming(TcpListenerStream::new(control_listener))
                 .await
         });
         let config = storage.path().join("compat.toml");
-        let origin_setting = origin.map_or_else(String::new, |origin| {
-            format!("browser_origins = [\"{origin}\"]")
-        });
+        let origin_setting =
+            origin.map_or_else(String::new, |o| format!("browser_origins = [\"{o}\"]"));
+        let canonical = writer.canonical_primary_path().display();
+        let reader = storage.path().join("canonical-reader");
         fs::write(
             &config,
             format!(
-                r#"[network]
-name = "zcash-regtest"
-[storage]
-path = "{}"
-secondary_path = "{}"
-raw_blob_policy = "transactions"
-{wallet_config}
-[ops]
-listen_addr = "127.0.0.1:0"
-[ingest_control]
-addr = "http://{control_addr}"
-[compat]
-serving = "{serving}"
-listen_addr = "127.0.0.1:0"
-reorg_window_blocks = 100
-stale_tip_limit_ms = 0
-{origin_setting}
-"#,
-                writer.canonical_primary_path().display(),
-                storage.path().join("canonical-reader").display(),
+                "[network]\nname = \"zcash-regtest\"\n[storage]\npath = \"{canonical}\"\n\
+                 secondary_path = \"{}\"\nraw_blob_policy = \"{retention}\"\n{wallet_config}\n\
+                 [ops]\nlisten_addr = \"127.0.0.1:0\"\n[ingest_control]\naddr = \"http://{control_addr}\"\n\
+                 [compat]\nserving = \"{serving}\"\nlisten_addr = \"127.0.0.1:0\"\n\
+                 reorg_window_blocks = 100\nstale_tip_limit_ms = 0\n{origin_setting}\n",
+                reader.display(),
             ),
         )?;
         let (addr, child) = start_listener(&config, &storage.path().join("compat.log"))
@@ -376,8 +393,8 @@ stale_tip_limit_ms = 0
             addr,
             _child: child,
             control,
-            _storage: storage,
-            _writer: writer,
+            storage,
+            writer,
         })
     }
 
@@ -386,7 +403,15 @@ stale_tip_limit_ms = 0
     }
 
     async fn native_client(&self) -> Result<CompactTxStreamerClient<Channel>> {
-        Ok(CompactTxStreamerClient::connect(format!("http://{}", self.addr)).await?)
+        CompactTxStreamerClient::connect(format!("http://{}", self.addr))
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "compat listener for {} failed to connect: {}",
+                    self.writer.canonical_primary_path().display(),
+                    fs::read_to_string(self.storage.path().join("compat.log")).unwrap_or_default()
+                )
+            })
     }
 
     async fn post(&self, http: &Client, method: &str, message: impl Message) -> Result<Response> {
@@ -400,22 +425,32 @@ stale_tip_limit_ms = 0
         encoding: &str,
         message: &impl Message,
     ) -> Result<Response> {
-        let mut body = vec![0];
-        body.extend_from_slice(&u32::try_from(message.encoded_len())?.to_be_bytes());
-        message.encode(&mut body)?;
-        if encoding == TEXT_CONTENT_TYPE {
-            body = STANDARD.encode(&body).into_bytes();
-        }
-        Ok(http
-            .post(self.method_url(method))
-            .header(header::ORIGIN, ORIGIN)
-            .header(header::CONTENT_TYPE, encoding)
-            .header(header::ACCEPT, encoding)
-            .header("x-grpc-web", "1")
-            .body(body)
-            .send()
-            .await?)
+        post_web_request(http, self.addr, method, encoding, message).await
     }
+}
+
+async fn post_web_request(
+    http: &Client,
+    addr: SocketAddr,
+    method: &str,
+    encoding: &str,
+    message: &impl Message,
+) -> Result<Response> {
+    let mut body = vec![0];
+    body.extend_from_slice(&u32::try_from(message.encoded_len())?.to_be_bytes());
+    message.encode(&mut body)?;
+    if encoding == TEXT_CONTENT_TYPE {
+        body = STANDARD.encode(&body).into_bytes();
+    }
+    Ok(http
+        .post(format!("http://{addr}/{SERVICE}/{method}"))
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::CONTENT_TYPE, encoding)
+        .header(header::ACCEPT, encoding)
+        .header("x-grpc-web", "1")
+        .body(body)
+        .send()
+        .await?)
 }
 
 async fn start_listener(config: &Path, log: &Path) -> Result<(SocketAddr, tokio::process::Child)> {

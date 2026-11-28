@@ -44,6 +44,7 @@ cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --profile=ci
+scripts/test-nextest-selectors.sh
 cargo nextest run --profile=ci-parity
 cargo nextest run --profile=ci-perf
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
@@ -55,6 +56,13 @@ scripts/runbook-lint.sh docs/runbooks/testing.md
 scripts/test-install-ci-tool.sh
 git diff --check
 ```
+
+`scripts/test-nextest-selectors.sh` checks that every test-name predicate in
+the nextest profiles, qualification script, and the live and parity workflows selects a
+compiled test, including ignored tests. It checks exclusions individually and
+reuses the workspace test binaries. With `NEXTEST_ARCHIVE_FILE` set to a
+`cargo nextest archive` of this tree, it lists the archived tests instead and
+needs neither Cargo nor rustc.
 
 The `dependency hygiene` CI job also runs script tests for release, deployment,
 storage-benchmark, and entrypoint policy. When you change one of those areas,
@@ -88,6 +96,16 @@ ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://zinder_bench:zinder_bench_local_
   cargo nextest run -p zinder-bench --profile=ci-postgres --run-ignored=all
 ```
 
+#### Containerized stateless-topology testing ground
+
+Run the disposable PostgreSQL 17/18 + `PgBouncer` (`pool_mode = transaction`) + Mock R2 + non-sticky Caddy L7 proxy verification harness (plus optional `--zinder-image` `--readers-only` read-only config validation):
+
+```bash
+scripts/run-postgres-testing-ground.sh --postgres-versions 18,17 --zinder-image zinder:local
+```
+
+Reports are written to `.tmp/postgres-testing-ground-<timestamp>/report.json` and `report.md`. See [deploy/bench/postgres-testing-ground/README.md](../../deploy/bench/postgres-testing-ground/README.md).
+
 ### Heavy probes
 
 Coverage and mutation testing are slow. Scheduled CI runs them weekly. The
@@ -104,13 +122,12 @@ the tests of the package that holds each mutant. A mutant in `zinder-store`
 is therefore caught only by a `zinder-store` test, so put the assertion that
 kills a mutant in the crate that owns the mutated file.
 
-The file list and filter select about 295 mutants. A run with `--jobs 3` on
-a GitHub-hosted runner took 56 minutes for 130 mutants, which puts one
-unsharded run near two hours. The job splits the mutants into three shards
-with `--shard`, about 100 mutants and under an hour each, and keeps a 90-minute
-timeout per shard. Grow the shard count in the workflow matrix, and the
-`--shard` denominator with it, before a shard approaches the timeout. A local
-run can use the same flag to cover one slice, such as `--shard 0/3`.
+Append `--list` to the mutation command to inspect the selected functions and
+mutations. CI splits them across four shards with a 90-minute timeout per
+shard. A GitHub-hosted run took 56 minutes for 130 mutants with `--jobs 3`,
+and the selection lists 567 mutants, about 142 per shard. If a shard
+approaches the timeout, increase the workflow matrix and the `--shard`
+denominator together. Use `--shard 0/4` to run one shard locally.
 
 ```bash
 cargo llvm-cov --workspace --all-features --no-report
@@ -120,15 +137,38 @@ cargo mutants --workspace --all-features --cap-lints true \
   --file crates/zinder-store/src/canonical_store/event_lifecycle.rs \
   --file crates/zinder-store/src/format/stream_cursor.rs \
   --file crates/zinder-store/src/canonical_store/rocksdb.rs \
+  --file crates/zinder-store/src/canonical_store/block_replay.rs \
   --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
   --file crates/zinder-store/src/canonical_store/control.rs \
+  --file crates/zinder-store/src/canonical_store/block_load/codec.rs \
+  --file crates/zinder-store/src/canonical_store/reader.rs \
   --file crates/zinder-store/src/canonical_store/served_tree_state.rs \
   --file crates/zinder-store/src/canonical_store/tree_state_replay.rs \
   --file crates/zinder-store/src/canonical_store/tree_state_densification.rs \
   --file crates/zinder-core/src/network_upgrade_activations.rs \
   --file crates/zinder-source/src/source_block.rs \
+  --file crates/zinder-source/src/source_transaction.rs \
+  --file crates/zinder-store/src/canonical_store/encoded_compact_range.rs \
+  --file crates/zinder-store/src/settled_shielded_segment/wire_projection.rs \
   --file services/zinder-ingest/src/artifact_builder.rs \
-  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer|framed_tree_size|skip_framed_node|read_tree_state_checkpoint_at|lookup_tree_state|find_tree_state|replay_tree_state|refuse_unadmitted_activations|reconstruct|required_seed_height|replay_compact_blocks|append_compact_block_commitments|requires_checkpoint|after_seed|scan_tree_state_strides|stride_ending_at_satisfied|next_tree_state_stride|first_seed_at_or_above|stride_satisfies|stored_heights_through_end|stored_tree_sizes|densify_tree_state_stride|replay_stride|append_stored_block|commitment_count|recorded_tree_sizes|commit_tree_state_stride|StoredStrideRows::read|StoredStrideRows::at|ReplayedTrees::append_block|ReplayedTrees::canonical_block_time|ReplayedTrees::checkpoint'
+  --file crates/zinder-rocksdb-bulk-load/src/bulk_load/variable_value_sort.rs \
+  --file crates/zinder-wallet-rocksdb/src/accumulator_hashing.rs \
+  --file crates/zinder-wallet-rocksdb/src/projection_load.rs \
+  --file crates/zinder-wallet-rocksdb/src/store.rs \
+  --file crates/zinder-core/src/utxo_set_commitment.rs \
+  --file crates/zinder-wallet-projection/src/digest.rs \
+  --file crates/zinder-core/src/lthash16.rs \
+  --re 'encoded_compact_range\.rs:.*\b(stream_ascending|stream_descending|read_settled_segment_step|verify_step_linkage|project_live_wire)\b' \
+  --re 'wire_projection\.rs:.*\b(project_shielded_block_wire_into|validate_shielded_block_wire|project_compact_tx_wire|extract_action_nullifier_wire)\b' \
+  --re 'variable_value_sort\.rs:.*\b(next_record|RunReader|SortedRunSource|remove_runs|merge_group|merge_run_group|read_run_head|ParallelVariableValueSorter|VariableValueSortShard|SharedRunBudget)\b' \
+  --re 'block_replay\.rs:.*\b(CanonicalReplaySliceSource|CanonicalReplaySliceScan|expected_visible_block_count)\b' \
+  --re 'projection_load\.rs:.*\b(partition_settled_height_chunks|parallel_scan_worker_count|verify_completed_chunks|scan_one_settled_chunk|spawn_canonical_scan_worker)\b' \
+  --re 'accumulator_hashing\.rs:.*\b(append_row|insert_unspent_output|settle|make_room|submit|spawn|drain|combine|push_row|push_unspent_output|hash_partial|HashingWorkers::start)\b' \
+  --re 'zinder-wallet-rocksdb/src/store\.rs:.*\b(hash_prefix_key_ranges|HashPrefixKeyRange|scan_range_count|primary_output_scan_range_count|address_transaction_scan_range_count|read_back_primary_output_rows|scan_primary_output_range|read_back_address_transaction_rows|scan_address_transaction_range|AddressTransactionTotals|PrimaryOutputTotals|PrimaryScanRange|SharedExpectedReorgUndoSuffix|spawn_validation_scan)\b' \
+  --re '(utxo_set_commitment|zinder-wallet-projection/src/digest)\.rs:.*\b(combine|fold_lanes)\b' \
+  --re '(artifact_builder|source_transaction)\.rs:.*\b(parse_source_block|bytes_consumed|validate_transaction_byte_layout|transaction_identifiers|witnessed_transaction_identifiers)\b' \
+  --re 'lthash16\.rs:.*\bexpand_lthash16_element\b' \
+  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer|read_stored_final_note_commitment_roots_in_range|decode_stored_tree_state_roots|decode_checked_stored_roots|resolve_stored_roots_headers|framed_tree_size|skip_framed_node|read_tree_state_checkpoint_at|lookup_tree_state|find_tree_state|replay_tree_state|refuse_unadmitted_activations|reconstruct|required_seed_height|replay_compact_blocks|append_compact_block_commitments|requires_checkpoint|after_seed|scan_tree_state_strides|stride_ending_at_satisfied|next_tree_state_stride|first_seed_at_or_above|stride_satisfies|stored_heights_through_end|stored_tree_sizes|densify_tree_state_stride|replay_stride|append_stored_block|commitment_count|recorded_tree_sizes|commit_tree_state_stride|StoredStrideRows::read|StoredStrideRows::at|ReplayedTrees::append_block|ReplayedTrees::canonical_block_time|ReplayedTrees::checkpoint'
 ```
 
 ## Run one test or one tier
@@ -190,20 +230,33 @@ exercises it.
 
 | Workflow | Runs on | What it checks |
 | --- | --- | --- |
-| `ci-pr` | Every pull request, pushes to `main`, and weekly | The `rust` job runs format, check, clippy, docs, and the `ci`, `ci-postgres`, `ci-parity`, and `ci-perf` profiles. `dependency hygiene` runs the changelog, runbook, alignment, and release-policy scripts, `cargo deny`, and `cargo machete`. Other jobs check the SDK packages and the vendored protocols. Coverage and mutation run only on the weekly schedule or a manual run. |
-| `protocol-contracts` | Pull requests and `main` pushes that touch the protocol | Checked-in generated code, `proto breaking` (pull requests only), and capability coverage |
-| `live-tests` | Node-facing pull requests, nightly Regtest, weekly Testnet, and manual Mainnet | The T3 suite, once against Zebra and once against Zakura on Regtest |
-| `parity-compat` | Node-facing pull requests and nightly | Live parity against a reference lightwalletd, on both nodes |
-| `binary-archives` | Pull requests that touch build inputs | Release binary archives for both platforms |
-| `build-images` | Pull requests that touch images or deployment files | Deployment admission and runtime image smoke builds |
+| `ci-pr` | Every pull request, pushes to `main`, and weekly | The Rust jobs below, `dependency hygiene` (changelog, runbook, alignment, and release-policy scripts, `cargo deny`, and `cargo machete`), and the vendored protocols. `ci gate` passes only when all of them do. Coverage and mutation run only on the weekly schedule or a manual run. |
+| `protocol-contracts` | Pull requests and `main` pushes that touch the protocol | Checked-in generated code, standalone API archive verification, and capability coverage. On pull requests, Buf checks compatibility against the base commit and the latest published contract unless `allow-proto-breaking` is set. |
+| `live-tests` | Node-facing pull requests, nightly Regtest, weekly Testnet, and manual Mainnet | The T3 suite against Zebra and Zakura on Regtest. The Zebra job also installs a release-shaped GNU/Linux archive and probes the native systemd services. |
+| `parity-compat` | Node-facing pull requests and nightly | Live parity against a reference lightwalletd and a pinned CBB light client, on both nodes, from binaries that `build parity binaries` compiles once |
+| `binary-archives` | Pull requests and `main` pushes that touch build inputs | Release binary archives for both platforms |
+| `build-images` | Pull requests and `main` pushes that touch images or deployment files | Deployment admission and runtime image smoke builds |
+
+The `ci-pr` Rust jobs run in parallel:
+
+| Job | What it runs |
+| --- | --- |
+| `changes` | Decides whether the Rust jobs run. They are skipped only when every file a pull request changes is under `.changes/`, `docs/adrs/`, or `docs/architecture/`, is `AGENTS.md` or `README.md`, or is a Markdown file under `scripts/wallet-clients/`. Anything else, including the runbooks, the reference pages, and `CLAUDE.md` that doc-contract tests read, runs them. |
+| `fmt` | `cargo fmt` and `git diff --check` |
+| `lint` | `cargo check`, the hermetic `zinder-proto` build, `cargo clippy`, and `cargo doc` |
+| `test build` | Builds the workspace tests once, uploads them as a `cargo nextest archive` with the wallet reader fixture, and checks the canonical storage defaults of the built runtimes |
+| `test (shard N/4)` | The `ci` profile from the archive, split into four `hash` partitions |
+| `test tiers` | From the same archive: the nextest selector check, the paired wallet reader measurement, the ext4 protected-history tests, and the `ci-postgres`, `ci-parity`, and `ci-perf` profiles |
+| Pasta and LtHash16 parity | Assembly and portable backends, including the assembly-enabled Pasta guard, on x86-64 and AArch64 |
+| `public SDK packages` | The registry packages and an extracted consumer build |
 
 All workflows follow these rules:
 
-- **A new push cancels the superseded run.** `ci-pr`, `protocol-contracts`,
-  `live-tests`, and `parity-compat` group runs by workflow, event, and pull
-  request number. Runs on `main`, scheduled runs, and manual runs are never
-  cancelled. `binary-archives` and `build-images` cancel any older run for the
-  same pull request or reference, including a manual one.
+- **A new push cancels the superseded run.** Every workflow groups pull
+  request runs by pull request and cancels the older one. Runs on `main`,
+  scheduled runs, and manual runs are never cancelled. `binary-archives` and
+  `build-images` queue them per branch, so two `main` runs never save the
+  same cache at once.
 - **Every job has a timeout.** A hung job stops at its `timeout-minutes`.
 - **Tools come from checksum-pinned release assets.** No job compiles
   `cargo-nextest`, `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`, or
@@ -213,13 +266,38 @@ All workflows follow these rules:
   `~/.cargo/bin`. To bump a tool, change its version, URL, and checksum
   together. The lock has x86_64 assets only, because no tool-installing job
   runs on arm64.
+- **External actions are pinned to commit SHAs.**
+  `scripts/test-workflow-action-pins.sh` checks every `uses:` in the
+  workflows, the composite actions under `.github/actions/`, and
+  `scripts/release-wallet-action/`. The `setup-rust` composite action installs
+  the toolchain, the Rust cache, and CI tools for every Rust job. A workflow
+  with a `paths` filter lists the composite actions it calls.
+- **Archived tests run without a toolchain.** Jobs that run a nextest archive
+  install only `cargo-nextest` and call `cargo-nextest nextest` directly, so
+  rustup never installs the toolchain from `rust-toolchain.toml`. Tests must
+  therefore follow [Writing tests that CI can run](#writing-tests-that-ci-can-run).
 - **Rust caches are written from `main` only.** Every `Swatinem/rust-cache`
-  step saves only when `github.ref` is `refs/heads/main`. The `ci-pr` `rust`
-  job and all `live-tests` jobs share the `test` key, `parity-compat` uses
-  `parity`, and other jobs use their own keys. In a two-node matrix, only the
-  Zebra leg saves. The action hashes every `CARGO_*` and `RUST*` variable into
-  the key, so jobs that share a key must keep identical workflow-level `env`
-  blocks.
+  step saves only when `github.ref` is `refs/heads/main`. The `ci-pr`
+  `test build` job saves the `test` key, which the `live-tests` jobs and
+  capability coverage only read. `lint`, `parity-compat`, and the other jobs
+  use their own keys. The action hashes every `CARGO_*` and `RUST*` variable
+  into the key, so `ci-pr`, `live-tests`, and `protocol-contracts` keep
+  identical `CARGO_*` workflow-level variables, including
+  `CARGO_PROFILE_DEV_DEBUG` and `CARGO_PROFILE_TEST_DEBUG` set to
+  `line-tables-only`.
+- **Release builds restore third-party crates from `main`.** BuildKit does
+  not export `RUN --mount=type=cache` directories with `--cache-to`, so the
+  `buildkit-cargo-cache` composite action moves the Cargo registry, git, and
+  target cache mounts of `deploy/Dockerfile` through the Actions cache. Its key
+  covers the toolchain, the Dockerfile before the workspace copy, and the
+  third-party `Cargo.lock` entries, so workspace-only changes reuse it, and a
+  prefix match seeds a build after a dependency bump. `binary-archives` saves
+  it from `main` without workspace artifacts, and both `binary-archives` and
+  `build-images` restore it. `build-images` saves the `zinder-build-base` layer
+  cache once per platform from `main`. Both workflows run
+  `crazy-max/ghaction-github-runtime` first, because `docker buildx build`
+  reaches the Actions cache only through the `ACTIONS_*` variables it
+  exports. `release.yml` builds without either cache.
 - **Live and parity share one path filter.** Keep the `paths` lists in
   `live-tests.yml` and `parity-compat.yml` identical.
 - **Live and parity Cargo commands use `--locked`**, so a stale lockfile fails
@@ -254,7 +332,7 @@ are set:
 | `ZINDER_TEST_PARITY_ZINDER_ADDR`, `ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR` | The `live::parity_against_lightwalletd` tests |
 | `ZINDER_TEST_ZINGOLIB_BIN`, `ZINDER_TEST_ZINGOLIB_SERVER` | The Zingolib real-client flow |
 | `ZINDER_TEST_COMPACT_*` | The two `live::compact_blocks_process` tests |
-| `ZINDER_TEST_CANONICAL_BLOCK_COUNT` | The block count of the Testnet canonical tracer (default 1,000) |
+| `ZINDER_TEST_CANONICAL_BLOCK_COUNT` | The block count of the Testnet or Mainnet checkpoint tracer (default 1,000) |
 
 When you record evidence, count only the tests that exercised the node.
 
@@ -422,7 +500,7 @@ export ZINDER_TEST_INDEXER_CONTAINER_NAME=zebra-regtest
 # export ZINDER_TEST_INDEXER_CONTAINER_NAME=zakura-regtest
 
 cargo nextest run --workspace --profile=ci-live --run-ignored=all \
-  -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
+  -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(canonical_blocks_load_requested_range_from_fixed_checkpoint) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
 sleep 6
 cargo nextest run --workspace --profile=ci-live --run-ignored=all \
   -E 'test(streaming_source_recovers_after_zebra_indexer_restart)'
@@ -458,6 +536,141 @@ stops the proxy, and checks that a broadcast moves to the fallback with cause
 The Zingolib flow cannot run on this chain. Zingolib 5.0.0 supports upgrades
 only through NU6.2, and the test refuses a tip at or past NU6.3.
 
+### Light-wallet serving
+
+Use the pinned Regtest node and mined chain from [Regtest through NU7](#regtest-through-nu7).
+The [light-wallet profile](../reference/configuration.md#light-wallet-profile) serves wallet RPCs with one canonical store and ingest
+control. Both `compact-blocks` and `light-wallet` check the
+writer's canonical fence when admitting a reader. Light-wallet serving also requires
+the writer to attest the reader's upgrade schedule. It uses the node for
+transparent balances, UTXOs, address history, transaction submission, and the
+recommended fee. Each forwarded read checks that the node holds, on its best
+chain, the tip of the reader the request captured. A broadcast checks the
+currently served reader instead, and returns `UNAVAILABLE` if the canonical
+fence or schedule revision changes during verification.
+Requests share evidence of broadcast support and agreement with the writer's
+schedule through the next block for up to one minute. A failed tip check, a
+new schedule revision, or a change to the upgrade active at the next block
+requires fresh discovery. If discovery fails, concurrent callers waiting for it
+return the refusal or a retryable error. The next request can retry immediately.
+
+Use the forwarded read contracts in
+[Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#method-behavior)
+to check results. A node on another chain fails the tip check.
+The node answers UTXO lookups at its own tip and reports that tip, so
+light-wallet serving keeps an answer only when every page names the served tip. The
+balance is the sum of the unspent outputs the node reports at the served tip,
+because `getaddressbalance` does not report the tip it answered at. While the
+node is ahead of the served tip, balance and UTXO calls fail, and a retry
+succeeds once ingest serves the newer blocks. A balance over more than
+100,000 unspent outputs returns `RESOURCE_EXHAUSTED`. Each reread of the last
+height of a bounded UTXO request must repeat, in order, every output an
+earlier read returned at that height, and must not name an output an earlier
+read placed below it. Otherwise the call returns `UNAVAILABLE`.
+
+The node orders UTXOs within a block by position. Light-wallet serving needs every
+matching output in the last block of a wallet's request to sort them by wallet
+transaction ID. A request can match more than 100,000 outputs across multiple
+blocks. Light-wallet serving uses bounded prefixes to finish the last requested
+height. A tip change between successful reads returns `UNAVAILABLE`.
+
+In the synthetic cutoff fixture, one height supplies 100,000 outputs and a
+later height supplies one more. The node has no ending-height filter, so
+light-wallet serving returns `RESOURCE_EXHAUSTED` when it cannot establish wallet
+order. On Zebra 7.1.0 and Zakura 1.8.6, each indexed output takes at least
+32 bytes. Those 100,000 outputs alone exceed the 2,000,000-byte block limit.
+
+Each light-wallet instance admits one nonempty UTXO request and one
+address-history request at a time. Balance requests read the node's UTXOs and
+share the UTXO slot. `GetTaddressTxids` and
+`GetTaddressTransactions` share the history slot. Each request holds its slot
+while it reads from the node and while the client drains the stream. A request
+for an occupied slot receives `RESOURCE_EXHAUSTED` and can retry with backoff.
+
+Build both standard binaries with Cargo.
+
+```bash
+cargo build --locked -p zinder-ingest -p zinder-compat-lightwalletd
+```
+
+In a shell with the Regtest node authentication from the preceding section,
+start ingest with a fresh store. The example uses the default ingest-control
+listener on port 9100.
+
+```bash
+unset ZINDER_NETWORK
+export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232
+export ZINDER_DEPLOYMENT__PROFILE=light-wallet
+mkdir -p .tmp
+target/debug/zinder-ingest --network zcash-regtest \
+  --storage-path .tmp/light-wallet-canonical >.tmp/light-wallet-ingest.log 2>&1 &
+```
+
+Once ingest reaches the mined tip and its `/readyz` on port 9105 returns 200,
+start compatibility from the same shell:
+
+```bash
+target/debug/zinder-compat-lightwalletd --network zcash-regtest \
+  --listen-addr 127.0.0.1:9089 \
+  --canonical-primary-path .tmp/light-wallet-canonical \
+  --canonical-secondary-root .tmp/light-wallet-secondary
+```
+
+The canonical reader serves compact blocks, nullifiers, tree states, and subtree
+roots. A subtree-root stream returns roots completed by its starting tip.
+It can continue across an append and returns `UNAVAILABLE` if a later page
+finds that tip has left the best chain. A writer halt observed by ingest control
+closes admission until the publisher verifies the recovered writer's fence.
+
+Both mempool methods use ingest control. If an address-history lookup
+exceeds a row or byte limit, light-wallet serving splits it into disjoint height ranges.
+Each page is read in order. For each transaction, one verbose node call
+obtains its bytes and mined block, then a block-hash lookup checks that the
+node still holds the served tip before the wallet receives the row. The stream
+also checks the served tip before reporting completion. A replacement returns
+`UNAVAILABLE`, bytes that differ from the recorded digest return `DATA_LOSS`,
+and cancelling the stream stops further calls. If one
+height exceeds the response limit, the stream ends with `RESOURCE_EXHAUSTED`.
+With `none`, `GetTransaction` finds the transaction's block in the canonical
+store and fetches only its bytes from the node. The node must report the same
+block, and the bytes must match the digest ingest recorded for that
+transaction, which every blob-retention policy keeps. Other bytes return
+`DATA_LOSS`. A transaction the served chain does not mine is looked up in the
+ingest mempool, as wallet serving does, even when the node has mined it in a
+later block. To exercise local mined-transaction reads, repeat with fresh store
+paths. Unset `ZINDER_DEPLOYMENT__PROFILE`, set `ZINDER_STORAGE__RAW_BLOB_POLICY=all`
+for both binaries, set `ZINDER_INGEST__RUN_OVERRIDES__COVERAGE=wallet-serving`
+for ingest, and pass `--serving light-wallet` to compatibility.
+
+Use `GetAddressUtxosStream` when a wallet may receive a large set. The
+generated Rust client's default unary decoding limit is 4 MiB. The
+100,000-output transport fixture produces a 10,748,600-byte unary response.
+The default client streams all rows, and a client configured with a 16 MiB
+decoding limit also receives the complete unary response.
+
+The parity workflow compares the light-wallet composition with wallet serving on
+both pinned nodes. To repeat it, use the workflow's disposable height-150 chain
+and its wallet-serving process on port 9087. The harness calls
+`getblockchaininfo` without credentials at the host's loopback endpoint and at
+`127.0.0.1:39232` inside the node container. Both compatibility processes use
+`ZINDER_COMPAT__STALE_TIP_LIMIT_MS=0` because the fixture has historical
+block timestamps and the outage removes the node witness for its tip.
+With the Regtest node authentication exported and `ZINDER_DEPLOYMENT__PROFILE` unset, run
+the following in place of the two manual processes
+above. The harness creates fresh stores for both policies. It submits one
+signed spend and compares pending `GetTransaction`, `GetMempoolTx`, and
+`GetMempoolStream` on the ordinary wallet endpoint and both light-wallet
+instances. It stops the named node for the outage checks and restarts it on exit.
+Use `zakura-regtest` for the Zakura lane. With `NEXTEST_ARCHIVE_FILE` set to an
+archive of the compat acceptance tests, the harness runs them from the archive
+instead of building them, as the parity workflow does.
+
+```bash
+ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  scripts/test-light-wallet-qualification.sh target/debug \
+  zebra-regtest http://127.0.0.1:9087
+```
+
 ### Testnet
 
 Testnet uses the same command with a cookie-authenticated node. This example
@@ -489,7 +702,9 @@ Two tests matter mostly on Testnet and Mainnet:
 - `canonical_blocks_load_requested_range_from_fixed_checkpoint` loads a fixed
   range (1,000 blocks by default) into a canonical store and verifies the
   written files. It leaves the store in its building state, so it does not
-  prove readiness.
+  prove readiness. The live profile allows five minutes. The weekly Testnet
+  lane skips this tracer, and the manually dispatched Mainnet lane includes
+  it. You can also run it locally on Testnet.
 
 To run that tracer in Docker beside a Z3 Testnet node, without touching the
 node's chain volume:
@@ -498,9 +713,9 @@ node's chain volume:
 docker build -f deploy/Dockerfile --target zinder-ingest-live-tests \
   -t zinder-ingest-live-tests:local .
 docker compose -p zinder-canonical-live-test \
-  -f deploy/docker-compose.canonical-live-test.yml run --rm canonical-blocks
+  -f deploy/bench/docker-compose.canonical-live-test.yml run --rm canonical-blocks
 docker compose -p zinder-canonical-live-test \
-  -f deploy/docker-compose.canonical-live-test.yml down -v
+  -f deploy/bench/docker-compose.canonical-live-test.yml down -v
 ```
 
 ### Mainnet
@@ -604,7 +819,28 @@ ZINDER_TEST_LIVE=1 \
 CI excludes the mempool parity tests, because this fixed-height setup has no
 live mempool composition.
 
+The [parity workflow](../../.github/workflows/parity-compat.yml) builds a
+pinned version of [Compact Block Bench](https://github.com/dismad/cbb) and
+runs one client per listener. Each client requests the last three blocks and
+the tree state one block below the fixed tip. The smoke requires both calls
+to succeed, every client to connect, and the range probe to succeed. CI dumps
+the JSON reports on failure. Timing is recorded without a latency threshold.
+
 ## Specialized procedures
+
+### Canonical schema v2 admission
+
+Run the canonical-store tests after changing construction, admission, or
+persisted rows. The control-record tests check exact schema v2 bytes for
+every retention policy. The store-open tests check that admission
+refuses unsupported schema markers without rewriting store control. The
+publication crash tests check that the initial schedule and READY control
+survive together. The wallet adapter integration tests check that the wallet
+projection requires the schema the canonical store publishes.
+
+```bash
+cargo nextest run --profile=ci -p zinder-store -p zinder-wallet-rocksdb
+```
 
 ### Reorg sweep
 
@@ -676,7 +912,7 @@ running. Disable its ops endpoint, so it cannot fail on the port instead:
   --storage-path .tmp/regtest.zinder-store > .tmp/ingest.log 2>&1 &
 first_pid=$!
 sleep 5
-ZINDER_OPS__LISTEN_ADDR= ./target/release/zinder-ingest --network zcash-regtest \
+ZINDER_OPS__LISTEN_ADDR=none ./target/release/zinder-ingest --network zcash-regtest \
   --storage-path .tmp/regtest.zinder-store
 kill "$first_pid"
 ```
@@ -720,19 +956,150 @@ after the others finish.
 | How does a wallet endpoint hold up while many wallets sync? | `zinder-bench lightwalletd-wallet-load` | Follow [section 7 of the zinder-bench README](../../services/zinder-bench/README.md#7-drive-wallet-shaped-load-at-an-endpoint). |
 | How long, and how much memory and disk, does a full build take? | `scripts/run-rocksdb-storage-lifecycle.sh` | Follow [RocksDB storage lifecycle](../../deploy/rocksdb-storage-lifecycle.md). |
 
+#### Run a paired benchmark campaign
+
+To compare two wallet reader binaries on the same private fixture and check the paired changes against a PR budget, follow [Wallet performance qualification](wallet-performance-qualification.md).
+
+Use `scripts/run-benchmark-campaign.py` to run the same cases against two
+prepared targets. It runs the existing benchmark commands in alternating
+before/after order and saves their raw reports. Build the clients first, and
+start the targets with equivalent data, resource limits, and cache preparation.
+Pin the workload to the same network, dataset, and height window. Record each
+server's revision or image digest, serving settings, and cache preparation in
+the campaign. The runner records client affinity and executable hashes.
+
+For example, save this campaign as `wallet-campaign.json`. Set the binary
+paths, endpoint addresses, revisions, and height window for your targets. This
+example assumes both Testnet endpoints serve the same history through height
+4,600,000. The two cases measure closed-loop block streaming and a classic SDK
+sync. Both use four clients.
+
+```json
+{
+  "environment": {"network": "zcash-testnet", "transport": "loopback h2c"},
+  "arms": {
+    "before": {"endpoint": "http://127.0.0.1:9067", "cbb_endpoint": "before=http://127.0.0.1:9067", "revision": "BASELINE_SHA"},
+    "after": {"endpoint": "http://127.0.0.1:9167", "cbb_endpoint": "after=http://127.0.0.1:9167", "revision": "CANDIDATE_SHA"}
+  },
+  "cases": {
+    "cbb-range": {
+      "command": ["cbb", "--endpoint", "{cbb_endpoint}", "--concurrency", "4", "--steps", "10", "--chunk", "100", "--start-height", "4598000", "--tree-every", "0", "--warmup", "0", "--json"],
+      "expect": {"/0/total_requests": 40, "/0/errors": 0}
+    },
+    "classic-sdk": {
+      "command": ["zinder-bench", "lightwalletd-wallet-load", "--endpoint", "{endpoint}", "--workload", "classic-sdk", "--wallets", "4", "--from-height", "4580011", "--to-height", "4600000", "--report", "{report}"],
+      "expect": {"/wallets_completed": 4, "/wallets_failed": 0, "/incomplete_streams": 0},
+      "match": ["/server/chain_name", "/from_height", "/to_height", "/blocks_received", "/bytes_received"]
+    }
+  }
+}
+```
+
+```sh
+python3 scripts/run-benchmark-campaign.py wallet-campaign.json \
+  --output .tmp/wallet-campaign
+```
+
+Each command runs in your current directory. A whole argument such as
+`{endpoint}` takes its value from the current arm. Use `{report}` for tools
+that write their own JSON file. Otherwise the runner reads JSON from standard
+output. Pass `{scratch}` when the tool needs an unused path where it can
+create a scratch or secondary directory for each run. `expect` checks values
+against a known workload contract. `match` checks that values agree across
+the two reports in each pair. Both use JSON pointers. For a store case, check
+the fixture digest, read range, and output digest. For wallet comparisons
+where the expected payload differs, use block counts and the window for
+matching and compare payload sizes in the raw reports. To check the same
+value in every case and both arms, map report pointers to keys from the
+campaign’s `environment` object with `expect_from_environment`.
+
+Add fixture manifests or an explicit CBB tree-height list to the optional
+`inputs` array to record their hashes. Each case defaults to four repetitions
+in `AB`, `BA`, `BA`, `AB` order. Set `repeats` or `timeout_seconds` at the top
+level to override the defaults of four repetitions and 600 seconds per command.
+Use credentials configured outside the campaign because its arguments and
+reports are saved verbatim.
+
+Read `summary.json` for failed commands, missing reports, and mismatched
+fields. Failures preserve their logs and do not stop later pairs. Compare
+per-method latency, errors, and work completed from the raw reports. Interpret
+RPC, storage, and wallet scanner results in their own units. Use the
+dedicated [storage campaign validator](../../deploy/storage-benchmark.md)
+for the PostgreSQL qualification contract.
+
+#### Compare first-block and whole-wallet latency
+
+The [Slipstream and Vizor campaign](../../scripts/compact-range-campaign.example.json)
+runs 16 simulated wallets per endpoint over Testnet heights 4,624,102 through
+4,644,091. The benchmark reads the tip before and after the wallet workload.
+Each observation must match the height and hash pinned in `environment`.
+For a stacked change, build the baseline from the preceding PR head and the
+candidate from the new head. Bind both listeners to the same four physical
+cores and use separate cores for the client and writers.
+Hold the store contents, serving settings (including the 256 KiB opening),
+and build flags constant. Run each profile once on each endpoint to warm
+the caches, and exclude those runs from the comparison.
+Copy the example to `compact-range-campaign.json` and record the server
+revisions, binary hashes, fixture identity, and CPU sets in its `environment`
+object. Use the same `zinder-bench` binary with request-identity reporting
+for both endpoints. Put it on `PATH` and run the command on
+your reserved client cores (8–11 here).
+
+```sh
+taskset -c 8-11 python3 scripts/run-benchmark-campaign.py compact-range-campaign.json \
+  --output .tmp/compact-range
+```
+
+A successful run has eight pairs per profile, 319,840 blocks per endpoint
+in each pair, and matching delivered bytes. Both reports must also have the
+same `wallet_request_identity_sha256`. Each wallet contributes the ranges,
+transaction IDs, and tree states it requested, including repeated attempts.
+Wallets can run in any order. Moving a request between wallets can change
+their individual completion times, so the comparison checks how the work
+was distributed. Slipstream
+connection counts can vary between runs and must agree within each pair.
+After the runner exits successfully,
+calculate each pair's change in `GetBlockRange` first-message p99 and whole-wallet sync p99 separately.
+A positive difference means the candidate took longer.
+
+```python
+import json
+from collections import defaultdict
+from pathlib import Path
+from statistics import median
+
+output = Path(".tmp/compact-range")
+
+
+def read_report(run):
+    return json.loads((output / run["path"] / "report.json").read_text())
+
+
+changes = defaultdict(list)
+for pair in json.loads((output / "summary.json").read_text()):
+    before = read_report(pair["runs"]["baseline"])
+    after = read_report(pair["runs"]["candidate"])
+    first = [r["rpcs"]["GetBlockRange"]["first_message_seconds"]["p99"] for r in (before, after)]
+    sync = [r["wallet_sync_seconds"]["p99"] for r in (before, after)]
+    for metric, (old, new) in (("range first", first), ("wallet sync", sync)):
+        changes[pair["case"], metric].append(1000 * (new - old))
+for (profile, metric), samples in changes.items():
+    print(f"{profile} {metric}: {median(samples):+.2f} ms")
+```
+
 ### Canonical runtime tracer
 
-This runs the real `zinder-ingest` image beside an existing Zebra Testnet
+This runs the unified `zinder` image (invoking `zinder-ingest`) beside an existing Zebra Testnet
 node, in a 10-CPU, 10 GiB container with its own disposable volume. It mounts
 only the node's cookie, never its chain volume.
 
 ```bash
-docker build -f deploy/Dockerfile --target zinder-ingest \
-  -t zinder-ingest:canonical-runtime-local .
-image_id=$(docker image inspect zinder-ingest:canonical-runtime-local --format '{{.Id}}')
+docker build -f deploy/Dockerfile --target zinder \
+  -t zinder:canonical-runtime-local .
+image_id=$(docker image inspect zinder:canonical-runtime-local --format '{{.Id}}')
 ZINDER_CANONICAL_RUNTIME_IMAGE="$image_id" \
 ZINDER_CANONICAL_RUNTIME_CHECKPOINT_HEIGHT="${checkpoint_height:?set a height below the node tip}" \
-  docker compose -f deploy/docker-compose.canonical-runtime-test.yml up -d zinder-ingest
+  docker compose -f deploy/bench/docker-compose.canonical-runtime-test.yml up -d zinder-ingest
 ```
 
 Set `checkpoint_height` to a height below the node's tip first. Poll `/readyz` and the
@@ -761,6 +1128,36 @@ ready:
 3. `GetAddressUtxosStream` returns the wallet's transparent outputs.
 4. A sent transaction appears in `GetMempoolStream`, then in
    `GetTransaction` after it is mined.
+
+#### Measure a Zkool restore on a fixed fixture
+
+Build the Zkool evaluator and prepare a loopback lightwalletd fixture using
+the [pinned zcash-sync-evals workflow](https://github.com/craftsoldier/zcash-sync-evals/blob/f0928f9fcc2292ea6be6b406d67355108aa61177/.github/workflows/bench.yml).
+The workflow records the Zkool revision, corpus checksum, and served height
+for each window. The evaluator uses a public test seed and the Mainnet
+consensus rules for the frozen corpus.
+
+For the Sapling fixture, run the evaluator against the server capped at
+height 1,499,999. Use a scratch path that does not exist and whose parent does.
+
+```sh
+python3 scripts/run-zkool-restore.py \
+  --binary /path/to/zkool_sync_eval \
+  --endpoint http://127.0.0.1:9067 \
+  --birthday 1300000 \
+  --expected-tip 1499999 \
+  --scratch .tmp/zkool-restore
+```
+
+The command saves the wallet database and evaluator logs under the scratch
+path. It prints JSON only after the evaluator reports the expected tip.
+`sync_seconds` measures the restore and synchronization, with database
+reporting outside the timed interval. The JSON records the evaluator SHA-256,
+which you can require with `--expected-sha256`. When comparing endpoints,
+verify that the final height, balances, note count, and history count agree
+before comparing timings. Record the evaluator revision and corpus checksum
+alongside the reports. This Sapling window exercises a restore with zero
+wallet activity.
 
 ## Failure interpretation
 
@@ -792,6 +1189,11 @@ wallet.read.block_id_by_selector_v1
 wallet.read.block_header_by_selector_v1
 wallet.read.compact_block_at_v2
 wallet.read.compact_block_range_v2
+wallet.read.compact_block_range_v3
+wallet.read.compact_nullifier_range_v1
+wallet.read.standard_fee_v1
+wallet.address.transparent_balances_v1
+wallet.address.transparent_batch_unspent_outputs_v1
 wallet.read.compact_block_ironwood_v2
 wallet.read.full_block_at_v1
 wallet.read.full_block_range_v1
@@ -869,3 +1271,518 @@ The tests in `crates/zinder-proto/tests/integration/capability_docs.rs` also
 check this file on every `ci` run: the quoted `default-filter` must match
 `.config/nextest.toml`, every profile in `RUNBOOK_REFERENCED_PROFILES` must
 exist and appear here, and the capability list must match the code.
+
+## Run Darkside in wallet SDK CI
+
+Use `zinder dev darkside` to serve a deterministic chain to a wallet on a
+Linux or macOS runner. The command uses memory and needs no node, database,
+or Docker. Build the binary with `cargo build --locked -p zinder` if a
+release binary is unavailable for your runner. Start one process per test
+worker. The listener defaults to
+`127.0.0.1:9067` and exits after 1,800 seconds. Use `--listen-addr 127.0.0.1:0`
+for parallel workers and read the bound address from the first stdout line.
+
+```bash
+zinder dev darkside --listen-addr 127.0.0.1:9067 --timeout-secs 120
+```
+
+Point the wallet SDK at the listener over native gRPC with TLS disabled.
+Drive the separate `cash.z.wallet.sdk.rpc.DarksideStreamer` control API from
+the test runner. Native gRPC reflection lets a runner with `grpcurl` try a
+fresh scenario as follows.
+
+```bash
+grpcurl -plaintext -d '{"saplingActivation":100,"branchID":"c2d6d0b4","chainName":"regtest"}' \
+  127.0.0.1:9067 cash.z.wallet.sdk.rpc.DarksideStreamer/Reset
+grpcurl -plaintext -d '{"height":100,"nonce":1,"count":6}' \
+  127.0.0.1:9067 cash.z.wallet.sdk.rpc.DarksideStreamer/StageBlocksCreate
+grpcurl -plaintext -d '{"height":105}' \
+  127.0.0.1:9067 cash.z.wallet.sdk.rpc.DarksideStreamer/ApplyStaged
+grpcurl -plaintext 127.0.0.1:9067 cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock
+```
+
+To test a reorg, stage two blocks starting at height 103 with a different
+nonce and apply height 104. Compare the wallet's responses before and after
+the apply. The new branch keeps heights 100 through 102, replaces 103 and
+104, and drops 105. Present an earlier tip by calling `ApplyStaged` at an
+earlier height with an empty staging area. A later apply can reveal the hidden
+suffix again. Failed applies leave the published chain and staging area intact.
+Call `Reset` to clear a scenario if its staged inputs need replacement.
+
+- Stage serialized blocks as hex with `StageBlocksStream` and transactions
+  as raw bytes with `StageTransactionsStream`. The latter requires the
+  height of the block that will contain each transaction. For URL staging,
+  pass `--fixture-origin` for the HTTP(S) origin that serves the fixture
+  files, with one hex record per line. The server refuses other origins and
+  redirects.
+- Register fixtures with `AddTreeState`, `SetSubtreeRoots`, and
+  `AddAddressUtxo` after applying the relevant blocks. Reads hide entries
+  above the presented tip. Replacing or dropping a block removes the
+  fixtures from the orphaned range. Add replacements explicitly.
+- `SendTransaction` returns the accepted transaction ID as display-order
+  hexadecimal in `errorMessage`. Pending transactions have height zero in
+  `GetTransaction` and `GetMempoolStream`. A tip change closes open
+  `GetMempoolStream` calls. `GetIncomingTransactions` drains the capture
+  queue and returns each transaction with height `u64::MAX`. Set its height
+  to the destination block before staging it.
+  Start the server with `--reject-broadcasts` to test a wallet's send
+  failure path using a valid transaction.
+- For browser SDKs, add `--grpc-web-origin http://127.0.0.1:5173` or
+  the origin of the browser test page. Use gRPC-Web for wallet reads
+  and native gRPC from the test runner for client-streaming fixture setup.
+- Keep the listener on loopback where possible. Use
+  `--allow-non-loopback` only on an isolated runner network, such as for a
+  device emulator that needs a non-loopback bind. Any reachable client can
+  change the scenario or shut down the server. Call `Stop` during teardown
+  or let the process exit at its deadline.
+
+Darkside exercises wallet behavior against supplied fixtures. Use the live
+validator lanes to verify consensus and node compatibility.
+
+## Disposable wallet Regtest fixtures
+
+Select the fixture using the wallet binary's compiled or configured activation
+heights. The node and the wallet must interpret the same block under the same
+consensus rules.
+
+| Wallet integration exercised | Zebra configuration under `deploy/zebra/` | Serving interface |
+| --- | --- | --- |
+| Zallet native backend | `regtest.toml` | Native WalletQuery with `--raw-blob-policy all` for full-block reads |
+| Zally native SDK | `regtest.toml` | Native WalletQuery |
+| Zingo CLI and zcash-devtool with the all-at-one schedule | `regtest-nu6-at-one.toml` | lightwalletd |
+| Zkool v6.37.0, the Cake Wallet v6.5.4 engine fork, and Vizor v0.0.65 configured for NU6.3 at 250 | `regtest-ironwood-at-250.toml` | lightwalletd |
+
+Give independent miners distinct fixture projects. After mining, wait until the
+serving endpoint returns the target block before asserting what the wallet has
+scanned. Rapid Regtest mining can fill the serving process's retained snapshots
+and delay publication even after ingest and projection have reached the target.
+Record the target height, the time it becomes readable, and the height the
+wallet actually scans. When a wallet needs another confirmation, mine that
+block explicitly and keep the original target in the assertion.
+
+
+Use `scripts/regtest-fixture.py` to give a real wallet a fresh, owned node and
+following single-host Zinder endpoints (`zinder-index` and `zinder-serve` from `deploy/docker-compose.yml`). Use a local Docker Engine on Linux or Docker Desktop
+in Linux container mode on macOS or Windows. You need Python 3.11 or later and
+Docker Compose. Native Linux Engine also needs iproute2. The default mining
+schedule needs Bash, curl, and jq. On Windows, make a native Windows distribution
+such as Git Bash the first Bash on your PATH and invoke the scripts with Python.
+Start from the checkout matching
+the candidate release. Pull the unified `ghcr.io/zcashfoundation/zinder` image first, or build `--target zinder` via
+`deploy/Dockerfile`.
+
+Create an image map with the exact release tag, digest, or built image reference. The command resolves references to immutable local image IDs before starting anything (see [scripts/README.md](../../scripts/README.md)):
+
+```bash
+cat > /tmp/fixture-images.json <<'JSON'
+{
+  "zinder": "ghcr.io/zcashfoundation/zinder:vX.Y.Z"
+}
+JSON
+scripts/regtest-fixture.py up --project zinder-fixture-review-a \
+  --port-base 42100 --images /tmp/fixture-images.json \
+  --revision 830b426060169f5b2e94d84ff0f134bc1ad96004
+scripts/regtest-fixture.py mine --project zinder-fixture-review-a --tip 152
+scripts/regtest-fixture.py status --project zinder-fixture-review-a
+scripts/regtest-fixture.py down --project zinder-fixture-review-a
+```
+
+Choose an unused project name and port range for each run. Ports are loopback
+only: base + 32 is node RPC, + 2 is native WalletQuery, + 67 is lightwalletd,
+and + 5 and + 8 are the `zinder-index` and `zinder-serve` ops listeners. Each project owns distinct internal Compose networks and volumes. The node's
+peer listener binds container loopback; it has no published peer port. An owned
+Python TCP relay exposes only the selected loopback ports. On native Linux the
+relay connects to bridge addresses. On Docker Desktop it uses `docker exec` to
+connect from inside the fixture's internal network. Both modes accept up to 64
+active forwards. The shutdown listener has its own connection limit.
+Readiness verifies internal network isolation, absence of a default route, and
+an empty peer list.
+Two unused /28 subnets are selected from `10.253.0.0/16`, excluding existing
+Docker networks and, for direct bridge access, Linux host routes. Set `--subnet-pool` if that range conflicts
+with your host. This avoids consuming Docker's large default address pools.
+Do not attach unrelated containers to these fixture networks. The unauthenticated RPC can mine only this project's
+fresh Regtest chain.
+
+The default node config and mining helper exercise the CI schedule through NU7
+and its shielded prefix. Use `--node-config <Regtest TOML>` for a client release's
+consensus schedule. The checked-in `deploy/zebra/regtest-nu6-at-one.toml` activates
+through NU6.3 at height 1, matching the demonstrated Zingo nakednet release.
+`deploy/zebra/regtest-ironwood-at-250.toml` delays NU6.3 to 250, matching the
+Zkool release evaluator; pass `--tip 260`. Both leave NU7 unset. Custom configs
+use transparent `generate` mining; they do not assert the default helper's
+three-pool shielded prefix. Schedule selection belongs to the fixture config,
+not wallet names in server runtime. Client adapters still own their wallet's
+funding and lifecycle transactions.
+
+Pass `--raw-blob-policy all` for Zallet full-block serving. Every canonical
+reader receives the same retention admission expectation. Use a new fixture
+when changing retention. To test a built or extracted unified `bin/zinder`
+executable with an existing runtime image, add `--bin-dir /absolute/candidate/bin`;
+the command mounts `/usr/local/bin/zinder` into both `zinder-index` and
+`zinder-serve` and records its SHA256 value. Both running `/healthz` revisions
+must equal `--revision`, including this mode.
+This check establishes executable identity, not release signature provenance.
+Verify downloaded archives or images through the release workflow separately.
+
+The fixture verifies the node reached the requested tip before starting Zinder.
+It waits for `zinder-index` to build its stores before starting the readers.
+The command prints the absolute `ready.json` path only after both `zinder-index`
+and `zinder-serve` `/readyz` responses reach the node tip. The receipt includes the actual node activation
+map, complete health capabilities and versions, candidate commit, image IDs,
+optional binary hashes, endpoints, retention, chain hash, and observation time.
+`mine` and `status` refresh it; a failed refresh removes stale readiness.
+Startup also saves `ready.initial.json` once. Pin that immutable receipt's SHA256
+as a lifecycle harness input. Keep the changing `ready.json` outside pinned
+inputs, because mining and status refresh it. Readiness does
+not certify a wallet lifecycle.
+
+Startup failure or interruption tears down this project's relay, containers,
+networks, and volumes. A random ownership label prevents stale state directories
+from controlling a newer instance that reuses the same Compose project name.
+`down` removes those resources and readiness but keeps local
+configuration and identity files for inspection. A stopped project directory
+cannot be reused accidentally: select a new name, or remove that specific
+stopped directory under `.tmp/regtest-fixtures/` before a fresh run. Never use
+another campaign's project name, store, or ports.
+
+Exercise setup, following, concurrent schedules, full-block capability, a fresh
+repeat, failed-start cleanup, and project-name reuse protection with:
+
+```bash
+scripts/test-regtest-fixture.py --images /tmp/fixture-images.json \
+  --revision 830b426060169f5b2e94d84ff0f134bc1ad96004 --port-base 43100
+```
+
+Run the platform-selection and relay shutdown unit tests without Docker:
+
+```bash
+python3 -m unittest scripts/test-regtest-fixture.py
+```
+
+## Gate a real wallet lifecycle
+
+Start the disposable fixture for the wallet's activation schedule, then use the
+client's entrypoint with the fixture's immutable `ready.initial.json`. Allocate
+a new wallet and output directory on each run.
+
+| Wallet engine | Reproduction entrypoint |
+| --- | --- |
+| Zingo and standalone Zkool | [Build the pinned engine and generate the case manifest](../../scripts/wallet-clients/README.md). Run each Zkool internal-address setting as its own case. |
+| Vizor | [Build the tagged Rust engine and run the funded wallet case](../../scripts/wallet-clients/vizor.md). |
+| Cake Wallet | [Build and run the exact Zcash engine pinned by the app](../../scripts/wallet-clients/cake-regtest.md). |
+| zcash-devtool | Use [run-devtool-regtest.py](../../scripts/wallet-clients/run-devtool-regtest.py) with the Regtest-enabled CLI, its source revision and binary SHA-256, the readiness receipt, and a fresh output directory. |
+
+For native WalletQuery, select the lifecycle adapter from the exact Zallet
+integration-tests or Zally revision under test. Zallet also requires canonical
+full blocks. Retain them during ingest and configure the query service with the
+same retention policy before starting the wallet.
+
+To run the pinned zcash-devtool case, start the all-at-one Regtest fixture and
+set `fixture_ready` to its `ready.initial.json`. From the Zinder checkout, build
+the wallet in a private directory and pass its lockfile and binary digest to
+the runner. Each step checks the node's block hash at the recorded fixture
+height. To exercise a candidate service on the same node, keep the release
+fixture as `--ready` and pass its service receipt with `--candidate`.
+The runner creates fresh wallet and evidence directories.
+
+```bash
+case_dir=$(mktemp -d)
+git clone https://github.com/zcash/zcash-devtool.git "$case_dir/client"
+git -C "$case_dir/client" checkout --detach c8322f7e71ae46ab24801a721523ba83b27d911b
+CARGO_TARGET_DIR="$case_dir/target" cargo +1.100.0 build --locked \
+  --manifest-path "$case_dir/client/Cargo.toml" --features regtest_support
+client="$case_dir/target/debug/zcash-devtool"
+python3 scripts/wallet-clients/run-devtool-regtest.py \
+  --client "$client" --client-sha256 "$(sha256sum "$client" | cut -d' ' -f1)" \
+  --client-revision "$(git -C "$case_dir/client" rev-parse HEAD)" \
+  --input "$case_dir/client/Cargo.lock" --ready "$fixture_ready" \
+  --output "$case_dir/evidence"
+```
+
+Run a pinned wallet adapter against an isolated, funded fixture:
+
+```sh
+python3 scripts/run-wallet-lifecycle.py \
+  --manifest /path/to/wallet-lifecycle.json \
+  --output .tmp/wallet-lifecycle-evidence
+```
+
+Start from [the schema v2 manifest example](../../scripts/wallet-lifecycle.example.json).
+Replace its paths, SHA-256 pins, endpoint, and adapter arguments. The example
+cannot certify without real inputs and an adapter. Run
+`python3 scripts/test-wallet-lifecycle.py` for isolated runner contract checks.
+Those checks use a test adapter; they do not qualify a real wallet.
+
+The manifest contains `schema_version: 2`, positive `timeout_seconds` per child,
+and nonempty named `cases`. Each case identifies `wallet`, `version`, `variant`,
+`network`, `implementation` (`app`, `engine`, or `simulated-profile`), `interface`
+(`lightwalletd` or `native-wallet-query`), `endpoint`, and boolean
+`require_no_fallback`. Use separate cases for Zkool `internal-enabled` and
+`external-only`, and for each wallet/version/network/endpoint you intend to
+qualify. The gate cannot infer a wallet omitted from the manifest.
+
+`client` contains an absolute executable `path` and `sha256`. `inputs` maps
+absolute file paths to required SHA-256 digests. Pin the client, adapter
+executable, interpreted adapter source, configuration, activation schedule,
+fixture identity, and patches. For a Python adapter, pin both interpreter and
+script. Record exact service image digests, source commits, node schedule,
+fixture height/hash, and configuration in the pinned fixture manifest. Pin an
+immutable readiness snapshot, such as the fixture operator's `ready.initial.json`;
+exclude mutable `ready.json` and wallet/node stores. The runner verifies inputs
+before and after the case and before each command. Missing or mismatched pins
+block execution. Hashes identify supplied inputs; reviewed adapter source and
+its receipts must show that the real client used them.
+
+`steps` maps these ordered names to commands: `bootstrap`, `restore`,
+`transparent-discovery`, `shielded-discovery`, `send`, `pending`, `mined`,
+`scanned`, `restart`, and `resume`. Commands are argv arrays. Whole arguments
+`{report}`, `{scratch}`, and `{endpoint}` expand to a fresh JSON report path, a
+shared private case directory, and the endpoint. Every command must receive
+`{report}` and have a nonempty `expect` map of JSON pointers to domain results.
+A counting-only command cannot qualify. Keep the persisted wallet in `{scratch}`
+across the lifecycle, and use a separate new database for restore.
+
+A single-process suite may execute once in `prepare` and save individual
+observations in `{scratch}` for ordered readers to export. Pin its source and
+record actual suite execution order in the fixture manifest. Reader order does
+not establish the order of wallet operations. A funded restore may occur after
+funding in that suite, provided it recovers existing activity into a genuinely
+new, independent wallet database.
+
+Every completed report contains `status: "completed"`, the exact `endpoint`,
+boolean `fallback_used`, `assertions_enabled: true`, and
+`assertion_mode: "always-on"`, plus domain fields. Always-on checks use explicit
+failure paths, such as Python `if`/`raise`, that survive interpreter optimization.
+Python `assert` alone is insufficient. An adapter may reject `-O`, but adapters
+using explicit checks can run safely with it. Native adapters use checks that
+are enabled in their measured build. These declarations are part of the pinned
+adapter contract; the runner cannot establish real observations from an
+unreviewed program that fabricates reports.
+
+The following typed objects are required in v2 reports. All fingerprints are
+64 lowercase hexadecimal SHA-256 characters; raw keys, seeds, transactions,
+and authorization material must never appear in them or in report identifiers.
+
+| Step | Required typed evidence |
+| --- | --- |
+| `send` | `transaction` with `fingerprint_sha256` and `observation: "submitted"` |
+| `pending` | `transaction` with the same fingerprint and `observation: "wallet-pending"` |
+| `mined` | `transaction` with the same fingerprint, `observation: "canonical-mined"`, and positive u32 `mined_height` |
+| `scanned` | `transaction` with the same fingerprint, `observation: "wallet-scanned"`, and the same `mined_height` |
+| `restore` | `restore` with the independent database, wallet, and activity fields below |
+| `restart` | `restart_scope` matching the case; process evidence fields below when `process-restart` |
+| `resume` | `progress` with u32 `before_height`, greater u32 `after_height`, and `new_block_mined_after_restart: true` |
+
+Compute the transaction fingerprint as SHA-256 of the 32 bytes decoded from the
+canonical RPC display transaction ID: `sha256(bytes.fromhex(display_txid))`.
+Normalize a wallet's byte order to that display form first. This fingerprint is
+not a hash of the full transaction. Obtain each stage independently from the
+send outcome, selected wallet pending record, canonical mined response, and
+selected scanned wallet record. Node mempool evidence alone cannot establish
+wallet pending observation. All four fingerprints and both mined heights must
+agree; sanitized linkage is retained in the receipts.
+
+The `restore` object contains `fresh_database: true`, positive integer
+`restored_activity_count`, and these fingerprint pairs:
+
+- `source_database_fingerprint_sha256` and `restored_database_fingerprint_sha256`
+  must differ. Hash canonical database paths or independent database identifiers.
+- `source_wallet_fingerprint_sha256` and `restored_wallet_fingerprint_sha256`
+  must agree. Use stable public account/address identity, never a seed or secret.
+- `source_activity_fingerprint_sha256` and `restored_activity_fingerprint_sha256`
+  must agree. Use the transaction fingerprint of known preexisting wallet activity.
+
+An empty restore or reopening the existing database does not satisfy restore.
+The known restored activity may precede the primary send tested later.
+
+`restart_scope` is `process-restart`, `wallet-reopen`, or `unspecified` (default).
+The completed restart report must repeat it. For `process-restart`, its `restart`
+object contains distinct positive `before_process_id` and `after_process_id`,
+and u32 `before_height` and `after_height` with no regression. These identify the
+old wallet process and a different process reopening its persisted wallet.
+Reopening at the same height is sufficient; a new block need not be scanned
+until resume. `resume.progress.before_height` must be at least the reopened
+height, and `after_height` must show actual progress on a block mined after
+restart. Neither a same-process reopen nor resuming without new progress grants
+process-restart lifecycle qualification.
+
+Record endpoint observations in `endpoint_evidence` with `scope`
+(`configured`, `process-trace`, or `local-only`), boolean `target_connected`, nonnegative integer
+`unexpected_connections`, and, for a process trace, `trace_fingerprint_sha256`.
+`local-only` means the operation made no Internet socket connection. Set
+`target_connected: false` and `unexpected_connections: 0`; it never supplies a
+positive connection observation. For example, an offline wallet list, local
+confirmation lookup, or database reopen can use this scope. Missing endpoint
+metadata also supplies no positive connection. A case needs at least one
+explicit `target_connected: true` observation from a wallet lifecycle step to
+qualify its target; fixture preparation or cleanup traffic cannot supply it.
+Mixed online and local steps can qualify, while an entirely offline case cannot.
+
+Retain a sanitized trace artifact matching that digest. Distinguish client
+traffic from control-node mining connections in the reviewed adapter. Configured
+endpoint evidence cannot establish the separate process-trace claim. That
+claim requires a trace digest for every step, including a socketless trace for
+local-only operations, and at least one observed target connection. A case
+cannot qualify its target if fallback is allowed, observed, or contradicted by
+unexpected trace connections. `require_no_fallback` must be true.
+
+Other report statuses are `skipped`, `blocked`, `unsupported`, and `no-evidence`;
+incomplete reports may add a non-sensitive identifier `reason_code`. Nonzero
+exits, timeouts, missing reports, and failed checks become `failed`. Missing
+steps become `no-evidence`, and later steps become `blocked`.
+
+Optional `prepare` and `cleanup` use the same command/report/check contract.
+Preparation can call the deployment runner for an isolated fixture. Cleanup runs
+after partial preparation or execution; it is skipped if no pinned command was
+entered. It must tolerate partial state and touch only case-owned resources.
+By default cleanup verifies every case input. If teardown can run independently,
+set `cleanup.input_paths` to the case input paths it needs, including any files
+the teardown program reads indirectly. The runner also checks its executable
+and pinned paths passed as command arguments. This lets teardown run if an
+unrelated input changes. Qualification checks every case input before and after
+cleanup, and an input change fails the case.
+Reuse deployment runners and `scripts/mine-live-regtest.sh`; do not stop shared
+processes by executable name. Process-group timeouts reuse the benchmark runner.
+SIGINT and SIGTERM trigger bounded cleanup. Independently daemonized services
+require explicit cleanup. Sends and mining are never retried automatically.
+
+V2 `certified` requires all steps and cleanup to complete, a real app or engine,
+linked primary transaction evidence, independent populated restore, target
+endpoint policy, different-process reopen, and post-restart progress. Case
+receipts expose `workflow_completed`, `transaction_linkage_certified`,
+`restore_certified`, `process_restart_certified`, `wallet_reopen_certified`,
+`resume_progress_certified`, `target_endpoint_certified`, and
+`endpoint_trace_certified` separately. `target_connection_observed` records
+whether any lifecycle step explicitly observed the target connection. A receipt
+without this field set to true does not independently establish that connection
+claim; retain its original runner digest and configured-versus-traced scope. `qualification_problems` names unmet flags.
+`endpoint_evidence_scope` is `configured`, `process-trace`, or `unqualified`.
+
+Schema v1 manifests remain accepted for workflow completeness, but cannot
+produce a qualification pass in this runner. Historical v1 receipts retain their
+original meaning and runner digest; do not reinterpret their `certified` field
+as the stronger v2 claim. The gate returns 0 only for complete v2 qualification,
+1 for incomplete qualification, 2 for invalid setup, and 130 on interruption.
+
+`summary.json` contains the case matrix, individual `receipt.json` files contain
+checks and sanitized typed observations, and `provenance.json` records schema,
+manifest and runner digests, source revision, and tracked diff digest. The named
+app or engine is the qualification scope; no mobile UI, platform build, or
+external certification follows from an engine run. General workflow completeness
+and simulated profiles remain separately visible.
+
+Keep credentials outside argv and manifests. Endpoint URLs omit userinfo, query
+strings, and fragments. The output directory is private. The runner discards
+child stdout/stderr, deletes raw reports and wallet scratch after cleanup, and
+retains only assertion names, pass/fail, hashes, heights, process IDs, and endpoint
+metadata. Adapters must not put secrets in identifiers or write sensitive files
+outside `{scratch}` and `{report}`. Review receipts before sharing them and retain
+the manifest privately to reproduce its digest. Historical sync-only evaluations
+and paired throughput campaigns remain separate evidence, using
+`scripts/run-zkool-restore.py` and `scripts/run-benchmark-campaign.py` respectively.
+
+## Compare wallet correctness across releases
+
+The [wallet coverage baseline](../../scripts/wallet-clients/coverage-v0.22.0.json) records each wallet build, interface, fixture, action, observed RPCs, and wallet assertions. A successful restore can prove persisted history even when its receipt identifies only the endpoint. Field handling requires a wallet observation or an inspection of the pinned consumer. Keep native WalletQuery and lightwalletd observations under their respective interfaces.
+
+Build the pinned Zingo CLI and Zkool example and generate the Python protobuf
+modules using the [client build instructions](../../scripts/wallet-clients/README.md#prerequisites).
+Use Linux with `strace`. Install the Python `toml` package in the same venv
+for the native ZIT driver and fixture commands. Set `release_tag` to the locally available selected
+release tag and `release_sha` to its peeled commit. Set `evidence` to a new
+private parent directory and `python_proto` to the generated modules.
+
+For the Testnet checks, serve an isolated, peerless copy of the Zebra, canonical,
+and wallet stores at the height and hash in the
+[fixture descriptor](../../scripts/wallet-clients/subtree-testnet.json).
+Use the selected release's ingest, projector, and lightwalletd binaries. Wait
+until all three report the fixture tip. Set `local_wallet_url` to that compat
+listener on IPv4 loopback. Each command verifies the running server commit and
+chain fence before starting. The public recovery vector has known historical
+activity in this window. Keep wallet databases and raw logs private.
+
+The reference Zkool engines have pinned executable digests. For a different build, pass `--client-version VERSION` from its source checkout to the interrupted-stream and reorg commands. Each receipt records the version alongside the executable digest.
+
+```bash
+release_sha=$(git rev-parse "$release_tag^{commit}")
+export PYTHONPATH="$python_proto"
+"$client_venv/bin/python" scripts/wallet-clients/subtree-ab.py \
+  --client "$zingo_cli" --endpoint "$local_wallet_url" \
+  --release-commit "$release_sha" --output "$evidence/subtree" \
+  --pagination --invalid-root-control
+"$client_venv/bin/python" scripts/wallet-clients/interrupted-zkool.py \
+  --client "$zkool_engine" --client-sha256 "$engine_sha256" \
+  --endpoint "$local_wallet_url" --revision "$release_sha" \
+  --output "$evidence/interrupted"
+```
+
+The first case restores the same wallet into fresh databases and changes only the
+completion block hash byte order. Separate controls exercise one-row pagination
+and the wallet's error path for an invalid Sapling root. The second case ends a
+compact-block stream after 64 delivered blocks, reopens the same Zkool database
+in a fresh process, and compares its final transaction history, notes, and pool
+balances with an uninterrupted restore. Both cases observe the wallet process's
+connections. The Zkool example exposes `testnet-read sync`, `resume`, and
+`report` for this check.
+
+To test wallet-visible rollback, use disposable Regtest images and matching
+release binaries. The runner creates an isolated fixture, mines an owned
+Ironwood coinbase on each side of the fork point, invalidates the later block,
+and follows the replacement chain through another process restart. It verifies
+the surviving transaction and the removal of the orphan's note and balance.
+
+```bash
+"$client_venv/bin/python" scripts/wallet-clients/reorg-zkool.py \
+  --engine "$zkool_engine" --engine-sha256 "$engine_sha256" \
+  --images "$fixture_images" --bin-dir "$release_bin_dir" \
+  --revision "$release_sha" --proto-dir "$python_proto" \
+  --port-base 48100 --output "$evidence/reorg"
+```
+
+For native stale-view recovery, build the ZIT external driver from
+`zcash/integration-tests` at `485e7616f75b176ace08ac359cfd56d40dab951c`
+against the selected Zallet checkout. The v0.22.0 baseline used Zallet
+`32488c5554e5e0275c3313b2fc06c00e6780746a`. Pin the resulting test executable
+and ordinary backend by SHA-256. The driver exposes a barrier before a native
+full-block read. The scenario changes the query epoch on its own disposable
+fixture, checks that the rejected read leaves scan work pending, then retries
+the entire range and verifies persisted canonical block hashes. The test
+harness triggers the retry.
+
+```bash
+zit_driver=$("$client_venv/bin/python" "$zit_root/qa/rpc-tests/build_zinder_driver.py" \
+  --zallet-root "$zallet_root" --build-dir "$zit_build")
+"$client_venv/bin/python" scripts/wallet-clients/native-expiry.py \
+  --driver "$zit_driver" --driver-sha256 "$zit_driver_sha256" \
+  --backend "$zallet_backend" --backend-sha256 "$zallet_backend_sha256" \
+  --images "$fixture_images" --bin-dir "$release_bin_dir" \
+  --revision "$release_sha" --port-base 48300 --output "$evidence/native-expiry"
+```
+
+Collect all eight schema-v2 lifecycle results using one `--lifecycle MANIFEST
+SUMMARY READY` argument per run. Supply fresh scenario receipts for the selected
+release. The comparator reports missing scenarios, lost calls, and lost wallet
+assertions. A focused rerun may legitimately report uncovered scenarios; review
+those lines before making a release-wide claim. To compare one family of
+scenarios, add `--scenario-prefix zkool-reorg-` to `compare`. Supply existing
+release-bound observations with repeated `--observations FILE` arguments.
+
+```bash
+python3 scripts/wallet-clients/coverage.py collect --release "$release_tag" \
+  --revision "$release_sha" "${lifecycle_args[@]}" \
+  --subtree-run "$evidence/subtree" --reorg-result "$evidence/reorg/receipt.json" \
+  --interrupted-result "$evidence/interrupted/receipt.json" \
+  --native-expiry-result "$evidence/native-expiry/receipt.json" \
+  --output "$evidence/coverage.json"
+python3 scripts/wallet-clients/coverage.py check "$evidence/coverage.json"
+python3 scripts/wallet-clients/coverage.py compare "$evidence/coverage.json"
+python3 scripts/wallet-clients/coverage.py render "$evidence/coverage.json" > "$evidence/coverage.md"
+```
+
+## Verify a two-wallet payment and return
+
+For Vizor, zcash-devtool, and Zally, the [counterparty payment procedure](../../scripts/wallet-clients/payment-roles.md) checks the engine and Zingo in both payment roles, the return spend, and persisted balances. It also shows how to compare the eighteen role observations against a release baseline.
+
+Use the [Zingo and Zallet round-trip procedure](../../scripts/wallet-clients/roundtrip.md) to verify a transfer through lightwalletd and native WalletQuery on the same chain. The disposable Regtest case controls mining and compares outcomes across independent runs. The live Testnet case can fund one payer through Fauzec and observe the payment through the selected release. Keep its private wallet state for interruption recovery. The [payment recovery cases](../../scripts/wallet-clients/payment-recovery.md) exercise a stopped wallet, a shallow rollback, and a running native wallet reconnecting to its endpoint.
+
+For Zkool’s internal-enabled and external-only profiles and Cake Wallet’s software Zcash engine, run the [two-party payment campaign](../../scripts/wallet-clients/zkool-payment.md). Each profile uses its own NU6.3-at-250 chain and verifies a spend from a note received from Zallet.

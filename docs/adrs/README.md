@@ -11,6 +11,11 @@ release policy. When an ADR already covers the domain, update that ADR in
 place instead of adding a sibling. A decision in a new domain takes the next
 number.
 
+Every decision an ADR adds or revises fills in the Evidence section, so a
+reader can tell a measured limit from a chosen tolerance and knows what would
+reopen it. Decisions written before the section existed gain an entry when
+they are next revised.
+
 ## Template
 
 ```markdown
@@ -24,6 +29,15 @@ The problem and the constraints that force a choice. A few short paragraphs.
 ## Decision
 What Zinder does. When the ADR covers several related decisions, number them.
 State each as a rule a reviewer can check.
+
+## Evidence
+What each new or revised decision rests on, as one of:
+- Measured: the number, what it was measured on, and the issue or pull
+  request that holds the receipt.
+- External constraint: the protocol, upstream behavior, advisory, or platform
+  fact that forces it.
+- Judgment: no measurement. When the judgment carries a cost, name the
+  observation that would reopen it.
 
 ## Consequences
 What this costs and what it obliges (operators, contributors, consumers).
@@ -39,10 +53,10 @@ stop the debate from being repeated.
 | --- | --- | --- |
 | [0001](0001-rocksdb-canonical-store.md) | Store chain data in RocksDB | RocksDB is the storage engine for chain, wallet, and view data in the supported single-host topology. |
 | [0002](0002-serialization-and-byte-order.md) | Serialization and byte order | Each boundary chooses its own serialization, and hashes on the wire use RPC byte order. |
-| [0003](0003-epoch-bound-reads-and-storage-roles.md) | Epoch-bound reads and storage roles | Every read binds to one chain epoch, and each store has exactly one writer with secondary readers. |
-| [0004](0004-storage-and-deployment-topologies.md) | Storage and deployment topologies | Canonical and projection storage stay separate, and each deployment runs one topology. Single-host RocksDB is supported; a multi-host PostgreSQL topology for hosted fleets is decided but not implemented. |
+| [0003](0003-epoch-bound-reads-and-storage-roles.md) | Epoch-bound reads and storage roles | Indexed lookups bind to one chain epoch or event fence, compatibility block ranges join chunks by hash, node-backed reads bind to the served tip, and each store has exactly one writer with secondary readers. |
+| [0004](0004-storage-and-deployment-topologies.md) | Storage and deployment topologies | Canonical and projection storage stay separate, and each deployment runs one topology. Single-host RocksDB (including RWO Kubernetes `StatefulSet`) is supported; horizontal `Deployment`/serverless topologies wait on PostgreSQL. |
 | [0005](0005-bounded-process-memory.md) | Bounded process memory | Process memory is bounded independently of store size, and service binaries allocate through jemalloc. |
-| [0006](0006-node-source-boundary.md) | Node source boundary | Node adapters sit behind one source boundary, separate from the protocols Zinder serves. |
+| [0006](0006-node-source-boundary.md) | Node source boundary | Admitted validator RPCs are the upstream authority. Archive construction and pruned live following have distinct admission rules. |
 | [0007](0007-node-failure-recovery-and-transport-policy.md) | Node failure recovery and transport policy | Ingest recovers from node failures, and each upstream transport owns its own policy. |
 | [0008](0008-consensus-parameters-from-the-node.md) | Consensus parameters from the node | Network-upgrade parameters come from the running node and are admitted by the canonical writer. |
 | [0009](0009-ingest-lifecycle-and-construction.md) | Ingest lifecycle and construction | One ingest process builds the store, then follows the tip. |
@@ -50,21 +64,30 @@ stop the debate from being repeated.
 | [0011](0011-ingest-control-transport-security.md) | Ingest control transport security | Ingest control authenticates with a bearer token, and the operator provides TLS. |
 | [0012](0012-mempool-topology-and-retention.md) | Mempool topology and retention | Ingest owns the one live mempool, and readers proxy it. |
 | [0013](0013-chain-event-streams.md) | Chain event streams | Event streams start at an explicit position and resume across reorgs. |
-| [0014](0014-consumer-neutral-wallet-data-plane.md) | Consumer-neutral wallet data plane | Wallets read one consumer-neutral data plane from stored artifacts. |
+| [0014](0014-consumer-neutral-wallet-data-plane.md) | Consumer-neutral wallet data plane | Native wallets read one consumer-neutral data plane from stored artifacts. The light-wallet composition forwards transparent lookups to the node, and the lean `wallet` profile fetches only verified mined bytes from it at the served tip. |
 | [0015](0015-wallet-runtime-composition.md) | Wallet runtime composition | Wallet runtimes advertise only the capabilities their composition proves. |
-| [0016](0016-wallet-serving-readiness.md) | Wallet-serving readiness | Wallet-serving readiness follows the canonical and wallet serving pair. |
+| [0016](0016-wallet-serving-readiness.md) | Wallet-serving readiness | Wallet-serving readiness follows the canonical and wallet serving pair, compact-blocks and light-wallet serving follow the canonical generation, and dependencies degrade instead of refusing traffic. |
 | [0017](0017-transparent-wallet-queries.md) | Transparent wallet queries | Only consumer-owned transparent methods are served, and wallet spend status comes from the wallet projection. |
 | [0018](0018-transaction-facts-status-and-broadcast.md) | Transaction facts, status, and broadcast | Transactions are parsed once, "not found" is a typed proof, and broadcast outcomes are typed. |
 | [0019](0019-explorer-plane.md) | Explorer plane | The Explorer is an optional runtime over canonical data with explicit freshness and typed privacy refusals. |
 | [0020](0020-materialized-views.md) | Materialized views | Explorer views are rebuildable projections with exact per-view schema admission and explicit coverage. |
-| [0021](0021-shared-configuration-sections.md) | Shared configuration sections | Shared configuration sections live in `zinder-runtime`, and each runtime composes only what it uses. |
-| [0022](0022-release-artifacts.md) | Release artifacts | Releases ship reproducible GNU/Linux binaries with signatures, provenance, and SBOMs. |
+| [0021](0021-shared-configuration-sections.md) | Shared configuration sections | Shared configuration sections live in `zinder-runtime` with zero-TOML `ZINDER_*` env-first loading, `storage.data_dir` derivation, sibling-section tolerance, and inline secret injection. |
+| [0022](0022-release-artifacts.md) | Release artifacts | Reproducible native archives and one OCI image ship with provenance. SDK distribution follows the versioned wire contract. |
+| [0023](0023-deployment-profiles.md) | Deployment profiles | Presets (`light-wallet`, `wallet`, `explorer`) plus orthogonal `--full-blocks` coordinate what Zinder's writers store and what its readers serve. |
+| [0024](0024-verified-edge-snapshot-bootstrap.md) | Verified edge snapshot bootstrap | Publisher signatures and validator attestation admit a private checkpoint. The ratified shared settled-segment pool uses a signed HTTPS catalog. |
+| [0025](0025-oblivious-http-gateway-boundary.md) | Oblivious HTTP gateway boundary | An external gateway terminates bounded wallet calls and keeps HPKE keys outside Zinder. |
+| [0026](0026-private-information-retrieval-sidecar-boundary.md) | Single-server PIR sidecar boundary | An external PIR service consumes immutable sealed segments after a scheme and wallet agree on shard records. |
 
 ## Earlier numbering
 
 The ADRs were merged by domain and renumbered. The changelog and older
 commits cite the earlier numbers, so this table maps each earlier number to
 the ADR that now covers it. There was no ADR-0040.
+
+The number 0023 is used twice. A citation of ADR-0023 that predates the
+renumbering means transaction facts, now [ADR-0018](0018-transaction-facts-status-and-broadcast.md).
+The current [ADR-0023](0023-deployment-profiles.md) records deployment
+profiles.
 
 | Earlier | Now | Earlier | Now | Earlier | Now |
 | --- | --- | --- | --- | --- | --- |

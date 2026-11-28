@@ -14,11 +14,12 @@ publish.workspace = true
 [dependencies]
 async-trait.workspace = true
 clap = { workspace = true, features = ["derive"] }
-config.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true
+rayon.workspace = true
+reqwest.workspace = true
 prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -45,10 +46,12 @@ rustix.workspace = true
 workspace = true
 
 [dev-dependencies]
+ring.workspace = true
 async-trait.workspace = true
 eyre.workspace = true
 hex.workspace = true
 metrics-exporter-prometheus.workspace = true
+proptest.workspace = true
 prost.workspace = true
 rust-rocksdb.workspace = true
 secrecy.workspace = true

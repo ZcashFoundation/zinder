@@ -36,7 +36,7 @@ done
 
 if [[ -n "$image" ]]; then
   [[ -z "$archive" && -z "$version" && -z "$platform" ]] || usage
-  [[ "$image" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/zinder-[a-z0-9-]+$ ]] || usage
+  [[ "$image" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/zinder(-[a-z0-9-]+)?$ ]] || usage
   [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || usage
   [[ "$commit" =~ ^[0-9a-f]{40}$ && "$digest" =~ ^sha256:[0-9a-f]{64}$ && -n "$output" ]] || usage
   case "$architecture" in
@@ -97,7 +97,7 @@ fi
 [[ -z "$release_tag" && -z "$architecture" && -z "$digest" ]] || usage
 [[ -s "$archive" && -n "$output" && -n "$version" && "$commit" =~ ^[0-9a-f]{40}$ ]] || usage
 case "$platform" in
-  x86_64-v3-unknown-linux-gnu|aarch64-unknown-linux-gnu) ;;
+  x86_64-v3-unknown-linux-gnu|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin) ;;
   *) usage ;;
 esac
 

@@ -11,13 +11,11 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use zinder_core::NetworkUpgradeActivations;
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
+    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreRequirements, RawBlobRetention,
     RocksDbCanonicalSecondary, RocksDbResourceBudget, RocksDbTreeStateVerifier,
 };
 
-use crate::runtime_config::{
-    HistoricalWorkGate, sleep_or_cancel, wait_until_historical_work_or_cancelled,
-};
+use crate::runtime_config::{sleep_or_cancel, wait_for_work_or_cancelled};
 
 /// How often a pass reopens its canonical secondary when no store is
 /// published yet.
@@ -28,7 +26,6 @@ pub(crate) struct BackgroundSecondary<'pass> {
     pub(crate) canonical_primary_path: &'pass Path,
     pub(crate) secondary_path: &'pass Path,
     pub(crate) network_upgrade_activations: &'pass Arc<NetworkUpgradeActivations>,
-    pub(crate) workload: CanonicalStoreWorkload,
     pub(crate) raw_blob_retention: RawBlobRetention,
     pub(crate) reorg_policy: CanonicalReorgPolicy,
     pub(crate) resource_budget: RocksDbResourceBudget,
@@ -46,8 +43,7 @@ impl BackgroundSecondaryHandle for RocksDbCanonicalSecondary {
             &opening.primary_path,
             &opening.secondary_path,
             &opening.activations,
-            opening.workload,
-            opening.raw_blob_retention,
+            CanonicalStoreRequirements::for_blob_retention(opening.raw_blob_retention),
             opening.reorg_policy,
             opening.resource_budget,
         )
@@ -60,7 +56,6 @@ impl BackgroundSecondaryHandle for RocksDbTreeStateVerifier {
             &opening.primary_path,
             &opening.secondary_path,
             &opening.activations,
-            opening.workload,
             opening.raw_blob_retention,
             opening.reorg_policy,
             opening.resource_budget,
@@ -74,7 +69,6 @@ pub(crate) struct SecondaryOpening {
     primary_path: PathBuf,
     secondary_path: PathBuf,
     activations: Arc<NetworkUpgradeActivations>,
-    workload: CanonicalStoreWorkload,
     raw_blob_retention: RawBlobRetention,
     reorg_policy: CanonicalReorgPolicy,
     resource_budget: RocksDbResourceBudget,
@@ -86,19 +80,17 @@ impl BackgroundSecondary<'_> {
     ///
     /// Opening catches the secondary up and admits the store, which reads
     /// retained history, so each attempt runs off the async workers live
-    /// ingest uses and, when `gate` is set, waits for it first. The first
+    /// ingest uses and waits for its pass to have work first. The first
     /// failed attempt logs `unavailable_event`.
     pub(crate) async fn open_when_published<Handle: BackgroundSecondaryHandle>(
         &self,
-        gate: Option<&HistoricalWorkGate>,
+        has_work: impl Fn() -> bool + Send + Sync,
         cancel: &CancellationToken,
         unavailable_event: &'static str,
     ) -> Option<Handle> {
         let mut waiting_logged = false;
         loop {
-            if let Some(gate) = gate
-                && wait_until_historical_work_or_cancelled(gate, cancel).await
-            {
+            if wait_for_work_or_cancelled(&has_work, cancel).await {
                 return None;
             }
             if cancel.is_cancelled() {
@@ -129,7 +121,6 @@ impl BackgroundSecondary<'_> {
             primary_path: self.canonical_primary_path.to_path_buf(),
             secondary_path: self.secondary_path.to_path_buf(),
             activations: Arc::clone(self.network_upgrade_activations),
-            workload: self.workload,
             raw_blob_retention: self.raw_blob_retention,
             reorg_policy: self.reorg_policy,
             resource_budget: self.resource_budget,

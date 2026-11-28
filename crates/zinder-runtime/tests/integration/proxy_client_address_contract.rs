@@ -13,24 +13,27 @@
     reason = "Integration test names describe the proxy contract under test."
 )]
 
-use std::fs;
+use std::{fs, path::PathBuf};
 
 use eyre::{Result, ensure, eyre};
 use zinder_runtime::{ENVIRONMENT_VARIABLES, PROXY_CLIENT_ADDRESS_HEADER};
 
 const CADDYFILE: &str = include_str!("../../../../deploy/compat-lightwalletd.Caddyfile");
 const TLS_RUNBOOK: &str = include_str!("../../../../docs/runbooks/exposing-over-tls.md");
-const DEPLOY_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
 const BASE_COMPOSE_FILE: &str = "docker-compose.yml";
 
-/// The base Compose file and every overlay that adds to its `zinder-ingest`
+fn deploy_directory() -> PathBuf {
+    zinder_testkit::manifest_dir!().join("../../deploy")
+}
+
+/// The base Compose file and every overlay that adds to its `zinder-index`
 /// service, as `(file name, contents)` pairs.
 ///
-/// An overlay's `zinder-ingest` names no image: only the base file defines
+/// An overlay's `zinder-index` names no image: only the base file defines
 /// how the service is built, so the overlay runs merged with it.
 fn wallet_serving_compose_files() -> Result<Vec<(String, String)>> {
     let mut files = Vec::new();
-    for entry in fs::read_dir(DEPLOY_DIRECTORY)? {
+    for entry in fs::read_dir(deploy_directory())? {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
@@ -40,9 +43,9 @@ fn wallet_serving_compose_files() -> Result<Vec<(String, String)>> {
             continue;
         }
         let contents = fs::read_to_string(&path)?;
-        let overlays_ingest = ingest_service(&contents)
+        let overlays_index = index_service(&contents)
             .is_some_and(|service| !service.iter().any(|line| line.starts_with("    image:")));
-        if name == BASE_COMPOSE_FILE || overlays_ingest {
+        if name == BASE_COMPOSE_FILE || overlays_index {
             files.push((name.to_owned(), contents));
         }
     }
@@ -108,12 +111,12 @@ fn section<'doc>(document: &'doc str, heading: &str) -> Result<&'doc str> {
     Ok(body.find("\n## ").map_or(body, |end| &body[..end]))
 }
 
-/// The lines of the Compose `zinder-ingest` service, without its own line,
+/// The lines of the Compose `zinder-index` service, without its own line,
 /// or `None` when the file does not define it.
-fn ingest_service(compose: &str) -> Option<Vec<&str>> {
+fn index_service(compose: &str) -> Option<Vec<&str>> {
     let mut lines = compose
         .lines()
-        .skip_while(|line| *line != "  zinder-ingest:");
+        .skip_while(|line| *line != "  zinder-index:");
     lines.next()?;
     Some(
         lines
@@ -122,14 +125,14 @@ fn ingest_service(compose: &str) -> Option<Vec<&str>> {
     )
 }
 
-/// The networks the Compose `zinder-ingest` service joins. Every public
+/// The networks the Compose `zinder-index` service joins. Every public
 /// listener runs in its network namespace.
 ///
 /// Reads the map form, the list form, and the flow form `[a, b]`, and fails
 /// on a `networks` key it cannot read, so a new form is never read as no
 /// networks.
-fn ingest_networks(compose: &str) -> Result<Vec<&str>> {
-    let service = ingest_service(compose).unwrap_or_default();
+fn index_networks(compose: &str) -> Result<Vec<&str>> {
+    let service = index_service(compose).unwrap_or_default();
     let Some(key) = service
         .iter()
         .position(|line| line.starts_with("    networks:"))
@@ -149,14 +152,14 @@ fn ingest_networks(compose: &str) -> Result<Vec<&str>> {
                 entry
                     .strip_prefix("- ")
                     .or_else(|| entry.split_once(':').map(|(name, _)| name))
-                    .ok_or_else(|| eyre!("unreadable zinder-ingest network entry {entry:?}"))
+                    .ok_or_else(|| eyre!("unreadable zinder-index network entry {entry:?}"))
             })
             .collect::<Result<Vec<_>>>()?
     } else {
         inline
             .strip_prefix('[')
             .and_then(|flow| flow.strip_suffix(']'))
-            .ok_or_else(|| eyre!("unreadable zinder-ingest networks value {inline:?}"))?
+            .ok_or_else(|| eyre!("unreadable zinder-index networks value {inline:?}"))?
             .split(',')
             .map(str::trim)
             .filter(|name| !name.is_empty())
@@ -168,7 +171,7 @@ fn ingest_networks(compose: &str) -> Result<Vec<&str>> {
         .collect::<Vec<_>>();
     ensure!(
         !names.is_empty(),
-        "zinder-ingest has a networks key that names no network"
+        "zinder-index has a networks key that names no network"
     );
     Ok(names)
 }
@@ -182,7 +185,7 @@ fn the_caddy_template_replaces_the_header_the_listener_reads() -> Result<()> {
 fn the_caddy_readiness_gate_reuses_a_bounded_pool_for_status_only_probes() -> Result<()> {
     let gate = caddy_block(
         CADDYFILE.lines(),
-        "forward_auth 127.0.0.1:{$ZINDER_COMPAT_OPS_HOST_PORT}",
+        "forward_auth 127.0.0.1:{$DEPLOY_SERVE_OPS_HOST_PORT}",
     )?;
     for directive in ["uri /readyz", "method HEAD", "header_down -Content-Length"] {
         assert!(
@@ -208,7 +211,7 @@ https://example.org:443 {
 \t\t\theader_up X-Zinder-Client-Address {http.request.remote}
 \t\t}
 
-\t\treverse_proxy h2c://127.0.0.1:{$ZINDER_COMPAT_HOST_PORT} {
+\t\treverse_proxy h2c://127.0.0.1:{$DEPLOY_COMPAT_HOST_PORT} {
 \t\t\tflush_interval -1
 \t\t}
 \t}
@@ -276,17 +279,17 @@ fn the_runbook_names_every_network_that_reaches_a_trusting_listener() -> Result<
     let requirements = section(TLS_RUNBOOK, "## Keep wallets apart in the receive limit")?;
     let compose_files = wallet_serving_compose_files()?;
     ensure!(
-        compose_files.len() > 1,
-        "found no overlay merged with deploy/{BASE_COMPOSE_FILE} in {DEPLOY_DIRECTORY}"
+        !compose_files.is_empty(),
+        "found no Compose file matching deploy/{BASE_COMPOSE_FILE} in {}",
+        deploy_directory().display()
     );
     let mut checked = 0;
     for (file, contents) in &compose_files {
-        let networks =
-            ingest_networks(contents).map_err(|error| eyre!("deploy/{file}: {error}"))?;
+        let networks = index_networks(contents).map_err(|error| eyre!("deploy/{file}: {error}"))?;
         for network in networks {
             ensure!(
                 requirements.contains(&format!("Compose `{network}` network")),
-                "the public listeners share zinder-ingest's namespace, which deploy/{file} \
+                "the public listeners share zinder-index's namespace, which deploy/{file} \
                  joins to the {network} network, but the runbook's requirements do not name it"
             );
             checked += 1;
@@ -294,7 +297,7 @@ fn the_runbook_names_every_network_that_reaches_a_trusting_listener() -> Result<
     }
     ensure!(
         checked > 0,
-        "found no networks for zinder-ingest in the Compose files"
+        "found no networks for zinder-index in the Compose files"
     );
     ensure!(
         requirements.contains("docker network inspect"),
@@ -304,10 +307,10 @@ fn the_runbook_names_every_network_that_reaches_a_trusting_listener() -> Result<
 }
 
 #[test]
-fn ingest_networks_are_read_from_the_service_block() {
+fn index_networks_are_read_from_the_service_block() {
     let compose = [
         "services:",
-        "  zinder-ingest:",
+        "  zinder-index:",
         "    image: zinder",
         "    networks:",
         "      node:",
@@ -316,23 +319,23 @@ fn ingest_networks_are_read_from_the_service_block() {
         "      observability:",
         "    volumes:",
         "      - data:/var/lib/zinder",
-        "  zinder-query:",
+        "  zinder-serve:",
         "    networks:",
         "      other:",
     ]
     .join("\n");
 
     assert_eq!(
-        ingest_networks(&compose).ok(),
+        index_networks(&compose).ok(),
         Some(vec!["node", "observability"])
     );
 }
 
 #[test]
-fn ingest_networks_are_read_in_the_list_and_flow_forms() {
+fn index_networks_are_read_in_the_list_and_flow_forms() {
     let list = [
         "services:",
-        "  zinder-ingest:",
+        "  zinder-index:",
         "    networks:",
         "      - node",
         "      # A wallet-facing network.",
@@ -341,11 +344,11 @@ fn ingest_networks_are_read_in_the_list_and_flow_forms() {
         "      - data:/var/lib/zinder",
     ]
     .join("\n");
-    let flow = "services:\n  zinder-ingest:\n    networks: [node, node-fallback]\n";
+    let flow = "services:\n  zinder-index:\n    networks: [node, node-fallback]\n";
 
     for compose in [list.as_str(), flow] {
         assert_eq!(
-            ingest_networks(compose).ok(),
+            index_networks(compose).ok(),
             Some(vec!["node", "node-fallback"]),
             "{compose}"
         );
@@ -353,13 +356,13 @@ fn ingest_networks_are_read_in_the_list_and_flow_forms() {
 }
 
 #[test]
-fn an_unreadable_ingest_networks_key_fails() {
+fn an_unreadable_index_networks_key_fails() {
     for compose in [
-        "services:\n  zinder-ingest:\n    networks: node\n",
-        "services:\n  zinder-ingest:\n    networks: {node: {}}\n",
-        "services:\n  zinder-ingest:\n    networks: []\n",
-        "services:\n  zinder-ingest:\n    networks:\n    volumes:\n",
+        "services:\n  zinder-index:\n    networks: node\n",
+        "services:\n  zinder-index:\n    networks: {node: {}}\n",
+        "services:\n  zinder-index:\n    networks: []\n",
+        "services:\n  zinder-index:\n    networks:\n    volumes:\n",
     ] {
-        assert!(ingest_networks(compose).is_err(), "{compose}");
+        assert!(index_networks(compose).is_err(), "{compose}");
     }
 }

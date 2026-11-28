@@ -26,7 +26,7 @@ use tokio::{
 use tokio_util::task::AbortOnDropHandle;
 use zinder_bench::metrics_scrape::{MetricSample, parse_prometheus_samples, sum_by_name};
 
-const TREE_STATE_RECONSTRUCTIONS: &str = "zinder_query_tree_state_replayed_blocks_count";
+const TREE_STATE_REPLAYED_BLOCKS_COUNT: &str = "zinder_query_tree_state_replayed_blocks_count";
 const TREE_STATE_REPLAYED_BLOCKS: &str = "zinder_query_tree_state_replayed_blocks_sum";
 const TREE_STATE_READS: &str = "zinder_query_tree_state_reads_total";
 const TREE_STATE_REPLAY_ADMISSIONS: &str = "zinder_query_tree_state_replay_admissions_total";
@@ -56,7 +56,7 @@ const STALE_TIP_REFUSALS: &str = "zinder_compat_stale_tip_refusals_total";
 
 /// Every counter the observation subtracts, checked for a reset.
 const OBSERVED_COUNTERS: [&str; 22] = [
-    TREE_STATE_RECONSTRUCTIONS,
+    TREE_STATE_REPLAYED_BLOCKS_COUNT,
     TREE_STATE_REPLAYED_BLOCKS,
     TREE_STATE_READS,
     TREE_STATE_REPLAY_ADMISSIONS,
@@ -371,11 +371,17 @@ impl ServerObserved {
                 (stage, time)
             })
             .collect();
+        let tree_state_replayed_reads = labeled(TREE_STATE_READS, ("source", "replayed"));
+        let counts_reads_by_source = after.iter().any(|sample| sample.name == TREE_STATE_READS);
         Ok(Self {
-            tree_state_reconstructions: count(TREE_STATE_RECONSTRUCTIONS),
+            tree_state_reconstructions: if counts_reads_by_source {
+                tree_state_replayed_reads
+            } else {
+                count(TREE_STATE_REPLAYED_BLOCKS_COUNT)
+            },
             tree_state_replayed_blocks: count(TREE_STATE_REPLAYED_BLOCKS),
             tree_state_stored_reads: labeled(TREE_STATE_READS, ("source", "stored")),
-            tree_state_replayed_reads: labeled(TREE_STATE_READS, ("source", "replayed")),
+            tree_state_replayed_reads,
             tree_state_stored_reads_by_band: reads_by_band(before, after, "stored"),
             tree_state_replayed_reads_by_band: reads_by_band(before, after, "replayed"),
             tree_state_replay_admissions: count(TREE_STATE_REPLAY_ADMISSIONS),
@@ -594,7 +600,7 @@ fn counter_value(increase: f64) -> u64 {
 }
 
 /// Reads the Prometheus exposition at an `http://host:port/path` URL.
-async fn scrape(url: &str) -> Result<Vec<MetricSample>, String> {
+pub(super) async fn scrape(url: &str) -> Result<Vec<MetricSample>, String> {
     scrape_within(url, SCRAPE_TIMEOUT, MAX_SCRAPE_BYTES).await
 }
 
@@ -804,6 +810,7 @@ mod tests {
         let after = parse_prometheus_samples(
             "zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"a\"} 7\n\
              zinder_query_tree_state_reads_total{source=\"replayed\",height_band=\"a\"} 4\n\
+             zinder_query_tree_state_replayed_blocks_count{height_band=\"a\"} 9\n\
              zinder_query_tree_state_replay_wait_duration_seconds_sum 0.25\n\
              zinder_query_tree_state_replay_wait_duration_seconds_count 4\n\
              zinder_compat_block_range_stage_duration_seconds_sum{stage=\"read\"} 4.0\n\
@@ -817,6 +824,7 @@ mod tests {
 
         assert_eq!(observed.tree_state_stored_reads, 5);
         assert_eq!(observed.tree_state_replayed_reads, 4);
+        assert_eq!(observed.tree_state_reconstructions, 4);
         assert_eq!(observed.tree_state_stored_reads_by_band["a"], 5);
         assert_eq!(observed.tree_state_replayed_reads_by_band["a"], 4);
         assert_eq!(observed.tree_state_replay_waits, 4);

@@ -1,7 +1,17 @@
 //! Bound on concurrent tree-state reconstructions, and the metrics of every
 //! tree-state read.
 
+mod flights;
+mod settled_cache;
+pub(crate) use flights::{
+    ReadyState, ReplayKey, ReplayedState, Selection, StoredTreeState, TakeReplayPermit,
+    read_missing_height,
+};
+pub use settled_cache::ServedTreeStateHex;
+pub(crate) use settled_cache::{CachedTreeState, ReaderGeneration};
+
 use std::{
+    borrow::Cow,
     num::NonZeroU32,
     sync::{
         Arc,
@@ -10,10 +20,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use parking_lot::RwLock;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zinder_core::{BlockHeight, ChainTipMetadata};
+use zinder_store::{ServedTreeState, TreeStateReplayOutcome};
 
-use crate::QueryError;
+use crate::{QueryError, StorageReadError};
 
 /// Blocks in one `height_band` label value.
 ///
@@ -82,6 +94,15 @@ pub const MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT: NonZeroU32 = NonZeroU32::MIN.s
 /// full. A waiter that is dropped gives up its place at once.
 #[derive(Clone, Debug)]
 pub(crate) struct TreeStateReplayLimit {
+    /// Active replay flights and anchor verification state.
+    ///
+    /// Lock order: whenever both `flights` and `settled` are locked, always
+    /// acquire `flights` before `settled`.
+    flights: Arc<parking_lot::Mutex<flights::Flights>>,
+    /// Bounded LRU cache of settled replayed tree states; read-locked on warm
+    /// cache hits without contending on `flights`.
+    settled: Arc<RwLock<settled_cache::SettledStates>>,
+    anchor_verify_slot: Arc<Semaphore>,
     slots: Arc<Semaphore>,
     max_replays: NonZeroU32,
     waiters: Arc<AtomicU32>,
@@ -108,6 +129,9 @@ impl TreeStateReplayLimit {
             .unwrap_or(Semaphore::MAX_PERMITS)
             .min(Semaphore::MAX_PERMITS);
         Self {
+            flights: Arc::default(),
+            settled: Arc::default(),
+            anchor_verify_slot: Arc::new(Semaphore::new(1)),
             slots: Arc::new(Semaphore::new(permits)),
             max_replays,
             waiters: Arc::new(AtomicU32::new(0)),
@@ -150,33 +174,82 @@ impl TreeStateReplayLimit {
     ///
     /// Returns [`QueryError::TreeStateReplayLimitReached`] when no slot frees
     /// within the wait, or when every waiting place is taken.
+    #[cfg(test)]
     pub(crate) async fn admit(&self) -> Result<OwnedSemaphorePermit, QueryError> {
-        let started_at = Instant::now();
-        let admission = self.acquire().await;
-        metrics::histogram!(REPLAY_WAIT_HISTOGRAM).record(started_at.elapsed().as_secs_f64());
-        let permit = admission.map_err(|refusal| {
-            metrics::counter!(REPLAY_REFUSALS_COUNTER, "reason" => refusal.label()).increment(1);
-            QueryError::TreeStateReplayLimitReached {
-                max_concurrent_replays: self.max_replays,
-            }
-        })?;
-        metrics::counter!(REPLAY_ADMISSIONS_COUNTER).increment(1);
-        Ok(permit)
+        let (admission, _waiting) = self.admit_until(self.deadline())?;
+        admission.await.map_err(|reason| self.refused(reason))
     }
 
-    async fn acquire(&self) -> Result<OwnedSemaphorePermit, ReplayRefusal> {
-        if let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() {
-            return Ok(permit);
+    pub(crate) fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.wait
+    }
+
+    fn refused(&self, refusal: ReplayRefusal) -> QueryError {
+        metrics::counter!(REPLAY_REFUSALS_COUNTER, "reason" => refusal.label()).increment(1);
+        QueryError::TreeStateReplayLimitReached {
+            max_concurrent_replays: self.max_replays,
         }
-        if self.wait.is_zero() {
+    }
+
+    fn admit_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<
+        (
+            impl Future<Output = Result<OwnedSemaphorePermit, ReplayRefusal>> + use<>,
+            Option<WaitingPlace>,
+        ),
+        QueryError,
+    > {
+        let started_at = Instant::now();
+        let (admission, waiting) = self.acquire(deadline).map_err(|reason| {
+            metrics::histogram!(REPLAY_WAIT_HISTOGRAM).record(started_at.elapsed().as_secs_f64());
+            self.refused(reason)
+        })?;
+        Ok((
+            async move {
+                let slot = admission.await;
+                metrics::histogram!(REPLAY_WAIT_HISTOGRAM)
+                    .record(started_at.elapsed().as_secs_f64());
+                if slot.is_ok() {
+                    metrics::counter!(REPLAY_ADMISSIONS_COUNTER).increment(1);
+                }
+                slot
+            },
+            waiting,
+        ))
+    }
+
+    fn acquire(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<
+        (
+            impl Future<Output = Result<OwnedSemaphorePermit, ReplayRefusal>> + use<>,
+            Option<WaitingPlace>,
+        ),
+        ReplayRefusal,
+    > {
+        use futures_util::future::{Either, ready};
+        let slots = Arc::clone(&self.slots);
+        if let Ok(permit) = slots.clone().try_acquire_owned() {
+            return Ok((Either::Left(ready(Ok(permit))), None));
+        }
+        if tokio::time::Instant::now() >= deadline {
             return Err(ReplayRefusal::WaitExpired);
         }
-        let _waiting_place = WaitingPlace::take(&self.waiters, self.max_waiters)
-            .ok_or(ReplayRefusal::WaitersFull)?;
-        match tokio::time::timeout(self.wait, Arc::clone(&self.slots).acquire_owned()).await {
-            Ok(Ok(permit)) => Ok(permit),
-            Ok(Err(_)) | Err(_) => Err(ReplayRefusal::WaitExpired),
-        }
+        let Some(place) = WaitingPlace::take(&self.waiters, self.max_waiters) else {
+            return Err(ReplayRefusal::WaitersFull);
+        };
+        Ok((
+            Either::Right(async move {
+                match tokio::time::timeout_at(deadline, slots.acquire_owned()).await {
+                    Ok(Ok(permit)) => Ok(permit),
+                    Ok(Err(_)) | Err(_) => Err(ReplayRefusal::WaitExpired),
+                }
+            }),
+            Some(place),
+        ))
     }
 }
 
@@ -200,70 +273,109 @@ impl ReplayRefusal {
 
 /// One of the places a request waiting for a replay slot holds, released
 /// when dropped.
-struct WaitingPlace<'waiters> {
-    waiters: &'waiters AtomicU32,
+#[derive(Debug)]
+struct WaitingPlace {
+    waiters: Arc<AtomicU32>,
 }
 
-impl<'waiters> WaitingPlace<'waiters> {
-    fn take(waiters: &'waiters AtomicU32, max_waiters: u32) -> Option<Self> {
+impl WaitingPlace {
+    fn take(waiters: &Arc<AtomicU32>, max_waiters: u32) -> Option<Self> {
         waiters
             .try_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
                 (waiting < max_waiters).then_some(waiting + 1)
             })
             .ok()
-            .map(|_| Self { waiters })
+            .map(|_| Self {
+                waiters: waiters.clone(),
+            })
     }
 }
 
-impl Drop for WaitingPlace<'_> {
+impl Drop for WaitingPlace {
     fn drop(&mut self) {
         self.waiters.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-/// Records one served tree-state read at `height` whose seed sits
-/// `replayed_blocks` below it, whose trees after that seed hold `seed_trees`,
-/// and whose answer holds `served_trees`.
-///
-/// A stored checkpoint is its own seed, so it counts as a `stored` read and
-/// records zero blocks and zero commitments in every pool. Every other read
-/// replays at least one block and counts as `replayed`.
-pub(crate) fn record_tree_state_read(
+/// Holds the slot on the replay task so cancelling the request cannot release
+/// capacity while its storage read is still running.
+async fn replay_holding_slot<Read>(
     height: BlockHeight,
+    replay_slot: OwnedSemaphorePermit,
+    read: Read,
+) -> Result<Option<(ServedTreeState, bool)>, StorageReadError>
+where
+    Read: Future<Output = Result<Option<TreeStateReplayOutcome>, StorageReadError>>,
+{
+    let started_at = Instant::now();
+    let outcome = read.await;
+    let duration = started_at.elapsed();
+    drop(replay_slot);
+    Ok(outcome?.map(|outcome| match outcome {
+        TreeStateReplayOutcome::Stored(stored) => (stored, false),
+        TreeStateReplayOutcome::Replayed { replay, tree_state } => {
+            record_replay_duration(height, duration);
+            record_replay_work(
+                &height_band(height),
+                replay.replayed_blocks(),
+                replay.seed().tip_metadata(),
+                tree_state.tip_metadata(),
+            );
+            (tree_state, true)
+        }
+    }))
+}
+
+fn record_tree_state_read(height: BlockHeight, source: &'static str) {
+    metrics::counter!(TREE_STATE_READS_COUNTER, "source" => source, "height_band" => height_band(height))
+        .increment(1);
+}
+
+fn record_replay_work(
+    band: &str,
     replayed_blocks: u32,
     seed_trees: ChainTipMetadata,
     served_trees: ChainTipMetadata,
 ) {
-    let band = height_band(height);
-    let source = if replayed_blocks == 0 {
-        "stored"
-    } else {
-        "replayed"
-    };
-    metrics::counter!(TREE_STATE_READS_COUNTER, "source" => source, "height_band" => band.clone())
-        .increment(1);
-    metrics::histogram!(REPLAYED_BLOCKS_HISTOGRAM, "height_band" => band.clone())
+    metrics::histogram!(REPLAYED_BLOCKS_HISTOGRAM, "height_band" => band.to_owned())
         .record(f64::from(replayed_blocks));
     for (pool, appended) in appended_commitments(seed_trees, served_trees) {
         metrics::histogram!(
             REPLAYED_COMMITMENTS_HISTOGRAM,
             "pool" => pool,
-            "height_band" => band.clone()
+            "height_band" => band.to_owned()
         )
         .record(f64::from(appended));
     }
 }
 
 /// Records how long one completed reconstruction of `height` spent replaying.
-pub(crate) fn record_replay_duration(height: BlockHeight, replay_duration: Duration) {
+fn record_replay_duration(height: BlockHeight, replay_duration: Duration) {
     metrics::histogram!(REPLAY_DURATION_HISTOGRAM, "height_band" => height_band(height))
         .record(replay_duration.as_secs_f64());
 }
 
+/// Pre-formatted labels for height bands `0` through `10_000_000` in
+/// [`HEIGHT_BAND_BLOCKS`]-block steps, avoiding per-request heap allocation on
+/// the `GetTreeState` metric hot path.
+const STATIC_HEIGHT_BANDS: [&str; 41] = [
+    "0", "250000", "500000", "750000", "1000000", "1250000", "1500000", "1750000", "2000000",
+    "2250000", "2500000", "2750000", "3000000", "3250000", "3500000", "3750000", "4000000",
+    "4250000", "4500000", "4750000", "5000000", "5250000", "5500000", "5750000", "6000000",
+    "6250000", "6500000", "6750000", "7000000", "7250000", "7500000", "7750000", "8000000",
+    "8250000", "8500000", "8750000", "9000000", "9250000", "9500000", "9750000", "10000000",
+];
+
 /// The `height_band` label of `height`: the first height of its
 /// [`HEIGHT_BAND_BLOCKS`]-block band.
-fn height_band(height: BlockHeight) -> String {
-    (height.value() - height.value() % HEIGHT_BAND_BLOCKS).to_string()
+fn height_band(height: BlockHeight) -> Cow<'static, str> {
+    let band_index = height.value() / HEIGHT_BAND_BLOCKS;
+    if let Ok(index) = usize::try_from(band_index)
+        && let Some(&label) = STATIC_HEIGHT_BANDS.get(index)
+    {
+        return Cow::Borrowed(label);
+    }
+    Cow::Owned((band_index * HEIGHT_BAND_BLOCKS).to_string())
 }
 
 /// Note commitments appended to each pool to grow `seed_trees` into
@@ -299,9 +411,8 @@ pub(crate) fn describe_metrics() {
     metrics::describe_counter!(
         TREE_STATE_READS_COUNTER,
         metrics::Unit::Count,
-        "Served tree-state reads. `source` is `stored` when a checkpoint is stored at the \
-         height and `replayed` when it was rebuilt; `height_band` is the first height of \
-         the read's 250,000-block band."
+        "Served tree-state reads by source (stored, cached, replayed, or coalesced) and \
+         250,000-block height band. Each caller receiving a state counts once."
     );
     metrics::describe_counter!(
         REPLAY_ADMISSIONS_COUNTER,
@@ -319,15 +430,12 @@ pub(crate) fn describe_metrics() {
     metrics::describe_histogram!(
         REPLAYED_BLOCKS_HISTOGRAM,
         metrics::Unit::Count,
-        "Compact blocks replayed to answer one tree-state request, from the nearest \
-         stored checkpoint to the requested height, by height band. A stored \
-         checkpoint records 0."
+        "Compact blocks replayed per completed reconstruction, by height band."
     );
     metrics::describe_histogram!(
         REPLAYED_COMMITMENTS_HISTOGRAM,
         metrics::Unit::Count,
-        "Note commitments appended to one pool to answer one tree-state request, by \
-         pool and height band. A stored checkpoint records 0."
+        "Note commitments appended per completed reconstruction, by pool and height band."
     );
     metrics::describe_histogram!(
         REPLAY_WAIT_HISTOGRAM,
@@ -455,7 +563,7 @@ mod tests {
 
         let started_at = tokio::time::Instant::now();
         assert_eq!(
-            limit.acquire().await.err(),
+            limit.acquire(limit.deadline()).err(),
             Some(ReplayRefusal::WaitersFull)
         );
         assert!(is_refused(&limit.admit().await));
@@ -477,7 +585,7 @@ mod tests {
         until_waiting(&limit, 3).await?;
 
         assert_eq!(
-            limit.acquire().await.err(),
+            limit.acquire(limit.deadline()).err(),
             Some(ReplayRefusal::WaitersFull)
         );
         for waiter in waiters {

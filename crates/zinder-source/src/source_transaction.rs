@@ -7,10 +7,7 @@
 
 use std::io::Cursor;
 
-use zcash_primitives::transaction::{
-    Transaction as LibrustzcashTransaction, TxVersion as LibrustzcashTransactionVersion,
-};
-use zcash_protocol::consensus::BranchId as LibrustzcashBranchId;
+use zcash_primitives::transaction::TxVersion as LibrustzcashTransactionVersion;
 use zebra_chain::{
     parameters::NetworkUpgrade as ZebraNetworkUpgrade, serialization::ZcashDeserialize,
     transaction::Transaction as ZebraTransaction, transparent::Input as ZebraTransparentInput,
@@ -60,7 +57,7 @@ pub fn parse_transaction_public_facts(
     let transaction = parse_zebra_transaction(raw_transaction_bytes)?;
     transaction_public_facts(
         &transaction,
-        raw_transaction_bytes,
+        raw_transaction_bytes.len(),
         mined_height,
         activations,
     )
@@ -75,7 +72,7 @@ pub fn parse_transaction_public_fact_set(
     let transaction = parse_zebra_transaction(raw_transaction_bytes)?;
     transaction_public_fact_set_from_parsed(
         &transaction,
-        raw_transaction_bytes,
+        raw_transaction_bytes.len(),
         mined_height,
         activations,
     )
@@ -105,19 +102,20 @@ fn parse_zebra_transaction(raw_transaction_bytes: &[u8]) -> Result<ZebraTransact
 ///
 /// Canonical block preparation uses this entry point so it can share the
 /// block parser's transaction values instead of serializing and deserializing
-/// every transaction again. `raw_transaction_bytes` must be the exact
-/// serialization of `transaction`; witnessed identifiers fail closed if the
-/// byte stream cannot be parsed or is not fully consumed. Byte-oriented callers should continue to use
-/// [`parse_transaction_public_fact_set`].
+/// every transaction again. `serialized_size_bytes` must be the length of the
+/// bytes the parser consumed for `transaction`; the facts record it as the
+/// transaction's size. Byte-oriented callers should continue to use
+/// [`parse_transaction_public_fact_set`], which parses the bytes and checks
+/// that the parse consumes all of them.
 pub fn transaction_public_fact_set_from_parsed(
     transaction: &ZebraTransaction,
-    raw_transaction_bytes: &[u8],
+    serialized_size_bytes: usize,
     mined_height: Option<BlockHeight>,
     activations: &NetworkUpgradeActivations,
 ) -> Result<TransactionPublicFactSet, SourceError> {
     let public_facts = transaction_public_facts(
         transaction,
-        raw_transaction_bytes,
+        serialized_size_bytes,
         mined_height,
         activations,
     )?;
@@ -164,7 +162,7 @@ fn transaction_intrinsic_value_balances(
 
 fn transaction_public_facts(
     transaction: &ZebraTransaction,
-    raw_transaction_bytes: &[u8],
+    serialized_size_bytes: usize,
     mined_height: Option<BlockHeight>,
     activations: &NetworkUpgradeActivations,
 ) -> Result<TransactionPublicFacts, SourceError> {
@@ -190,11 +188,10 @@ fn transaction_public_facts(
         vec![UnsupportedSection::FutureVersionHeader]
     };
     let consensus_branch_id = resolve_consensus_branch_id(transaction, mined_height, activations);
-    let (transaction_id, auth_digest, wtxid) =
-        transaction_identifiers(transaction, raw_transaction_bytes)?;
+    let (transaction_id, auth_digest, wtxid) = transaction_identifiers(transaction)?;
     let lock_time = extract_lock_time(transaction);
     let expiry_height = extract_expiry_height(transaction);
-    let size_bytes = u32::try_from(raw_transaction_bytes.len()).unwrap_or(u32::MAX);
+    let size_bytes = u32::try_from(serialized_size_bytes).unwrap_or(u32::MAX);
     let privacy_shape = classify_privacy_shape(counts, is_coinbase, version);
 
     Ok(TransactionPublicFacts {
@@ -304,75 +301,47 @@ pub fn transaction_component_counts(transaction: &ZebraTransaction) -> Transacti
 
 fn transaction_identifiers(
     transaction: &ZebraTransaction,
-    raw_transaction_bytes: &[u8],
 ) -> Result<(TransactionId, Option<AuthDigest>, Option<Wtxid>), SourceError> {
-    let witnessed_version = match transaction.tx_version() {
+    let transaction_id_bytes = transaction.hash().0;
+    match transaction.tx_version() {
         LibrustzcashTransactionVersion::Sprout(_)
         | LibrustzcashTransactionVersion::V3
         | LibrustzcashTransactionVersion::V4 => {
-            return Ok((TransactionId::from_bytes(transaction.hash().0), None, None));
+            Ok((TransactionId::from_bytes(transaction_id_bytes), None, None))
         }
-        LibrustzcashTransactionVersion::V5 => LibrustzcashTransactionVersion::V5,
-        LibrustzcashTransactionVersion::V6 => LibrustzcashTransactionVersion::V6,
-    };
-    witnessed_transaction_identifiers(transaction, witnessed_version, raw_transaction_bytes)
+        LibrustzcashTransactionVersion::V5 | LibrustzcashTransactionVersion::V6 => {
+            witnessed_transaction_identifiers(transaction, transaction_id_bytes)
+        }
+    }
 }
 
-/// Derives both witnessed digests from one librustzcash transaction parse.
+/// Returns the authorizing digest and witnessed ID of a v5 or v6 transaction.
 ///
-/// Zebra's current `WtxId::from(&Transaction)` path converts the transaction
-/// separately for its transaction ID and authorizing digest. This source hot
-/// path keeps the same librustzcash release line as Zebra but performs that
-/// conversion once. Prefer a one-pass Zebra API when upstream exposes one.
+/// A `zebra-chain` transaction wraps the librustzcash transaction its parse
+/// built. That parse computed the ZIP-244 transaction ID, so
+/// `Transaction::hash` reads it, and `Transaction::auth_digest` hashes the
+/// authorizing data once.
 fn witnessed_transaction_identifiers(
     transaction: &ZebraTransaction,
-    expected_version: LibrustzcashTransactionVersion,
-    raw_transaction_bytes: &[u8],
+    transaction_id_bytes: [u8; 32],
 ) -> Result<(TransactionId, Option<AuthDigest>, Option<Wtxid>), SourceError> {
-    let branch_id = transaction
+    let supported_branch_id = transaction
         .network_upgrade()
         .and_then(|network_upgrade| network_upgrade.branch_id())
-        .and_then(|branch_id| LibrustzcashBranchId::try_from(u32::from(branch_id)).ok())
         .ok_or_else(|| SourceError::RawTransactionParseFailed {
             reason: "witnessed transaction has no supported consensus branch ID".to_owned(),
         })?;
-    let mut raw_transaction_cursor = Cursor::new(raw_transaction_bytes);
-    let librustzcash_transaction =
-        LibrustzcashTransaction::read(&mut raw_transaction_cursor, branch_id).map_err(
-            |source| SourceError::RawTransactionParseFailed {
-                reason: source.to_string(),
-            },
-        )?;
-    if librustzcash_transaction.version() != expected_version {
+    if u32::from(supported_branch_id) != u32::from(transaction.consensus_branch_id()) {
         return Err(SourceError::RawTransactionParseFailed {
-            reason: "parsed transaction version does not match the Zebra transaction".to_owned(),
+            reason: "witnessed transaction branch ID does not match its network upgrade".to_owned(),
         });
     }
-    if librustzcash_transaction.consensus_branch_id() != branch_id {
-        return Err(SourceError::RawTransactionParseFailed {
-            reason: "parsed transaction branch ID does not match the Zebra transaction".to_owned(),
-        });
-    }
-    let consumed_byte_count =
-        usize::try_from(raw_transaction_cursor.position()).unwrap_or(usize::MAX);
-    if consumed_byte_count != raw_transaction_bytes.len() {
-        return Err(SourceError::RawTransactionParseFailed {
-            reason: format!(
-                "witnessed transaction parser consumed {consumed_byte_count} of {} bytes",
-                raw_transaction_bytes.len()
-            ),
-        });
-    }
-
-    let transaction_id_bytes = *librustzcash_transaction.txid().as_ref();
-    let auth_digest = librustzcash_transaction.auth_commitment();
-    let auth_digest_bytes: [u8; 32] =
-        auth_digest
-            .as_bytes()
-            .try_into()
-            .map_err(|_| SourceError::RawTransactionParseFailed {
-                reason: "witnessed transaction auth digest is not 32 bytes".to_owned(),
-            })?;
+    let auth_digest_bytes = transaction
+        .auth_digest()
+        .ok_or_else(|| SourceError::RawTransactionParseFailed {
+            reason: "witnessed transaction has no auth digest".to_owned(),
+        })?
+        .0;
     let mut wtxid_bytes = [0u8; 64];
     wtxid_bytes[..32].copy_from_slice(&transaction_id_bytes);
     wtxid_bytes[32..].copy_from_slice(&auth_digest_bytes);
@@ -430,11 +399,20 @@ fn zebra_network_upgrade_branch_id(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::io::Cursor;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
+    use proptest::{
+        arbitrary::any,
+        test_runner::{Config, TestCaseError, TestRng, TestRunner},
+    };
     use zcash_primitives::transaction::{
-        Authorized, TransactionData as LibrustzcashTransactionData,
+        Authorized, Transaction as LibrustzcashTransaction,
+        TransactionData as LibrustzcashTransactionData,
         TxVersion as LibrustzcashTransactionVersion,
     };
     use zcash_protocol::consensus::{BlockHeight as LibrustzcashBlockHeight, BranchId};
@@ -447,6 +425,7 @@ mod tests {
     };
     use zebra_chain::{
         block::Block as ZebraBlock,
+        parameters::NetworkUpgrade as ZebraNetworkUpgrade,
         serialization::{ZcashDeserialize, ZcashSerialize},
         transaction::{Transaction as ZebraTransaction, WtxId as ZebraWtxId},
     };
@@ -475,7 +454,7 @@ mod tests {
             let fact_set = parse_transaction_public_fact_set(&raw_transaction, None, &activations)?;
             let parsed_fact_set = transaction_public_fact_set_from_parsed(
                 &transaction,
-                &raw_transaction,
+                raw_transaction.len(),
                 None,
                 &activations,
             )?;
@@ -556,57 +535,10 @@ mod tests {
     }
 
     #[test]
-    fn witnessed_identifiers_reject_mismatched_serialized_bytes()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let raw_transactions = minimal_transaction_encodings()?;
-        let raw_v5_transaction = raw_transactions.get(4).ok_or("missing V5 fixture")?;
-        let raw_v6_transaction = raw_transactions.get(5).ok_or("missing V6 fixture")?;
-        let v5_transaction = parse_zebra_transaction(raw_v5_transaction)?;
-        let v6_transaction = parse_zebra_transaction(raw_v6_transaction)?;
-        let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
-
-        let mut trailing_bytes = (*raw_v5_transaction).clone();
-        trailing_bytes.push(0);
-        let mut truncated_bytes = (*raw_v5_transaction).clone();
-        truncated_bytes.truncate(truncated_bytes.len().saturating_sub(1));
-        let mut trailing_v6_bytes = (*raw_v6_transaction).clone();
-        trailing_v6_bytes.push(0);
-        let mut truncated_v6_bytes = (*raw_v6_transaction).clone();
-        truncated_v6_bytes.truncate(truncated_v6_bytes.len().saturating_sub(1));
-
-        for malformed_bytes in [
-            &trailing_bytes,
-            &truncated_bytes,
-            &trailing_v6_bytes,
-            &truncated_v6_bytes,
-        ] {
-            assert!(matches!(
-                parse_transaction_public_fact_set(malformed_bytes, None, &activations),
-                Err(SourceError::RawTransactionParseFailed { .. })
-            ));
-        }
-        assert!(matches!(
-            transaction_public_fact_set_from_parsed(
-                &v6_transaction,
-                raw_v5_transaction,
-                None,
-                &activations,
-            ),
-            Err(SourceError::RawTransactionParseFailed { .. })
-        ));
-        assert_eq!(
-            v5_transaction.tx_version(),
-            LibrustzcashTransactionVersion::V5
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn byte_entry_points_reject_trailing_and_truncated_bytes_for_every_version()
     -> Result<(), Box<dyn std::error::Error>> {
-        // V1 to V4 have no witnessed-identifier parse, so the complete-consumption
-        // check in `parse_zebra_transaction` is their only trailing-byte guard.
+        // The complete-consumption check in `parse_zebra_transaction` is the
+        // only trailing-byte guard: identifiers come from that one parse.
         let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
         for raw_transaction in minimal_transaction_encodings()? {
             let mut trailing_bytes = raw_transaction.clone();
@@ -777,6 +709,220 @@ mod tests {
             u32::try_from(output_count)?,
         );
 
+        Ok(())
+    }
+
+    /// Every block fixture the repository holds, covering Sprout, Sapling
+    /// (v4), NU5 and NU6.2 (v5), and Ironwood and NU7 (v6), with coinbases.
+    const BLOCK_FIXTURES: [&str; 10] = [
+        include_str!(
+            "../../../services/zinder-ingest/tests/fixtures/zcash-mainnet-sprout-block-396.json"
+        ),
+        include_str!(
+            "../../../services/zinder-ingest/tests/fixtures/zcash-mainnet-sapling-spend-block-419202.json"
+        ),
+        include_str!(
+            "../../../services/zinder-ingest/tests/fixtures/zcash-testnet-sapling-block-1842432.json"
+        ),
+        include_str!(
+            "../../../services/zinder-ingest/tests/fixtures/zcash-testnet-orchard-block-1842462.json"
+        ),
+        include_str!("../../../services/zinder-ingest/tests/fixtures/z3-regtest-block-1.json"),
+        include_str!(
+            "../../../services/zinder-ingest/tests/fixtures/z3-regtest-ironwood-block-603.json"
+        ),
+        include_str!(
+            "../../../services/zinder-ingest/tests/fixtures/zakura-1.8.6-regtest-orchard-block-111.json"
+        ),
+        include_str!(
+            "../../../services/zinder-ingest/tests/fixtures/zakura-1.8.6-regtest-ironwood-block-132.json"
+        ),
+        include_str!(
+            "../../../services/zinder-ingest/tests/fixtures/zakura-1.8.6-regtest-nu7-block-162.json"
+        ),
+        include_str!(
+            "../../../services/zinder-ingest/tests/fixtures/zebra-7.0.0-regtest-nu7-block-159.json"
+        ),
+    ];
+
+    /// Identifiers as Zinder derived them before it trusted the block parse:
+    /// a second librustzcash parse of the bytes with the branch ID that Zebra's
+    /// network upgrade maps back to.
+    fn second_parse_witnessed_identifiers(
+        transaction: &ZebraTransaction,
+        raw_transaction_bytes: &[u8],
+    ) -> Result<([u8; 32], [u8; 32]), Box<dyn std::error::Error>> {
+        let branch_id = transaction
+            .network_upgrade()
+            .and_then(|network_upgrade| network_upgrade.branch_id())
+            .ok_or("witnessed transaction has no supported branch ID")?;
+        let branch_id = BranchId::try_from(u32::from(branch_id))?;
+        let mut cursor = Cursor::new(raw_transaction_bytes);
+        let reparsed = LibrustzcashTransaction::read(&mut cursor, branch_id)?;
+        if usize::try_from(cursor.position())? != raw_transaction_bytes.len() {
+            return Err("second parse left bytes unread".into());
+        }
+        if reparsed.version() != transaction.tx_version()
+            || reparsed.consensus_branch_id() != branch_id
+        {
+            return Err("second parse disagrees with the Zebra transaction".into());
+        }
+        let auth_digest: [u8; 32] = reparsed.auth_commitment().as_bytes().try_into()?;
+        Ok((*reparsed.txid().as_ref(), auth_digest))
+    }
+
+    /// Checks one transaction's byte-path and parsed-path facts against the
+    /// second-parse identifiers, and returns whether it is witnessed.
+    fn assert_identifiers_match_second_parse(
+        raw_transaction_bytes: &[u8],
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let transaction = parse_zebra_transaction(raw_transaction_bytes)?;
+        let byte_facts =
+            parse_transaction_public_fact_set(raw_transaction_bytes, None, &activations)?;
+        let parsed_facts = transaction_public_fact_set_from_parsed(
+            &transaction,
+            raw_transaction_bytes.len(),
+            None,
+            &activations,
+        )?;
+        assert_eq!(parsed_facts, byte_facts);
+        let facts = byte_facts.public_facts;
+        assert_eq!(
+            usize::try_from(facts.size_bytes)?,
+            raw_transaction_bytes.len()
+        );
+        if transaction.network_upgrade().is_none() {
+            assert_eq!(
+                facts.transaction_id,
+                TransactionId::from_bytes(transaction.hash().0)
+            );
+            assert_eq!((facts.auth_digest, facts.wtxid), (None, None));
+            return Ok(false);
+        }
+        let (transaction_id, auth_digest) =
+            second_parse_witnessed_identifiers(&transaction, raw_transaction_bytes)?;
+        let mut wtxid = [0_u8; 64];
+        wtxid[..32].copy_from_slice(&transaction_id);
+        wtxid[32..].copy_from_slice(&auth_digest);
+        assert_eq!(
+            facts.transaction_id,
+            TransactionId::from_bytes(transaction_id)
+        );
+        assert_eq!(facts.auth_digest, Some(AuthDigest::from_bytes(auth_digest)));
+        assert_eq!(facts.wtxid, Some(Wtxid::from_bytes(wtxid)));
+        Ok(true)
+    }
+
+    /// A parsed transaction with the bytes it was parsed from.
+    type FixtureTransaction = (ZebraTransaction, Vec<u8>);
+
+    fn fixture_transactions(
+        fixture_json: &str,
+    ) -> Result<Vec<FixtureTransaction>, Box<dyn std::error::Error>> {
+        let fixture: serde_json::Value = serde_json::from_str(fixture_json)?;
+        let raw_block = hex::decode(
+            fixture
+                .get("raw_block_hex")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("block fixture is missing raw_block_hex")?,
+        )?;
+        let block = ZebraBlock::zcash_deserialize(&mut Cursor::new(raw_block))?;
+        block
+            .transactions
+            .iter()
+            .map(|transaction| {
+                let raw_transaction_bytes = transaction.zcash_serialize_to_vec()?;
+                Ok((
+                    parse_zebra_transaction(&raw_transaction_bytes)?,
+                    raw_transaction_bytes,
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_fixture_transaction_keeps_the_identifiers_of_a_second_parse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut covered = BTreeSet::new();
+        for fixture_json in BLOCK_FIXTURES {
+            for (transaction, raw_transaction_bytes) in fixture_transactions(fixture_json)? {
+                assert_identifiers_match_second_parse(&raw_transaction_bytes)?;
+                covered.insert((
+                    transaction.version(),
+                    transaction.network_upgrade(),
+                    transaction.is_coinbase(),
+                ));
+            }
+        }
+
+        for required in [
+            (1, None, true),
+            (2, None, false),
+            (4, None, true),
+            (4, None, false),
+            (5, Some(ZebraNetworkUpgrade::Nu5), false),
+            (5, Some(ZebraNetworkUpgrade::Nu6_2), false),
+            (6, Some(ZebraNetworkUpgrade::Nu6_3), true),
+            (6, Some(ZebraNetworkUpgrade::Nu6_3), false),
+            (6, Some(ZebraNetworkUpgrade::Nu7), true),
+            (6, Some(ZebraNetworkUpgrade::Nu7), false),
+        ] {
+            assert!(
+                covered.contains(&required),
+                "fixtures lack {required:?}; covered {covered:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Flips one byte of a captured v5 or v6 transaction at a time.
+    ///
+    /// Flips in proofs and signatures change only the authorizing digest,
+    /// flips in note ciphertexts change only the transaction ID, and flips in
+    /// curve points or lengths usually fail the parse. Whenever the byte path
+    /// accepts the bytes, its identifiers must equal the second parse's.
+    #[test]
+    fn mutated_witnessed_transactions_keep_the_identifiers_of_a_second_parse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut witnessed = Vec::new();
+        for fixture_json in BLOCK_FIXTURES {
+            for (transaction, raw_transaction_bytes) in fixture_transactions(fixture_json)? {
+                if transaction.network_upgrade().is_some() {
+                    witnessed.push(raw_transaction_bytes);
+                }
+            }
+        }
+        let transaction_count = witnessed.len();
+        let accepted = AtomicUsize::new(0);
+        let config = Config {
+            cases: 512,
+            failure_persistence: None,
+            ..Config::default()
+        };
+        let rng = TestRng::deterministic_rng(config.rng_algorithm);
+        let mut runner = TestRunner::new_with_rng(config, rng);
+        runner
+            .run(
+                &(0..transaction_count, any::<usize>(), 1_u8..=u8::MAX),
+                |(transaction_index, position, flip)| {
+                    let mut mutated = witnessed[transaction_index].clone();
+                    let position = position % mutated.len();
+                    mutated[position] ^= flip;
+                    if parse_zebra_transaction(&mutated).is_err() {
+                        return Ok(());
+                    }
+                    accepted.fetch_add(1, Ordering::Relaxed);
+                    assert_identifiers_match_second_parse(&mutated)
+                        .map(|_| ())
+                        .map_err(|error| TestCaseError::fail(error.to_string()))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(
+            accepted.load(Ordering::Relaxed) >= 128,
+            "too few mutated transactions parsed to exercise the property"
+        );
         Ok(())
     }
 

@@ -161,7 +161,7 @@ impl ScanStore {
 
 fn lightwalletd_scan_store_fixture() -> eyre::Result<ScanStore> {
     let mut chain_fixture = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(LIGHTWALLETD_SCAN_BLOCK_COUNT);
     for height_value in 1..=LIGHTWALLETD_SCAN_BLOCK_COUNT {
         let height = BlockHeight::new(height_value);

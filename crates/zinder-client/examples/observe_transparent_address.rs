@@ -38,7 +38,7 @@ use tokio_stream::StreamExt;
 use zinder_client::{
     BlockHeight, ChainEvent, ChainEventStreamFamily, ChainIndex, ChainSnapshot,
     EndpointBackedIndex, EventStreamStart, IndexerError, Network, RemoteChainIndex,
-    RemoteOpenOptions, RetryPolicy, TransparentAddressScriptHash,
+    RemoteClientOptions, RemoteOpenOptions, RetryPolicy, TransparentAddressScriptHash,
 };
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -97,7 +97,9 @@ async fn run(endpoint: String, network: Network, address: String) -> Result<(), 
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
                 RetryPolicy::RefreshChainEpoch | RetryPolicy::RestartFromEarliestRetained => {}
-                RetryPolicy::OperatorActionRequired | RetryPolicy::ClientError => {
+                RetryPolicy::OperatorActionRequired
+                | RetryPolicy::ClientError
+                | RetryPolicy::RefreshMempoolSnapshot => {
                     return Err(error);
                 }
                 // RetryPolicy is non-exhaustive; fail closed on unknown
@@ -109,10 +111,13 @@ async fn run(endpoint: String, network: Network, address: String) -> Result<(), 
 }
 
 async fn observe_once(endpoint: &str, network: Network, address: &str) -> Result<(), IndexerError> {
-    let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
-        endpoint: endpoint.to_owned(),
-        network,
-    })?;
+    let chain_index = RemoteChainIndex::connect_with_options(
+        RemoteOpenOptions {
+            endpoint: endpoint.to_owned(),
+            network,
+        },
+        RemoteClientOptions::default().with_read_retries(),
+    )?;
 
     let wallet_info = chain_index.server_info().await?;
     println!(

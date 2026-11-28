@@ -22,8 +22,8 @@ struct Args {
     /// Canonical Testnet wallet-serving store.
     #[arg(long)]
     store: PathBuf,
-    /// Raw blob policy used by the canonical writer (none, transactions, or all).
-    #[arg(long, default_value = "transactions", value_parser = parse_raw_blob_retention)]
+    /// Minimum raw blob retention required from the canonical writer (none or all).
+    #[arg(long, default_value = "none", value_parser = parse_raw_blob_retention)]
     raw_blob_retention: RawBlobRetention,
     /// First height, inclusive.
     #[arg(long)]
@@ -37,8 +37,7 @@ struct Args {
 }
 
 fn parse_raw_blob_retention(encoded: &str) -> Result<RawBlobRetention, String> {
-    RawBlobRetention::from_kebab_case(encoded)
-        .ok_or_else(|| "expected none, transactions, or all".to_owned())
+    RawBlobRetention::from_kebab_case(encoded).ok_or_else(|| "expected none or all".to_owned())
 }
 
 fn write_action(writer: &mut impl Write, action: &ScanAction) -> Result<()> {
@@ -129,7 +128,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn archive_retention_defaults_to_transactions_and_accepts_full_blocks() -> Result<()> {
+    fn archive_retention_defaults_to_none_and_accepts_full_blocks() -> Result<()> {
         let arguments = [
             "export-wallet-scan-corpus",
             "--store",
@@ -141,13 +140,17 @@ mod tests {
         ];
         assert_eq!(
             Args::try_parse_from(arguments)?.raw_blob_retention,
-            RawBlobRetention::Transactions
+            RawBlobRetention::None
         );
         let full_blocks = arguments.into_iter().chain(["--raw-blob-retention", "all"]);
         assert_eq!(
             Args::try_parse_from(full_blocks)?.raw_blob_retention,
             RawBlobRetention::All
         );
+        let retired = arguments
+            .into_iter()
+            .chain(["--raw-blob-retention", "transactions"]);
+        assert!(Args::try_parse_from(retired).is_err());
         Ok(())
     }
 
@@ -220,7 +223,7 @@ mod tests {
         let mut attempts = 0;
         let failure = measure(None, |_| {
             attempts += 1;
-            Err(CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted {
+            Err(CanonicalStoreError::StoreNotReady {
                 path: PathBuf::from("canonical"),
             }
             .into())
@@ -229,7 +232,7 @@ mod tests {
         .ok_or_eyre("expected the admission error")?;
         assert!(matches!(
             failure.downcast::<CanonicalStoreError>()?,
-            CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. }
+            CanonicalStoreError::StoreNotReady { .. }
         ));
         assert_eq!(attempts, 1);
         Ok(())

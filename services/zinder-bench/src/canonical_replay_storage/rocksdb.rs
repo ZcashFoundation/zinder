@@ -148,6 +148,7 @@ pub async fn run_rocksdb_canonical_replay_storage(
         &config,
         &manifest,
         &external_sst_staging.file_path,
+        &bounded_open.block_cache,
         preparation_context,
     )
     .await?;
@@ -235,6 +236,7 @@ async fn build_canonical_replay_storage_sst(
     config: &RocksDbCanonicalReplayConfig,
     manifest: &FixtureManifest,
     external_sst_path: &Path,
+    block_cache: &Cache,
     preparation_context: CanonicalReplayPreparationContext,
 ) -> Result<PreparedCanonicalReplaySst, BenchError> {
     let CanonicalReplayPreparationContext {
@@ -245,6 +247,7 @@ async fn build_canonical_replay_storage_sst(
     let persistence_started = Instant::now();
     let mut sst_options = Options::default();
     sst_options.set_compression_type(DBCompressionType::Snappy);
+    sst_options.set_block_based_table_factory(&build_block_based_table_factory(block_cache));
     let mut sst_writer = SstFileWriter::create(&sst_options);
     sst_writer
         .open(external_sst_path)

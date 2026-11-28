@@ -84,6 +84,26 @@ impl From<IngestPhase> for ingest_proto::WriterPhase {
     }
 }
 
+/// Work that keeps the canonical writer from admitting traffic while following.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FollowWaitReason {
+    /// The writer has confirmed its tip and is waiting for mempool hydration.
+    MempoolHydrationAtTip,
+    /// The writer is checking its tip or processing a canonical transition.
+    CanonicalProgress,
+}
+
+impl From<FollowWaitReason> for ops_proto::FollowWaitReason {
+    fn from(reason: FollowWaitReason) -> Self {
+        match reason {
+            FollowWaitReason::MempoolHydrationAtTip => Self::MempoolHydrationAtTip,
+            FollowWaitReason::CanonicalProgress => Self::CanonicalProgress,
+        }
+    }
+}
+
 /// Stable readiness cause matching `docs/reference/readiness.md`.
 ///
 /// Causes that carry operator-actionable detail use struct variants so the
@@ -102,6 +122,9 @@ pub enum ReadinessCause {
         /// Distance between the visible chain tip and the target tip, when
         /// known. `None` for read-only services with no observable tip.
         lag_blocks: Option<u64>,
+        /// What the canonical writer is waiting for in its current follow iteration.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wait_reason: Option<FollowWaitReason>,
     },
     /// Service is healthy and accepting production traffic.
     Ready,
@@ -594,6 +617,7 @@ struct RuntimeReadiness {
     state: ReadinessState,
     dependencies: Vec<ReadinessDependency>,
     served_epoch_committed_at: Option<UnixTimestampMillis>,
+    served_tip_heights: Option<(u32, u32)>,
 }
 
 impl Default for Readiness {
@@ -615,6 +639,7 @@ impl Readiness {
                 state,
                 dependencies: Vec::new(),
                 served_epoch_committed_at: None,
+                served_tip_heights: None,
             })),
             materialized_view_identities: Arc::new(Mutex::new(Vec::new())),
             active_node: Arc::new(Mutex::new(None)),
@@ -651,7 +676,45 @@ impl Readiness {
     /// serves, from which reports derive
     /// [`ReadinessReport::served_epoch_age_seconds`].
     pub fn set_served_epoch_committed_at(&self, committed_at: UnixTimestampMillis) {
-        self.inner.lock().served_epoch_committed_at = Some(committed_at);
+        let mut guard = self.inner.lock();
+        guard.served_epoch_committed_at = Some(committed_at);
+        guard.served_tip_heights = None;
+    }
+
+    /// Publishes both tip heights and the commit time of the epoch this reader serves.
+    pub fn set_served_chain_epoch(&self, epoch: &zinder_core::ChainEpoch) {
+        let mut guard = self.inner.lock();
+        guard.served_tip_heights = Some((
+            epoch.visible_tip_height.value(),
+            epoch.settled_tip_height.value(),
+        ));
+        guard.served_epoch_committed_at = Some(epoch.created_at);
+    }
+
+    pub(crate) fn ops_status(&self, server: &crate::OpsServer) -> crate::OpsStatus {
+        let guard = self.inner.lock();
+        let cause = &guard.state.cause;
+        crate::OpsStatus {
+            status: if cause.permits_traffic() {
+                "ready"
+            } else {
+                "not_ready"
+            },
+            service: server.service_name,
+            version: server.service_version,
+            git_commit: crate::BUILD_GIT_COMMIT,
+            network: server.network_name,
+            cause: cause.metric_label(),
+            mode: None,
+            preset: None,
+            served_chain: crate::ServedChainStatus {
+                served_visible_tip_height: guard.served_tip_heights.map(|(visible, _)| visible),
+                served_settled_tip_height: guard.served_tip_heights.map(|(_, settled)| settled),
+                served_epoch_age_seconds: guard
+                    .served_epoch_committed_at
+                    .map(served_epoch_age_seconds),
+            },
+        }
     }
 
     /// Replaces the state and dependency causes with one composition's
@@ -749,6 +812,7 @@ impl Readiness {
             state,
             dependencies,
             served_epoch_committed_at,
+            ..
         } = self.inner.lock().clone();
         let materialized_view_identities = self.materialized_view_identities.lock().clone();
         let active_node = *self.active_node.lock();
@@ -759,12 +823,7 @@ impl Readiness {
             target_height: state.target_height,
             phase: state.phase,
             materialized_view_identities,
-            served_epoch_age_seconds: served_epoch_committed_at.map(|committed_at| {
-                UnixTimestampMillis::now()
-                    .value()
-                    .saturating_sub(committed_at.value())
-                    / 1_000
-            }),
+            served_epoch_age_seconds: served_epoch_committed_at.map(served_epoch_age_seconds),
             degraded: dependencies
                 .into_iter()
                 .filter(ReadinessDependency::is_degraded)
@@ -772,6 +831,13 @@ impl Readiness {
             active_node,
         }
     }
+}
+
+fn served_epoch_age_seconds(committed_at: UnixTimestampMillis) -> u64 {
+    UnixTimestampMillis::now()
+        .value()
+        .saturating_sub(committed_at.value())
+        / 1_000
 }
 
 /// Rejects new gRPC requests while the shared runtime readiness state blocks traffic.
@@ -798,6 +864,12 @@ impl Interceptor for TrafficReadinessInterceptor {
         if report.is_ready {
             Ok(request)
         } else {
+            if let Some(method) = request
+                .extensions()
+                .get::<crate::public_grpc_server::WalletRpcMethod>()
+            {
+                method.record_readiness_refusal();
+            }
             Err(not_ready_status(&report.cause))
         }
     }
@@ -830,21 +902,32 @@ pub fn not_ready_status(cause: &ReadinessCause) -> Status {
             || format!("its {configured}-block reorg window"),
             |covered| format!("the {covered} blocks its {configured}-block reorg window covered"),
         );
-        return status_with_reason_and_metadata(
+        return crate::RetryPushback::DoNotRetry.apply(status_with_reason_and_metadata(
             ErrorReason::ReorgWindowExceeded,
             format!(
                 "the canonical writer is parked: a {depth}-block replacement exceeds {coverage}, and an operator must reconcile the canonical store"
             ),
             ErrorDetails::new(),
             metadata,
-        );
+        ));
     }
-    status_with_reason_and_metadata(
+    let pushback = if matches!(
+        cause,
+        ReadinessCause::SchemaMismatch
+            | ReadinessCause::CanonicalStoreDamaged { .. }
+            | ReadinessCause::NodeCapabilityMissing { .. }
+            | ReadinessCause::WalletTransitionLimitExceeded { .. }
+    ) {
+        crate::RetryPushback::DoNotRetry
+    } else {
+        crate::RetryPushback::Backoff
+    };
+    pushback.apply(status_with_reason_and_metadata(
         ErrorReason::ServiceNotReady,
         format!("service is not ready to accept new traffic: {readiness_cause}"),
         ErrorDetails::new(),
         metadata,
-    )
+    ))
 }
 
 /// Mutable readiness state owned by the service's runtime task.
@@ -919,10 +1002,32 @@ impl ReadinessState {
         target_height: Option<u32>,
     ) -> Self {
         Self {
-            cause: ReadinessCause::Syncing { lag_blocks },
+            cause: ReadinessCause::Syncing {
+                lag_blocks,
+                wait_reason: None,
+            },
             current_height,
             target_height,
             phase: None,
+        }
+    }
+
+    /// Returns the canonical writer's syncing state for its current follow iteration.
+    #[must_use]
+    pub const fn follow_syncing(
+        wait_reason: FollowWaitReason,
+        lag_blocks: Option<u64>,
+        current_height: Option<u32>,
+        target_height: Option<u32>,
+    ) -> Self {
+        Self {
+            cause: ReadinessCause::Syncing {
+                lag_blocks,
+                wait_reason: Some(wait_reason),
+            },
+            current_height,
+            target_height,
+            phase: Some(IngestPhase::FollowingTip),
         }
     }
 
@@ -1234,11 +1339,14 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
     )]
     fn from(cause: &ReadinessCause) -> Self {
         let payload = match cause {
-            ReadinessCause::Syncing { lag_blocks } => {
-                ops_proto::readiness_cause_detail::Payload::Syncing(ops_proto::SyncingDetail {
-                    lag_blocks: *lag_blocks,
-                })
-            }
+            ReadinessCause::Syncing {
+                lag_blocks,
+                wait_reason,
+            } => ops_proto::readiness_cause_detail::Payload::Syncing(ops_proto::SyncingDetail {
+                lag_blocks: *lag_blocks,
+                wait_reason: wait_reason
+                    .map(|reason| ops_proto::FollowWaitReason::from(reason) as i32),
+            }),
             ReadinessCause::NodeCapabilityMissing { capability } => {
                 ops_proto::readiness_cause_detail::Payload::NodeCapabilityMissing(
                     ops_proto::NodeCapabilityMissingDetail {
@@ -1432,6 +1540,10 @@ mod tests {
             .err()
             .ok_or("schema mismatch readiness must reject new traffic")?;
         assert_eq!(blocked.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            blocked.metadata().get("grpc-retry-pushback-ms"),
+            Some(&tonic::metadata::MetadataValue::from_static("-1"))
+        );
 
         readiness.set(ReadinessState::reorg_window_exceeded(
             1_001,
@@ -1499,18 +1611,47 @@ mod tests {
         Ok(())
     }
 
-    // `deploy/wallet-serving-runtime-entrypoint` matches this exact text to
-    // tell ingest's mempool gate from a writer that trails its node.
     #[test]
     fn syncing_cause_renders_unknown_lag_as_null() -> Result<(), serde_json::Error> {
         for (lag_blocks, expected) in [
             (None, r#"{"syncing":{"lag_blocks":null}}"#),
             (Some(40), r#"{"syncing":{"lag_blocks":40}}"#),
         ] {
-            let rendered = serde_json::to_string(&ReadinessCause::Syncing { lag_blocks })?;
+            let rendered =
+                serde_json::to_string(&ReadinessState::syncing(lag_blocks, None, None).cause)?;
             assert_eq!(rendered, expected);
         }
         Ok(())
+    }
+
+    #[test]
+    fn syncing_detail_carries_the_current_follow_wait_reason() {
+        for (reason, expected) in [
+            (None, None),
+            (
+                Some(FollowWaitReason::MempoolHydrationAtTip),
+                Some(ops_proto::FollowWaitReason::MempoolHydrationAtTip),
+            ),
+            (
+                Some(FollowWaitReason::CanonicalProgress),
+                Some(ops_proto::FollowWaitReason::CanonicalProgress),
+            ),
+        ] {
+            let detail =
+                Option::<ops_proto::ReadinessCauseDetail>::from(&ReadinessCause::Syncing {
+                    lag_blocks: Some(1),
+                    wait_reason: reason,
+                });
+            assert_eq!(
+                detail.and_then(|detail| detail.payload),
+                Some(ops_proto::readiness_cause_detail::Payload::Syncing(
+                    ops_proto::SyncingDetail {
+                        lag_blocks: Some(1),
+                        wait_reason: expected.map(|reason| reason as i32),
+                    }
+                ))
+            );
+        }
     }
 
     #[test]
@@ -1672,7 +1813,8 @@ mod tests {
         assert!(matches!(
             report.cause,
             ReadinessCause::Syncing {
-                lag_blocks: Some(5)
+                lag_blocks: Some(5),
+                wait_reason: None,
             }
         ));
         assert_eq!(report.current_height, Some(5));
@@ -1758,7 +1900,17 @@ mod tests {
 
         let refusal = not_ready_status(&report.cause);
         assert_eq!(refusal.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            refusal.metadata().get("grpc-retry-pushback-ms"),
+            Some(&tonic::metadata::MetadataValue::from_static("-1"))
+        );
         let refusal_details = refusal.get_error_details();
+        assert_eq!(
+            refusal_details
+                .error_info()
+                .map(|error_info| error_info.reason.as_str()),
+            Some(ErrorReason::ServiceNotReady.as_str_name())
+        );
         assert_eq!(
             refusal_details
                 .error_info()
@@ -1806,7 +1958,10 @@ mod tests {
         // variant count so a new variant cannot silently drop a gauge.
         let every_cause: &[ReadinessCause] = &[
             ReadinessCause::Starting,
-            ReadinessCause::Syncing { lag_blocks: None },
+            ReadinessCause::Syncing {
+                lag_blocks: None,
+                wait_reason: None,
+            },
             ReadinessCause::Ready,
             ReadinessCause::NodeUnavailable(NodeUnavailableDetail::first_iteration(
                 "node_unreachable",
@@ -1918,7 +2073,10 @@ mod tests {
     fn every_rust_cause() -> Vec<ReadinessCause> {
         vec![
             ReadinessCause::Starting,
-            ReadinessCause::Syncing { lag_blocks: None },
+            ReadinessCause::Syncing {
+                lag_blocks: None,
+                wait_reason: None,
+            },
             ReadinessCause::Ready,
             ReadinessCause::NodeUnavailable(NodeUnavailableDetail::first_iteration(
                 "node_unreachable",

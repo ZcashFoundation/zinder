@@ -54,6 +54,23 @@ const STARTUP_PHASE_DURATION_SECONDS_BUCKETS: &[f64] = &[
     0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 60.0, 180.0, 300.0, 600.0,
 ];
 
+/// Histogram bucket boundaries (in seconds) for the wallet build-stage
+/// histogram, which records each stage once per build.
+///
+/// A stage takes milliseconds on a small store and more than an hour on a
+/// Mainnet build from genesis, so the buckets run from 0.01 s to four hours.
+const WALLET_BUILD_STAGE_DURATION_SECONDS_BUCKETS: &[f64] = &[
+    0.01, 0.1, 1.0, 10.0, 30.0, 60.0, 180.0, 600.0, 1_800.0, 3_600.0, 7_200.0, 14_400.0,
+];
+
+const GENERATION_WAIT_METRIC: &str =
+    "zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds";
+
+// Include the one-minute retention window and the additional released-read limit.
+const GENERATION_WAIT_SECONDS_BUCKETS: &[f64] = &[
+    0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 75.0, 90.0, 120.0,
+];
+
 /// Histogram bucket boundaries for the receive slots a public gRPC pool held
 /// once it admitted a request.
 ///
@@ -72,7 +89,9 @@ impl MetricsHandle {
     /// Renders the current metric snapshot in Prometheus text format.
     #[must_use]
     pub fn render(&self) -> String {
-        self.prometheus.render()
+        let mut exposition = self.prometheus.render();
+        crate::process::append_metrics(&mut exposition);
+        exposition
     }
 }
 
@@ -206,8 +225,35 @@ fn prometheus_builder() -> Result<PrometheusBuilder, BuildError> {
             STARTUP_PHASE_DURATION_SECONDS_BUCKETS,
         )?
         .set_buckets_for_metric(
+            Matcher::Full("zinder_wallet_projection_build_stage_duration_seconds".to_owned()),
+            WALLET_BUILD_STAGE_DURATION_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full(crate::public_grpc_server::RANGE_DURATION.to_owned()),
+            &[
+                0.01, 0.1, 1.0, 3.0, 10.0, 30.0, 60.0, 180.0, 600.0, 1_800.0, 3_600.0,
+            ],
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full(crate::public_grpc_server::RANGE_BLOCKS.to_owned()),
+            &[
+                0.0, 1.0, 4.0, 16.0, 64.0, 100.0, 256.0, 1_000.0, 4_096.0, 10_000.0, 100_000.0,
+            ],
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("zinder_store_settled_segment_pread_duration_seconds".to_owned()),
+            &[
+                0.000_001, 0.000_005, 0.000_01, 0.000_05, 0.000_1, 0.000_5, 0.001, 0.005, 0.01,
+                0.05, 0.1, 0.5, 1.0,
+            ],
+        )?
+        .set_buckets_for_metric(
             Matcher::Suffix("_duration_seconds".to_owned()),
             DURATION_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full(GENERATION_WAIT_METRIC.to_owned()),
+            GENERATION_WAIT_SECONDS_BUCKETS,
         )?
         .set_buckets_for_metric(
             Matcher::Full(RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC.to_owned()),
@@ -249,6 +295,22 @@ mod tests {
         MetricsInstallError, RECEIVE_SLOTS_HELD_AT_ADMISSION_METRIC, drain_on_schedule,
         install_global_recorder, prometheus_builder, spawn_upkeep,
     };
+
+    #[test]
+    fn generation_wait_buckets_cover_retention_and_released_reads() -> Result<(), super::BuildError>
+    {
+        let recorder = prometheus_builder()?.build_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!(super::GENERATION_WAIT_METRIC).record(52.0);
+        });
+        let text = recorder.handle().render();
+        for (le, count) in [("50", 0), ("60", 1), ("90", 1)] {
+            assert!(text.lines().any(|line| line == format!(
+                "zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds_bucket{{le=\"{le}\"}} {count}"
+            )));
+        }
+        Ok(())
+    }
 
     /// A histogram no bucket matcher names, so it renders as a summary.
     const UPKEEP_PROBE_METRIC: &str = "zinder_test_upkeep_probe";
@@ -335,6 +397,30 @@ mod tests {
 
         for _ in 0..3 {
             observed.recv_timeout(Duration::from_secs(10))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_rpc_range_histograms_export_long_duration_and_block_count_buckets()
+    -> Result<(), super::BuildError> {
+        let recorder = prometheus_builder()?.build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!(crate::public_grpc_server::RANGE_DURATION).record(42.0);
+            metrics::histogram!(crate::public_grpc_server::RANGE_BLOCKS).record(900);
+        });
+        let exposition = handle.render();
+        for sample in [
+            r#"zinder_wallet_rpc_block_range_duration_seconds_bucket{le="30"} 0"#,
+            r#"zinder_wallet_rpc_block_range_duration_seconds_bucket{le="60"} 1"#,
+            r#"zinder_wallet_rpc_block_range_blocks_bucket{le="256"} 0"#,
+            r#"zinder_wallet_rpc_block_range_blocks_bucket{le="1000"} 1"#,
+        ] {
+            assert!(
+                exposition.lines().any(|line| line == sample),
+                "{sample}\n{exposition}"
+            );
         }
         Ok(())
     }

@@ -41,9 +41,8 @@ use zinder_source::{NodeSource as _, ZebraJsonRpcSource, ZebraJsonRpcSourceOptio
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
-    TREE_STATE_CHECKPOINT_STRIDE,
+    CanonicalStoreBuildPlan, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore, RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, encode_fixture_block_replay_with_raw_block,
@@ -217,7 +216,7 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
     }
     fs::create_dir_all(&evidence_root)?;
     let source_before = inventory(&canonical_path)?;
-    let source_manifest = canonical_path.join("canonical-construction-manifest.v4.json");
+    let source_manifest = canonical_path.join("canonical-construction-manifest.v2.json");
     let source_manifest_before = sha256_file(&source_manifest)?;
 
     let source = ZebraJsonRpcSource::with_options(
@@ -228,6 +227,7 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?;
     let activations = source.fetch_network_upgrade_activations().await?;
@@ -236,8 +236,7 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
         &canonical_path,
         &control_secondary,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        expected_raw_blob_policy,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(expected_raw_blob_policy),
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -581,6 +580,7 @@ async fn compact_blocks_process_refreshes_after_shallow_reorg() -> Result<()> {
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?;
     let activations = source.fetch_network_upgrade_activations().await?;
@@ -789,7 +789,6 @@ fn build_reorg_process_primary(
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -810,10 +809,7 @@ fn build_reorg_process_primary(
         baseline_tip,
         UnixTimestampMillis::new(1_774_669_000_000),
     ))?;
-    let mut primary = validated.publish_baseline(publication)?;
-    // The writer admits its first schedule revision when it opens the store,
-    // and the compatibility reader opens only on an admitted schedule.
-    primary.admit_network_upgrade_schedule(activations)?;
+    let primary = validated.publish_baseline(publication)?;
     let live_block = canonical_build_blocks(chain, activations)?
         .pop()
         .ok_or_else(|| eyre!("reorg process fixture did not produce a live block"))?;
@@ -885,7 +881,6 @@ fn canonical_build_blocks(
             compact_block,
             tip_metadata: ChainTipMetadata::empty(),
             tree_state_checkpoint,
-            block_final_note_commitment_roots: None,
             transaction_blobs: Vec::new(),
             block_blob: None,
         });

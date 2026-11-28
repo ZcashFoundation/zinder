@@ -9,6 +9,7 @@
 
 use std::{num::NonZeroU32, pin::Pin, sync::Arc, time::Duration};
 
+use prost::Message as _;
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
@@ -18,6 +19,7 @@ use zinder_core::{
 };
 use zinder_proto::{
     capabilities::{CapabilitySurface, capabilities_for_surface},
+    status_for_reason,
     v1::{
         ingest::{
             MempoolTransactionRequest, ServerInfoRequest, ServerInfoResponse, WriterPhase,
@@ -30,17 +32,17 @@ use zinder_proto::{
 };
 use zinder_runtime::{
     BearerToken, BearerTokenServerInterceptor, ComposedReadiness, IngestPhase, ReadinessCause,
-    ReadinessInput, ReadinessReport, UpstreamNotReadyDetail,
+    ReadinessInput, ReadinessReport, RetryPushback, UpstreamNotReadyDetail,
 };
 use zinder_source::{NodeCapability, NodeSource, SourceError};
 use zinder_store::{
     CanonicalEventKind, block_tip_message, chain_epoch_message, chain_view_message,
-    event_stream_start_from_message, mempool_entry_message,
+    event_stream_start_from_message,
 };
 
 use crate::{
     CanonicalControlHandle, LiveMempoolOwner,
-    writer::control::{CanonicalIngestEvent, CanonicalWriterSnapshot},
+    writer::control::{CanonicalIngestEvent, CanonicalReadDeadline, CanonicalWriterSnapshot},
 };
 
 type IngestControlStream<Message> = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send>>;
@@ -48,8 +50,14 @@ type VisibleChainEventsStream = IngestControlStream<wallet::ChainEventEnvelope>;
 type MempoolEventsStream = IngestControlStream<wallet::MempoolEventEnvelope>;
 
 const DEFAULT_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 256;
-/// Hard response bound shared by the private writer control APIs.
+/// Hard response entry-count bound shared by the private writer control APIs.
 pub const MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1_024;
+/// Maximum encoded protobuf size of a `MempoolSnapshotResponse` page.
+///
+/// Leaves 512 KiB of headroom below tonic's 4 MiB default client decode limit
+/// while comfortably fitting a single consensus-maximum (~2 MiB) Zcash
+/// transaction with its compact and transparent overlays.
+pub const MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES: usize = 3_584 * 1_024;
 const CANONICAL_EVENT_PAGE_SIZE: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
 const EVENT_STREAM_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -151,10 +159,9 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
 
     async fn writer_status(
         &self,
-        _request: Request<WriterStatusRequest>,
+        request: Request<WriterStatusRequest>,
     ) -> Result<Response<WriterStatusResponse>, Status> {
         let readiness_report = self.readiness.runtime_readiness().report();
-        let node_source_observation = self.readiness.input_cause(ReadinessInput::NodeSource);
         // Fresh construction has no published epoch, and the writer services
         // its command queue only once it follows a published store.
         if readiness_report.phase == Some(IngestPhase::BulkCatchup) {
@@ -162,14 +169,16 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                 self.network,
                 None,
                 &readiness_report,
-                node_source_observation.as_ref(),
-                FollowedNode::of(&self.readiness),
+                &self.readiness,
             )));
         }
         // A parked writer reports its frozen fence while it still answers;
         // once its owner loop has stopped, readers still need the typed halt
         // rather than an unavailable control channel.
-        let chain_epoch = match self.current_chain_epoch().await {
+        let chain_epoch = match CanonicalReadDeadline::from_request(&request)
+            .wait(self.current_chain_epoch())
+            .await
+        {
             Ok(snapshot) => Some(snapshot.chain_epoch),
             Err(_)
                 if matches!(
@@ -185,8 +194,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             self.network,
             chain_epoch,
             &readiness_report,
-            node_source_observation.as_ref(),
-            FollowedNode::of(&self.readiness),
+            &self.readiness,
         )))
     }
 
@@ -194,6 +202,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         &self,
         request: Request<wallet::EventStreamStart>,
     ) -> Result<Response<Self::VisibleChainEventsStream>, Status> {
+        let deadline = CanonicalReadDeadline::from_request(&request);
         let after_cursor = match request
             .into_inner()
             .position
@@ -202,7 +211,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             wallet::event_stream_start::Position::AfterCursor(cursor) => Some(cursor),
             wallet::event_stream_start::Position::EarliestRetained(_) => None,
             wallet::event_stream_start::Position::LiveTail(_) => {
-                let snapshot = self.current_chain_epoch().await?;
+                let snapshot = deadline.wait(self.current_chain_epoch()).await?;
                 (snapshot.fence.chain_event_sequence() != 0)
                     .then(|| {
                         zinder_store::CanonicalEventCursor::at(
@@ -226,43 +235,52 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         &self,
         request: Request<wallet::MempoolSnapshotRequest>,
     ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
+        let deadline = CanonicalReadDeadline::from_request(&request);
         let request = request.into_inner();
         // The owner captures the canonical fence before touching the mempool
         // page. A tip committed during or after the page read is therefore
         // observable as a strictly newer chain event by tip-coherent consumers.
-        let (chain_epoch, page) = self
-            .mempool
-            .snapshot_page_at_canonical_tip(
+        let (chain_epoch, page) = deadline
+            .wait(self.mempool.snapshot_page_at_canonical_tip(
                 &self.canonical,
                 bounded_snapshot_page_size(request.max_entries),
                 request.from_cursor,
-            )
+            ))
             .await?;
-        Ok(Response::new(wallet::MempoolSnapshotResponse {
+        let response = wallet::MempoolSnapshotResponse {
             chain_view: Some(chain_view_message(chain_epoch)),
             events_resume_cursor: page.events_resume_cursor,
             snapshot_age_millis: page.snapshot_age_millis,
-            entries: page
-                .entries
-                .iter()
-                .map(|entry| mempool_entry_message(entry.as_ref()))
-                .collect(),
+            entries: page.entries,
             next_cursor: page.next_cursor,
             source_tip: Some(block_tip_message(
                 page.source_tip.height,
                 page.source_tip.hash,
             )),
-        }))
+        };
+        if response.encoded_len() > MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES {
+            return Err(status_for_reason(
+                ops::ErrorReason::UnsupportedWalletEncoding,
+                format!(
+                    "mempool snapshot response ({} bytes) exceeds the {MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES}-byte response budget",
+                    response.encoded_len(),
+                ),
+            ));
+        }
+        Ok(Response::new(response))
     }
 
     async fn mempool_transaction(
         &self,
         request: Request<MempoolTransactionRequest>,
     ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
+        let deadline = CanonicalReadDeadline::from_request(&request);
         let transaction_id = transaction_id_from_rpc_hex(&request.into_inner().transaction_id)?;
-        let (chain_epoch, entry) = self
-            .mempool
-            .entry_at_canonical_tip(&self.canonical, transaction_id)
+        let (chain_epoch, entry) = deadline
+            .wait(
+                self.mempool
+                    .entry_at_canonical_tip(&self.canonical, transaction_id),
+            )
             .await?;
         let entry = entry.ok_or_else(|| {
             TransactionAbsence::at_epoch(chain_epoch, true)
@@ -282,23 +300,23 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         &self,
         request: Request<wallet::MempoolEventsRequest>,
     ) -> Result<Response<Self::MempoolEventsStream>, Status> {
+        let deadline = CanonicalReadDeadline::for_mempool_events(&request);
         let request = request.into_inner();
         let start = event_stream_start_from_message(request.start)
             .ok_or_else(|| Status::invalid_argument("event stream start is required"))?;
-        let after_cursor = self
-            .mempool
-            .resolve_event_start(&self.canonical, start)
+        let stream_start = deadline
+            .wait(self.mempool.resolve_event_start(&self.canonical, start))
             .await?;
         Ok(Response::new(spawn_mempool_event_stream(
             self.mempool.clone(),
             self.canonical.clone(),
-            after_cursor,
+            stream_start,
         )))
     }
 
     async fn chain_value_pools_at_tip(
         &self,
-        _request: Request<wallet::ChainValuePoolsAtTipRequest>,
+        request: Request<wallet::ChainValuePoolsAtTipRequest>,
     ) -> Result<Response<wallet::ChainValuePoolsAtTipResponse>, Status> {
         if !self
             .node_source
@@ -309,7 +327,9 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                 "upstream node does not advertise chain_value_pools",
             ));
         }
-        let snapshot = self.current_chain_epoch().await?;
+        let snapshot = CanonicalReadDeadline::from_request(&request)
+            .wait(self.current_chain_epoch())
+            .await?;
         let value_pools = self
             .node_source
             .fetch_chain_value_pools_at_tip()
@@ -361,30 +381,68 @@ fn spawn_visible_chain_event_stream(
 fn spawn_mempool_event_stream(
     mempool: LiveMempoolOwner,
     canonical: CanonicalControlHandle,
-    mut after_cursor: Option<zinder_store::StreamCursorTokenV1>,
+    stream_start: zinder_store::CanonicalMempoolEventStreamStart,
 ) -> MempoolEventsStream {
     let (event_sender, event_receiver) = mpsc::channel(16);
     tokio::spawn(async move {
+        let (mut after_cursor, mut last_sequence, replay_through_sequence, mut head_subscription) =
+            stream_start.into_parts();
+        let mut at_live_tail = last_sequence >= replay_through_sequence;
+        let mut empty_at_head = last_sequence;
+        let mut withdrawal = std::pin::pin!(mempool.live_tail_withdrawn());
         loop {
-            match mempool.event_page(&canonical, after_cursor.clone()).await {
-                Ok(events) if events.is_empty() => {
-                    tokio::select! {
-                        () = tokio::time::sleep(EVENT_STREAM_IDLE_POLL_INTERVAL) => {}
-                        () = event_sender.closed() => return,
+            let wait_target = last_sequence.max(empty_at_head);
+            let mut notifications_closed = false;
+            if head_subscription.current_head_sequence() <= wait_target {
+                tokio::select! {
+                    biased;
+                    () = event_sender.closed() => return,
+                    status = &mut withdrawal, if at_live_tail => {
+                        let _sent = event_sender.send(Err(status)).await;
+                        return;
+                    }
+                    advanced = head_subscription.wait_for_advance_past(wait_target) => {
+                        notifications_closed = advanced.is_none();
                     }
                 }
-                Ok(events) => {
-                    for event in events {
-                        after_cursor = Some(zinder_store::StreamCursorTokenV1::from_bytes(
-                            event.cursor.clone(),
-                        ));
-                        if event_sender.send(Ok(event)).await.is_err() {
-                            return;
-                        }
-                    }
-                }
+            }
+            let observed_head = head_subscription.current_head_sequence();
+            let page = tokio::select! {
+                biased;
+                () = event_sender.closed() => return,
+                status = &mut withdrawal, if at_live_tail => Err(status),
+                page = mempool.event_page(&canonical, after_cursor.clone()) => page,
+            };
+            let events = match page {
+                Ok(events) => events,
                 Err(status) => {
-                    let _send_result = event_sender.send(Err(status)).await;
+                    let _sent = event_sender.send(Err(status)).await;
+                    return;
+                }
+            };
+            if events.is_empty() {
+                if notifications_closed {
+                    let _sent = event_sender
+                        .send(Err(Status::unavailable(
+                            "mempool event head notifications closed before delivering further events",
+                        )))
+                        .await;
+                    return;
+                }
+                empty_at_head = empty_at_head.max(observed_head);
+                continue;
+            }
+            for event in events {
+                last_sequence = event.event_sequence;
+                after_cursor = Some(zinder_store::StreamCursorTokenV1::from_bytes(
+                    event.cursor.clone(),
+                ));
+                // Replay everything retained at establishment before relying on live observation.
+                if !at_live_tail && last_sequence >= replay_through_sequence {
+                    withdrawal.set(mempool.live_tail_withdrawn());
+                    at_live_tail = true;
+                }
+                if event_sender.send(Ok(event)).await.is_err() {
                     return;
                 }
             }
@@ -469,22 +527,19 @@ fn writer_status_response(
     network: Network,
     chain_epoch: Option<ChainEpoch>,
     readiness_report: &ReadinessReport,
-    node_source_observation: Option<&ReadinessCause>,
-    followed_node: FollowedNode,
+    readiness: &ComposedReadiness,
 ) -> WriterStatusResponse {
-    let upstream_not_ready = [node_source_observation, Some(&readiness_report.cause)]
-        .into_iter()
-        .flatten()
-        .find_map(|cause| {
-            if let ReadinessCause::UpstreamNotReady(detail) = cause {
-                Some(detail)
-            } else {
-                None
-            }
-        });
-    // The health probe keeps its last observation when a probe fails, so
-    // while the follower reports the node unreachable that observation is
-    // stale and names no tip the node can still vouch for.
+    let followed_node = FollowedNode::of(readiness);
+    let node_source_observation = readiness.input_cause(ReadinessInput::NodeSource);
+    let upstream_not_ready = if let ReadinessCause::UpstreamNotReady(detail) =
+        node_source_observation
+            .as_ref()
+            .unwrap_or(&readiness_report.cause)
+    {
+        Some(detail)
+    } else {
+        None
+    };
     let upstream_tip = if followed_node.is_unavailable
         || matches!(readiness_report.cause, ReadinessCause::NodeUnavailable(_))
     {
@@ -520,10 +575,9 @@ fn writer_status_response(
 /// Returns the node tip to report from the follower's observed target and
 /// the node-health probe's not-ready report.
 ///
-/// A probe keeps its last report when a probe fails, so after an outage the
-/// report can name an older tip than the follower observes. Each height is
-/// therefore the larger of the two, and Zebra's `/ready` reports, which carry
-/// no heights, leave the follower's target.
+/// The follower can observe a newer tip between health probes. Each height
+/// is the larger of the two, and a heightless `/ready` report leaves the
+/// follower's target.
 fn upstream_tip_from_readiness(
     followed_target: Option<u32>,
     upstream_not_ready: Option<&UpstreamNotReadyDetail>,
@@ -567,6 +621,10 @@ fn chain_value_pools_response(
 fn status_from_source_error(error: &SourceError) -> Status {
     match error {
         SourceError::NodeUnavailable { reason } => Status::unavailable(reason.clone()),
+        SourceError::NodeRateLimited { .. } => RetryPushback::Backoff.apply(status_for_reason(
+            ops::ErrorReason::NodeRateLimited,
+            error.to_string(),
+        )),
         SourceError::NodeCapabilityMissing { capability } => {
             Status::failed_precondition(format!("upstream node is missing {capability}"))
         }
@@ -937,6 +995,156 @@ mod tests {
         fixture.shutdown().await
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_walk_pins_point_in_time_membership_across_same_epoch_mutations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = shared_control_fixture().await?;
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        // `shared_control_fixture` seeds `0xA1`; adding `0xB2` forms `{0xA1, 0xB2}`.
+        let entry_a = fixture_mempool_entry(chain_epoch)?;
+        let entry_b = fixture_mempool_entry_with_id(0xB2, chain_epoch)?;
+        let entry_c = fixture_mempool_entry_with_id(0xC3, chain_epoch)?;
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Added {
+                    entry: entry_b.clone(),
+                },
+                UnixTimestampMillis::new(1_750_000_000_150),
+            )
+            .await?;
+
+        let first_page = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1,
+                from_cursor: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(first_page.entries.len(), 1);
+        assert_eq!(
+            first_page.entries[0].transaction_id,
+            encode_rpc_transaction_id_hex(entry_a.transaction_id())
+        );
+
+        // Evict `A` and add `C` before page 2 runs at the same `ChainEpoch`.
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Invalidated {
+                    transaction_id: entry_a.transaction_id(),
+                    reason: zinder_core::MempoolEvictionReason::Expired,
+                },
+                UnixTimestampMillis::new(1_750_000_000_200),
+            )
+            .await?;
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Added { entry: entry_c },
+                UnixTimestampMillis::new(1_750_000_000_250),
+            )
+            .await?;
+
+        let second_page = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 10,
+                from_cursor: first_page.next_cursor,
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(second_page.entries.len(), 1);
+        assert_eq!(
+            second_page.entries[0].transaction_id,
+            encode_rpc_transaction_id_hex(entry_b.transaction_id())
+        );
+        assert_eq!(second_page.next_cursor, [] as [u8; 0]);
+
+        fixture.shutdown().await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_walk_expires_cursor_once_lru_pin_is_evicted_and_index_advances()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tonic_types::StatusExt as _;
+
+        let mut fixture = shared_control_fixture().await?;
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        for tx_byte in [0x10_u8, 0x20_u8] {
+            fixture
+                .mempool
+                .apply_event(
+                    &fixture.canonical,
+                    MempoolEvent::Added {
+                        entry: fixture_mempool_entry_with_id(tx_byte, chain_epoch)?,
+                    },
+                    UnixTimestampMillis::new(1_750_000_000_100),
+                )
+                .await?;
+        }
+
+        let oldest_walk = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1,
+                from_cursor: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+
+        let eviction_steps = u8::try_from(crate::mempool::MAX_PINNED_SNAPSHOT_WALKS)?;
+        for step in 0_u8..=eviction_steps {
+            fixture
+                .mempool
+                .apply_event(
+                    &fixture.canonical,
+                    MempoolEvent::Added {
+                        entry: fixture_mempool_entry_with_id(0x60 + step, chain_epoch)?,
+                    },
+                    UnixTimestampMillis::new(1_750_000_000_200 + u64::from(step)),
+                )
+                .await?;
+            let _newer_walk = fixture
+                .ingest_client
+                .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                    max_entries: 1,
+                    from_cursor: Vec::new(),
+                }))
+                .await?;
+        }
+
+        let Err(status) = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1,
+                from_cursor: oldest_walk.next_cursor,
+            }))
+            .await
+        else {
+            return Err("evicted snapshot walk cursor must expire after index updates".into());
+        };
+        assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+        assert_eq!(
+            status
+                .get_error_details()
+                .error_info()
+                .map(|detail| (detail.domain.clone(), detail.reason.clone())),
+            Some((
+                zinder_proto::ZINDER_ERROR_DOMAIN.to_owned(),
+                zinder_proto::v1::ops::ErrorReason::SnapshotPageCursorExpired
+                    .as_str_name()
+                    .to_owned(),
+            )),
+        );
+
+        fixture.shutdown().await
+    }
+
     /// Retention is owned by the canonical writer: once a mined envelope is
     /// pruned, its cursor must be rejected at the public replay boundary.
     #[tokio::test(flavor = "multi_thread")]
@@ -1062,6 +1270,7 @@ mod tests {
                 BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x42; 32])),
                 vec![ChainValuePool::new("transparent", true, Some(1_000))],
             ),
+            rate_limited: false,
         };
         let adapter = CanonicalIngestControlGrpcAdapter::new(
             zinder_core::Network::ZcashTestnet,
@@ -1100,6 +1309,52 @@ mod tests {
             Some(expected_epoch.id.value())
         );
 
+        fixture.shutdown().await
+    }
+
+    /// A node that refuses the value-pool read with HTTP 429 reaches the
+    /// client as `UNAVAILABLE` with `NODE_RATE_LIMITED` and retry pushback.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_limited_value_pool_read_is_unavailable_with_its_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = shared_control_fixture().await?;
+        let source = StaticValuePoolSource {
+            capabilities: NodeCapabilities::new([NodeCapability::ChainValuePools])?,
+            value_pools: ChainValuePools::new(
+                BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x42; 32])),
+                Vec::new(),
+            ),
+            rate_limited: true,
+        };
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            fixture.canonical.clone(),
+            fixture.mempool.clone(),
+            Arc::new(source),
+            ComposedReadiness::new(Readiness::default(), &[]),
+        );
+
+        let status = IngestControl::chain_value_pools_at_tip(
+            &adapter,
+            Request::new(zinder_proto::v1::wallet::ChainValuePoolsAtTipRequest {}),
+        )
+        .await
+        .err()
+        .ok_or("a rate-limited node must fail the value-pool read")?;
+
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(
+            tonic_types::StatusExt::get_details_error_info(&status)
+                .map(|error_info| error_info.reason),
+            Some("NODE_RATE_LIMITED".to_owned())
+        );
+        let delay_ms = status
+            .metadata()
+            .get("grpc-retry-pushback-ms")
+            .ok_or("missing retry pushback")?
+            .to_str()?
+            .parse::<i32>()?;
+        assert!((500..=1500).contains(&delay_ms));
         fixture.shutdown().await
     }
 
@@ -1362,12 +1617,97 @@ mod tests {
         ))
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_health_observation_withdraws_the_writer_sync_report()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
+
+        let (progress, reports) = tokio::sync::watch::channel(Some(0.5));
+        let (requests, mut seen_requests) = tokio::sync::watch::channel(0_u64);
+        let server =
+            JsonRpcTestServer::start([method("getblockchaininfo").reply_with(move |_| {
+                let progress = reports.borrow();
+                requests.send_modify(|count| *count += 1);
+                progress.map_or_else(
+                    || RpcReply::error("node temporarily unavailable"),
+                    |progress| {
+                        RpcReply::result(serde_json::json!({
+                            "blocks": 100, "estimatedheight": 100, "verificationprogress": progress,
+                        }))
+                    },
+                )
+            })])?;
+        let source = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            server.url(),
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?;
+        let fixture = shared_control_fixture().await?;
+        let composed = ComposedReadiness::new(Readiness::default(), &[ReadinessInput::NodeSource]);
+        composed.publish_admission(
+            ReadinessState::syncing(Some(5), Some(95), Some(100))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+        let adapter = writer_status_adapter(&fixture, composed.clone())?;
+        let cancel = CancellationToken::new();
+        let probe = crate::spawn_upstream_health_probe_task(
+            Arc::new(source),
+            composed.clone(),
+            Duration::from_millis(5),
+            None,
+            cancel.clone(),
+        );
+        for (next_progress, expected_input) in [
+            (Some(0.5), "upstream_not_ready"),
+            (None, "node_unavailable"),
+            (Some(0.5), "upstream_not_ready"),
+            (Some(1.0), "ready"),
+        ] {
+            progress.send(next_progress)?;
+            // The second request starts only after the probe published the first reply.
+            let second_request = *seen_requests.borrow() + 2;
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                seen_requests.wait_for(|n| *n >= second_request),
+            )
+            .await??;
+            let status =
+                IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
+                    .await?
+                    .into_inner();
+            assert_eq!(
+                status.upstream_not_ready.is_some(),
+                expected_input == "upstream_not_ready"
+            );
+            let report = composed.runtime_readiness().report();
+            assert_eq!(
+                report.cause,
+                ReadinessCause::Syncing {
+                    lag_blocks: Some(5),
+                    wait_reason: None,
+                }
+            );
+            assert_eq!(
+                (report.current_height, report.target_height),
+                (Some(95), Some(100))
+            );
+            assert_eq!(
+                composed
+                    .input_cause(ReadinessInput::NodeSource)
+                    .map(|cause| cause.metric_label()),
+                Some(expected_input)
+            );
+        }
+        cancel.cancel();
+        probe.await?;
+        fixture.shutdown().await
+    }
+
     /// Writer status reports the newer of the probe's and the follower's tip.
     ///
-    /// The JSON-RPC health fallback's not-ready report from before an outage
-    /// names an older tip than the one the follower observes once the node
-    /// returns, and a failed probe keeps that report, so the old report must
-    /// not vouch for a stale tip.
+    /// The follower can observe a newer tip after an outage and before the
+    /// next health probe completes.
     #[tokio::test(flavor = "multi_thread")]
     async fn writer_status_never_reports_a_probe_tip_below_the_followed_one()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1617,6 +1957,7 @@ mod tests {
     struct StaticValuePoolSource {
         capabilities: NodeCapabilities,
         value_pools: ChainValuePools,
+        rate_limited: bool,
     }
 
     #[async_trait]
@@ -1651,6 +1992,11 @@ mod tests {
         }
 
         async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
+            if self.rate_limited {
+                return Err(SourceError::NodeRateLimited {
+                    operation: "getblockchaininfo",
+                });
+            }
             Ok(self.value_pools.clone())
         }
     }
@@ -1724,6 +2070,335 @@ mod tests {
         fixture.shutdown().await
     }
 
+    /// Oversized raw entries fail deterministically with `UNSUPPORTED_WALLET_ENCODING`.
+    ///
+    /// Preceding entries that fit within the page budget still stream before
+    /// the oversized page is reached over the default 4 MiB tonic channel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mempool_snapshot_rejects_oversized_raw_entry_with_typed_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use prost::Message as _;
+        use tonic_types::StatusExt as _;
+
+        let mut fixture = shared_control_fixture().await?;
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        let oversized = MempoolEntry::new(
+            TransactionId::from_bytes([0xFE; 32]),
+            None,
+            RawTransactionBytes::new(vec![0xAB; 4 * 1_024 * 1_024 + 65_536]),
+            CompactTransactionData::default(),
+            MempoolObservation {
+                first_seen_unix_millis: UnixTimestampMillis::new(1_750_000_000_900),
+                first_seen_chain_epoch: chain_epoch,
+            },
+        )?;
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Added { entry: oversized },
+                UnixTimestampMillis::new(1_750_000_000_900),
+            )
+            .await?;
+
+        let first_page = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1_024,
+                from_cursor: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(first_page.entries.len(), 1);
+        assert!(first_page.encoded_len() <= super::MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES);
+        assert_ne!(first_page.next_cursor, [] as [u8; 0]);
+
+        let second_outcome = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1_024,
+                from_cursor: first_page.next_cursor,
+            }))
+            .await;
+        let Err(status) = second_outcome else {
+            return Err("oversized >4 MiB entry must fail deterministically".into());
+        };
+        assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+        let details = status.get_error_details();
+        let error_detail = details
+            .error_info()
+            .ok_or("oversized mempool entry status must carry google.rpc.ErrorInfo")?;
+        assert_eq!(error_detail.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+        assert_eq!(
+            error_detail.reason,
+            zinder_proto::v1::ops::ErrorReason::UnsupportedWalletEncoding.as_str_name()
+        );
+        fixture.shutdown().await
+    }
+
+    /// Restored owners advance their applied anchor across pruned additions.
+    ///
+    /// When retention prunes an `Added` event before a retained `Mined` event,
+    /// reconciling unchanged active entries must still pin multi-page walks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restored_owner_after_pruned_add_serves_multi_page_snapshots_without_cursor_expiry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, commands) = canonical_control_channel();
+        let parked = Arc::new(parking_lot::Mutex::new(None));
+        let command_task = spawn_fixture_owner_loop(store, commands, parked);
+        let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+        let source_tip = BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+
+        let (entry_b, entry_c) = seed_pruned_mempool_history(&canonical, source_tip).await?;
+        let mut expected_ids = [entry_b.transaction_id, entry_c.transaction_id];
+        expected_ids.sort();
+
+        let (second_source, second_feed) = zinder_testkit::MockMempoolSource::streaming();
+        let restored_owner = LiveMempoolOwner::default();
+        let (ready_signal, ready_gate) = crate::mempool_ready_channel();
+        let owner_cancel = CancellationToken::new();
+        let owner_task = tokio::spawn(crate::run_live_mempool_owner(
+            Arc::new(second_source),
+            canonical.clone(),
+            restored_owner.clone(),
+            ready_signal,
+            owner_cancel.clone(),
+        ));
+        wait_for_condition(|| second_feed.open_count() >= 1).await?;
+        second_feed.push_added(entry_b)?;
+        second_feed.push_added(entry_c)?;
+        second_feed.complete_initial_snapshot(source_tip)?;
+        wait_for_condition(|| ready_gate.admits_canonical_tip(source_tip)).await?;
+
+        let (mut client, server_cancel, server_task) =
+            serve_ingest_control_for_owner(canonical.clone(), restored_owner).await?;
+        let first_page = client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1,
+                from_cursor: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(first_page.entries.len(), 1);
+        assert_eq!(
+            first_page.entries[0].transaction_id,
+            encode_rpc_transaction_id_hex(expected_ids[0])
+        );
+        assert_ne!(first_page.next_cursor, [] as [u8; 0]);
+
+        let late_entry = synthetic_mempool_source_entry(4, 1_750_000_000_500)?;
+        let late_tx_id = late_entry.transaction_id;
+        second_feed.push_added(late_entry)?;
+        wait_for_live_mempool_entry(&mut client, late_tx_id).await?;
+
+        let second_page = client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 10,
+                from_cursor: first_page.next_cursor,
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(second_page.entries.len(), 1);
+        assert_eq!(
+            second_page.entries[0].transaction_id,
+            encode_rpc_transaction_id_hex(expected_ids[1])
+        );
+        assert_eq!(second_page.next_cursor, [] as [u8; 0]);
+
+        drop(client);
+        server_cancel.cancel();
+        server_task.await??;
+        owner_cancel.cancel();
+        owner_task.await?;
+        command_task.abort();
+        let _ = command_task.await;
+        Ok(())
+    }
+
+    async fn seed_pruned_mempool_history(
+        canonical: &crate::CanonicalControlHandle,
+        source_tip: BlockId,
+    ) -> Result<
+        (
+            zinder_source::MempoolSourceEntry,
+            zinder_source::MempoolSourceEntry,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let (first_source, first_feed) = zinder_testkit::MockMempoolSource::streaming();
+        let first_owner = LiveMempoolOwner::default();
+        let (ready_signal, ready_gate) = crate::mempool_ready_channel();
+        let first_cancel = CancellationToken::new();
+        let first_task = tokio::spawn(crate::run_live_mempool_owner(
+            Arc::new(first_source),
+            canonical.clone(),
+            first_owner.clone(),
+            ready_signal,
+            first_cancel.clone(),
+        ));
+        wait_for_condition(|| first_feed.open_count() >= 1).await?;
+        first_feed.complete_initial_snapshot(source_tip)?;
+        wait_for_condition(|| ready_gate.admits_canonical_tip(source_tip)).await?;
+
+        let entry_a = synthetic_mempool_source_entry(1, 1_750_000_000_100)?;
+        let entry_b = synthetic_mempool_source_entry(2, 1_750_000_000_200)?;
+        let entry_c = synthetic_mempool_source_entry(3, 1_750_000_000_300)?;
+        let mined_tx_id = entry_a.transaction_id;
+        first_feed.push_added(entry_a)?;
+        first_feed.push_added(entry_b.clone())?;
+        first_feed.push_added(entry_c.clone())?;
+        first_feed.push_mined(mined_tx_id, source_tip.height, source_tip.hash)?;
+        wait_for_durable_sequence(canonical, 4).await?;
+
+        let retention = MempoolEventRetentionConfig::new(Some(Duration::from_millis(1)), None);
+        let budget = zinder_store::MempoolEventRetentionStepBudget::new(
+            NonZeroU32::new(8).ok_or("retention event budget must be nonzero")?,
+            std::num::NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+        );
+        let prune_now =
+            UnixTimestampMillis::new(UnixTimestampMillis::now().value().saturating_add(10_000));
+        let prune_outcome = first_owner
+            .prune_events(canonical, prune_now, retention, budget)
+            .await?;
+        assert_eq!(prune_outcome.report.oldest_retained_sequence, Some(2));
+        assert_eq!(prune_outcome.report.pruned_added_count, 1);
+
+        first_cancel.cancel();
+        first_task.await?;
+        Ok((entry_b, entry_c))
+    }
+
+    async fn serve_ingest_control_for_owner(
+        canonical: crate::CanonicalControlHandle,
+        owner: LiveMempoolOwner,
+    ) -> Result<
+        (
+            IngestControlClient<tonic::transport::Channel>,
+            CancellationToken,
+            tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let bearer_token = BearerToken::from_str("fixture-control-token")?;
+        let node_source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            "http://127.0.0.1:1",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?);
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+        readiness.publish_admission(ReadinessState::ready(Some(1)));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listen_addr = listener.local_addr()?;
+        let server_cancel = CancellationToken::new();
+        let shutdown_token = server_cancel.clone();
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            canonical,
+            owner,
+            node_source,
+            readiness,
+        )
+        .with_bearer_token(Some(bearer_token));
+        let server_task = tokio::spawn(async move {
+            Server::builder()
+                .add_service(adapter.into_server())
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    shutdown_token.cancelled_owned(),
+                )
+                .await
+        });
+        let client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
+        Ok((client, server_cancel, server_task))
+    }
+
+    fn synthetic_mempool_source_entry(
+        transaction_nonce: u32,
+        observed_at_millis: u64,
+    ) -> Result<zinder_source::MempoolSourceEntry, Box<dyn std::error::Error>> {
+        use zebra_chain::{
+            serialization::ZcashDeserializeInto as _, transaction::Transaction as ZebraTransaction,
+        };
+
+        let mut raw_bytes = Vec::with_capacity(27);
+        raw_bytes.extend_from_slice(&0x8000_0004_u32.to_le_bytes());
+        raw_bytes.extend_from_slice(&0x892F_2085_u32.to_le_bytes());
+        raw_bytes.extend_from_slice(&[0, 0]);
+        raw_bytes.extend_from_slice(&transaction_nonce.to_le_bytes());
+        raw_bytes.extend_from_slice(&0_u32.to_le_bytes());
+        raw_bytes.extend_from_slice(&0_i64.to_le_bytes());
+        raw_bytes.extend_from_slice(&[0, 0, 0]);
+        let parsed: ZebraTransaction = raw_bytes.as_slice().zcash_deserialize_into()?;
+        Ok(zinder_source::MempoolSourceEntry {
+            transaction_id: TransactionId::from_bytes(parsed.hash().0),
+            auth_digest: parsed
+                .auth_digest()
+                .map(|digest| zinder_core::AuthDigest::from_bytes(digest.0)),
+            raw_transaction_bytes: RawTransactionBytes::new(raw_bytes),
+            observed_at_unix_millis: UnixTimestampMillis::new(observed_at_millis),
+        })
+    }
+
+    async fn wait_for_durable_sequence(
+        canonical: &crate::CanonicalControlHandle,
+        expected_sequence: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let page_size = NonZeroU32::new(16).ok_or("mempool page size must be nonzero")?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let page = canonical.mempool_event_page(None, page_size).await?;
+            if page
+                .last()
+                .is_some_and(|envelope| envelope.event_sequence >= expected_sequence)
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() > deadline {
+                return Err("timed out waiting for durable mempool event sequence".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_live_mempool_entry(
+        client: &mut IngestControlClient<tonic::transport::Channel>,
+        expected_tx_id: TransactionId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tx_hex = encode_rpc_transaction_id_hex(expected_tx_id);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if client
+                .mempool_transaction(authenticated(MempoolTransactionRequest {
+                    transaction_id: tx_hex.clone(),
+                }))
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() > deadline {
+                return Err("timed out waiting for late entry in live mempool index".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_condition(
+        mut predicate: impl FnMut() -> bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !predicate() {
+            if std::time::Instant::now() > deadline {
+                return Err("timed out waiting for mempool owner state".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
     struct SharedControlFixture {
         temporary: tempfile::TempDir,
         canonical_client: CanonicalControlClient<tonic::transport::Channel>,
@@ -1792,7 +2467,10 @@ mod tests {
             .await?;
         let source_tip =
             zinder_core::BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
-        let _certification = owner.try_complete_hydration(&canonical, source_tip).await?;
+        let endpoint = crate::mempool_ready_channel().0.observe_node_endpoint();
+        let _certification = owner
+            .try_complete_hydration(&canonical, source_tip, &endpoint)
+            .await?;
 
         let bearer_token = BearerToken::from_str("fixture-control-token")?;
         let node_source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
@@ -2015,5 +2693,562 @@ mod tests {
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_750_000_000_000),
         }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct IdleMempoolStats {
+        mempool_event_page_calls: u64,
+        event_row_reads: u64,
+        envelope_decodes: u64,
+        rocksdb_keys_read: u64,
+        rocksdb_bytes_read: u64,
+    }
+
+    async fn read_idle_mempool_stats(
+        stats_tx: &tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<IdleMempoolStats>>,
+    ) -> Result<IdleMempoolStats, Box<dyn std::error::Error>> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        stats_tx.send(reply_tx).await?;
+        Ok(reply_rx.await?)
+    }
+
+    fn spawn_instrumented_owner_loop(
+        mut store: zinder_store::RocksDbCanonicalStore,
+        mut commands: tokio::sync::mpsc::Receiver<crate::writer::control::CanonicalControlCommand>,
+        mut stats_rx: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<IdleMempoolStats>>,
+    ) -> tokio::task::JoinHandle<()> {
+        use rust_rocksdb::statistics::Ticker;
+
+        tokio::spawn(async move {
+            let mut mempool_event_page_calls = 0_u64;
+            loop {
+                tokio::select! {
+                    maybe_command = commands.recv() => {
+                        let Some(command) = maybe_command else {
+                            return;
+                        };
+                        if matches!(
+                            &command,
+                            crate::writer::control::CanonicalControlCommand::MempoolEventPage { .. }
+                        ) {
+                            mempool_event_page_calls = mempool_event_page_calls.saturating_add(1);
+                        }
+                        let _scheduling = apply_canonical_control_command(&mut store, command);
+                    }
+                    maybe_stats = stats_rx.recv() => {
+                        let Some(reply_tx) = maybe_stats else {
+                            return;
+                        };
+                        let counts = store.mempool_event_read_counts();
+                        let _sent = reply_tx.send(IdleMempoolStats {
+                            mempool_event_page_calls,
+                            event_row_reads: counts.event_row_reads,
+                            envelope_decodes: counts.envelope_decodes,
+                            rocksdb_keys_read: store.rocksdb_ticker_count(Ticker::NumberKeysRead),
+                            rocksdb_bytes_read: store.rocksdb_ticker_count(Ticker::BytesRead),
+                        });
+                    }
+                }
+            }
+        })
+    }
+
+    async fn advance_idle_virtual_time(duration: Duration) {
+        let step = Duration::from_millis(250);
+        let steps = duration.as_millis() / step.as_millis();
+        for _ in 0..steps {
+            tokio::time::advance(step).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "verifies 1 and multiple caught-up subscribers before and after head advances"
+    )]
+    async fn caught_up_idle_mempool_subscribers_perform_zero_durable_reads_or_decodes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, commands) = canonical_control_channel();
+        let (stats_tx, stats_rx) = tokio::sync::mpsc::channel(8);
+        let command_task = spawn_instrumented_owner_loop(store, commands, stats_rx);
+        let owner = LiveMempoolOwner::default();
+        let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+
+        let large_entry = MempoolEntry::new(
+            TransactionId::from_bytes([0x99; 32]),
+            None,
+            RawTransactionBytes::new(vec![0x5A; 256 * 1_024]),
+            CompactTransactionData::default(),
+            MempoolObservation {
+                first_seen_unix_millis: UnixTimestampMillis::new(1_750_000_000_100),
+                first_seen_chain_epoch: chain_epoch,
+            },
+        )?;
+        owner
+            .apply_event(
+                &canonical,
+                MempoolEvent::Added { entry: large_entry },
+                UnixTimestampMillis::new(1_750_000_000_100),
+            )
+            .await?;
+        let source_tip = BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+        let endpoint = crate::mempool_ready_channel().0.observe_node_endpoint();
+        owner
+            .try_complete_hydration(&canonical, source_tip, &endpoint)
+            .await?;
+
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+        readiness.publish_admission(ReadinessState::ready(Some(1)));
+        let node_source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            "http://127.0.0.1:1",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?);
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            canonical.clone(),
+            owner.clone(),
+            node_source,
+            readiness,
+        );
+
+        let subscribe = |position| {
+            IngestControl::mempool_events(
+                &adapter,
+                Request::new(MempoolEventsRequest {
+                    start: Some(event_stream_start_message(&position)),
+                }),
+            )
+        };
+
+        // 1 caught-up idle subscriber incurs zero reads/decodes while idle.
+        let single_tail = subscribe(EventStreamStartPosition::LiveTail)
+            .await?
+            .into_inner();
+        tokio::task::yield_now().await;
+        let single_baseline = read_idle_mempool_stats(&stats_tx).await?;
+        advance_idle_virtual_time(Duration::from_secs(5)).await;
+        assert_eq!(read_idle_mempool_stats(&stats_tx).await?, single_baseline);
+
+        // Scale to 8 concurrent caught-up subscribers (LiveTail, AfterCursor, drained EarliestRetained).
+        let mut drained = subscribe(EventStreamStartPosition::EarliestRetained)
+            .await?
+            .into_inner();
+        let first_event = drained
+            .next()
+            .await
+            .ok_or("EarliestRetained omitted initial event")??;
+        let head_cursor = zinder_store::StreamCursorTokenV1::from_bytes(first_event.cursor);
+        let mut subscribers = vec![single_tail, drained];
+        for _ in 0..3 {
+            subscribers.push(
+                subscribe(EventStreamStartPosition::LiveTail)
+                    .await?
+                    .into_inner(),
+            );
+        }
+        for _ in 0..3 {
+            subscribers.push(
+                subscribe(EventStreamStartPosition::AfterCursor(head_cursor.clone()))
+                    .await?
+                    .into_inner(),
+            );
+        }
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let multi_baseline = read_idle_mempool_stats(&stats_tx).await?;
+        advance_idle_virtual_time(Duration::from_secs(5)).await;
+        assert_eq!(read_idle_mempool_stats(&stats_tx).await?, multi_baseline);
+
+        // Advancing the head wakes all 8 subscribers immediately with strict order.
+        let next_entry = fixture_mempool_entry_with_id(0xB7, chain_epoch)?;
+        let next_txid = next_entry.transaction_id();
+        owner
+            .apply_event(
+                &canonical,
+                MempoolEvent::Added { entry: next_entry },
+                UnixTimestampMillis::new(1_750_000_000_200),
+            )
+            .await?;
+        owner
+            .apply_event(
+                &canonical,
+                MempoolEvent::Mined {
+                    transaction_id: next_txid,
+                    mined_height: chain_epoch.visible_tip_height,
+                    block_hash: chain_epoch.visible_tip_hash,
+                },
+                UnixTimestampMillis::new(1_750_000_000_300),
+            )
+            .await?;
+        owner
+            .apply_event(
+                &canonical,
+                MempoolEvent::Invalidated {
+                    transaction_id: TransactionId::from_bytes([0x99; 32]),
+                    reason: zinder_core::MempoolEvictionReason::Expired,
+                },
+                UnixTimestampMillis::new(1_750_000_000_400),
+            )
+            .await?;
+
+        for subscriber in &mut subscribers {
+            let mut observed_sequences = Vec::with_capacity(3);
+            for _ in 0..3 {
+                let envelope = tokio::time::timeout(Duration::from_millis(200), subscriber.next())
+                    .await?
+                    .ok_or("caught-up subscriber ended prematurely")??;
+                observed_sequences.push(envelope.event_sequence);
+            }
+            assert_eq!(observed_sequences, vec![2, 3, 4]);
+        }
+
+        // Remaining idle subscribers stay at zero reads/decodes after catch-up.
+        subscribers.truncate(6);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let post_advance_baseline = read_idle_mempool_stats(&stats_tx).await?;
+        advance_idle_virtual_time(Duration::from_secs(5)).await;
+        assert_eq!(
+            read_idle_mempool_stats(&stats_tx).await?,
+            post_advance_baseline
+        );
+
+        drop(subscribers);
+        command_task.abort();
+        let _ = command_task.await;
+        Ok(())
+    }
+
+    fn unique_mempool_entry(
+        nonce: u32,
+        raw_bytes_len: usize,
+        chain_epoch: ChainEpoch,
+    ) -> Result<MempoolEntry, zinder_core::MempoolEntryBuildError> {
+        let mut txid_bytes = [0_u8; 32];
+        txid_bytes[..4].copy_from_slice(&nonce.to_le_bytes());
+        txid_bytes[31] = 0x7E;
+        MempoolEntry::new(
+            TransactionId::from_bytes(txid_bytes),
+            None,
+            RawTransactionBytes::new(vec![0x55; raw_bytes_len]),
+            CompactTransactionData::default(),
+            MempoolObservation {
+                first_seen_unix_millis: UnixTimestampMillis::new(1_750_000_000_100),
+                first_seen_chain_epoch: chain_epoch,
+            },
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exercises replay-to-live ordering, slow consumers, expiry, and owner withdrawal"
+    )]
+    async fn mempool_stream_handles_replay_to_live_ordering_slow_consumers_expiry_and_withdrawal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tonic_types::StatusExt as _;
+
+        let mut fixture = shared_control_fixture().await?;
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        let expired_at = UnixTimestampMillis::new(1_750_000_000_100);
+
+        // Seed 69 more durable events (70 total, spanning >1 page of 64 events)
+        // using 8 KiB Added payloads so paused HTTP/2 consumers hit backpressure
+        // inside page 1.
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Invalidated {
+                    transaction_id: TransactionId::from_bytes([0xA1; 32]),
+                    reason: zinder_core::MempoolEvictionReason::Expired,
+                },
+                expired_at,
+            )
+            .await?;
+        for idx in 1_u32..=34 {
+            let entry = unique_mempool_entry(idx, 8 * 1_024, chain_epoch)?;
+            fixture
+                .mempool
+                .apply_event(
+                    &fixture.canonical,
+                    MempoolEvent::Added { entry },
+                    expired_at,
+                )
+                .await?;
+        }
+        for idx in 1_u32..=34 {
+            let entry = unique_mempool_entry(idx, 8, chain_epoch)?;
+            let event = if idx % 2 == 0 {
+                MempoolEvent::Invalidated {
+                    transaction_id: entry.transaction_id(),
+                    reason: zinder_core::MempoolEvictionReason::Expired,
+                }
+            } else {
+                MempoolEvent::Mined {
+                    transaction_id: entry.transaction_id(),
+                    mined_height: chain_epoch.visible_tip_height,
+                    block_hash: chain_epoch.visible_tip_hash,
+                }
+            };
+            fixture
+                .mempool
+                .apply_event(&fixture.canonical, event, expired_at)
+                .await?;
+        }
+
+        let mut replay_to_live = fixture
+            .ingest_client
+            .mempool_events(authenticated(MempoolEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::EarliestRetained,
+                )),
+            }))
+            .await?
+            .into_inner();
+        let mut fast_live = fixture
+            .ingest_client
+            .mempool_events(authenticated(MempoolEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::LiveTail,
+                )),
+            }))
+            .await?
+            .into_inner();
+        let mut slow_live = fixture
+            .ingest_client
+            .mempool_events(authenticated(MempoolEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::LiveTail,
+                )),
+            }))
+            .await?
+            .into_inner();
+        // Direct adapter streams hit the bounded mpsc::channel(16) directly without
+        // HTTP/2 or loopback socket buffering.
+        let direct_adapter =
+            writer_status_adapter(&fixture, ComposedReadiness::new(Readiness::default(), &[]))?;
+        let mut channel_backpressured_slow_live = IngestControl::mempool_events(
+            &direct_adapter,
+            Request::new(MempoolEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::LiveTail,
+                )),
+            }),
+        )
+        .await?
+        .into_inner();
+        // Paused at EarliestRetained so mpsc::channel(16) stops it inside page 1
+        // (seqs 1..=64) before requesting page 2 (after_cursor = seq 64).
+        let mut paused_for_expiry = IngestControl::mempool_events(
+            &direct_adapter,
+            Request::new(MempoolEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::EarliestRetained,
+                )),
+            }),
+        )
+        .await?
+        .into_inner();
+
+        // Advance the head across replay-to-live (events 71..=100, >16 channel capacity).
+        for idx in 101_u32..=114 {
+            let entry = unique_mempool_entry(idx, 8 * 1_024, chain_epoch)?;
+            fixture
+                .mempool
+                .apply_event(
+                    &fixture.canonical,
+                    MempoolEvent::Added { entry },
+                    expired_at,
+                )
+                .await?;
+        }
+        for idx in 101_u32..=114 {
+            let entry = unique_mempool_entry(idx, 8, chain_epoch)?;
+            let event = if idx % 2 == 0 {
+                MempoolEvent::Invalidated {
+                    transaction_id: entry.transaction_id(),
+                    reason: zinder_core::MempoolEvictionReason::Expired,
+                }
+            } else {
+                MempoolEvent::Mined {
+                    transaction_id: entry.transaction_id(),
+                    mined_height: chain_epoch.visible_tip_height,
+                    block_hash: chain_epoch.visible_tip_hash,
+                }
+            };
+            fixture
+                .mempool
+                .apply_event(&fixture.canonical, event, expired_at)
+                .await?;
+        }
+        let unexpired_entry = unique_mempool_entry(200, 8 * 1_024, chain_epoch)?;
+        let unexpired_txid = unexpired_entry.transaction_id();
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Added {
+                    entry: unexpired_entry,
+                },
+                UnixTimestampMillis::now(),
+            )
+            .await?;
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Invalidated {
+                    transaction_id: unexpired_txid,
+                    reason: zinder_core::MempoolEvictionReason::Expired,
+                },
+                UnixTimestampMillis::now(),
+            )
+            .await?;
+
+        let mut cursor_1_bytes = Vec::new();
+        let mut replay_sequences = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let envelope = tokio::time::timeout(Duration::from_secs(2), replay_to_live.next())
+                .await?
+                .ok_or("replay_to_live ended early")??;
+            if envelope.event_sequence == 1 {
+                cursor_1_bytes = envelope.cursor.clone();
+            }
+            replay_sequences.push(envelope.event_sequence);
+        }
+        assert_eq!(replay_sequences, (1_u64..=100).collect::<Vec<_>>());
+
+        let mut fast_sequences = Vec::with_capacity(30);
+        for _ in 0..30 {
+            let envelope = tokio::time::timeout(Duration::from_secs(2), fast_live.next())
+                .await?
+                .ok_or("fast_live ended early")??;
+            fast_sequences.push(envelope.event_sequence);
+        }
+        assert_eq!(fast_sequences, (71_u64..=100).collect::<Vec<_>>());
+
+        // Slow consumers recover independently after head moved past channel & HTTP/2 buffers.
+        let mut slow_sequences = Vec::with_capacity(30);
+        for _ in 0..30 {
+            let envelope = tokio::time::timeout(Duration::from_secs(2), slow_live.next())
+                .await?
+                .ok_or("slow_live ended early")??;
+            slow_sequences.push(envelope.event_sequence);
+        }
+        assert_eq!(slow_sequences, (71_u64..=100).collect::<Vec<_>>());
+        let mut direct_slow_sequences = Vec::with_capacity(30);
+        for _ in 0..30 {
+            let envelope = tokio::time::timeout(
+                Duration::from_secs(2),
+                channel_backpressured_slow_live.next(),
+            )
+            .await?
+            .ok_or("channel_backpressured_slow_live ended early")??;
+            direct_slow_sequences.push(envelope.event_sequence);
+        }
+        assert_eq!(direct_slow_sequences, (71_u64..=100).collect::<Vec<_>>());
+
+        // Prune 1..=98 so floor reaches 99 while paused_for_expiry still has seq 64 as page-2 cursor.
+        let retention = MempoolEventRetentionConfig::new(
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_millis(1)),
+        );
+        let budget = zinder_store::MempoolEventRetentionStepBudget::new(
+            NonZeroU32::new(64).ok_or("nonzero budget")?,
+            std::num::NonZeroU64::new(1_000_000).ok_or("nonzero bytes")?,
+        );
+        let prune_now =
+            UnixTimestampMillis::new(UnixTimestampMillis::now().value().saturating_sub(500));
+        loop {
+            let outcome = fixture
+                .mempool
+                .prune_events(&fixture.canonical, prune_now, retention, budget)
+                .await?;
+            if !outcome.has_immediate_work() {
+                assert_eq!(outcome.report.oldest_retained_sequence, Some(99));
+                break;
+            }
+        }
+
+        // Open-time expiry check on pruned cursor 1.
+        let expired_attach = fixture
+            .ingest_client
+            .mempool_events(authenticated(MempoolEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::AfterCursor(
+                        zinder_store::StreamCursorTokenV1::from_bytes(cursor_1_bytes),
+                    ),
+                )),
+            }))
+            .await
+            .err()
+            .ok_or("pruned cursor attached unexpectedly")?;
+        assert_eq!(expired_attach.code(), Code::FailedPrecondition);
+        assert_eq!(
+            expired_attach
+                .get_error_details()
+                .error_info()
+                .map(|detail| detail.reason.as_str()),
+            Some(zinder_proto::v1::ops::ErrorReason::MempoolEventCursorExpired.as_str_name())
+        );
+
+        // Mid-stream expiry once paused_for_expiry drains page 1 and advances to page 2.
+        let mut saw_expiry = false;
+        for _ in 0..70 {
+            match tokio::time::timeout(Duration::from_secs(2), paused_for_expiry.next()).await? {
+                Some(Ok(_)) => {}
+                Some(Err(status)) => {
+                    assert_eq!(status.code(), Code::FailedPrecondition);
+                    assert_eq!(
+                        status
+                            .get_error_details()
+                            .error_info()
+                            .map(|detail| detail.reason.as_str()),
+                        Some(
+                            zinder_proto::v1::ops::ErrorReason::MempoolEventCursorExpired
+                                .as_str_name()
+                        )
+                    );
+                    saw_expiry = true;
+                    break;
+                }
+                None => return Err("paused stream closed without cursor expiry".into()),
+            }
+        }
+        assert!(saw_expiry, "expected MempoolEventCursorExpired mid-stream");
+
+        // Owner withdrawal ends caught-up streams with NodeUnavailable.
+        fixture.mempool.withdraw_for_rebuild().await;
+        for stream in [&mut replay_to_live, &mut fast_live, &mut slow_live] {
+            let terminal = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await?
+                .ok_or("caught-up stream closed instead of reporting withdrawal")?;
+            let Err(status) = terminal else {
+                return Err("caught-up stream stayed open after owner withdrawal".into());
+            };
+            assert_eq!(status.code(), Code::Unavailable);
+            assert_eq!(
+                status
+                    .get_error_details()
+                    .error_info()
+                    .map(|detail| detail.reason.as_str()),
+                Some(zinder_proto::v1::ops::ErrorReason::NodeUnavailable.as_str_name())
+            );
+        }
+
+        drop(replay_to_live);
+        drop(fast_live);
+        drop(slow_live);
+        drop(channel_backpressured_slow_live);
+        drop(paused_for_expiry);
+        fixture.shutdown().await
     }
 }

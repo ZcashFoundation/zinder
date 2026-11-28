@@ -6,12 +6,14 @@ use eyre::{OptionExt as _, Result, ensure, eyre};
 use prost::{Message as _, encoding::bytes};
 use serde::Serialize;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, Network, wire::encode_rpc_block_hash_hex,
+    BlockHash, BlockHeight, BlockHeightRange, CompactBlockArtifact, Network,
+    wire::encode_rpc_block_hash_hex,
 };
 use zinder_proto::{v1::wallet, wire::compact_block_message};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, DEFAULT_REORG_WINDOW_BLOCKS, RawBlobRetention,
-    RocksDbCanonicalSecondary, RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreReadyEvidence, CanonicalStoreRequirements,
+    DEFAULT_REORG_WINDOW_BLOCKS, RawBlobRetention, RocksDbCanonicalSecondary,
+    RocksDbResourceBudget,
 };
 
 use crate::corpus::{Pool, ScanAction, shifted_ephemeral_key};
@@ -35,7 +37,7 @@ pub(crate) fn read_range(
     raw_blob_retention: RawBlobRetention,
     start: u32,
     end: u32,
-    mut visit: impl FnMut(ScanAction) -> Result<()>,
+    visit: impl FnMut(ScanAction) -> Result<()>,
 ) -> Result<ProjectionReport> {
     ensure!(
         start > 0 && start <= end,
@@ -46,12 +48,26 @@ pub(crate) fn read_range(
         store,
         temporary.path(),
         Network::ZcashTestnet,
-        CanonicalStoreWorkload::Wallet,
-        raw_blob_retention,
+        CanonicalStoreRequirements::for_blob_retention(raw_blob_retention),
         CanonicalReorgPolicy::new(DEFAULT_REORG_WINDOW_BLOCKS)?,
         RocksDbResourceBudget::canonical_reader_defaults(),
     )?;
-    let fence = reader.ready_evidence();
+    measure_retained_range(
+        &reader.ready_evidence(),
+        start,
+        end,
+        |range| Ok(reader.compact_blocks_in_range(range)?),
+        visit,
+    )
+}
+
+fn measure_retained_range(
+    fence: &CanonicalStoreReadyEvidence,
+    start: u32,
+    end: u32,
+    mut read_blocks: impl FnMut(BlockHeightRange) -> Result<Vec<CompactBlockArtifact>>,
+    mut visit: impl FnMut(ScanAction) -> Result<()>,
+) -> Result<ProjectionReport> {
     ensure!(
         start >= fence.first_retained_block.height.value()
             && end <= fence.visible_tip.height.value(),
@@ -68,7 +84,7 @@ pub(crate) fn read_range(
     loop {
         let last = first.saturating_add(127).min(end);
         let range = BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last));
-        let blocks = reader.compact_blocks_in_range(range)?;
+        let blocks = read_blocks(range)?;
         ensure!(
             usize::try_from(last - first + 1)? == blocks.len(),
             "short compact-block range"
@@ -191,6 +207,14 @@ mod tests {
         group::{Group as _, GroupEncoding as _, ff::Field as _},
         pallas,
     };
+    use zinder_core::{
+        BlockId, CompactShieldedAction, CompactTransaction, CompactTransactionData,
+        NetworkUpgradeActivations, TransactionId,
+    };
+    use zinder_testkit::{
+        CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
+        network_upgrade_fixtures::sample_regtest_upgrade_activations,
+    };
 
     use super::*;
 
@@ -309,6 +333,236 @@ mod tests {
         assert_eq!(orchard.hint, Some((point * shift).to_bytes()));
         assert_eq!(malformed.hint, None);
         assert_eq!(ironwood.hint, Some((point.double() * shift).to_bytes()));
+        Ok(())
+    }
+
+    #[derive(prost::Message)]
+    struct HintedAction {
+        #[prost(bytes = "vec", tag = "1")]
+        nullifier: Vec<u8>,
+        #[prost(bytes = "vec", tag = "2")]
+        commitment: Vec<u8>,
+        #[prost(bytes = "vec", tag = "3")]
+        ephemeral_key: Vec<u8>,
+        #[prost(bytes = "vec", tag = "4")]
+        ciphertext: Vec<u8>,
+        #[prost(bytes = "vec", tag = "5")]
+        shifted_key: Vec<u8>,
+    }
+
+    #[derive(prost::Message)]
+    struct HintedData {
+        #[prost(message, repeated, tag = "4")]
+        orchard_actions: Vec<HintedAction>,
+    }
+
+    #[derive(prost::Message)]
+    struct HintedTransaction {
+        #[prost(message, required, tag = "3")]
+        scan_fields: HintedData,
+    }
+
+    #[derive(prost::Message)]
+    struct HintedBlock {
+        #[prost(message, repeated, tag = "5")]
+        transactions: Vec<HintedTransaction>,
+    }
+
+    #[derive(prost::Message)]
+    struct HintedItem {
+        #[prost(message, required, tag = "2")]
+        block: HintedBlock,
+    }
+
+    #[test]
+    fn counts_enclosing_lengths_that_grow_past_two_varint_bytes() -> Result<()> {
+        const ACTIONS: usize = 100;
+        const MAX_TWO_BYTE_VARINT: usize = 16_383;
+        let original = action(pallas::Point::generator().to_bytes());
+        let fields = wallet::CompactTransactionData {
+            orchard_actions: vec![original.clone(); ACTIONS],
+            ..Default::default()
+        };
+        let hinted_fields = HintedData {
+            orchard_actions: (0..ACTIONS)
+                .map(|_| HintedAction {
+                    nullifier: original.nullifier.clone(),
+                    commitment: original.commitment.clone(),
+                    ephemeral_key: original.ephemeral_key.clone(),
+                    ciphertext: original.ciphertext.clone(),
+                    shifted_key: vec![4; 32],
+                })
+                .collect(),
+        };
+        assert!(fields.encoded_len() <= MAX_TWO_BYTE_VARINT);
+        assert!(hinted_fields.encoded_len() > MAX_TWO_BYTE_VARINT);
+        let block = wallet::CompactBlock {
+            transactions: vec![wallet::CompactTransaction {
+                data: Some(fields),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let expected = HintedItem {
+            block: HintedBlock {
+                transactions: vec![HintedTransaction {
+                    scan_fields: hinted_fields,
+                }],
+            },
+        };
+        assert!(block.encoded_len() <= MAX_TWO_BYTE_VARINT);
+        assert_eq!(
+            expected.encoded_len() - stream_item(block.clone()).encoded_len(),
+            ACTIONS * 34 + 3,
+        );
+
+        let mut report = ProjectionReport::default();
+        measure_block(block, &mut report, &mut |_| Ok(()))?;
+        assert_eq!(report.shifted_keys, ACTIONS);
+        assert_eq!(
+            report.shielded_with_hints_native_item_bytes,
+            u64::try_from(expected.encode_to_vec().len())?,
+        );
+        Ok(())
+    }
+
+    fn retained_testnet_chain() -> Result<ChainFixture> {
+        let mut chain = ChainFixture::new(Network::ZcashTestnet).extend_blocks(130);
+        let ephemeral_key = pallas::Point::generator().to_bytes();
+        for marker in [2, 129, 130] {
+            let block = chain
+                .block_at(BlockHeight::new(u32::from(marker)))
+                .ok_or_eyre("fixture is missing a marked block")?;
+            let id = TransactionId::from_bytes([marker; 32]);
+            let compact = CompactBlockArtifact::new(
+                BlockId::new(block.height, block.hash),
+                block.parent_hash,
+                block.block_time_seconds,
+                vec![CompactTransaction {
+                    index: 0,
+                    transaction_id: id,
+                    data: CompactTransactionData {
+                        orchard_actions: vec![CompactShieldedAction {
+                            nullifier: [marker; 32],
+                            commitment: [0; 32],
+                            ephemeral_key,
+                            ciphertext: [0; 52],
+                        }],
+                        ..Default::default()
+                    },
+                }],
+                block.compact_block_artifact().chain_metadata(),
+            )?;
+            let transaction = FixtureTransactionRows::from_raw_transaction(
+                id,
+                block.height,
+                block.hash,
+                0,
+                [marker],
+            );
+            chain = chain
+                .with_transaction_rows(transaction)
+                .with_compact_block_artifact(compact);
+        }
+        Ok(chain)
+    }
+
+    #[test]
+    fn measures_both_retained_endpoints_and_rejects_a_disconnected_batch() -> Result<()> {
+        let chain = retained_testnet_chain()?;
+        let activations = NetworkUpgradeActivations::new(
+            Network::ZcashTestnet,
+            sample_regtest_upgrade_activations().activations().to_vec(),
+        )?;
+        let baseline = CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(1));
+        let writer = CanonicalWriterFixture::publish(&baseline, &activations)?;
+        let temporary = tempfile::tempdir()?;
+        let reader = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+            writer.canonical_primary_path(),
+            temporary.path(),
+            Network::ZcashTestnet,
+            CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
+            writer.canonical_primary()?.reorg_policy(),
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let fence = reader.ready_evidence();
+        let mut ranges = Vec::new();
+        let mut nullifiers = Vec::new();
+        let report = measure_retained_range(
+            &fence,
+            2,
+            130,
+            |range| {
+                ranges.push((range.start.value(), range.end.value()));
+                Ok(reader.compact_blocks_in_range(range)?)
+            },
+            |action| {
+                nullifiers.push(action.nullifier);
+                Ok(())
+            },
+        )?;
+        assert_eq!(ranges, [(2, 129), (130, 130)]);
+        assert_eq!((report.start_height, report.end_height), (2, 130));
+        let tip = chain
+            .block_at(BlockHeight::new(130))
+            .ok_or_eyre("fixture is missing the range endpoint")?;
+        assert_eq!(report.end_hash, encode_rpc_block_hash_hex(tip.hash));
+        assert_eq!(nullifiers, [[2; 32], [129; 32], [130; 32]]);
+
+        for (start, end) in [(1, 130), (2, 131)] {
+            let error = measure_retained_range(
+                &fence,
+                start,
+                end,
+                |_| Err(eyre!("outside range reached the reader")),
+                |_| Ok(()),
+            )
+            .err()
+            .ok_or_eyre("outside range was accepted")?;
+            assert_eq!(
+                error.to_string(),
+                "range is outside the retained Testnet snapshot"
+            );
+        }
+
+        assert_disconnected_boundary_is_not_published(&reader)
+    }
+
+    fn assert_disconnected_boundary_is_not_published(
+        reader: &RocksDbCanonicalSecondary,
+    ) -> Result<()> {
+        let output = tempfile::tempdir()?;
+        let path = output.path().join("wallet.scan");
+        let tip = reader
+            .compact_block_at(BlockHeight::new(130))?
+            .ok_or_eyre("missing retained tip")?
+            .into_parts();
+        let disconnected = CompactBlockArtifact::new(
+            tip.block_id,
+            BlockHash::from_bytes([0xff; 32]),
+            tip.time,
+            tip.transactions,
+            tip.chain_metadata,
+        )?;
+        let error = crate::measure(Some(&path), |visit| {
+            measure_retained_range(
+                &reader.ready_evidence(),
+                2,
+                130,
+                |range| {
+                    if range.start.value() == 130 {
+                        return Ok(vec![disconnected.clone()]);
+                    }
+                    Ok(reader.compact_blocks_in_range(range)?)
+                },
+                visit,
+            )
+        })
+        .err()
+        .ok_or_eyre("disconnected batch was accepted")?;
+        assert_eq!(error.to_string(), "chain discontinuity at 130");
+        assert!(!path.exists());
+        assert_eq!(output.path().read_dir()?.count(), 0);
         Ok(())
     }
 }

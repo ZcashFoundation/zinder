@@ -6,6 +6,7 @@
 mod json_rpc_mempool;
 mod mempool_source;
 mod node_auth;
+mod node_call_budget;
 mod node_capabilities;
 mod node_set;
 mod node_source;
@@ -43,9 +44,11 @@ pub use node_source::{
 };
 pub use node_target::{
     DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS, DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS,
-    DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR, DEFAULT_NODE_REQUEST_TIMEOUT_SECS,
-    NodeAuthSection, NodeConfigError, NodeFallbackSections, NodeHealthConfig, NodeHealthSection,
-    NodeIndexerClientIdentity, NodeIndexerTls, NodeIndexerTlsSection, NodeSection, NodeTarget,
+    DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR, DEFAULT_NODE_MAX_CONCURRENT_REQUESTS,
+    DEFAULT_NODE_REQUEST_TIMEOUT_SECS, DISABLED_SENTINEL, IndexerTlsMaterial,
+    MAX_NODE_MAX_CONCURRENT_REQUESTS, NodeAuthSection, NodeConfigError, NodeFallbackSections,
+    NodeHealthConfig, NodeHealthSection, NodeIndexerClientIdentity, NodeIndexerTls,
+    NodeIndexerTlsSection, NodeSection, NodeTarget, REDACTED_PLACEHOLDER, SecretNodeInput,
     redact_endpoint_url,
 };
 pub use source_block::{
@@ -54,7 +57,7 @@ pub use source_block::{
 };
 pub use source_chain_update::{
     SourceChainCursor, SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats,
-    SourceChainUpdate,
+    SourceChainUpdate, SourceKnownTip,
 };
 pub use source_error::{SourceError, SourceFailureClass};
 pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};
@@ -64,8 +67,8 @@ pub use source_transaction::{
 };
 pub use source_transparent_address::{
     MAX_TRANSPARENT_ADDRESS_LOOKUP_ADDRESSES, SourceTransparentAddressBalance,
-    SourceTransparentUnspentOutput, TransparentAddressLookup, TransparentAddressLookupError,
-    TransparentAddressRowLimit,
+    SourceTransparentUnspentOutput, SourceTransparentUtxoPage, TransparentAddressLookup,
+    TransparentAddressLookupError, TransparentAddressRowLimit,
 };
 pub use transparent_address::{
     MAX_TRANSPARENT_ADDRESS_TEXT_BYTES, TransparentAddressParseError, parse_transparent_address,
@@ -73,8 +76,8 @@ pub use transparent_address::{
 };
 pub use transport::{
     ResilientClient, ZEBRA_REBUILD_THRESHOLD, ZebraIndexerChannelOptions, ZebraTransportError,
-    build_zebra_json_rpc_client, connect_zebra_indexer_channel, is_transport_failure,
-    validate_zebra_indexer_endpoint,
+    build_zebra_json_rpc_client, connect_zebra_indexer_channel, connect_zebra_indexer_channel_lazy,
+    is_transport_failure, validate_zebra_indexer_endpoint,
 };
 pub use upstream_health::{
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR, UPSTREAM_HEALTH_REASON_INSUFFICIENT_PEERS,

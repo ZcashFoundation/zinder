@@ -4,12 +4,11 @@ use std::{path::PathBuf, time::Duration};
 
 use clap::Args;
 use serde::Serialize;
-use zinder_bench::BenchError;
+use zinder_bench::{BenchError, report::WalletBuildStageSeconds};
 use zinder_core::wire::decode_zinder_native_chain_name;
 use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalReorgPolicy, RawBlobRetention, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_wallet_rocksdb::{RocksDbWalletBuildOptions, build_wallet_from_canonical};
 
@@ -43,7 +42,7 @@ pub(crate) struct RocksDbWalletRebuildArgs {
     /// Persisted raw-blob retention contract expected on the canonical store.
     #[arg(
         long = "raw-blob-retention",
-        default_value = "transactions",
+        default_value = "none",
         value_parser = parse_raw_blob_retention
     )]
     raw_blob_retention: RawBlobRetention,
@@ -86,6 +85,7 @@ pub(crate) struct RocksDbWalletRebuildReport {
     cold_validation_reorg_undo_readback_seconds: f64,
     ready_publication_seconds: f64,
     total_seconds: f64,
+    build_stages: Vec<WalletBuildStageSeconds>,
 }
 
 /// Rebuilds one wallet projection from the exact admitted canonical fence.
@@ -109,6 +109,7 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
                 || BenchError::invalid_argument("max response bytes must be non-zero"),
             )?,
             broadcast_timeout: None,
+            ..ZebraJsonRpcSourceOptions::default()
         },
     )?;
     let activations =
@@ -117,7 +118,6 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
     let canonical_store = RocksDbCanonicalStore::open_ready(
         &args.canonical_store,
         &activations,
-        CanonicalStoreWorkload::Wallet,
         args.raw_blob_retention,
         CanonicalReorgPolicy::new(args.supported_reorg_depth)?,
         RocksDbResourceBudget::canonical_reader_defaults(),
@@ -135,6 +135,8 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
             sst_target_logical_bytes: WALLET_SST_TARGET_LOGICAL_BYTES,
             max_accounted_reorg_undo_bytes: WALLET_ACCOUNTED_REORG_UNDO_BYTES,
             supported_reorg_depth: args.supported_reorg_depth,
+            accumulator_hashing_workers:
+                RocksDbWalletBuildOptions::automatic_accumulator_hashing_workers(),
         },
     )?;
     Ok(rebuild_report(&canonical_ready, &outcome.report))
@@ -182,12 +184,13 @@ fn rebuild_report(
             .as_secs_f64(),
         ready_publication_seconds: durations.ready_publication.as_secs_f64(),
         total_seconds: durations.total.as_secs_f64(),
+        build_stages: WalletBuildStageSeconds::from_report(report),
     }
 }
 
 pub(crate) fn parse_raw_blob_retention(encoded: &str) -> Result<RawBlobRetention, String> {
     RawBlobRetention::from_kebab_case(encoded)
-        .ok_or_else(|| "--raw-blob-retention must be one of none, transactions, or all".to_owned())
+        .ok_or_else(|| "--raw-blob-retention must be none or all".to_owned())
 }
 
 fn validate_rebuild_args(args: &RocksDbWalletRebuildArgs) -> Result<(), BenchError> {

@@ -4,23 +4,22 @@ use std::collections::HashSet;
 
 use rust_rocksdb::{DB, WriteBatch, WriteOptions};
 use zinder_core::{
-    BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFactsDigestVersion,
-    CanonicalBlockFactsSequenceDigestBuilder, ChainEpochId, CommitmentTreeAccumulator,
+    BlockFinalNoteCommitmentRoots, BlockHeight, BlockHeightRange, BlockId,
+    CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigestBuilder,
+    CanonicalBlockReplayFormatVersion, ChainEpochId, CommitmentTreeAccumulator,
     CommitmentTreeCheckpoint, NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootHash,
-    UnixTimestampMillis,
+    UnixTimestampMillis, encode_canonical_block_replay,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 
 use super::{
     CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalEventFence, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RocksDbCanonicalStore,
+    CanonicalStoreReadyEvidence, CanonicalStoredData, RocksDbCanonicalStore,
     block_load::{
-        decode_block_final_note_commitment_roots, encode_block_position,
-        encode_transaction_position, read_persisted_tip_metadata, validate_live_block,
+        decode_stored_tree_state_roots, encode_block_position, read_persisted_tip_metadata,
+        validate_live_block,
     },
-    block_replay::{
-        BLOCK_REPLAY_COLUMN_FAMILY, read_persisted_replay, resume_persisted_sequence_checkpoint,
-    },
+    block_replay::{read_persisted_replay, resume_persisted_sequence_checkpoint},
     control::encode_ready_store_control_with_revisions,
     displaced_archive::{
         CanonicalDisplacedBlock, DisplacedArchiveEvent, PreparedDisplacedArchiveWrite,
@@ -31,13 +30,14 @@ use super::{
         validate_live_replacement_publication,
     },
     rocksdb::{
-        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
         BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
-        CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY, STORE_CONTROL_KEY,
-        SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
+        CHAIN_EVENT_COLUMN_FAMILY, LIVE_TAIL_BLOCK_COLUMN_FAMILY,
+        LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY, STORE_CONTROL_KEY, SUBTREE_ROOT_COLUMN_FAMILY,
         TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
-    subtree_load::{encode_subtree_root_key, required_subtree_root_ranges},
+    settled_segments::store_access,
+    stored_set::required_subtree_root_ranges,
+    subtree_load::encode_subtree_root_key,
     tree_state_replay::append_compact_block_commitments,
 };
 
@@ -238,12 +238,12 @@ impl PreparedLiveReplacement {
                     "canonical replacement cannot begin at height zero",
                 )
             })?);
-        let parent_replay = read_persisted_replay(&store.bounded_open.db, parent_height)?;
+        let parent_replay = read_persisted_replay(store.segment_context(), parent_height)?;
         let parent_id = BlockId::new(
             parent_height,
             parent_replay.replay.facts().block_header.block_hash,
         );
-        let parent_metadata = read_persisted_tip_metadata(&store.bounded_open.db, parent_id)?;
+        let parent_metadata = read_persisted_tip_metadata(store.segment_context(), parent_id)?;
         validate_replacement_blocks(
             store,
             &replacement.blocks,
@@ -276,7 +276,7 @@ impl PreparedLiveReplacement {
         let (chain_epoch_id, chain_event_sequence) = next_live_fence(&store.ready_evidence)?;
         let displaced = capture_displaced_blocks(store, reverted_range)?;
         let old_tip_metadata =
-            read_persisted_tip_metadata(&store.bounded_open.db, store.ready_evidence.visible_tip)?;
+            read_persisted_tip_metadata(store.segment_context(), store.ready_evidence.visible_tip)?;
         let deletions = PreparedCanonicalDeletions::new(
             store,
             reverted_range,
@@ -310,7 +310,6 @@ impl PreparedLiveReplacement {
             ..store.ready_evidence
         };
         let encoded_control = encode_ready_store_control_with_revisions(
-            store.workload,
             &store.build_plan,
             store.cursor_auth_key,
             &ready_evidence,
@@ -324,8 +323,10 @@ impl PreparedLiveReplacement {
             let next_metadata = replacement_block.block.tip_metadata;
             replacement_rows.push(PreparedLiveBlockRows::from_block(
                 replacement_block.block,
+                store.stored_set,
                 previous_metadata,
                 replacement_block.subtree_roots,
+                true,
             )?);
             previous_metadata = next_metadata;
         }
@@ -413,7 +414,7 @@ impl PreparedLiveReplacement {
             ));
         }
         validate_live_replacement_publication(
-            &store.bounded_open.db,
+            store.segment_context(),
             &self.ready_evidence,
             self.previous_epoch_id,
             self.reverted_range,
@@ -427,8 +428,13 @@ impl PreparedLiveReplacement {
             .checked_sub(1)
             .map(BlockHeight::new)
             .ok_or_else(|| CanonicalStoreError::live_commit("replacement has no parent"))?;
+        let ctx = super::settled_segments::store_access::SegmentStoreContext {
+            db: &store.bounded_open.db,
+            segment_cache: Some(&store.segment_cache),
+            sealed_segments: Some(&store.sealed_segments),
+        };
         advance_ready_replay_tail(
-            &store.bounded_open.db,
+            ctx,
             reorg_policy,
             &self.ready_evidence,
             common_parent_height,
@@ -469,11 +475,7 @@ fn validate_replacement_blocks(
     })?;
     let mut expected_parent = parent_id;
     for replacement in blocks {
-        validate_live_block(
-            store.workload,
-            store.build_plan.raw_blob_retention(),
-            &replacement.block,
-        )?;
+        validate_live_block(&store.stored_set, &replacement.block)?;
         let header = &replacement.block.facts.block_header;
         let expected_height = expected_parent.height.next().ok_or_else(|| {
             CanonicalStoreError::live_commit("replacement height exceeds u32::MAX")
@@ -546,7 +548,7 @@ fn replacement_visible_sequence(
     blocks: &[CanonicalReplacementBlock],
 ) -> Result<super::CanonicalSequenceCheckpoint, CanonicalStoreError> {
     let prefix = resume_persisted_sequence_checkpoint(
-        &store.bounded_open.db,
+        store.segment_context(),
         store.ready_evidence.sequence_checkpoint,
         parent_height,
         store.reorg_policy().reorg_window_blocks(),
@@ -599,62 +601,58 @@ fn capture_displaced_blocks(
     store: &RocksDbCanonicalStore,
     reverted_range: BlockHeightRange,
 ) -> Result<Vec<CanonicalDisplacedBlock>, CanonicalStoreError> {
+    let retains_raw_blocks = store.stored_set.contains(CanonicalStoredData::BlockBodies);
     reverted_range
         .into_iter()
         .map(|height| {
-            let replay = read_family_required(
-                &store.bounded_open.db,
-                BLOCK_REPLAY_COLUMN_FAMILY,
-                &encode_block_position(height),
-                "displaced canonical replay read",
-            )?;
-            let validated = read_persisted_replay(&store.bounded_open.db, height)?;
+            let validated = read_persisted_replay(store.segment_context(), height)?;
+            let replay_bytes = encode_canonical_block_replay(
+                validated.replay.facts(),
+                CanonicalBlockReplayFormatVersion::V1,
+                CanonicalBlockFactsDigestVersion::V1,
+            )
+            .into_bytes();
             let block_id = BlockId::new(height, validated.replay.facts().block_header.block_hash);
-            let raw_block_bytes = read_family_optional(
-                &store.bounded_open.db,
-                BLOCK_BLOB_COLUMN_FAMILY,
-                &encode_block_position(height),
-                "displaced raw block read",
-            )?;
-            let final_note_commitment_roots = read_family_optional(
-                &store.bounded_open.db,
-                BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-                &encode_block_position(height),
-                "displaced final roots read",
-            )?
-            .map(|encoded| {
-                decode_block_final_note_commitment_roots(height, block_id.hash, &encoded)
-            })
-            .transpose()
-            .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
-            if raw_block_bytes.is_some()
-                != store.build_plan.raw_blob_retention().retains_block_blobs()
-            {
+            let raw_block_bytes =
+                store_access::read_live_tail_raw_block(&store.bounded_open.db, height)?
+                    .map(|raw_block| raw_block.raw_block_bytes);
+            if raw_block_bytes.is_some() != retains_raw_blocks {
                 return Err(CanonicalStoreError::live_commit(
                     "canonical suffix raw block rows do not match admitted retention",
                 ));
             }
-            match store.workload {
-                CanonicalStoreWorkload::Wallet if final_note_commitment_roots.is_some() => {
-                    return Err(CanonicalStoreError::live_commit(
-                        "wallet canonical suffix contains explorer-only rows",
-                    ));
-                }
-                CanonicalStoreWorkload::Explorer if final_note_commitment_roots.is_none() => {
-                    return Err(CanonicalStoreError::live_commit(
-                        "explorer canonical suffix is missing archive facts",
-                    ));
-                }
-                CanonicalStoreWorkload::Wallet | CanonicalStoreWorkload::Explorer => {}
-            }
+            let final_note_commitment_roots =
+                capture_displaced_block_roots(&store.bounded_open.db, block_id)?;
             Ok(CanonicalDisplacedBlock {
                 block_id,
-                replay_bytes: replay,
+                replay_bytes,
                 raw_block_bytes,
                 final_note_commitment_roots,
             })
         })
         .collect()
+}
+
+fn capture_displaced_block_roots(
+    db: &DB,
+    block_id: BlockId,
+) -> Result<Option<BlockFinalNoteCommitmentRoots>, CanonicalStoreError> {
+    let Some(encoded_checkpoint) = read_family_optional(
+        db,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        &encode_block_position(block_id.height),
+        "displaced tree-state checkpoint read",
+    )?
+    else {
+        return Ok(None);
+    };
+    let roots = decode_stored_tree_state_roots(&encoded_checkpoint)
+        .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?
+        .into_block_roots(block_id.height, block_id.hash);
+    Ok(
+        (roots.sapling.is_some() || roots.orchard.is_some() || roots.ironwood.is_some())
+            .then_some(roots),
+    )
 }
 
 struct PreparedCanonicalDeletions {
@@ -671,7 +669,7 @@ impl PreparedCanonicalDeletions {
     ) -> Result<Self, CanonicalStoreError> {
         let mut rows = Vec::new();
         for (height, block) in reverted_range.into_iter().zip(displaced) {
-            let persisted = read_persisted_replay(&store.bounded_open.db, height)?;
+            let persisted = read_persisted_replay(store.segment_context(), height)?;
             let facts = persisted.replay.facts();
             if facts.block_header.block_hash != block.block_id.hash {
                 return Err(CanonicalStoreError::live_commit(
@@ -681,11 +679,9 @@ impl PreparedCanonicalDeletions {
             let height_key = encode_block_position(height).to_vec();
             for family in [
                 BLOCK_HEADER_COLUMN_FAMILY,
-                BLOCK_REPLAY_COLUMN_FAMILY,
-                COMPACT_BLOCK_COLUMN_FAMILY,
-                BLOCK_BLOB_COLUMN_FAMILY,
+                LIVE_TAIL_BLOCK_COLUMN_FAMILY,
+                LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY,
                 TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-                BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
             ] {
                 rows.push((family, height_key.clone()));
             }
@@ -693,14 +689,7 @@ impl PreparedCanonicalDeletions {
                 BLOCK_HASH_INDEX_COLUMN_FAMILY,
                 encode_internal_block_hash(facts.block_header.block_hash).to_vec(),
             ));
-            for (index, transaction) in facts.transactions.iter().enumerate() {
-                let index = u32::try_from(index).map_err(|_| {
-                    CanonicalStoreError::live_commit("displaced transaction index exceeds u32")
-                })?;
-                rows.push((
-                    TRANSACTION_BLOB_COLUMN_FAMILY,
-                    encode_transaction_position(height, index).to_vec(),
-                ));
+            for transaction in &facts.transactions {
                 rows.push((
                     TRANSACTION_LOCATION_COLUMN_FAMILY,
                     encode_internal_transaction_id(transaction.public_facts.transaction_id)
@@ -752,16 +741,6 @@ impl PreparedCanonicalDeletions {
         }
         Ok(())
     }
-}
-
-fn read_family_required(
-    db: &DB,
-    family: &'static str,
-    key: &[u8],
-    operation: &'static str,
-) -> Result<Vec<u8>, CanonicalStoreError> {
-    read_family_optional(db, family, key, operation)?
-        .ok_or_else(|| CanonicalStoreError::live_commit(format!("required {family} row is absent")))
 }
 
 fn read_family_optional(

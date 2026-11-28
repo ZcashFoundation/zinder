@@ -15,9 +15,11 @@ publish.workspace = true
 clap = { workspace = true, features = ["derive"] }
 getrandom.workspace = true
 hex.workspace = true
+rustix.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream.workspace = true
@@ -36,7 +38,10 @@ zinder-wallet-rocksdb.workspace = true
 [dev-dependencies]
 eyre.workspace = true
 parking_lot.workspace = true
-tempfile.workspace = true
+rust-rocksdb.workspace = true
+tokio = { workspace = true, features = ["process"] }
+zinder-ingest.workspace = true
+zinder-source.workspace = true
 zinder-testkit.workspace = true
 
 [[bin]]

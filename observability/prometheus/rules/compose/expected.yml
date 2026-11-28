@@ -1,0 +1,10 @@
+groups:
+  - name: zinder-compose-targets
+    labels: {stack: zinder}
+    rules:
+      - record: zinder:expected_target
+        expr: vector(1)
+        labels: {service: zinder-index, job: zinder-index, instance: "zinder-index:9105"}
+      - record: zinder:expected_target
+        expr: vector(1)
+        labels: {service: zinder-serve, job: zinder-serve, instance: "zinder-index:9108"}
