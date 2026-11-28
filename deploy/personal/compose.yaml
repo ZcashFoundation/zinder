@@ -29,10 +29,10 @@ services:
       retries: 12
 
   zinder:
-    image: ${ZINDER_IMAGE:-ghcr.io/zcashfoundation/zinder:${ZINDER_VERSION:?set the Zinder release tag}}
+    image: ${DEPLOY_IMAGE:-ghcr.io/zcashfoundation/zinder:${DEPLOY_VERSION:?set the Zinder release tag}}
     restart: unless-stopped
     stop_grace_period: 30s
-    mem_limit: ${ZINDER_SERVE_MEMORY_LIMIT:-8g}
+    mem_limit: ${DEPLOY_SERVE_MEMORY_LIMIT:-8g}
     ulimits:
       nofile:
         soft: 65536
@@ -40,16 +40,17 @@ services:
     depends_on:
       zebra:
         condition: service_healthy
-    command: ["serve", "--preset", "light-wallet"]
+    command: ["serve"]
     environment:
+      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_DEPLOYMENT__PROFILE:-light-wallet}
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
       ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
       ZINDER_NODE__AUTH__METHOD: cookie
       ZINDER_NODE__AUTH__PATH: /var/run/zebra-auth/.cookie
       ZINDER_STORAGE__DATA_DIR: /var/lib/zinder
       ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
-      ZINDER_COMPAT__LISTEN_ADDR: "0.0.0.0:9067"
-      ZINDER_OPS__LISTEN_ADDR: "0.0.0.0:9108"
+      ZINDER_COMPAT__LISTEN_ADDR: "[::]:9067"
+      ZINDER_OPS__LISTEN_ADDR: "[::]:9108"
     volumes:
       - zinder-data:/var/lib/zinder
       - zebra-auth:/var/run/zebra-auth:ro

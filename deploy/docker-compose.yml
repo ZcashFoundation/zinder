@@ -33,6 +33,7 @@ x-zinder-image: &zinder-image
     target: zinder
     args:
       ZINDER_PASTA_ASM: ${DEPLOY_PASTA_ASM:-1}
+      ZINDER_X86_64_CPU_BASELINE: ${DEPLOY_X86_64_CPU_BASELINE:-x86-64-v3}
 
 services:
   state-init:
