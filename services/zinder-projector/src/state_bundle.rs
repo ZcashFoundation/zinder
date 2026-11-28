@@ -1612,7 +1612,8 @@ struct WalletRowCountsManifest {
     transparent_address_transaction: u64,
     transparent_address_balance: u64,
     reorg_undo: u64,
-    block_hash_by_height: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    block_hash_by_height: Option<u64>,
 }
 
 impl WalletRowCountsManifest {
@@ -1625,11 +1626,15 @@ impl WalletRowCountsManifest {
             transparent_address_transaction: counts.transparent_address_transaction_count,
             transparent_address_balance: counts.transparent_address_balance_count,
             reorg_undo: counts.reorg_undo_count,
-            block_hash_by_height: counts.block_hash_by_height_count,
+            block_hash_by_height: Some(counts.block_hash_by_height_count),
         }
     }
 
     fn validate(&self) -> Result<(), StateBundleError> {
+        require_manifest_value(
+            self.block_hash_by_height.is_some(),
+            "wallet checkpoint row_counts must include block_hash_by_height for schema version 2",
+        )?;
         require_manifest_value(
             self.transparent_unspent_output == self.transparent_unspent_output_by_address,
             "wallet unspent primary and address-index row counts differ",
@@ -2311,6 +2316,78 @@ pub(crate) mod tests {
             assert!(message.contains(observed), "{message}");
             assert!(message.contains("this release reads only"), "{message}");
             assert!(message.contains("rebuild the wallet store"), "{message}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn genuine_v1_manifest_without_block_hash_row_count_reports_schema_mismatch_and_v2_requires_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = StateBundleManifest::from_admitted(
+            "bundle-a",
+            &sample_canonical_admission(7),
+            &sample_wallet_admission(7)?,
+        )?;
+        let valid = serde_json::to_value(manifest)?;
+
+        let temporary = TempDir::new()?;
+        let paths = prepare_state_bundle_capture(temporary.path(), "bundle-a")?;
+        fs::create_dir(paths.canonical_checkpoint())?;
+        fs::create_dir(paths.wallet_checkpoint())?;
+        let mut v1_manifest = valid.clone();
+        *v1_manifest
+            .pointer_mut("/wallet_checkpoint/schema_version")
+            .ok_or("wallet schema_version pointer must resolve")? = Value::from(1_u16);
+        v1_manifest
+            .pointer_mut("/wallet_checkpoint/row_counts")
+            .and_then(Value::as_object_mut)
+            .ok_or("wallet row_counts pointer must resolve")?
+            .remove("block_hash_by_height");
+        fs::write(paths.manifest(), serde_json::to_vec_pretty(&v1_manifest)?)?;
+
+        let v1_error = StateBundleManifest::read(paths.root(), Network::ZcashRegtest)
+            .err()
+            .ok_or("genuine v1 manifest without block_hash_by_height was admitted")?;
+        assert!(
+            matches!(v1_error, StateBundleError::ManifestContract { .. }),
+            "{v1_error}"
+        );
+        let v1_message = v1_error.to_string();
+        assert!(
+            v1_message.contains("wallet schema version 1"),
+            "{v1_message}"
+        );
+        assert!(
+            v1_message.contains("this release reads only"),
+            "{v1_message}"
+        );
+        assert!(
+            v1_message.contains("rebuild the wallet store"),
+            "{v1_message}"
+        );
+
+        let mut v2_missing = valid.clone();
+        v2_missing
+            .pointer_mut("/wallet_checkpoint/row_counts")
+            .and_then(Value::as_object_mut)
+            .ok_or("wallet row_counts pointer must resolve")?
+            .remove("block_hash_by_height");
+        let mut v2_null = valid;
+        *v2_null
+            .pointer_mut("/wallet_checkpoint/row_counts/block_hash_by_height")
+            .ok_or("wallet block_hash_by_height pointer must resolve")? = Value::Null;
+        for invalid_v2 in [v2_missing, v2_null] {
+            let decoded = serde_json::from_value::<StateBundleManifest>(invalid_v2)?;
+            let error = decoded
+                .validate(Network::ZcashRegtest)
+                .err()
+                .ok_or("v2 manifest without block_hash_by_height was admitted")?;
+            assert!(
+                matches!(error, StateBundleError::ManifestContract { .. }),
+                "{error}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("block_hash_by_height"), "{message}");
         }
         Ok(())
     }

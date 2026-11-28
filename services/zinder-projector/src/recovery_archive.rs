@@ -1654,6 +1654,13 @@ mod tests {
             .pointer_mut("/wallet_checkpoint/schema_version")
             .ok_or("inner manifest has a wallet schema")? =
             serde_json::Value::from(unsupported_schema);
+        if unsupported_schema == 1 {
+            inner
+                .pointer_mut("/wallet_checkpoint/row_counts")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or("inner manifest has wallet row_counts")?
+                .remove("block_hash_by_height");
+        }
         let inner = serde_json::to_vec(&inner)?;
         fs::write(archive.join(STATE_BUNDLE_MANIFEST_FILE_NAME), &inner)?;
         let missing = RecoveryArchiveFile {
