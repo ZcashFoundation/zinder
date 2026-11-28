@@ -1,7 +1,0 @@
-kind: added
-body: Require an Upgrade class (compatible, additive-schema, projection-layout, or canonical-layout) on every changelog fragment, derive and render one deterministic Upgrade class header per release starting at v0.28.0, and validate release headers and prerelease archives in scripts/validate-changelog.sh.
-time: 2026-11-27T21:47:00Z
-custom:
-  Bump: minor
-  PR: "716"
-  Upgrade: compatible
