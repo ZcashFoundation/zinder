@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.29.0
 
 # Canonical Zinder runtime image builder.
 #
