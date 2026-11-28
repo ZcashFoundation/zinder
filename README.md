@@ -29,14 +29,14 @@ flowchart LR
 
 ## Quickstart
 
-Start Zinder on Testnet with Docker Compose (requires an archive node URL in `deploy/.env.testnet` and control token files in `${ZINDER_CONTROL_SECRETS_DIR}`; zero TOML config files needed):
+Start Zinder on Testnet with Docker Compose (requires an archive node URL in `deploy/profiles/testnet/zinder.env` and control token files in `${DEPLOY_CONTROL_SECRETS_DIR}`; zero TOML config files needed):
 
 ```bash
-export ZINDER_CONTROL_SECRETS_DIR=/etc/zinder/control-secrets
-sudo install -d -o root -g 10001 -m 0750 "$ZINDER_CONTROL_SECRETS_DIR"
-head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin "$ZINDER_CONTROL_SECRETS_DIR/ingest.token"
-head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin "$ZINDER_CONTROL_SECRETS_DIR/checkpoint.token"
-docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml up -d
+export DEPLOY_CONTROL_SECRETS_DIR=/etc/zinder/control-secrets
+sudo install -d -o root -g 10001 -m 0750 "$DEPLOY_CONTROL_SECRETS_DIR"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin "$DEPLOY_CONTROL_SECRETS_DIR/ingest.token"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin "$DEPLOY_CONTROL_SECRETS_DIR/checkpoint.token"
+docker compose --env-file deploy/profiles/testnet/deploy.env -f deploy/docker-compose.yml up -d
 ```
 
 Or run the unified `zinder` CLI directly against an existing store or node:

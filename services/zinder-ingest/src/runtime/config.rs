@@ -9,27 +9,28 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::BlockHeight;
+pub use zinder_runtime::IngestCoverage;
 use zinder_runtime::{
-    ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection, DeploymentToml,
-    IngestControlSection, IngestControlWriterToml, NetworkSection, NetworkToml, NodeFallbacksToml,
-    NodeToml, OpsSection, OpsServerError, OpsToml, ResolvedIngestControlWriter, ResolvedRetention,
-    RetentionSection, RetentionToml, RuntimeService, SecuritySection, SecurityToml,
-    StorageRoleSection, StorageRoleToml, derive_canonical_path, duration_as_millis_u64,
-    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
-    resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_writer_with_data_dir,
-    resolve_manual_raw_blob_retention, resolve_materialized_view_writer_rocksdb_budget,
-    resolve_ops_listen_addr, resolve_retention, section_defaults::DEFAULT_DATA_DIR,
-    validate_optional_data_dir,
+    ConfigError, ConfigLoader, DEFAULT_ALLOW_PUBLIC_BIND, DeploymentProfile, DeploymentSection,
+    IngestConstructionSection, IngestControlSection, IngestFollowSection, IngestMempoolSection,
+    IngestPhaseClassificationSection, IngestRunOverridesSection, IngestSection,
+    IngestTreeStateDensificationSection, IngestTreeStateVerificationSection, NetworkSection,
+    OpsSection, OpsServerError, ResolvedIngestControlWriter, ResolvedRetention, RetentionSection,
+    RuntimeService, SecuritySection, StorageRoleSection, StorageSection, TreeStateSelectionName,
+    ZinderConfig, derive_canonical_path, duration_as_millis_u64, guard_optional_serving_bind,
+    require_field, resolve_allow_public_bind, resolve_canonical_writer_rocksdb_budget,
+    resolve_ingest_control_writer_with_data_dir, resolve_manual_raw_blob_retention,
+    resolve_materialized_view_writer_rocksdb_budget, resolve_ops_listen_addr, resolve_retention,
+    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir, validate_optional_path,
 };
 use zinder_source::{
     DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES, DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
     MempoolSourceAdmissionLimits, NodeFallbackSections, NodeSection, NodeTarget,
     ZebraIndexerSourceTarget,
 };
-use zinder_store::{RawBlobRetention, TreeStateCheckpointSelection};
+use zinder_store::TreeStateCheckpointSelection;
 
 use crate::{
     CanonicalConstructionSettings, CanonicalFollowSettings, CanonicalPipelineLimits,
@@ -46,7 +47,6 @@ use super::cli::parse::{parse_node_source, parse_poll_interval_ms, parse_reorg_w
 const DEFAULT_REORG_WINDOW_BLOCKS: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
 
 const DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS: u64 = 1_000;
-const DEFAULT_INGEST_COVERAGE: IngestCoverage = IngestCoverage::Explicit;
 const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
 
 /// Fully loaded command configuration for the `zinder-ingest`
@@ -90,35 +90,6 @@ pub struct IngestCommandConfig {
     pub tree_state_densification: TreeStateDensificationConfig,
     /// Background tree-state checkpoint verification settings.
     pub tree_state_verification: TreeStateVerificationConfig,
-}
-
-/// Coverage policy applied to the [`CanonicalRunOverrides`] bootstrap path.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum IngestCoverage {
-    /// Use explicitly supplied modifier heights as-is.
-    Explicit,
-    /// Derive the historical floor needed by native wallet serving. The
-    /// ingest loop looks up the checkpoint against the
-    /// upstream node before entering the first phase.
-    WalletServing,
-}
-
-impl IngestCoverage {
-    /// Returns the kebab-case configuration representation of this coverage mode.
-    #[must_use]
-    pub const fn as_kebab_case(self) -> &'static str {
-        match self {
-            Self::Explicit => "explicit",
-            Self::WalletServing => "wallet-serving",
-        }
-    }
-}
-
-impl Default for IngestCoverage {
-    fn default() -> Self {
-        DEFAULT_INGEST_COVERAGE
-    }
 }
 
 /// Command-line overrides for the phase-driven ingest invocation.
@@ -222,36 +193,7 @@ pub fn load_ingest_config_with_env<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    let raw_config: IngestConfig = ConfigLoader::new()
-        .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
-        .with_default(
-            "ingest.explorer_views_min_free_bytes",
-            DEFAULT_EXPLORER_VIEWS_MIN_FREE_BYTES,
-        )?
-        .with_default(
-            "ingest.mempool.max_transaction_count",
-            DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT.get(),
-        )?
-        .with_default(
-            "ingest.mempool.max_total_raw_transaction_bytes",
-            DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES.get(),
-        )?
-        .with_default(
-            "ingest.mempool.reconciliation_batch_target_raw_transaction_bytes",
-            DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES,
-        )?
-        .with_default(
-            "ingest.follow.poll_interval_ms",
-            DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS,
-        )?
-        .with_default(
-            "ingest.follow.lag_threshold_blocks",
-            DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
-        )?
-        .with_default(
-            "ingest.follow.max_replacement_bytes",
-            crate::DEFAULT_MAX_REPLACEMENT_BYTES.get(),
-        )?
+    let raw_config: ZinderConfig = ConfigLoader::new()
         .with_ops_section(RuntimeService::Ingest)?
         .with_security_section()?
         .with_file(config_path)
@@ -328,144 +270,179 @@ where
         )?
         .load()?;
 
-    resolve_ingest_config(raw_config)
+    resolve_ingest_config_from_raw(raw_config)
 }
 
 /// Renders the effective ingest configuration in the accepted TOML
 /// shape.
+#[allow(
+    clippy::too_many_lines,
+    reason = "redacted print-config mirrors the resolved ingest TOML shape field by field"
+)]
 pub fn redacted_ingest_config_toml(
     config: &IngestCommandConfig,
 ) -> Result<String, IngestConfigError> {
-    let rendered = toml::to_string(&RedactedIngestConfigToml::from_ingest_config(config))
-        .map_err(|source| ConfigError::Render { source })?;
+    let runtime_config = &config.runtime_config;
+    let (selection, commitment_budget) = match config.tree_state_densification.selection {
+        TreeStateCheckpointSelection::CommitmentBudget(budget) => {
+            (TreeStateSelectionName::CommitmentBudget, Some(budget.get()))
+        }
+        TreeStateCheckpointSelection::EveryBlock | _ => (TreeStateSelectionName::EveryBlock, None),
+    };
+    let toml_config = ZinderConfig {
+        deployment: DeploymentSection::from_resolved(config.profile),
+        network: NetworkSection::from_network(runtime_config.node.network),
+        ops: OpsSection::from_resolved(config.ops_listen_addr),
+        observability: config.observability.clone(),
+        security: SecuritySection::from_resolved(config.allow_public_bind),
+        node: NodeSection::from_resolved(&runtime_config.node),
+        node_fallbacks: NodeFallbackSections::from_resolved(&runtime_config.node_fallbacks),
+        storage: StorageSection {
+            data_dir: config.storage_data_dir.clone(),
+            path: Some(runtime_config.storage_path.clone()),
+            full_blocks: config.storage_full_blocks,
+            raw_blob_policy: config
+                .profile
+                .is_none()
+                .then_some(runtime_config.raw_blob_policy.to_retention()),
+            canonical: StorageRoleSection::from_resolved(runtime_config.canonical_rocksdb_budget),
+            materialized_views: StorageRoleSection::from_resolved(
+                runtime_config.materialized_view_rocksdb_budget,
+            ),
+            ..StorageSection::default()
+        },
+        ingest: IngestSection {
+            source: Some(node_source_name(runtime_config.node_source).to_owned()),
+            explorer_views: (config.profile != Some(DeploymentProfile::Explorer)
+                && (config.profile.is_none() || config.explorer_views))
+                .then_some(config.explorer_views),
+            explorer_views_min_free_bytes: Some(config.explorer_views_min_free_bytes),
+            reorg_window_blocks: Some(runtime_config.reorg_window_blocks),
+            phase_classification: IngestPhaseClassificationSection {
+                catchup_threshold_blocks: Some(
+                    runtime_config.phase_classification.catchup_threshold_blocks,
+                ),
+            },
+            construction: IngestConstructionSection {
+                source_segment_max_blocks: Some(
+                    runtime_config
+                        .construction
+                        .pipeline_limits
+                        .source_segment_max_blocks
+                        .get(),
+                ),
+                source_segment_target_response_bytes: Some(
+                    runtime_config
+                        .construction
+                        .pipeline_limits
+                        .source_segment_target_response_bytes
+                        .get(),
+                ),
+                source_fetch_max_in_flight_requests: Some(
+                    runtime_config
+                        .construction
+                        .pipeline_limits
+                        .source_fetch_max_in_flight_requests
+                        .get(),
+                ),
+                source_fetch_max_in_flight_bytes: Some(
+                    runtime_config
+                        .construction
+                        .pipeline_limits
+                        .source_fetch_max_in_flight_bytes
+                        .get(),
+                ),
+                block_prepare_concurrency: Some(
+                    runtime_config
+                        .construction
+                        .pipeline_limits
+                        .block_prepare_concurrency
+                        .get(),
+                ),
+                block_prepare_memory_watermark_bytes: Some(
+                    runtime_config
+                        .construction
+                        .pipeline_limits
+                        .block_prepare_memory_watermark_bytes
+                        .get(),
+                ),
+                tree_hashing_workers: Some(
+                    runtime_config
+                        .construction
+                        .pipeline_limits
+                        .tree_hashing_workers
+                        .get(),
+                ),
+            },
+            mempool: IngestMempoolSection {
+                max_transaction_count: Some(
+                    runtime_config
+                        .mempool
+                        .source_admission_limits
+                        .max_transaction_count
+                        .get(),
+                ),
+                max_total_raw_transaction_bytes: Some(
+                    runtime_config
+                        .mempool
+                        .source_admission_limits
+                        .max_total_raw_transaction_bytes
+                        .get(),
+                ),
+                reconciliation_batch_target_raw_transaction_bytes: Some(
+                    runtime_config
+                        .mempool
+                        .reconciliation_batch_target_raw_transaction_bytes
+                        .get(),
+                ),
+            },
+            follow: IngestFollowSection {
+                poll_interval_ms: Some(duration_as_millis_u64(runtime_config.follow.poll_interval)),
+                lag_threshold_blocks: Some(runtime_config.follow.lag_threshold_blocks),
+                max_replacement_bytes: Some(runtime_config.follow.max_replacement_bytes.get()),
+            },
+            run_overrides: IngestRunOverridesSection {
+                target_height: runtime_config
+                    .run_overrides
+                    .target_height
+                    .map(BlockHeight::value),
+                checkpoint_height: runtime_config
+                    .run_overrides
+                    .checkpoint_height
+                    .map(BlockHeight::value),
+                coverage: config.profile.is_none().then_some(config.coverage),
+            },
+            tree_state_densification: IngestTreeStateDensificationSection {
+                enabled: Some(config.tree_state_densification.enabled),
+                during_construction: Some(config.tree_state_densification.during_construction),
+                selection: Some(selection),
+                commitment_budget,
+                workers: Some(config.tree_state_densification.workers.get()),
+                max_blocks_per_second: Some(
+                    config.tree_state_densification.max_blocks_per_second.get(),
+                ),
+            },
+            tree_state_verification: IngestTreeStateVerificationSection {
+                enabled: Some(config.tree_state_verification.enabled),
+                max_rows_per_second: Some(config.tree_state_verification.max_rows_per_second.get()),
+            },
+        },
+        ingest_control: IngestControlSection::from_writer(&ResolvedIngestControlWriter {
+            listen_addr: config.ingest_control_listen_addr,
+            bearer_token_path: config.ingest_control_bearer_token_path.clone(),
+            bearer_token: config.ingest_control_bearer_token.clone(),
+            checkpoint_bearer_token_path: config
+                .ingest_control_checkpoint_bearer_token_path
+                .clone(),
+            checkpoint_bearer_token: config.ingest_control_checkpoint_bearer_token.clone(),
+            checkpoint_staging_root: config.ingest_control_checkpoint_staging_root.clone(),
+        }),
+        retention: RetentionSection::from_resolved(config.retention),
+        ..ZinderConfig::default()
+    };
+    let rendered =
+        toml::to_string(&toml_config).map_err(|source| ConfigError::Render { source })?;
     Ok(rendered)
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestConfig {
-    deployment: DeploymentSection,
-    network: NetworkSection,
-    ops: OpsSection,
-    observability: zinder_runtime::ObservabilityConfig,
-    node: NodeSection,
-    node_fallbacks: NodeFallbackSections,
-    storage: IngestPrimaryStorageSection,
-    ingest: IngestSection,
-    ingest_control: IngestControlSection,
-    retention: RetentionSection,
-    security: SecuritySection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestPrimaryStorageSection {
-    data_dir: Option<PathBuf>,
-    path: Option<PathBuf>,
-    canonical: StorageRoleSection,
-    materialized_views: StorageRoleSection,
-    raw_blob_policy: Option<RawBlobPolicy>,
-    full_blocks: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestSection {
-    /// Canonical source-adapter selector (`zebra-json-rpc` or
-    /// `zebra-indexer-grpc`).
-    source: Option<String>,
-    /// Whether the complete bundled Explorer materialized-view workload is
-    /// requested. Omitted values remain false unless `deployment.profile = "explorer"`.
-    explorer_views: Option<bool>,
-    /// Available bytes on the store volume below which Explorer view replay
-    /// pauses. Zero disables the guard.
-    explorer_views_min_free_bytes: Option<u64>,
-    /// Chain-truth invariant: how deep into the upstream tip the
-    /// settled-tip cliff sits. Defaults to
-    /// `zinder_store::DEFAULT_REORG_WINDOW_BLOCKS`.
-    reorg_window_blocks: Option<u32>,
-    /// Phase classifier knobs for `zinder-ingest probe`.
-    phase_classification: IngestPhaseClassificationSection,
-    /// Source-fetch and block-preparation knobs for canonical construction.
-    construction: IngestConstructionSection,
-    /// Live mempool admission and durable reconciliation limits.
-    mempool: IngestMempoolSection,
-    /// Canonical follower knobs.
-    follow: IngestFollowSection,
-    /// One-shot `run_overrides` for the ingest run.
-    run_overrides: IngestRunOverridesSection,
-    /// Background densification of settled tree-state checkpoints.
-    tree_state_densification: IngestTreeStateDensificationSection,
-    /// Background verification of stored tree-state checkpoints.
-    tree_state_verification: IngestTreeStateVerificationSection,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestTreeStateDensificationSection {
-    enabled: Option<bool>,
-    during_construction: Option<bool>,
-    selection: Option<TreeStateSelectionName>,
-    commitment_budget: Option<u32>,
-    workers: Option<u32>,
-    max_blocks_per_second: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestTreeStateVerificationSection {
-    enabled: Option<bool>,
-    max_rows_per_second: Option<u32>,
-}
-
-/// Configured name of a tree-state checkpoint selection.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum TreeStateSelectionName {
-    EveryBlock,
-    CommitmentBudget,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestMempoolSection {
-    max_transaction_count: Option<u32>,
-    max_total_raw_transaction_bytes: Option<u64>,
-    reconciliation_batch_target_raw_transaction_bytes: Option<u64>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestPhaseClassificationSection {
-    catchup_threshold_blocks: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestConstructionSection {
-    source_segment_max_blocks: Option<u32>,
-    source_segment_target_response_bytes: Option<u64>,
-    source_fetch_max_in_flight_requests: Option<u32>,
-    source_fetch_max_in_flight_bytes: Option<u64>,
-    block_prepare_concurrency: Option<u32>,
-    block_prepare_memory_watermark_bytes: Option<u64>,
-    tree_hashing_workers: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestFollowSection {
-    poll_interval_ms: Option<u64>,
-    lag_threshold_blocks: Option<u64>,
-    max_replacement_bytes: Option<u64>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestRunOverridesSection {
-    target_height: Option<u32>,
-    checkpoint_height: Option<u32>,
-    coverage: Option<IngestCoverage>,
 }
 
 const fn node_source_name(node_source: NodeSourceKind) -> &'static str {
@@ -575,12 +552,14 @@ fn validate_node_source_target(
     }
 }
 
+/// Validates and resolves an already-deserialized unified [`ZinderConfig`] for
+/// `zinder-ingest`.
 #[allow(
     clippy::too_many_lines,
     reason = "the ingest resolver composes the network, source, storage, phase, construction, follow, and modifier knobs in one auditable validation sequence."
 )]
-fn resolve_ingest_config(
-    mut config: IngestConfig,
+pub fn resolve_ingest_config_from_raw(
+    mut config: ZinderConfig,
 ) -> Result<IngestCommandConfig, IngestConfigError> {
     apply_deployment_profile(&mut config)?;
     let network = config.network.resolve()?;
@@ -618,29 +597,25 @@ fn resolve_ingest_config(
         .unwrap_or_else(|| node_source_name(NodeSourceKind::ZebraJsonRpc).to_owned());
     let node_source = parse_node_source(&node_source_text)?;
     validate_node_source_targets(node_source, &node_target, &node_fallbacks)?;
-    let configured_raw_blob_policy = config.storage.raw_blob_policy;
+    let configured_raw_blob_policy = config.storage.raw_blob_policy.map(RawBlobPolicy::from);
     let storage_data_dir = validate_optional_data_dir(config.storage.data_dir)?;
     let storage_full_blocks = config.storage.full_blocks;
-    let storage_path = if let Some(path) = config.storage.path {
-        if path.to_string_lossy().trim().is_empty() {
-            return Err(ConfigError::invalid("storage.path must not be blank").into());
-        }
-        path
-    } else {
-        let root = storage_data_dir
-            .as_deref()
-            .unwrap_or_else(|| Path::new(DEFAULT_DATA_DIR));
-        derive_canonical_path(root)
-    };
+    let storage_path =
+        validate_optional_path(config.storage.path, "storage.path")?.unwrap_or_else(|| {
+            let root = storage_data_dir
+                .as_deref()
+                .unwrap_or_else(|| Path::new(DEFAULT_DATA_DIR));
+            derive_canonical_path(root)
+        });
     let canonical_rocksdb_budget =
         resolve_canonical_writer_rocksdb_budget(config.storage.canonical.rocksdb)?;
     let materialized_view_rocksdb_budget =
         resolve_materialized_view_writer_rocksdb_budget(config.storage.materialized_views.rocksdb)?;
 
-    let reorg_window_blocks = require_field(
-        config.ingest.reorg_window_blocks,
-        "ingest.reorg_window_blocks",
-    )?;
+    let reorg_window_blocks = config
+        .ingest
+        .reorg_window_blocks
+        .unwrap_or(DEFAULT_REORG_WINDOW_BLOCKS);
     let reorg_window_blocks = parse_reorg_window_blocks(reorg_window_blocks)?;
 
     let catchup_threshold_blocks = config
@@ -650,18 +625,29 @@ fn resolve_ingest_config(
         .unwrap_or(reorg_window_blocks);
 
     let mempool_max_transaction_count = nonzero_u32_config(
-        config.ingest.mempool.max_transaction_count,
+        config
+            .ingest
+            .mempool
+            .max_transaction_count
+            .or(Some(DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT.get())),
         "ingest.mempool.max_transaction_count",
     )?;
     let mempool_max_total_raw_transaction_bytes = nonzero_u64_config(
-        config.ingest.mempool.max_total_raw_transaction_bytes,
+        config
+            .ingest
+            .mempool
+            .max_total_raw_transaction_bytes
+            .or(Some(DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES.get())),
         "ingest.mempool.max_total_raw_transaction_bytes",
     )?;
     let reconciliation_batch_target_raw_transaction_bytes = nonzero_u64_config(
         config
             .ingest
             .mempool
-            .reconciliation_batch_target_raw_transaction_bytes,
+            .reconciliation_batch_target_raw_transaction_bytes
+            .or(Some(
+                DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES,
+            )),
         "ingest.mempool.reconciliation_batch_target_raw_transaction_bytes",
     )?;
 
@@ -730,20 +716,25 @@ fn resolve_ingest_config(
         ))
     })?;
 
-    let poll_interval_ms = require_field(
-        config.ingest.follow.poll_interval_ms,
-        "ingest.follow.poll_interval_ms",
-    )?;
+    let poll_interval_ms = config
+        .ingest
+        .follow
+        .poll_interval_ms
+        .unwrap_or(DEFAULT_TIP_FOLLOW_POLL_INTERVAL_MS);
     let poll_interval = parse_poll_interval_ms(poll_interval_ms)?;
 
-    let lag_threshold_blocks = require_field(
-        config.ingest.follow.lag_threshold_blocks,
-        "ingest.follow.lag_threshold_blocks",
-    )?;
-    let max_replacement_bytes = NonZeroU64::new(require_field(
-        config.ingest.follow.max_replacement_bytes,
-        "ingest.follow.max_replacement_bytes",
-    )?)
+    let lag_threshold_blocks = config
+        .ingest
+        .follow
+        .lag_threshold_blocks
+        .unwrap_or(DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS);
+    let max_replacement_bytes = NonZeroU64::new(
+        config
+            .ingest
+            .follow
+            .max_replacement_bytes
+            .unwrap_or(crate::DEFAULT_MAX_REPLACEMENT_BYTES.get()),
+    )
     .ok_or_else(|| {
         ConfigError::invalid("ingest.follow.max_replacement_bytes must be greater than zero")
     })?;
@@ -753,10 +744,10 @@ fn resolve_ingest_config(
         storage_full_blocks,
         configured_raw_blob_policy,
     )?;
-    let explorer_views_min_free_bytes = require_field(
-        config.ingest.explorer_views_min_free_bytes,
-        "ingest.explorer_views_min_free_bytes",
-    )?;
+    let explorer_views_min_free_bytes = config
+        .ingest
+        .explorer_views_min_free_bytes
+        .unwrap_or(DEFAULT_EXPLORER_VIEWS_MIN_FREE_BYTES);
 
     if matches!(coverage, IngestCoverage::WalletServing)
         && config.ingest.run_overrides.checkpoint_height.is_some()
@@ -782,7 +773,14 @@ fn resolve_ingest_config(
     let tree_state_verification =
         resolve_tree_state_verification(config.ingest.tree_state_verification)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
-    let allow_public_bind = resolve_allow_public_bind(config.security)?;
+    let allow_public_bind = resolve_allow_public_bind(SecuritySection {
+        allow_public_bind: Some(
+            config
+                .security
+                .allow_public_bind
+                .unwrap_or(DEFAULT_ALLOW_PUBLIC_BIND),
+        ),
+    })?;
     guard_optional_serving_bind(
         "ingest_control.listen_addr",
         ingest_control_listen_addr,
@@ -945,35 +943,23 @@ fn guard_ingest_control_bearer_token(
     Ok(())
 }
 
-fn raw_blob_retention_from_policy(policy: RawBlobPolicy) -> RawBlobRetention {
-    match policy {
-        RawBlobPolicy::None => RawBlobRetention::None,
-        RawBlobPolicy::All => RawBlobRetention::All,
-    }
-}
-
-fn apply_deployment_profile(config: &mut IngestConfig) -> Result<(), ConfigError> {
+fn apply_deployment_profile(config: &mut ZinderConfig) -> Result<(), ConfigError> {
     let Some(profile) = config.deployment.profile else {
         return Ok(());
     };
-    let raw_blob_policy = RawBlobPolicy::from(
-        profile
-            .resolve_raw_blob_retention_with_full_blocks(
-                config.storage.full_blocks,
-                config
-                    .storage
-                    .raw_blob_policy
-                    .map(raw_blob_retention_from_policy),
-            )
-            .map_err(|error| {
-                let message = error.to_string();
-                if message.contains("remove conflicting overrides") {
-                    error
-                } else {
-                    ConfigError::invalid(format!("{message}; remove conflicting overrides"))
-                }
-            })?,
-    );
+    let retention = profile
+        .resolve_raw_blob_retention_with_full_blocks(
+            config.storage.full_blocks,
+            config.storage.raw_blob_policy,
+        )
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("remove conflicting overrides") {
+                error
+            } else {
+                ConfigError::invalid(format!("{message}; remove conflicting overrides"))
+            }
+        })?;
     if profile == DeploymentProfile::Explorer && config.ingest.explorer_views == Some(false) {
         return Err(ConfigError::invalid(
             "deployment.profile = \"explorer\" requires ingest.explorer_views = true; remove ingest.explorer_views or choose a wallet profile",
@@ -994,7 +980,7 @@ fn apply_deployment_profile(config: &mut IngestConfig) -> Result<(), ConfigError
     if profile == DeploymentProfile::Explorer {
         config.ingest.explorer_views.get_or_insert(true);
     }
-    config.storage.raw_blob_policy = Some(raw_blob_policy);
+    config.storage.raw_blob_policy = Some(retention);
     Ok(())
 }
 
@@ -1008,270 +994,10 @@ fn resolve_raw_blob_policy(
     }
     let resolved_retention = resolve_manual_raw_blob_retention(
         full_blocks,
-        configured_policy.map(raw_blob_retention_from_policy),
+        configured_policy.map(RawBlobPolicy::to_retention),
     )?;
     let resolved_policy = resolved_retention.map(RawBlobPolicy::from);
     Ok(resolved_policy.unwrap_or(DEFAULT_RAW_BLOB_POLICY))
-}
-
-#[derive(Serialize)]
-struct RedactedIngestConfigToml {
-    #[serde(skip_serializing_if = "DeploymentToml::is_empty")]
-    deployment: DeploymentToml,
-    network: NetworkToml,
-    ops: OpsToml,
-    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
-    observability: zinder_runtime::ObservabilityConfig,
-    security: SecurityToml,
-    node: NodeToml,
-    #[serde(skip_serializing_if = "NodeFallbacksToml::is_empty")]
-    node_fallbacks: NodeFallbacksToml,
-    storage: IngestStorageToml,
-    ingest: IngestToml,
-    ingest_control: IngestControlWriterToml,
-    retention: RetentionToml,
-}
-
-impl RedactedIngestConfigToml {
-    #[allow(
-        clippy::too_many_lines,
-        reason = "redacted print-config mirrors the resolved ingest TOML shape field by field"
-    )]
-    fn from_ingest_config(config: &IngestCommandConfig) -> Self {
-        let runtime_config = &config.runtime_config;
-        Self {
-            deployment: DeploymentToml::from_resolved(config.profile),
-            network: NetworkToml::from_network(runtime_config.node.network),
-            ops: OpsToml::from_resolved(config.ops_listen_addr),
-            observability: config.observability.clone(),
-            security: SecurityToml::from_resolved(config.allow_public_bind),
-            node: NodeToml::from_node_target(&runtime_config.node),
-            node_fallbacks: NodeFallbacksToml::from_node_targets(&runtime_config.node_fallbacks),
-            storage: IngestStorageToml {
-                data_dir: config
-                    .storage_data_dir
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
-                path: runtime_config.storage_path.display().to_string(),
-                full_blocks: config.storage_full_blocks,
-                raw_blob_policy: config
-                    .profile
-                    .is_none()
-                    .then_some(runtime_config.raw_blob_policy),
-                canonical: StorageRoleToml::from_resolved(runtime_config.canonical_rocksdb_budget),
-                materialized_views: StorageRoleToml::from_resolved(
-                    runtime_config.materialized_view_rocksdb_budget,
-                ),
-            },
-            ingest: IngestToml {
-                source: node_source_name(runtime_config.node_source),
-                explorer_views: (config.profile != Some(DeploymentProfile::Explorer)
-                    && (config.profile.is_none() || config.explorer_views))
-                    .then_some(config.explorer_views),
-                explorer_views_min_free_bytes: config.explorer_views_min_free_bytes,
-                reorg_window_blocks: runtime_config.reorg_window_blocks,
-                phase_classification: IngestPhaseClassificationToml {
-                    catchup_threshold_blocks: runtime_config
-                        .phase_classification
-                        .catchup_threshold_blocks,
-                },
-                construction: IngestConstructionToml {
-                    source_segment_max_blocks: runtime_config
-                        .construction
-                        .pipeline_limits
-                        .source_segment_max_blocks
-                        .get(),
-                    source_segment_target_response_bytes: runtime_config
-                        .construction
-                        .pipeline_limits
-                        .source_segment_target_response_bytes
-                        .get(),
-                    source_fetch_max_in_flight_requests: runtime_config
-                        .construction
-                        .pipeline_limits
-                        .source_fetch_max_in_flight_requests
-                        .get(),
-                    source_fetch_max_in_flight_bytes: runtime_config
-                        .construction
-                        .pipeline_limits
-                        .source_fetch_max_in_flight_bytes
-                        .get(),
-                    block_prepare_concurrency: runtime_config
-                        .construction
-                        .pipeline_limits
-                        .block_prepare_concurrency
-                        .get(),
-                    block_prepare_memory_watermark_bytes: runtime_config
-                        .construction
-                        .pipeline_limits
-                        .block_prepare_memory_watermark_bytes
-                        .get(),
-                    tree_hashing_workers: runtime_config
-                        .construction
-                        .pipeline_limits
-                        .tree_hashing_workers
-                        .get(),
-                },
-                mempool: IngestMempoolToml {
-                    max_transaction_count: runtime_config
-                        .mempool
-                        .source_admission_limits
-                        .max_transaction_count
-                        .get(),
-                    max_total_raw_transaction_bytes: runtime_config
-                        .mempool
-                        .source_admission_limits
-                        .max_total_raw_transaction_bytes
-                        .get(),
-                    reconciliation_batch_target_raw_transaction_bytes: runtime_config
-                        .mempool
-                        .reconciliation_batch_target_raw_transaction_bytes
-                        .get(),
-                },
-                follow: IngestFollowToml {
-                    poll_interval_ms: duration_as_millis_u64(runtime_config.follow.poll_interval),
-                    lag_threshold_blocks: runtime_config.follow.lag_threshold_blocks,
-                    max_replacement_bytes: runtime_config.follow.max_replacement_bytes.get(),
-                },
-                run_overrides: IngestRunOverridesToml {
-                    target_height: runtime_config
-                        .run_overrides
-                        .target_height
-                        .map(BlockHeight::value),
-                    checkpoint_height: runtime_config
-                        .run_overrides
-                        .checkpoint_height
-                        .map(BlockHeight::value),
-                    coverage: config.profile.is_none().then_some(config.coverage),
-                },
-                tree_state_densification: IngestTreeStateDensificationToml::from_resolved(
-                    config.tree_state_densification,
-                ),
-                tree_state_verification: IngestTreeStateVerificationToml {
-                    enabled: config.tree_state_verification.enabled,
-                    max_rows_per_second: config.tree_state_verification.max_rows_per_second.get(),
-                },
-            },
-            ingest_control: IngestControlWriterToml::from_writer(&ResolvedIngestControlWriter {
-                listen_addr: config.ingest_control_listen_addr,
-                bearer_token_path: config.ingest_control_bearer_token_path.clone(),
-                bearer_token: config.ingest_control_bearer_token.clone(),
-                checkpoint_bearer_token_path: config
-                    .ingest_control_checkpoint_bearer_token_path
-                    .clone(),
-                checkpoint_bearer_token: config.ingest_control_checkpoint_bearer_token.clone(),
-                checkpoint_staging_root: config.ingest_control_checkpoint_staging_root.clone(),
-            }),
-            retention: RetentionToml::from_resolved(config.retention),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct IngestToml {
-    source: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    explorer_views: Option<bool>,
-    explorer_views_min_free_bytes: u64,
-    reorg_window_blocks: u32,
-    phase_classification: IngestPhaseClassificationToml,
-    construction: IngestConstructionToml,
-    mempool: IngestMempoolToml,
-    follow: IngestFollowToml,
-    run_overrides: IngestRunOverridesToml,
-    tree_state_densification: IngestTreeStateDensificationToml,
-    tree_state_verification: IngestTreeStateVerificationToml,
-}
-
-#[derive(Serialize)]
-struct IngestTreeStateVerificationToml {
-    enabled: bool,
-    max_rows_per_second: u32,
-}
-
-#[derive(Serialize)]
-struct IngestTreeStateDensificationToml {
-    enabled: bool,
-    during_construction: bool,
-    selection: TreeStateSelectionName,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    commitment_budget: Option<u32>,
-    workers: u32,
-    max_blocks_per_second: u32,
-}
-
-impl IngestTreeStateDensificationToml {
-    fn from_resolved(config: TreeStateDensificationConfig) -> Self {
-        let (selection, commitment_budget) = match config.selection {
-            TreeStateCheckpointSelection::CommitmentBudget(budget) => {
-                (TreeStateSelectionName::CommitmentBudget, Some(budget.get()))
-            }
-            TreeStateCheckpointSelection::EveryBlock | _ => {
-                (TreeStateSelectionName::EveryBlock, None)
-            }
-        };
-        Self {
-            enabled: config.enabled,
-            during_construction: config.during_construction,
-            selection,
-            commitment_budget,
-            workers: config.workers.get(),
-            max_blocks_per_second: config.max_blocks_per_second.get(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct IngestMempoolToml {
-    max_transaction_count: u32,
-    max_total_raw_transaction_bytes: u64,
-    reconciliation_batch_target_raw_transaction_bytes: u64,
-}
-
-#[derive(Serialize)]
-struct IngestStorageToml {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data_dir: Option<String>,
-    path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    full_blocks: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    raw_blob_policy: Option<RawBlobPolicy>,
-    canonical: StorageRoleToml,
-    materialized_views: StorageRoleToml,
-}
-
-#[derive(Serialize)]
-struct IngestPhaseClassificationToml {
-    catchup_threshold_blocks: u32,
-}
-
-#[derive(Serialize)]
-struct IngestConstructionToml {
-    source_segment_max_blocks: u32,
-    source_segment_target_response_bytes: u64,
-    source_fetch_max_in_flight_requests: u32,
-    source_fetch_max_in_flight_bytes: u64,
-    block_prepare_concurrency: u32,
-    block_prepare_memory_watermark_bytes: u64,
-    tree_hashing_workers: u32,
-}
-
-#[derive(Serialize)]
-struct IngestFollowToml {
-    poll_interval_ms: u64,
-    lag_threshold_blocks: u64,
-    max_replacement_bytes: u64,
-}
-
-#[derive(Serialize)]
-struct IngestRunOverridesToml {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target_height: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    checkpoint_height: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    coverage: Option<IngestCoverage>,
 }
 
 #[cfg(test)]

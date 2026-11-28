@@ -37,12 +37,41 @@ impl<'de> Deserialize<'de> for BrowserOrigins {
         }
 
         let origins = match Origins::deserialize(deserializer)? {
-            Origins::List(origins) => origins,
-            Origins::CommaSeparated(origins) if origins.is_empty() => Vec::new(),
-            Origins::CommaSeparated(origins) => origins
-                .split(',')
-                .map(|origin| origin.trim().to_owned())
-                .collect(),
+            Origins::List(origins) => {
+                let mut trimmed = Vec::with_capacity(origins.len());
+                for origin in origins {
+                    let candidate = origin.trim();
+                    if candidate.is_empty() {
+                        return Err(D::Error::custom(
+                            "browser_origins must not contain empty elements",
+                        ));
+                    }
+                    trimmed.push(candidate.to_owned());
+                }
+                trimmed
+            }
+            Origins::CommaSeparated(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(D::Error::custom(
+                        "empty value is not allowed; omit the setting, use \"none\", or use [] to disable",
+                    ));
+                }
+                if trimmed == crate::DISABLED_SENTINEL {
+                    Vec::new()
+                } else {
+                    let parts: Vec<String> = trimmed
+                        .split(',')
+                        .map(|origin| origin.trim().to_owned())
+                        .collect();
+                    if parts.iter().any(String::is_empty) {
+                        return Err(D::Error::custom(
+                            "browser_origins must not contain empty elements",
+                        ));
+                    }
+                    parts
+                }
+            }
         };
         if origins.iter().any(|origin| origin == "*") {
             if origins.len() == 1 {
@@ -90,7 +119,21 @@ impl Serialize for BrowserOrigins {
     }
 }
 
+impl PartialEq for BrowserOrigins {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_ref() == other.0.as_ref()
+    }
+}
+
+impl Eq for BrowserOrigins {}
+
 impl BrowserOrigins {
+    /// Returns whether browser gRPC-Web transport is disabled (no permitted origins).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// Returns whether the listener explicitly permits every browser origin.
     #[must_use]
     pub fn allows_any_origin(&self) -> bool {

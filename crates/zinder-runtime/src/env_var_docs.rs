@@ -2,30 +2,22 @@
 //!
 //! The `ZINDER_*` env-var schema is part of Zinder's public interface (see
 //! [Configuration §Environment variables]). The entries in
-//! [`ENVIRONMENT_VARIABLES`] are the hand-maintained description of that
-//! surface and feed the Markdown table embedded in
+//! [`ENVIRONMENT_VARIABLES`] map 1-to-1 with every leaf field in
+//! [`crate::ZinderConfig`] and feed the Markdown table embedded in
 //! `docs/reference/configuration.md`.
 //!
-//! [`render_environment_variable_table`] returns the Markdown the doc block
-//! must contain. The doc-mirror integration test in this crate asserts exact
-//! equality and prints the regeneration command on failure.
+//! Two checks keep documentation and implementation in sync:
 //!
-//! Two kinds of drift are caught, in different places:
+//! - Table against docs: [`render_environment_variable_table`] must match the
+//!   `env-var-table:public-interfaces` block in `docs/reference/configuration.md`.
+//! - Table against schema: the integration tests in
+//!   `crates/zinder-runtime/tests/integration/env_var_docs.rs` verify a strict
+//!   bijection between [`crate::discover_schema_leaf_paths`] and
+//!   [`ENVIRONMENT_VARIABLES`], and confirm [`crate::ConfigLoader`] accepts
+//!   every documented variable into [`crate::ZinderConfig`].
 //!
-//! - Doc against table: the doc-mirror test above.
-//! - Table against loaders: each service's `env_var_contract` integration
-//!   test runs the binary's real configuration loader. Every row naming the
-//!   binary must be accepted, and every key the loader accepts must have a
-//!   row naming the binary, except keys the test lists as accepted only
-//!   because the section type is shared.
-//!
-//! A row lists a binary when the binary reads the variable into its
-//! configuration. A description says when a listed binary does not apply the
-//! value, as for `RocksDB` background job caps on secondary opens.
-//!
-//! Neither check validates descriptions, defaults, requirement, sensitivity,
-//! or whether a binary acts on a variable it accepts. Adding a config field
-//! means adding a row here and regenerating the doc block.
+//! A row lists a binary when the binary acts on that field. Empty `ZINDER_*`
+//! values are rejected; toggleable fields opt out explicitly via `"none"`.
 //!
 //! [Configuration §Environment variables]:
 //!     ../../docs/reference/configuration.md#environment-variables
@@ -84,22 +76,346 @@ impl Requirement {
     }
 }
 
-/// Operator-facing `ZINDER_*` environment variables advertised by Zinder
-/// service binaries.
-///
-/// Mirrored into `docs/reference/configuration.md` between the
-/// `<!-- env-var-table:public-interfaces:start -->` and corresponding `:end`
-/// markers; the doc-mirror test in
-/// `crates/zinder-runtime/tests/integration/env_var_docs.rs` fails when the
-/// rendered table and the doc block diverge. Each service's
-/// `tests/integration/env_var_contract.rs` checks the rows against that
-/// binary's loader.
-///
-/// `ZINDER_TEST_*` variables are intentionally absent: they are stripped at
-/// the runtime config loader so production binaries never observe them.
-/// Live-test environment knobs are documented next to the affected tests in
-/// `CLAUDE.md` and `docs/runbooks/testing.md`.
-pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
+const NODE_SHARED_BINARIES: &[&str] = &[
+    "zinder-ingest",
+    "zinder-query",
+    "zinder-compat-lightwalletd",
+    "zinder-explorer",
+];
+
+macro_rules! node_env_var_docs {
+    (
+        env_prefix: $env_prefix:literal,
+        toml_prefix: $toml_prefix:literal,
+        rpc_req: $rpc_req:expr,
+        rpc_desc: $rpc_desc:expr,
+        idx_desc: $idx_desc:expr,
+        tls_cert_cond: $tls_cert_cond:expr,
+        tls_key_cond: $tls_key_cond:expr,
+        tls_ca_path_desc: $tls_ca_path_desc:expr,
+        tls_ca_pem_desc: $tls_ca_pem_desc:expr,
+        tls_client_cert_path_desc: $tls_client_cert_path_desc:expr,
+        tls_client_cert_pem_desc: $tls_client_cert_pem_desc:expr,
+        tls_client_key_path_desc: $tls_client_key_path_desc:expr,
+        tls_client_key_pem_desc: $tls_client_key_pem_desc:expr,
+        tls_server_name_desc: $tls_server_name_desc:expr,
+        auth_method_desc: $auth_method_desc:expr,
+        auth_user_cond: $auth_user_cond:expr,
+        auth_user_desc: $auth_user_desc:expr,
+        auth_pass_desc: $auth_pass_desc:expr,
+        auth_cookie_cond: $auth_cookie_cond:expr,
+        auth_path_desc: $auth_path_desc:expr,
+        auth_cookie_desc: $auth_cookie_desc:expr,
+        req_timeout_desc: $req_timeout_desc:expr,
+        max_resp_desc: $max_resp_desc:expr,
+        broadcast_desc: $broadcast_desc:expr,
+        max_conc_desc: $max_conc_desc:expr,
+        health_addr_desc: $health_addr_desc:expr,
+        health_poll_desc: $health_poll_desc:expr,
+        health_vp_desc: $health_vp_desc:expr,
+        health_gap_desc: $health_gap_desc:expr $(,)?
+    ) => {
+        [
+            EnvVarDoc {
+                name: concat!($env_prefix, "JSON_RPC_ADDR"),
+                toml_path: concat!($toml_prefix, "json_rpc_addr"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: $rpc_req,
+                sensitive: false,
+                description: $rpc_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "INDEXER_GRPC_ADDR"),
+                toml_path: concat!($toml_prefix, "indexer_grpc_addr"),
+                used_by: &["zinder-ingest"],
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $idx_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "INDEXER_TLS__CA_CERT_PATH"),
+                toml_path: concat!($toml_prefix, "indexer_tls.ca_cert_path"),
+                used_by: &["zinder-ingest"],
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $tls_ca_path_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "INDEXER_TLS__CA_CERT_PEM"),
+                toml_path: concat!($toml_prefix, "indexer_tls.ca_cert_pem"),
+                used_by: &["zinder-ingest"],
+                requirement: Requirement::Optional,
+                sensitive: true,
+                description: $tls_ca_pem_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "INDEXER_TLS__CLIENT_CERT_PATH"),
+                toml_path: concat!($toml_prefix, "indexer_tls.client_cert_path"),
+                used_by: &["zinder-ingest"],
+                requirement: Requirement::ConditionalOn($tls_cert_cond),
+                sensitive: false,
+                description: $tls_client_cert_path_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "INDEXER_TLS__CLIENT_CERT_PEM"),
+                toml_path: concat!($toml_prefix, "indexer_tls.client_cert_pem"),
+                used_by: &["zinder-ingest"],
+                requirement: Requirement::ConditionalOn($tls_cert_cond),
+                sensitive: true,
+                description: $tls_client_cert_pem_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "INDEXER_TLS__CLIENT_KEY_PATH"),
+                toml_path: concat!($toml_prefix, "indexer_tls.client_key_path"),
+                used_by: &["zinder-ingest"],
+                requirement: Requirement::ConditionalOn($tls_key_cond),
+                sensitive: false,
+                description: $tls_client_key_path_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "INDEXER_TLS__CLIENT_KEY_PEM"),
+                toml_path: concat!($toml_prefix, "indexer_tls.client_key_pem"),
+                used_by: &["zinder-ingest"],
+                requirement: Requirement::ConditionalOn($tls_key_cond),
+                sensitive: true,
+                description: $tls_client_key_pem_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "INDEXER_TLS__SERVER_NAME"),
+                toml_path: concat!($toml_prefix, "indexer_tls.server_name"),
+                used_by: &["zinder-ingest"],
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $tls_server_name_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "AUTH__METHOD"),
+                toml_path: concat!($toml_prefix, "auth.method"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $auth_method_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "AUTH__USERNAME"),
+                toml_path: concat!($toml_prefix, "auth.username"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::ConditionalOn($auth_user_cond),
+                sensitive: false,
+                description: $auth_user_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "AUTH__PASSWORD"),
+                toml_path: concat!($toml_prefix, "auth.password"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::ConditionalOn($auth_user_cond),
+                sensitive: true,
+                description: $auth_pass_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "AUTH__PATH"),
+                toml_path: concat!($toml_prefix, "auth.path"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::ConditionalOn($auth_cookie_cond),
+                sensitive: false,
+                description: $auth_path_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "AUTH__COOKIE"),
+                toml_path: concat!($toml_prefix, "auth.cookie"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::ConditionalOn($auth_cookie_cond),
+                sensitive: true,
+                description: $auth_cookie_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "REQUEST_TIMEOUT_SECS"),
+                toml_path: concat!($toml_prefix, "request_timeout_secs"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $req_timeout_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "MAX_RESPONSE_BYTES"),
+                toml_path: concat!($toml_prefix, "max_response_bytes"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $max_resp_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "BROADCAST_TIMEOUT_SECS"),
+                toml_path: concat!($toml_prefix, "broadcast_timeout_secs"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $broadcast_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "MAX_CONCURRENT_REQUESTS"),
+                toml_path: concat!($toml_prefix, "max_concurrent_requests"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $max_conc_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "HEALTH__ADDR"),
+                toml_path: concat!($toml_prefix, "health.addr"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $health_addr_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "HEALTH__POLL_INTERVAL_MS"),
+                toml_path: concat!($toml_prefix, "health.poll_interval_ms"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $health_poll_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "HEALTH__VERIFICATION_PROGRESS_FLOOR"),
+                toml_path: concat!($toml_prefix, "health.verification_progress_floor"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $health_vp_desc,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS"),
+                toml_path: concat!($toml_prefix, "health.estimated_gap_floor_blocks"),
+                used_by: NODE_SHARED_BINARIES,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $health_gap_desc,
+            },
+        ]
+    };
+}
+
+macro_rules! rocksdb_env_var_docs {
+    (
+        env_prefix: $env_prefix:literal,
+        toml_prefix: $toml_prefix:literal,
+        used_by: $used_by:expr,
+        block_cache: $block_cache:expr,
+        max_wal: $max_wal:expr,
+        max_open_files: $max_open_files:expr,
+        write_buffer: $write_buffer:expr,
+        max_write_buffer_count: $max_write_buffer_count:expr,
+        max_background_jobs: $max_background_jobs:expr,
+        memtable_budget: $memtable_budget:expr,
+        statistics_level: $statistics_level:expr $(,)?
+    ) => {
+        [
+            EnvVarDoc {
+                name: concat!($env_prefix, "BLOCK_CACHE_BYTES"),
+                toml_path: concat!($toml_prefix, "block_cache_bytes"),
+                used_by: $used_by,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $block_cache,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "MAX_WAL_BYTES"),
+                toml_path: concat!($toml_prefix, "max_wal_bytes"),
+                used_by: $used_by,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $max_wal,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "MAX_OPEN_FILES"),
+                toml_path: concat!($toml_prefix, "max_open_files"),
+                used_by: $used_by,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $max_open_files,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "WRITE_BUFFER_BYTES"),
+                toml_path: concat!($toml_prefix, "write_buffer_bytes"),
+                used_by: $used_by,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $write_buffer,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "MAX_WRITE_BUFFER_COUNT"),
+                toml_path: concat!($toml_prefix, "max_write_buffer_count"),
+                used_by: $used_by,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $max_write_buffer_count,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "MAX_BACKGROUND_JOBS"),
+                toml_path: concat!($toml_prefix, "max_background_jobs"),
+                used_by: $used_by,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $max_background_jobs,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "MEMTABLE_BUDGET_BYTES"),
+                toml_path: concat!($toml_prefix, "memtable_budget_bytes"),
+                used_by: $used_by,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $memtable_budget,
+            },
+            EnvVarDoc {
+                name: concat!($env_prefix, "STATISTICS_LEVEL"),
+                toml_path: concat!($toml_prefix, "statistics_level"),
+                used_by: $used_by,
+                requirement: Requirement::Optional,
+                sensitive: false,
+                description: $statistics_level,
+            },
+        ]
+    };
+}
+
+const PLACEHOLDER_DOC: EnvVarDoc = EnvVarDoc {
+    name: "",
+    toml_path: "",
+    used_by: &[],
+    requirement: Requirement::Optional,
+    sensitive: false,
+    description: "",
+};
+
+const fn count_env_var_docs(groups: &[&[EnvVarDoc]]) -> usize {
+    let mut total = 0;
+    let mut idx = 0;
+    while idx < groups.len() {
+        total += groups[idx].len();
+        idx += 1;
+    }
+    total
+}
+
+const fn flatten_env_var_docs<const TOTAL: usize>(groups: &[&[EnvVarDoc]]) -> [EnvVarDoc; TOTAL] {
+    let mut out = [PLACEHOLDER_DOC; TOTAL];
+    let mut cursor = 0;
+    let mut group_idx = 0;
+    while group_idx < groups.len() {
+        let slice = groups[group_idx];
+        let mut entry_idx = 0;
+        while entry_idx < slice.len() {
+            out[cursor] = slice[entry_idx];
+            cursor += 1;
+            entry_idx += 1;
+        }
+        group_idx += 1;
+    }
+    out
+}
+
+const CORE_HEAD_DOCS: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_DEPLOYMENT__PROFILE",
         toml_path: "deployment.profile",
@@ -126,7 +442,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: true,
-        description: "OTLP gRPC collector origin. An unset or blank value disables trace export. See [trace export](#trace-export).",
+        description: "OTLP gRPC collector origin. Omit or set to `\"none\"` to disable trace export; empty values are rejected. See [trace export](#trace-export).",
     },
     EnvVarDoc {
         name: "ZINDER_OBSERVABILITY__SAMPLING_RATE",
@@ -160,560 +476,84 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Note: live-test gating reads the bare `ZINDER_NETWORK` env var directly \
                       and never reaches the config loader, so test runbooks still quote that form.",
     },
-    EnvVarDoc {
-        name: "ZINDER_NODE__JSON_RPC_ADDR",
-        toml_path: "node.json_rpc_addr",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::ConditionalOn(
-            "running ingest, light-wallet serving, or lean wallet serving, or using broadcast or fee reads",
-        ),
-        sensitive: false,
-        description: "Upstream node JSON-RPC URL. Light-wallet serving forwards transparent \
-                      address reads, omitted transaction bodies, broadcasts, and fee reads to \
-                      this node. Query and wallet-mode compatibility use a configured node for \
-                      broadcasts and verified mined transaction bytes in lean wallet mode. Wallet-mode compatibility also reads the fee. \
-                      Compact-blocks serving rejects node settings. Explorer uses the address \
-                      for upstream tip observation. See [The node sections](#the-node-sections).",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__INDEXER_GRPC_ADDR",
-        toml_path: "node.indexer_grpc_addr",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Optional Zebra indexer gRPC endpoint enabling the streaming mempool source \
-                      and required when `ingest.source = \"zebra-indexer-grpc\"` for binary \
-                      `GetBlock` block reads. Falls back to JSON-RPC mempool polling when unset \
-                      or empty. An `https://` URL negotiates TLS, configured by the \
-                      `ZINDER_NODE__INDEXER_TLS__*` variables; without them the node is verified \
-                      against the system roots.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
-        toml_path: "node.indexer_tls.ca_cert_path",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Path to the PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`. Read at startup and whenever an indexer stream reconnects.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM",
-        toml_path: "node.indexer_tls.ca_cert_pem",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: true,
-        description: "Inline PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`. Redacted in `--print-config` and structured logs.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH",
-        toml_path: "node.indexer_tls.client_cert_path",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::ConditionalOn("indexer client key is configured"),
-        sensitive: false,
-        description: "Path to the PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with a client private key. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM",
-        toml_path: "node.indexer_tls.client_cert_pem",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::ConditionalOn("indexer client key is configured"),
-        sensitive: true,
-        description: "Inline PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with a client private key. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`. Redacted in `--print-config` and structured logs.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH",
-        toml_path: "node.indexer_tls.client_key_path",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::ConditionalOn("indexer client certificate is configured"),
-        sensitive: false,
-        description: "Path to the PEM private key for the indexer client certificate. The path is shown in `--print-config`; the key is read at startup and whenever an indexer stream reconnects. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM",
-        toml_path: "node.indexer_tls.client_key_pem",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::ConditionalOn("indexer client certificate is configured"),
-        sensitive: true,
-        description: "Inline PEM private key for the indexer client certificate. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`. Redacted in `--print-config` and structured logs.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__INDEXER_TLS__SERVER_NAME",
-        toml_path: "node.indexer_tls.server_name",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Name verified against the indexer's certificate when it differs from the \
-                      host in `ZINDER_NODE__INDEXER_GRPC_ADDR`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__AUTH__METHOD",
-        toml_path: "node.auth.method",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Upstream-node auth shape: `basic`, `cookie`, or unset for no auth.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__AUTH__USERNAME",
-        toml_path: "node.auth.username",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::ConditionalOn("ZINDER_NODE__AUTH__METHOD=basic"),
-        sensitive: false,
-        description: "Basic-auth username. Paired with `ZINDER_NODE__AUTH__PASSWORD`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__AUTH__PASSWORD",
-        toml_path: "node.auth.password",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::ConditionalOn("ZINDER_NODE__AUTH__METHOD=basic"),
-        sensitive: true,
-        description: "Basic-auth password. Redacted in `--print-config` and structured logs.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__AUTH__PATH",
-        toml_path: "node.auth.path",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::ConditionalOn("ZINDER_NODE__AUTH__METHOD=cookie"),
-        sensitive: false,
-        description: "Path to a cookie file. Mutually exclusive with `ZINDER_NODE__AUTH__COOKIE`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__AUTH__COOKIE",
-        toml_path: "node.auth.cookie",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::ConditionalOn("ZINDER_NODE__AUTH__METHOD=cookie"),
-        sensitive: true,
-        description: "Inline cookie credentials (`username:password`). Mutually exclusive with \
-                      `ZINDER_NODE__AUTH__PATH`. Accepted for PaaS environments without \
-                      persistent disks.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__REQUEST_TIMEOUT_SECS",
-        toml_path: "node.request_timeout_secs",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Upstream-node JSON-RPC request timeout in seconds. Defaults to 30.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__MAX_RESPONSE_BYTES",
-        toml_path: "node.max_response_bytes",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Maximum JSON-RPC response body size (bytes) accepted from the node. \
-                      Defaults to 67108864 (64 MiB). This is a ceiling on what Zinder accepts, \
-                      not a request size: Zebra 7.1.0 and Zakura 1.8.6 refuse responses above \
-                      50 MiB by default, and ingest splits a source segment the node refuses.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__BROADCAST_TIMEOUT_SECS",
-        toml_path: "node.broadcast_timeout_secs",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Per-call timeout (seconds) applied only to `sendrawtransaction`. When \
-                      unset, the global `request_timeout_secs` applies instead. Recommended: 7. \
-                      With fallback endpoints, a broadcast moves to the next endpoint only after \
-                      the endpoint's own timeout, so keep it well below wallet request \
-                      deadlines. Fallback endpoints do not inherit it; set \
-                      `ZINDER_NODE_FALLBACKS__<N>__BROADCAST_TIMEOUT_SECS` for each.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__MAX_CONCURRENT_REQUESTS",
-        toml_path: "node.max_concurrent_requests",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Most JSON-RPC calls the process has in flight to this node at once, from 1 \
-                      to 1024. Defaults to 64, below Zebra's default limit of 100 JSON-RPC \
-                      connections, above which Zebra answers HTTP 429. A call beyond the limit \
-                      waits for a free slot for at most its own timeout. Readiness probes use \
-                      a separate slot. When several Zinder processes share one node, keep \
-                      their sum below the node's connection limit. Fallback endpoints do not \
-                      inherit it.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__HEALTH__ADDR",
-        toml_path: "node.health.addr",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "URL of the upstream's HTTP `/ready` endpoint. When set, ingest, the \
-                      wallet-serving readers, and `zinder-explorer` poll it as the primary \
-                      upstream-sync signal; when unset, they fall back \
-                      to `getblockchaininfo.verificationprogress`/`estimatedheight`. \
-                      Compatibility with `compat.serving = \"compact-blocks\"` rejects \
-                      every node setting. See \
-                      [ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md).",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__HEALTH__POLL_INTERVAL_MS",
-        toml_path: "node.health.poll_interval_ms",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Cadence of the upstream-health probe in milliseconds. Defaults to 30000. \
-                      Must be greater than zero. Query and wallet-serving compatibility use \
-                      it to verify every broadcast endpoint, `[node]` and each fallback, on \
-                      first contact and then refresh the node dependency their readiness \
-                      reports; compact-blocks \
-                      compatibility rejects it; `zinder-explorer` reuses the same cadence for \
-                      its upstream-observation probe (the one that populates \
-                      `ExplorerFreshness.chain_view.upstream_tip`).",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR",
-        toml_path: "node.health.verification_progress_floor",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Lower bound on `getblockchaininfo.verificationprogress` below which the \
-                      fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in \
-                      `(0.0, 1.0)`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS",
-        toml_path: "node.health.estimated_gap_floor_blocks",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Block gap between `estimatedheight` and the local tip above which the \
-                      fallback path reports `upstream_not_ready`. Defaults to 10.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__JSON_RPC_ADDR",
-        toml_path: "node_fallbacks.<N>.json_rpc_addr",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::ConditionalOn("any ZINDER_NODE_FALLBACKS__<N>__* is set"),
-        sensitive: false,
-        description: "JSON-RPC URL of fallback node endpoint `<N>`. Endpoints form one ordered list: \
-                      `[node]` is position 0 and `[node_fallbacks.N]` is position `N`, starting at 1 \
-                      with no gap. Every `ZINDER_NODE__*` field has a `ZINDER_NODE_FALLBACKS__<N>__*` \
-                      counterpart. `zinder-ingest` switches to a fallback when its active endpoint \
-                      fails. `zinder-query` and wallet-mode `zinder-compat-lightwalletd` broadcast, \
-                      and compatibility reads the recommended fee, through the next verified \
-                      endpoint when one is unreachable. `zinder-explorer` validates the list and \
-                      reads only `[node]`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_GRPC_ADDR",
-        toml_path: "node_fallbacks.<N>.indexer_grpc_addr",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__INDEXER_GRPC_ADDR`, for fallback endpoint `<N>`. After a switch, ingest follows the mempool of the new endpoint through it.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CA_CERT_PATH",
-        toml_path: "node_fallbacks.<N>.indexer_tls.ca_cert_path",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CA_CERT_PEM",
-        toml_path: "node_fallbacks.<N>.indexer_tls.ca_cert_pem",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: true,
-        description: "Same as `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PATH",
-        toml_path: "node_fallbacks.<N>.indexer_tls.client_cert_path",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::ConditionalOn("fallback indexer client key is configured"),
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PEM",
-        toml_path: "node_fallbacks.<N>.indexer_tls.client_cert_pem",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::ConditionalOn("fallback indexer client key is configured"),
-        sensitive: true,
-        description: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PATH",
-        toml_path: "node_fallbacks.<N>.indexer_tls.client_key_path",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::ConditionalOn(
-            "fallback indexer client certificate is configured",
-        ),
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PEM",
-        toml_path: "node_fallbacks.<N>.indexer_tls.client_key_pem",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::ConditionalOn(
-            "fallback indexer client certificate is configured",
-        ),
-        sensitive: true,
-        description: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__SERVER_NAME",
-        toml_path: "node_fallbacks.<N>.indexer_tls.server_name",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__INDEXER_TLS__SERVER_NAME`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD",
-        toml_path: "node_fallbacks.<N>.auth.method",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__AUTH__METHOD`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__AUTH__USERNAME",
-        toml_path: "node_fallbacks.<N>.auth.username",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::ConditionalOn("ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD=basic"),
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__AUTH__USERNAME`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__AUTH__PASSWORD",
-        toml_path: "node_fallbacks.<N>.auth.password",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::ConditionalOn("ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD=basic"),
-        sensitive: true,
-        description: "Same as `ZINDER_NODE__AUTH__PASSWORD`, for fallback endpoint `<N>`. Redacted in `--print-config` and structured logs.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__AUTH__PATH",
-        toml_path: "node_fallbacks.<N>.auth.path",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::ConditionalOn("ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD=cookie"),
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__AUTH__PATH`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__AUTH__COOKIE",
-        toml_path: "node_fallbacks.<N>.auth.cookie",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::ConditionalOn("ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD=cookie"),
-        sensitive: true,
-        description: "Same as `ZINDER_NODE__AUTH__COOKIE`, for fallback endpoint `<N>`. Redacted in `--print-config` and structured logs.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__REQUEST_TIMEOUT_SECS",
-        toml_path: "node_fallbacks.<N>.request_timeout_secs",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__REQUEST_TIMEOUT_SECS`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__MAX_RESPONSE_BYTES",
-        toml_path: "node_fallbacks.<N>.max_response_bytes",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__MAX_RESPONSE_BYTES`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__BROADCAST_TIMEOUT_SECS",
-        toml_path: "node_fallbacks.<N>.broadcast_timeout_secs",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__BROADCAST_TIMEOUT_SECS`, for fallback endpoint \
-                      `<N>`. It is not inherited from `[node]`: when unset, this endpoint's \
-                      own `request_timeout_secs` applies. Recommended: 7.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__MAX_CONCURRENT_REQUESTS",
-        toml_path: "node_fallbacks.<N>.max_concurrent_requests",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__MAX_CONCURRENT_REQUESTS`, for fallback endpoint `<N>`. \
-                      It is not inherited from `[node]`: when unset, the default of 64 applies.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__HEALTH__ADDR",
-        toml_path: "node_fallbacks.<N>.health.addr",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__HEALTH__ADDR`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__HEALTH__POLL_INTERVAL_MS",
-        toml_path: "node_fallbacks.<N>.health.poll_interval_ms",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS`, for fallback endpoint \
-                      `<N>`, in ingest. Query and wallet-serving compatibility ignore it and \
-                      verify and observe every endpoint on \
-                      `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__HEALTH__VERIFICATION_PROGRESS_FLOOR",
-        toml_path: "node_fallbacks.<N>.health.verification_progress_floor",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR`, for fallback endpoint `<N>`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_NODE_FALLBACKS__<N>__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS",
-        toml_path: "node_fallbacks.<N>.health.estimated_gap_floor_blocks",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Same as `ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS`, for fallback endpoint `<N>`.",
-    },
+];
+
+const NODE_PRIMARY_DOCS: [EnvVarDoc; 22] = node_env_var_docs!(
+    env_prefix: "ZINDER_NODE__",
+    toml_prefix: "node.",
+    rpc_req: Requirement::ConditionalOn(
+        "running ingest, light-wallet serving, or lean wallet serving, or using broadcast or fee reads",
+    ),
+    rpc_desc: "Upstream node JSON-RPC URL. Light-wallet serving forwards transparent \
+               address reads, omitted transaction bodies, broadcasts, and fee reads to \
+               this node. Query and wallet-mode compatibility use a configured node for \
+               broadcasts and verified mined transaction bytes in lean wallet mode. Wallet-mode compatibility also reads the fee. \
+               Compact-blocks serving rejects node settings. Explorer uses the address \
+               for upstream tip observation. See [The node sections](#the-node-sections).",
+    idx_desc: "Optional Zebra indexer gRPC endpoint enabling the streaming mempool source \
+               and required when `ingest.source = \"zebra-indexer-grpc\"` for binary \
+               `GetBlock` block reads. Omit or set to `\"none\"` to fall back to JSON-RPC mempool polling; empty values are rejected. An `https://` URL negotiates TLS, configured by the \
+               `ZINDER_NODE__INDEXER_TLS__*` variables; without them the node is verified \
+               against the system roots.",
+    tls_cert_cond: "indexer client key is configured",
+    tls_key_cond: "indexer client certificate is configured",
+    tls_ca_path_desc: "Path to the PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`. Read at startup and whenever an indexer stream reconnects.",
+    tls_ca_pem_desc: "Inline PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`. Redacted in `--print-config` and structured logs.",
+    tls_client_cert_path_desc: "Path to the PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with a client private key. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`.",
+    tls_client_cert_pem_desc: "Inline PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with a client private key. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`. Redacted in `--print-config` and structured logs.",
+    tls_client_key_path_desc: "Path to the PEM private key for the indexer client certificate. The path is shown in `--print-config`; the key is read at startup and whenever an indexer stream reconnects. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM`.",
+    tls_client_key_pem_desc: "Inline PEM private key for the indexer client certificate. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`. Redacted in `--print-config` and structured logs.",
+    tls_server_name_desc: "Name verified against the indexer's certificate when it differs from the host in `ZINDER_NODE__INDEXER_GRPC_ADDR`.",
+    auth_method_desc: "Upstream-node auth shape: `basic`, `cookie`, or `none` / unset for no auth.",
+    auth_user_cond: "ZINDER_NODE__AUTH__METHOD=basic",
+    auth_user_desc: "Basic-auth username. Paired with `ZINDER_NODE__AUTH__PASSWORD`.",
+    auth_pass_desc: "Basic-auth password. Redacted in `--print-config` and structured logs.",
+    auth_cookie_cond: "ZINDER_NODE__AUTH__METHOD=cookie",
+    auth_path_desc: "Path to a cookie file. Mutually exclusive with `ZINDER_NODE__AUTH__COOKIE`.",
+    auth_cookie_desc: "Inline cookie credentials (`username:password`). Mutually exclusive with `ZINDER_NODE__AUTH__PATH`. Accepted for PaaS environments without persistent disks.",
+    req_timeout_desc: "Upstream-node JSON-RPC request timeout in seconds. Defaults to 30.",
+    max_resp_desc: "Maximum JSON-RPC response body size (bytes) accepted from the node. Defaults to 67108864 (64 MiB). This is a ceiling on what Zinder accepts, not a request size: Zebra 7.1.0 and Zakura 1.8.6 refuse responses above 50 MiB by default, and ingest splits a source segment the node refuses.",
+    broadcast_desc: "Per-call timeout (seconds) applied only to `sendrawtransaction`. When unset, the global `request_timeout_secs` applies instead. Recommended: 7. With fallback endpoints, a broadcast moves to the next endpoint only after the endpoint's own timeout, so keep it well below wallet request deadlines. Fallback endpoints do not inherit it; set `ZINDER_NODE_FALLBACKS__<N>__BROADCAST_TIMEOUT_SECS` for each.",
+    max_conc_desc: "Most JSON-RPC calls the process has in flight to this node at once, from 1 to 1024. Defaults to 64, below Zebra's default limit of 100 JSON-RPC connections, above which Zebra answers HTTP 429. A call beyond the limit waits for a free slot for at most its own timeout. Readiness probes use a separate slot. When several Zinder processes share one node, keep their sum below the node's connection limit. Fallback endpoints do not inherit it.",
+    health_addr_desc: "URL of the upstream's HTTP `/ready` endpoint. When set, ingest, the wallet-serving readers, and `zinder-explorer` poll it as the primary upstream-sync signal; when omitted or set to `\"none\"`, they fall back to `getblockchaininfo.verificationprogress`/`estimatedheight` (empty values are rejected). Compatibility with `compat.serving = \"compact-blocks\"` rejects every node setting. See [ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md).",
+    health_poll_desc: "Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. Query and wallet-serving compatibility use it to verify every broadcast endpoint, `[node]` and each fallback, on first contact and then refresh the node dependency their readiness reports; compact-blocks compatibility rejects it; `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.chain_view.upstream_tip`).",
+    health_vp_desc: "Lower bound on `getblockchaininfo.verificationprogress` below which the fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in `(0.0, 1.0)`.",
+    health_gap_desc: "Block gap between `estimatedheight` and the local tip above which the fallback path reports `upstream_not_ready`. Defaults to 10.",
+);
+
+const NODE_FALLBACK_DOCS: [EnvVarDoc; 22] = node_env_var_docs!(
+    env_prefix: "ZINDER_NODE_FALLBACKS__<N>__",
+    toml_prefix: "node_fallbacks.<N>.",
+    rpc_req: Requirement::ConditionalOn("any ZINDER_NODE_FALLBACKS__<N>__* is set"),
+    rpc_desc: "JSON-RPC URL of fallback node endpoint `<N>`. Endpoints form one ordered list: `[node]` is position 0 and `[node_fallbacks.N]` is position `N`, starting at 1 with no gap. Every `ZINDER_NODE__*` field has a `ZINDER_NODE_FALLBACKS__<N>__*` counterpart. `zinder-ingest` switches to a fallback when its active endpoint fails. `zinder-query` and wallet-mode `zinder-compat-lightwalletd` broadcast, and compatibility reads the recommended fee, through the next verified endpoint when one is unreachable. `zinder-explorer` validates the list and reads only `[node]`.",
+    idx_desc: "Same as `ZINDER_NODE__INDEXER_GRPC_ADDR`, for fallback endpoint `<N>`. After a switch, ingest follows the mempool of the new endpoint through it.",
+    tls_cert_cond: "fallback indexer client key is configured",
+    tls_key_cond: "fallback indexer client certificate is configured",
+    tls_ca_path_desc: "Same as `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`, for fallback endpoint `<N>`.",
+    tls_ca_pem_desc: "Same as `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`, for fallback endpoint `<N>`.",
+    tls_client_cert_path_desc: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`, for fallback endpoint `<N>`.",
+    tls_client_cert_pem_desc: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`, for fallback endpoint `<N>`.",
+    tls_client_key_path_desc: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`, for fallback endpoint `<N>`.",
+    tls_client_key_pem_desc: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM`, for fallback endpoint `<N>`.",
+    tls_server_name_desc: "Same as `ZINDER_NODE__INDEXER_TLS__SERVER_NAME`, for fallback endpoint `<N>`.",
+    auth_method_desc: "Same as `ZINDER_NODE__AUTH__METHOD`, for fallback endpoint `<N>`.",
+    auth_user_cond: "ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD=basic",
+    auth_user_desc: "Same as `ZINDER_NODE__AUTH__USERNAME`, for fallback endpoint `<N>`.",
+    auth_pass_desc: "Same as `ZINDER_NODE__AUTH__PASSWORD`, for fallback endpoint `<N>`. Redacted in `--print-config` and structured logs.",
+    auth_cookie_cond: "ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD=cookie",
+    auth_path_desc: "Same as `ZINDER_NODE__AUTH__PATH`, for fallback endpoint `<N>`.",
+    auth_cookie_desc: "Same as `ZINDER_NODE__AUTH__COOKIE`, for fallback endpoint `<N>`. Redacted in `--print-config` and structured logs.",
+    req_timeout_desc: "Same as `ZINDER_NODE__REQUEST_TIMEOUT_SECS`, for fallback endpoint `<N>`.",
+    max_resp_desc: "Same as `ZINDER_NODE__MAX_RESPONSE_BYTES`, for fallback endpoint `<N>`.",
+    broadcast_desc: "Same as `ZINDER_NODE__BROADCAST_TIMEOUT_SECS`, for fallback endpoint `<N>`. It is not inherited from `[node]`: when unset, this endpoint's own `request_timeout_secs` applies. Recommended: 7.",
+    max_conc_desc: "Same as `ZINDER_NODE__MAX_CONCURRENT_REQUESTS`, for fallback endpoint `<N>`. It is not inherited from `[node]`: when unset, the default of 64 applies.",
+    health_addr_desc: "Same as `ZINDER_NODE__HEALTH__ADDR`, for fallback endpoint `<N>`.",
+    health_poll_desc: "Same as `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS`, for fallback endpoint `<N>`, in ingest. Query and wallet-serving compatibility ignore it and verify and observe every endpoint on `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS`.",
+    health_vp_desc: "Same as `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR`, for fallback endpoint `<N>`.",
+    health_gap_desc: "Same as `ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS`, for fallback endpoint `<N>`.",
+);
+
+const OPS_CONTROL_STORAGE_DOCS: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_OPS__LISTEN_ADDR",
         toml_path: "ops.listen_addr",
@@ -730,8 +570,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Listen address for the operational HTTP endpoint \
                       (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service \
                       loopback address (`127.0.0.1:9105` ingest, `9110` projector, `9106` query, \
-                      `9107` compat, `9069` explorer, `9108` cipherscan). Set to an empty string to \
-                      disable the endpoint entirely.",
+                      `9107` compat, `9069` explorer, `9108` cipherscan). Set to `\"none\"` to \
+                      disable the endpoint entirely; empty values are rejected.",
     },
     EnvVarDoc {
         name: "ZINDER_SECURITY__ALLOW_PUBLIC_BIND",
@@ -761,8 +601,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Listen address of the private IngestControl gRPC endpoint. Localhost-only \
                       by default; cross-host deployments must add bearer-token auth per ADR-0011. \
-                      Set to an empty string to disable the endpoint for diagnostic one-shot runs \
-                      (such as `--target-height` pre-seed).",
+                      Set to `\"none\"` to disable the endpoint for diagnostic one-shot runs \
+                      (such as `--target-height` pre-seed); empty values are rejected.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST_CONTROL__ADDR",
@@ -841,7 +681,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Loopback-only private ProjectorControl gRPC endpoint for coherent capture. \
-                      Empty or unset disables it; an enabled endpoint requires \
+                      Omit or set to `\"none\"` to disable it (empty values are rejected); an enabled endpoint requires \
                       projector_control.bearer_token_path or projector_control.bearer_token.",
     },
     EnvVarDoc {
@@ -877,18 +717,20 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "storage.path",
         used_by: &[
             "zinder-ingest",
+            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Canonical RocksDB store directory. Defaults to `<storage.data_dir>/canonical` or `/var/lib/zinder/canonical` unless explicit secondary paths omit it. Ingest writes the primary store here; Explorer locates its materialized-view store beneath this directory; query and lightwalletd open the canonical store as a secondary.",
+        description: "Canonical RocksDB store directory. Defaults to `<storage.data_dir>/canonical` or `/var/lib/zinder/canonical` unless explicit secondary paths omit it. Ingest writes the primary store here; Explorer locates its materialized-view store beneath this directory; projector, query, and lightwalletd open the canonical store as a secondary.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__SECONDARY_PATH",
         toml_path: "storage.secondary_path",
         used_by: &[
+            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -939,22 +781,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       waiting for the writer. Defaults to 300000. Must be greater than zero.",
     },
     EnvVarDoc {
-        name: "ZINDER_STORAGE__CANONICAL_PATH",
-        toml_path: "storage.canonical_path",
-        used_by: &["zinder-projector"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Canonical primary RocksDB path the projector opens as a read-only secondary. Defaults to `<storage.data_dir>/canonical` or `/var/lib/zinder/canonical`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__CANONICAL_SECONDARY_PATH",
-        toml_path: "storage.canonical_secondary_path",
-        used_by: &["zinder-projector"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Projector-local RocksDB secondary metadata directory for canonical reads. Defaults to `<storage.data_dir>/canonical-secondary/projector` when `storage.data_dir` is set, or `/var/lib/zinder/projector/canonical-secondary`; never share it with another process.",
-    },
-    EnvVarDoc {
         name: "ZINDER_WALLET__PATH",
         toml_path: "wallet.path",
         used_by: &[
@@ -974,238 +800,71 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Wallet-serving reader root for immutable wallet-secondary generations. Defaults to `<storage.data_dir>/wallet-secondary/<service>` or `/var/lib/zinder/wallet-secondary/<service>` when all storage paths are omitted; required when explicit storage paths omit it. Must be distinct from every primary and canonical-secondary path.",
     },
-    EnvVarDoc {
-        name: "ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES",
-        toml_path: "wallet.rocksdb.block_cache_bytes",
-        used_by: &[
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Wallet-projection RocksDB block cache budget in bytes. Defaults to 268435456 \
-                      for the writer and 67108864 for the wallet-serving reader. In zinder-query \
-                      and zinder-compat-lightwalletd, one cache of this size serves every wallet \
-                      secondary generation of the process.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_WALLET__ROCKSDB__MAX_WAL_BYTES",
-        toml_path: "wallet.rocksdb.max_wal_bytes",
-        used_by: &[
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Wallet-projection RocksDB live WAL ceiling in bytes. Defaults to 33554432 \
-                      for the writer and 16777216 for the wallet-serving reader.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_WALLET__ROCKSDB__MAX_OPEN_FILES",
-        toml_path: "wallet.rocksdb.max_open_files",
-        used_by: &[
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Wallet-projection RocksDB open SST file cap. Defaults to 512 for the writer \
-                      and 1024 for the wallet-serving reader.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_WALLET__ROCKSDB__WRITE_BUFFER_BYTES",
-        toml_path: "wallet.rocksdb.write_buffer_bytes",
-        used_by: &[
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Wallet-projection RocksDB per-column-family write buffer size. Defaults to \
-                      16777216 for the writer and 4194304 for the wallet-serving reader.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_WALLET__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
-        toml_path: "wallet.rocksdb.max_write_buffer_count",
-        used_by: &[
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Wallet-projection RocksDB mutable plus immutable write buffer count. Defaults \
-                      to 4 for the writer and 2 for the wallet-serving reader.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_WALLET__ROCKSDB__MAX_BACKGROUND_JOBS",
-        toml_path: "wallet.rocksdb.max_background_jobs",
-        used_by: &[
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Wallet-projection primary-writer RocksDB background job cap shared by flush \
-                      and compaction work. Defaults to 2 and is not applied to secondary opens, \
-                      including wallet-serving readers.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_WALLET__ROCKSDB__MEMTABLE_BUDGET_BYTES",
-        toml_path: "wallet.rocksdb.memtable_budget_bytes",
-        used_by: &[
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Wallet-projection RocksDB total memtable budget across column families. \
+];
+
+const WALLET_ROCKSDB_DOCS: [EnvVarDoc; 8] = rocksdb_env_var_docs!(
+    env_prefix: "ZINDER_WALLET__ROCKSDB__",
+    toml_prefix: "wallet.rocksdb.",
+    used_by: &[
+        "zinder-projector",
+        "zinder-query",
+        "zinder-compat-lightwalletd",
+    ],
+    block_cache: "Wallet-projection RocksDB block cache budget in bytes. Defaults to 268435456 \
+                  for the writer and 67108864 for the wallet-serving reader. In zinder-query \
+                  and zinder-compat-lightwalletd, one cache of this size serves every wallet \
+                  secondary generation of the process.",
+    max_wal: "Wallet-projection RocksDB live WAL ceiling in bytes. Defaults to 33554432 \
+              for the writer and 16777216 for the wallet-serving reader.",
+    max_open_files: "Wallet-projection RocksDB open SST file cap. Defaults to 512 for the writer \
+                     and 1024 for the wallet-serving reader.",
+    write_buffer: "Wallet-projection RocksDB per-column-family write buffer size. Defaults to \
+                   16777216 for the writer and 4194304 for the wallet-serving reader.",
+    max_write_buffer_count: "Wallet-projection RocksDB mutable plus immutable write buffer count. Defaults \
+                             to 4 for the writer and 2 for the wallet-serving reader.",
+    max_background_jobs: "Wallet-projection primary-writer RocksDB background job cap shared by flush \
+                          and compaction work. Defaults to 2 and is not applied to secondary opens, \
+                          including wallet-serving readers.",
+    memtable_budget: "Wallet-projection RocksDB total memtable budget across column families. \
                       Defaults to 536870912 for the writer and 16777216 for a wallet-serving \
                       reader.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_WALLET__ROCKSDB__STATISTICS_LEVEL",
-        toml_path: "wallet.rocksdb.statistics_level",
-        used_by: &[
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Wallet-projection RocksDB statistics collection gate: `off`, `tickers`, or \
-                      `full`. Defaults to `tickers`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__BLOCK_CACHE_BYTES",
-        toml_path: "storage.canonical.rocksdb.block_cache_bytes",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Canonical-store RocksDB block cache budget in bytes. Defaults to 536870912 \
-                      for writers. Readers default to one eighth of the detected cgroup memory \
-                      limit, clamped between 134217728 and 536870912, and to 134217728 without \
-                      a limit. In zinder-query and zinder-compat-lightwalletd, one cache of this \
-                      size serves every canonical secondary generation of the process.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WAL_BYTES",
-        toml_path: "storage.canonical.rocksdb.max_wal_bytes",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Canonical-store RocksDB live WAL ceiling in bytes. Defaults to 268435456 \
-                      for writers and 33554432 for readers.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES",
-        toml_path: "storage.canonical.rocksdb.max_open_files",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Canonical-store RocksDB open SST file cap. Defaults to 512 for writers. \
-                      Readers default to 1024 to 2048 based on the detected container memory limit, \
-                      or 2048 without a limit.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__WRITE_BUFFER_BYTES",
-        toml_path: "storage.canonical.rocksdb.write_buffer_bytes",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Canonical-store per-column-family RocksDB write buffer size. Defaults to \
-                      16777216 for writers and 8388608 for readers.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
-        toml_path: "storage.canonical.rocksdb.max_write_buffer_count",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Canonical-store per-column-family mutable plus immutable RocksDB write \
-                      buffer count. Defaults to 2.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_BACKGROUND_JOBS",
-        toml_path: "storage.canonical.rocksdb.max_background_jobs",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Canonical-store primary-writer RocksDB background job cap shared by flush \
-                      and compaction work. Defaults to 2 and is not applied to secondary opens.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MEMTABLE_BUDGET_BYTES",
-        toml_path: "storage.canonical.rocksdb.memtable_budget_bytes",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Canonical-store total RocksDB memtable budget across column families. \
+    statistics_level: "Wallet-projection RocksDB statistics collection gate: `off`, `tickers`, or \
+                       `full`. Defaults to `tickers`.",
+);
+
+const CANONICAL_ROCKSDB_DOCS: [EnvVarDoc; 8] = rocksdb_env_var_docs!(
+    env_prefix: "ZINDER_STORAGE__CANONICAL__ROCKSDB__",
+    toml_prefix: "storage.canonical.rocksdb.",
+    used_by: &[
+        "zinder-ingest",
+        "zinder-projector",
+        "zinder-query",
+        "zinder-compat-lightwalletd",
+        "zinder-explorer",
+    ],
+    block_cache: "Canonical-store RocksDB block cache budget in bytes. Defaults to 536870912 \
+                  for writers. Readers default to one eighth of the detected cgroup memory \
+                  limit, clamped between 134217728 and 536870912, and to 134217728 without \
+                  a limit. In zinder-query and zinder-compat-lightwalletd, one cache of this \
+                  size serves every canonical secondary generation of the process.",
+    max_wal: "Canonical-store RocksDB live WAL ceiling in bytes. Defaults to 268435456 \
+              for writers and 33554432 for readers.",
+    max_open_files: "Canonical-store RocksDB open SST file cap. Defaults to 512 for writers. \
+                     Readers default to 1024 to 2048 based on the detected container memory limit, \
+                     or 2048 without a limit.",
+    write_buffer: "Canonical-store per-column-family RocksDB write buffer size. Defaults to \
+                   16777216 for writers and 8388608 for readers.",
+    max_write_buffer_count: "Canonical-store per-column-family mutable plus immutable RocksDB write \
+                             buffer count. Defaults to 2.",
+    max_background_jobs: "Canonical-store primary-writer RocksDB background job cap shared by flush \
+                          and compaction work. Defaults to 2 and is not applied to secondary opens.",
+    memtable_budget: "Canonical-store total RocksDB memtable budget across column families. \
                       Defaults to 268435456 for writers and 16777216 for readers.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__STATISTICS_LEVEL",
-        toml_path: "storage.canonical.rocksdb.statistics_level",
-        used_by: &[
-            "zinder-ingest",
-            "zinder-projector",
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Canonical-store RocksDB statistics collection gate: `off`, `tickers`, or \
-                      `full`. Defaults to `tickers`.",
-    },
+    statistics_level: "Canonical-store RocksDB statistics collection gate: `off`, `tickers`, or \
+                       `full`. Defaults to `tickers`.",
+);
+
+const QUERY_COMPAT_DOCS: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_QUERY__LISTEN_ADDR",
         toml_path: "query.listen_addr",
@@ -1221,8 +880,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-query"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Enables gRPC-Web on the WalletQuery listener for the configured origins. \
-                      Defaults to disabled. See [Browser origins](#browser-origins).",
+        description: "Enables gRPC-Web on the WalletQuery listener for the configured origins. Use \
+                      comma-separated HTTP or HTTPS origins in the environment, or an array in \
+                      TOML. Omit or set to `\"none\"` (or `[]` in TOML) to disable browser access \
+                      (the default); empty environment values are rejected. See [Browser origins](#browser-origins).",
     },
     EnvVarDoc {
         name: "ZINDER_QUERY__REORG_WINDOW_BLOCKS",
@@ -1319,7 +980,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-query"],
         requirement: Requirement::Optional,
         sensitive: true,
-        description: "Comma-separated CIDRs for trusted TCP proxies. Requires a PROXY v1 or v2 preface on every connection. Disabled when omitted.",
+        description: "Comma-separated CIDRs for trusted TCP proxies. Requires a PROXY v1 or v2 preface on every connection. Disabled when omitted or set to `\"none\"`; empty values are rejected.",
     },
     EnvVarDoc {
         name: "ZINDER_QUERY__RANGE_ADMISSION__MAX_STREAMS_PER_CLIENT",
@@ -1373,8 +1034,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Enables gRPC-Web for the listed browser origins. Use comma-separated HTTP \
-                      or HTTPS origins in the environment, or an array in TOML. An empty list \
-                      disables browser access (the default). Use `*` alone to allow every origin.",
+                      or HTTPS origins in the environment, or an array in TOML. Omit or set to \
+                      `\"none\"` (or `[]` in TOML) to disable browser access (the default); empty \
+                      environment values are rejected. Use `*` alone to allow every origin.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__SERVING",
@@ -1545,7 +1207,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: true,
-        description: "Comma-separated CIDRs for trusted TCP proxies. Requires a PROXY v1 or v2 preface on every connection. Disabled when omitted.",
+        description: "Comma-separated CIDRs for trusted TCP proxies. Requires a PROXY v1 or v2 preface on every connection. Disabled when omitted or set to `\"none\"`; empty values are rejected.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__RANGE_ADMISSION__MAX_STREAMS_PER_CLIENT",
@@ -1583,79 +1245,32 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       refuse. Set it only when clients reach the listener solely through a \
                       proxy that replaces the header. Defaults to false.",
     },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES",
-        toml_path: "storage.materialized_views.rocksdb.block_cache_bytes",
-        used_by: &["zinder-ingest", "zinder-explorer"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Materialized-view store RocksDB block cache budget in bytes. Defaults to \
-                      268435456 for writers and 67108864 for readers.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WAL_BYTES",
-        toml_path: "storage.materialized_views.rocksdb.max_wal_bytes",
-        used_by: &["zinder-ingest", "zinder-explorer"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Materialized-view store RocksDB live WAL ceiling in bytes. Defaults to \
-                      268435456 for writers and 16777216 for readers.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES",
-        toml_path: "storage.materialized_views.rocksdb.max_open_files",
-        used_by: &["zinder-ingest", "zinder-explorer"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Materialized-view store RocksDB open SST file cap. Defaults to 512 for \
-                      writers and 64 for readers.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__WRITE_BUFFER_BYTES",
-        toml_path: "storage.materialized_views.rocksdb.write_buffer_bytes",
-        used_by: &["zinder-ingest", "zinder-explorer"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Materialized-view store per-column-family RocksDB write buffer size. \
-                      Defaults to 16777216 for writers and 4194304 for readers.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
-        toml_path: "storage.materialized_views.rocksdb.max_write_buffer_count",
-        used_by: &["zinder-ingest", "zinder-explorer"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Materialized-view store per-column-family mutable plus immutable RocksDB write \
-                      buffer count. Defaults to 4 for writers and 2 for readers.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_BACKGROUND_JOBS",
-        toml_path: "storage.materialized_views.rocksdb.max_background_jobs",
-        used_by: &["zinder-ingest", "zinder-explorer"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Materialized-view store primary-writer RocksDB background job cap shared by \
-                      flush and compaction work. Defaults to 2 and is not applied to secondary \
-                      opens, including `zinder-explorer`.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MEMTABLE_BUDGET_BYTES",
-        toml_path: "storage.materialized_views.rocksdb.memtable_budget_bytes",
-        used_by: &["zinder-ingest", "zinder-explorer"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Materialized-view store total RocksDB memtable budget across column families. \
+];
+
+const MATERIALIZED_VIEWS_ROCKSDB_DOCS: [EnvVarDoc; 8] = rocksdb_env_var_docs!(
+    env_prefix: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__",
+    toml_prefix: "storage.materialized_views.rocksdb.",
+    used_by: &["zinder-ingest", "zinder-explorer"],
+    block_cache: "Materialized-view store RocksDB block cache budget in bytes. Defaults to \
+                  268435456 for writers and 67108864 for readers.",
+    max_wal: "Materialized-view store RocksDB live WAL ceiling in bytes. Defaults to \
+              268435456 for writers and 16777216 for readers.",
+    max_open_files: "Materialized-view store RocksDB open SST file cap. Defaults to 512 for \
+                     writers and 64 for readers.",
+    write_buffer: "Materialized-view store per-column-family RocksDB write buffer size. \
+                   Defaults to 16777216 for writers and 4194304 for readers.",
+    max_write_buffer_count: "Materialized-view store per-column-family mutable plus immutable RocksDB write \
+                             buffer count. Defaults to 4 for writers and 2 for readers.",
+    max_background_jobs: "Materialized-view store primary-writer RocksDB background job cap shared by \
+                          flush and compaction work. Defaults to 2 and is not applied to secondary \
+                          opens, including `zinder-explorer`.",
+    memtable_budget: "Materialized-view store total RocksDB memtable budget across column families. \
                       Defaults to 536870912 for writers and 16777216 for readers.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__STATISTICS_LEVEL",
-        toml_path: "storage.materialized_views.rocksdb.statistics_level",
-        used_by: &["zinder-ingest", "zinder-explorer"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Materialized-view store RocksDB statistics collection gate: `off`, `tickers`, or `full`. \
-                      Defaults to `tickers`.",
-    },
+    statistics_level: "Materialized-view store RocksDB statistics collection gate: `off`, `tickers`, or `full`. \
+                       Defaults to `tickers`.",
+);
+
+const TAIL_DOCS: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_INGEST__SOURCE",
         toml_path: "ingest.source",
@@ -2259,7 +1874,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Enables gRPC-Web on the ExplorerQuery listener for the configured origins. \
-                      Defaults to disabled. See [Browser origins](#browser-origins).",
+                      Use comma-separated HTTP or HTTPS origins in the environment, or an array in \
+                      TOML. Omit or set to `\"none\"` (or `[]` in TOML) to disable browser access \
+                      (the default); empty environment values are rejected. See [Browser origins](#browser-origins).",
     },
     EnvVarDoc {
         name: "ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS",
@@ -2280,8 +1897,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "WalletQuery gRPC endpoint backing the explorer's wallet-composed reads \
-                      (transaction detail, block views, search, mempool activity). Empty/unset \
-                      disables the explorer capabilities that compose canonical wallet reads.",
+                      (transaction detail, block views, search, mempool activity). Omit or set to \
+                      `\"none\"` to disable the explorer capabilities that compose canonical wallet \
+                      reads; empty values are rejected.",
     },
     EnvVarDoc {
         name: "ZINDER_CIPHERSCAN__LISTEN_ADDR",
@@ -2346,6 +1964,33 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Inline shared-secret bearer token the adapter presents to both the ExplorerQuery and WalletQuery endpoints (ADR-0011). Mutually exclusive with `ZINDER_CIPHERSCAN__BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs.",
     },
 ];
+
+const DOC_GROUPS: &[&[EnvVarDoc]] = &[
+    CORE_HEAD_DOCS,
+    &NODE_PRIMARY_DOCS,
+    &NODE_FALLBACK_DOCS,
+    OPS_CONTROL_STORAGE_DOCS,
+    &WALLET_ROCKSDB_DOCS,
+    &CANONICAL_ROCKSDB_DOCS,
+    QUERY_COMPAT_DOCS,
+    &MATERIALIZED_VIEWS_ROCKSDB_DOCS,
+    TAIL_DOCS,
+];
+
+const DOC_COUNT: usize = count_env_var_docs(DOC_GROUPS);
+static ENVIRONMENT_VARIABLES_STORAGE: [EnvVarDoc; DOC_COUNT] = flatten_env_var_docs(DOC_GROUPS);
+
+/// Operator-facing `ZINDER_*` environment variables advertised by Zinder
+/// service binaries.
+///
+/// Mapped 1-to-1 with every leaf field in [`crate::ZinderConfig`] and
+/// mirrored into `docs/reference/configuration.md` between the
+/// `<!-- env-var-table:public-interfaces:start -->` and corresponding `:end`
+/// markers.
+///
+/// `ZINDER_TEST_*` variables are intentionally absent: they are stripped at
+/// the runtime config loader so production binaries never observe them.
+pub static ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &ENVIRONMENT_VARIABLES_STORAGE;
 
 /// Renders [`ENVIRONMENT_VARIABLES`] as a GitHub-flavored Markdown table.
 ///

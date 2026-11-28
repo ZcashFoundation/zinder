@@ -427,7 +427,8 @@ fn assert_profile_policy_rejections(
     );
     let legacy_stderr = String::from_utf8(legacy_transactions.stderr)?;
     assert!(
-        legacy_stderr.contains("does not have variant constructor transactions"),
+        legacy_stderr.contains("ZINDER_STORAGE__RAW_BLOB_POLICY")
+            && legacy_stderr.contains("expected `none` or `all`"),
         "{legacy_stderr}"
     );
     Ok(())

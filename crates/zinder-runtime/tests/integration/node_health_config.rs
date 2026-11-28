@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use zinder_core::Network;
-use zinder_runtime::{ConfigLoader, NodeToml};
+use zinder_runtime::ConfigLoader;
 use zinder_source::{
     NodeCapability, NodeSection, NodeSource, NodeTarget,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, ZebraJsonRpcSource,
@@ -60,7 +60,7 @@ async fn fallback_health_config_applies_with_an_absent_or_failed_ready_endpoint(
             addr.is_some()
         );
 
-        let printed = toml::Value::try_from(NodeToml::from_node_target(&target))?;
+        let printed = toml::Value::try_from(NodeSection::from_resolved(&target))?;
         let health = &printed["health"];
         assert_eq!(health["estimated_gap_floor_blocks"].as_integer(), Some(14));
         assert_eq!(

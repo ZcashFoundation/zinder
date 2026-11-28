@@ -101,7 +101,7 @@ if __name__ == "__main__":
     dashboard = json.loads((ROOT / "observability/grafana/dashboards/zinder-overview.json").read_text())
     panel = next(p for p in dashboard["panels"] if p["title"] == "Scrape Targets")["targets"][0]["expr"]
     compose = [
-        "--env-file", "deploy/.env.regtest",
+        "--env-file", "deploy/profiles/regtest/deploy.env",
         "-f", "deploy/docker-compose.yml",
         "--profile", "observability",
     ]

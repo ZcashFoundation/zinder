@@ -17,7 +17,7 @@ use zinder_proto::compat::lightwalletd::{EncodedBlock, EncodedBlockBatcher};
 
 use crate::{
     HeightOrder,
-    positional_source::{ByteRange, PositionalByteSource},
+    positional_source::{ByteRange, PositionalByteSource, SegmentSource},
     segment_verity,
 };
 
@@ -1136,7 +1136,7 @@ impl SettledShieldedSegmentIndex {
 
 /// Authenticated positional reader over one settled `ZSHRNG02` shielded segment.
 pub struct SettledShieldedSegmentReader<S = File> {
-    source: S,
+    source: SegmentSource<S>,
     index: SettledShieldedSegmentIndex,
 }
 
@@ -1184,7 +1184,12 @@ impl SettledShieldedSegmentReader<File> {
         if options.require_fs_verity && !kernel_verified {
             return Err(SettledShieldedSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(file, expected, options, kernel_verified)
+        Self::admit_with_verity(
+            SegmentSource::file(file, "shielded"),
+            expected,
+            options,
+            kernel_verified,
+        )
     }
 }
 
@@ -1204,11 +1209,20 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
         if options.require_fs_verity {
             return Err(SettledShieldedSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(source, expected, options, false)
+        Self::admit_with_verity(SegmentSource::unmeasured(source), expected, options, false)
+    }
+
+    pub(crate) fn index_heap_bytes(&self) -> usize {
+        std::mem::size_of_val(self.index.rows.as_ref())
+            + self
+                .index
+                .index_page_digests
+                .as_deref()
+                .map_or(0, std::mem::size_of_val)
     }
 
     fn admit_with_verity(
-        source: S,
+        source: SegmentSource<S>,
         expected: &ShieldedSegmentIdentity,
         options: SettledShieldedSegmentOpenOptions,
         kernel_verified: bool,

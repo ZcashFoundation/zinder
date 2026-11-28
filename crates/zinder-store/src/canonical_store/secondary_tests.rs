@@ -505,7 +505,126 @@ fn a_bounded_read_its_first_block_fills_fetches_only_that_block()
                 "a {order:?} read with a {max_bytes}-byte budget must fetch one row"
             );
         }
+        assert_encoded_prefix_on_stale_secondary(
+            &store,
+            secondary,
+            *order,
+            BlockHeightRange::inclusive(*first, *first),
+            split_heights(),
+        )?;
     }
+    Ok(())
+}
+
+#[test]
+fn a_bounded_encoded_read_keeps_an_exact_fit_row_in_its_second_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    use prost::encoding::{WireType, encode_key, encode_varint};
+
+    const PADDING_BYTES: u64 = 8 * 1024;
+
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let first = BlockHeight::new(1);
+    let exact_fit = BlockHeight::new(17);
+    let missing = BlockHeight::new(18);
+    let tip = BlockHeight::new(SPLIT_HEIGHTS);
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        tip,
+        BlockHeight::new(SPLIT_HEIGHTS - REORG_WINDOW),
+    )?;
+    let db = &store.bounded_open.db;
+    let cf = db
+        .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+        .ok_or("missing live-tail family")?;
+    let key = encode_block_position(exact_fit);
+    let bytes = db.get_cf(&cf, key)?.ok_or("missing exact-fit row")?;
+    let mut record = LiveTailBlockRecord::decode_v1(&bytes)?;
+    // An unknown protobuf field enlarges the exact-fit frame without changing
+    // its facts. The smaller rows in the first batch lead to a multi-key probe.
+    let payload = &mut record.shielded_payload;
+    encode_key(127, WireType::LengthDelimited, payload);
+    encode_varint(PADDING_BYTES, payload);
+    payload.resize(payload.len() + usize::try_from(PADDING_BYTES)?, 0);
+    db.put_cf(&cf, key, record.encode_v1()?)?;
+
+    split_rows_into_bottom_level_files(db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_table_files(db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    let secondary = open_secondary(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        RawBlobRetention::All,
+    )??;
+    compact_away_rows_in(
+        db,
+        LIVE_TAIL_BLOCK_COLUMN_FAMILY,
+        BlockHeightRange::inclusive(missing, tip),
+    )?;
+    let missing_row = secondary.compact_block_at(missing);
+    assert!(
+        missing_row
+            .as_ref()
+            .is_err_and(CanonicalStoreError::is_missing_table_file),
+        "the first height after the exact-fit prefix must require a missing SST, got {missing_row:?}"
+    );
+    assert_encoded_prefix_on_stale_secondary(
+        &store,
+        &secondary,
+        HeightOrder::Ascending,
+        BlockHeightRange::inclusive(first, exact_fit),
+        BlockHeightRange::inclusive(first, tip),
+    )
+}
+
+fn assert_encoded_prefix_on_stale_secondary(
+    primary: &RocksDbCanonicalStore,
+    secondary: &RocksDbCanonicalSecondary,
+    order: HeightOrder,
+    prefix_range: BlockHeightRange,
+    requested_range: BlockHeightRange,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use zinder_proto::compat::lightwalletd::EncodedBlock;
+
+    use crate::{
+        EncodedCompactBlockOutput, EncodedCompactBlockPayload, EncodedCompactBlockRangeRequest,
+        ShieldedProjectionSelection,
+    };
+
+    let mut request = EncodedCompactBlockRangeRequest {
+        range: prefix_range,
+        order,
+        selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+        include_transparent: false,
+        output: EncodedCompactBlockOutput::Blocks,
+        max_bytes: usize::MAX,
+        enforce_wire_fee_limit: true,
+    };
+    let expected = primary
+        .encoded_compact_block_range_up_to(request, None)?
+        .ok_or("expected encoded prefix from the primary")?;
+    let EncodedCompactBlockPayload::Blocks(frames) = expected.payload else {
+        return Err("expected individual frames".into());
+    };
+    request.range = requested_range;
+    request.max_bytes = frames.iter().map(EncodedBlock::payload_len).sum();
+    let prefix = secondary
+        .encoded_compact_block_range_up_to(request, None)?
+        .ok_or("expected encoded prefix from the stale secondary")?;
+    assert_eq!(prefix.block_count, expected.block_count);
+    assert_eq!(prefix.covered, prefix_range);
+    assert_eq!(prefix.first_link, expected.first_link);
+    assert_eq!(prefix.last_link, expected.last_link);
+
+    request.max_bytes = usize::MAX;
+    assert!(
+        secondary
+            .encoded_compact_block_range_up_to(request, None)
+            .is_err_and(|error| error.is_missing_table_file())
+    );
     Ok(())
 }
 
@@ -3738,7 +3857,11 @@ fn encoded_range_and_unary_reads_have_bounded_lookups_and_zero_table_scans()
     )?;
 
     // 1. Settled-only shielded range (1..=4,096): zero RocksDB MultiGet/seek/next/prev, zero ZSTSUP01 opens.
-    secondary.segment_cache.clear();
+    let segment_cache = secondary
+        .segment_context()
+        .segment_cache
+        .ok_or("secondary segment cache is missing")?;
+    segment_cache.clear();
     let before = range_read_tickers(&secondary);
     let scan_before = capture_db_scan_ticker(&secondary);
     let settled_shielded = secondary
@@ -3760,18 +3883,8 @@ fn encoded_range_and_unary_reads_have_bounded_lookups_and_zero_table_scans()
     let delta = range_read_tickers(&secondary).since(before);
     assert_eq!(delta.multi_get_calls, 0);
     assert_eq!(delta.multi_get_keys, 0);
-    assert_eq!(
-        secondary
-            .segment_cache
-            .open_count(SettledSegmentKind::Shielded),
-        1
-    );
-    assert_eq!(
-        secondary
-            .segment_cache
-            .open_count(SettledSegmentKind::Supplement),
-        0
-    );
+    assert_eq!(segment_cache.open_count(SettledSegmentKind::Shielded), 1);
+    assert_eq!(segment_cache.open_count(SettledSegmentKind::Supplement), 0);
 
     assert_boundary_range_tickers(&secondary)?;
     assert_unary_lookup_tickers(&secondary)?;
@@ -3809,8 +3922,7 @@ fn assert_boundary_range_tickers(
         assert_eq!(boundary.block_count, 10);
         assert_zero_table_scans(secondary, before, scan_before);
         let delta = range_read_tickers(secondary).since(before);
-        // Probe batch (1 key) learns largest_live_row_bytes; second MultiGet fetches the remaining 7 keys.
-        assert_eq!(delta.multi_get_calls, 2);
+        assert_eq!(delta.multi_get_calls, 1);
         assert_eq!(delta.multi_get_keys, 8);
     }
 

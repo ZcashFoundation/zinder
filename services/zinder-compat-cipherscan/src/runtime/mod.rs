@@ -19,7 +19,7 @@ use crate::CipherscanRestAdapter;
 
 pub use config::{
     CipherscanConfig, CipherscanConfigError, CipherscanConfigOverrides, cipherscan_config_toml,
-    load_cipherscan_config, load_cipherscan_config_with_env,
+    load_cipherscan_config, load_cipherscan_config_with_env, resolve_cipherscan_config_from_raw,
 };
 
 /// Command-line interface for the `zinder-compat-cipherscan` adapter.

@@ -32,6 +32,7 @@ use super::{
         read_retained_event_from_db,
     },
     live_commit::event_fence_from_ready,
+    live_tail_cache::LiveTailShieldedCache,
     mempool_lifecycle::validate_mempool_lifecycle_admission,
     publication::{follow_ready_replay_tail, validate_ready_publication},
     replay_tail::AuthenticatedReplayTail,
@@ -94,7 +95,7 @@ pub struct RocksDbCanonicalSecondary {
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
     reorg_policy: super::CanonicalReorgPolicy,
     pub(super) replay_tail: AuthenticatedReplayTail,
-    pub(super) segment_cache: Arc<SettledSegmentReaderCache>,
+    read_caches: Box<SecondaryReadCaches>,
     pub(super) sealed_segments: Vec<SettledSegmentIndexEntry>,
 }
 
@@ -104,6 +105,11 @@ struct SecondaryOpenSettings {
     resources: RocksDbOpenResources,
     column_families: fn(&Cache, RocksDbResourceBudget) -> Vec<ColumnFamilyDescriptor>,
     recovery_directory: Option<TempDir>,
+}
+
+struct SecondaryReadCaches {
+    settled: Arc<SettledSegmentReaderCache>,
+    live_tail: Option<LiveTailShieldedCache>,
 }
 
 impl RocksDbCanonicalSecondary {
@@ -317,7 +323,10 @@ impl RocksDbCanonicalSecondary {
             activation_schedule,
             reorg_policy,
             replay_tail,
-            segment_cache,
+            read_caches: Box::new(SecondaryReadCaches {
+                settled: segment_cache,
+                live_tail: Some(live_tail_cache_for(&ready_evidence)),
+            }),
             sealed_segments,
         })
     }
@@ -332,15 +341,17 @@ impl RocksDbCanonicalSecondary {
         &mut self,
         height: BlockHeight,
     ) -> Result<(), CanonicalStoreError> {
-        *self = self.open_live_tail_recovery(height, &self.ready_evidence)?;
+        let observed_ready = self.ready_evidence;
+        *self = self.open_live_tail_recovery(height, &observed_ready)?;
         Ok(())
     }
 
     fn open_live_tail_recovery(
-        &self,
+        &mut self,
         height: BlockHeight,
         observed_ready: &CanonicalStoreReadyEvidence,
     ) -> Result<Self, CanonicalStoreError> {
+        self.read_caches.live_tail = None;
         let before = self.event_fence();
         if height < observed_ready.first_retained_block.height
             || height > observed_ready.visible_tip.height
@@ -546,6 +557,27 @@ impl RocksDbCanonicalSecondary {
         &mut self,
         recover_missing_live_tail: bool,
     ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
+        // RocksDB can advance before admission fails. Restore cached rows
+        // only when this handle successfully admits the same READY evidence.
+        let previous_cache = self.read_caches.live_tail.take();
+        let previous_ready = self.ready_evidence;
+        let outcome = self.catch_up_inner(recover_missing_live_tail);
+        // A successful reopen already installed its own empty cache.
+        if outcome.is_ok() && self.read_caches.live_tail.is_none() {
+            self.read_caches.live_tail = if previous_ready == self.ready_evidence {
+                previous_cache
+            } else {
+                None
+            }
+            .or_else(|| Some(live_tail_cache_for(&self.ready_evidence)));
+        }
+        outcome
+    }
+
+    fn catch_up_inner(
+        &mut self,
+        recover_missing_live_tail: bool,
+    ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
         let before = self.event_fence();
         self.bounded_open
             .db
@@ -634,7 +666,7 @@ impl RocksDbCanonicalSecondary {
     ) -> Result<(), CanonicalStoreError> {
         let ctx = SegmentStoreContext {
             db: &self.bounded_open.db,
-            segment_cache: Some(&self.segment_cache),
+            segment_cache: Some(&self.read_caches.settled),
             sealed_segments: Some(updated_sealed_segments.unwrap_or(&self.sealed_segments)),
         };
         follow_ready_replay_tail(
@@ -740,7 +772,7 @@ impl RocksDbCanonicalSecondary {
             }
             store_access::open_replay_segment_readers(
                 &self.bounded_open.db,
-                Some(&self.segment_cache),
+                Some(&self.read_caches.settled),
                 entry,
             )
             .map_err(|err| CanonicalStoreError::admission(self.primary_path(), err.to_string()))?;
@@ -786,10 +818,14 @@ impl RocksDbCanonicalSecondary {
         Ok(())
     }
 
+    pub(super) fn live_tail_cache(&self) -> Option<&LiveTailShieldedCache> {
+        self.read_caches.live_tail.as_ref()
+    }
+
     pub(super) fn segment_context(&self) -> SegmentStoreContext<'_> {
         SegmentStoreContext {
             db: &self.bounded_open.db,
-            segment_cache: Some(&self.segment_cache),
+            segment_cache: Some(&self.read_caches.settled),
             sealed_segments: Some(&self.sealed_segments),
         }
     }
@@ -979,6 +1015,13 @@ impl RocksDbCanonicalSecondary {
     pub const fn io_mode(&self) -> RocksDbIoMode {
         self.bounded_open.io_mode
     }
+}
+
+fn live_tail_cache_for(evidence: &CanonicalStoreReadyEvidence) -> LiveTailShieldedCache {
+    LiveTailShieldedCache::new(
+        evidence.sequence_checkpoint.through().height,
+        evidence.visible_tip.height,
+    )
 }
 
 fn require_exact_primary_column_family_metadata(

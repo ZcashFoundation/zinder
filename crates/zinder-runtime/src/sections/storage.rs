@@ -1,12 +1,9 @@
-//! Shared `[storage]` config section.
+//! Shared `[storage]` and `[wallet]` config sections.
 //!
-//! Reader shapes mirror the storage boundaries documented in
-//! [ADR-0003](../../../../docs/adrs/0003-epoch-bound-reads-and-storage-roles.md):
-//!
-//! - [`SecondaryStorageSection`] for readers that open both canonical and
-//!   materialized-view stores (`zinder-query`, `zinder-explorer`).
-//! - [`CanonicalSecondaryStorageSection`] for readers that open only the
-//!   canonical store (`zinder-query`).
+//! All storage-reading and -writing roles deserialize from the single unified
+//! [`StorageSection`] (and, for wallet-aware roles, [`WalletSection`]), while
+//! resolved contracts preserve the role-specific runtime boundaries documented in
+//! [ADR-0003](../../../../docs/adrs/0003-epoch-bound-reads-and-storage-roles.md).
 
 use std::{
     path::{Path, PathBuf},
@@ -18,7 +15,8 @@ use zinder_store::{RawBlobRetention, RocksDbResourceBudget, RocksDbStatisticsLev
 
 use crate::{
     ConfigError, canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
-    config::duration_as_millis_u64, sections::deployment::resolve_manual_raw_blob_retention,
+    config::{duration_as_millis_u64, validate_optional_path},
+    sections::deployment::resolve_manual_raw_blob_retention,
 };
 
 const DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS: u64 = 1_000;
@@ -33,31 +31,68 @@ const DEFAULT_SERVING_PAIR_STALENESS_CEILING_MS: u64 = 300_000;
 /// [ADR-0005](../../../../docs/adrs/0005-bounded-process-memory.md).
 /// Operators override any subset of fields; unspecified fields fall through
 /// to the role default selected by the resolver.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RocksDbResourceBudgetSection {
     /// Override [`RocksDbResourceBudget::block_cache_bytes`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub block_cache_bytes: Option<u64>,
     /// Override [`RocksDbResourceBudget::max_wal_bytes`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_wal_bytes: Option<u64>,
     /// Override [`RocksDbResourceBudget::max_open_files`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_open_files: Option<i32>,
     /// Override [`RocksDbResourceBudget::write_buffer_bytes`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub write_buffer_bytes: Option<u64>,
     /// Override [`RocksDbResourceBudget::max_write_buffer_count`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_write_buffer_count: Option<i32>,
     /// Override the primary-writer
     /// [`RocksDbResourceBudget::max_background_jobs`] limit. Secondary opens
     /// retain this field in their uniform budget but do not apply it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_background_jobs: Option<i32>,
     /// Override [`RocksDbResourceBudget::memtable_budget_bytes`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub memtable_budget_bytes: Option<u64>,
     /// Override [`RocksDbResourceBudget::statistics_level`]: `off`,
     /// `tickers`, or `full`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub statistics_level: Option<String>,
 }
 
 impl RocksDbResourceBudgetSection {
+    /// Reports whether no `RocksDB` overrides are present.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.block_cache_bytes.is_none()
+            && self.max_wal_bytes.is_none()
+            && self.max_open_files.is_none()
+            && self.write_buffer_bytes.is_none()
+            && self.max_write_buffer_count.is_none()
+            && self.max_background_jobs.is_none()
+            && self.memtable_budget_bytes.is_none()
+            && self.statistics_level.is_none()
+    }
+
+    /// Builds a section populated from a resolved [`RocksDbResourceBudget`]
+    /// for `--print-config` rendering.
+    #[must_use]
+    pub fn from_resolved(budget: RocksDbResourceBudget) -> Self {
+        Self {
+            block_cache_bytes: Some(budget.block_cache_bytes),
+            max_wal_bytes: Some(budget.max_wal_bytes),
+            max_open_files: Some(budget.max_open_files),
+            write_buffer_bytes: Some(budget.write_buffer_bytes),
+            max_write_buffer_count: Some(budget.max_write_buffer_count),
+            max_background_jobs: Some(budget.max_background_jobs),
+            memtable_budget_bytes: Some(budget.memtable_budget_bytes),
+            statistics_level: Some(budget.statistics_level.as_str().to_owned()),
+        }
+    }
+
     /// Merges any `Some` overrides onto `defaults`. Use writer or reader
     /// defaults for the selected store posture.
     ///
@@ -105,74 +140,195 @@ impl RocksDbResourceBudgetSection {
 
 /// Raw storage-role section consumed as `[storage.canonical]` and
 /// `[storage.materialized_views]`.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageRoleSection {
     /// `RocksDB` resource budget overrides for this storage role.
+    #[serde(
+        default,
+        skip_serializing_if = "RocksDbResourceBudgetSection::is_empty"
+    )]
     pub rocksdb: RocksDbResourceBudgetSection,
 }
 
-/// Raw `[storage]` section consumed by reader binaries.
-#[derive(Clone, Debug, Default, Deserialize)]
+impl StorageRoleSection {
+    /// Reports whether no role overrides are present.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.rocksdb.is_empty()
+    }
+
+    /// Builds a [`StorageRoleSection`] from a resolved budget for
+    /// `--print-config` rendering.
+    #[must_use]
+    pub fn from_resolved(budget: RocksDbResourceBudget) -> Self {
+        Self {
+            rocksdb: RocksDbResourceBudgetSection::from_resolved(budget),
+        }
+    }
+}
+
+/// Unified `[storage]` config section across canonical writer and reader roles.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct SecondaryStorageSection {
-    /// Base data directory from which unset storage paths are derived.
+pub struct StorageSection {
+    /// Base data directory from which unset storage and wallet paths are
+    /// derived.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<PathBuf>,
-    /// Filesystem path of the canonical primary instance the reader opens
-    /// as a `RocksDB` secondary.
+    /// Filesystem path of the canonical primary store.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    /// Reader-local secondary metadata path; must be unique per reader
-    /// process per ADR-0003.
+    /// Reader-local canonical secondary metadata path; must be unique per
+    /// reader process per ADR-0003.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub secondary_path: Option<PathBuf>,
-    /// Orthogonal opt-in for full-block retention (shared-env compatibility).
+    /// Explicit raw-blob retention policy (`none` or `all`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_blob_policy: Option<RawBlobRetention>,
+    /// Orthogonal opt-in for full serialized raw-block retention alongside any preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub full_blocks: Option<bool>,
     /// Catchup tick cadence in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub secondary_catchup_interval_ms: Option<u64>,
-    /// Maximum startup catchup duration in milliseconds before the reader
+    /// Maximum startup catchup duration in milliseconds before a reader
     /// proceeds with the opened secondary and lets readiness report lag.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_catchup_timeout_ms: Option<u64>,
     /// Replica-lag threshold in chain epochs. Crossing this threshold
     /// flips readiness to [`crate::ReadinessCause::ReplicaLagging`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub secondary_replica_lag_threshold_chain_epochs: Option<u64>,
+    /// Longest a wallet-serving pair keeps admitting traffic in milliseconds
+    /// after the last writer attestation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serving_pair_staleness_ceiling_ms: Option<u64>,
     /// Canonical store role budget.
+    #[serde(default, skip_serializing_if = "StorageRoleSection::is_empty")]
     pub canonical: StorageRoleSection,
     /// Materialized-view store role budget.
+    #[serde(default, skip_serializing_if = "StorageRoleSection::is_empty")]
     pub materialized_views: StorageRoleSection,
 }
 
-/// Raw `[storage]` section consumed by reader binaries that only open the
-/// canonical store as a `RocksDB` secondary.
-#[derive(Clone, Debug, Default, Deserialize)]
+impl StorageSection {
+    /// Reports whether every field and role subsection in `[storage]` is unset.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.data_dir.is_none()
+            && self.path.is_none()
+            && self.secondary_path.is_none()
+            && self.raw_blob_policy.is_none()
+            && self.full_blocks.is_none()
+            && self.secondary_catchup_interval_ms.is_none()
+            && self.initial_catchup_timeout_ms.is_none()
+            && self.secondary_replica_lag_threshold_chain_epochs.is_none()
+            && self.serving_pair_staleness_ceiling_ms.is_none()
+            && self.canonical.is_empty()
+            && self.materialized_views.is_empty()
+    }
+
+    /// Builds a `[storage]` projection from a resolved secondary configuration.
+    #[must_use]
+    pub fn from_secondary(resolved: &ResolvedSecondaryStorage) -> Self {
+        Self {
+            data_dir: resolved.data_dir.clone(),
+            path: Some(resolved.path.clone()),
+            secondary_path: Some(resolved.secondary_path.clone()),
+            secondary_catchup_interval_ms: Some(duration_as_millis_u64(
+                resolved.secondary_catchup_interval,
+            )),
+            initial_catchup_timeout_ms: Some(duration_as_millis_u64(
+                resolved.initial_catchup_timeout,
+            )),
+            secondary_replica_lag_threshold_chain_epochs: Some(
+                resolved.secondary_replica_lag_threshold_chain_epochs,
+            ),
+            canonical: StorageRoleSection::from_resolved(resolved.canonical_rocksdb_budget),
+            materialized_views: StorageRoleSection::from_resolved(
+                resolved.materialized_view_rocksdb_budget,
+            ),
+            ..Self::default()
+        }
+    }
+
+    /// Builds a `[storage]` projection from a resolved canonical-secondary
+    /// configuration.
+    #[must_use]
+    pub fn from_canonical_secondary(resolved: &ResolvedCanonicalSecondaryStorage) -> Self {
+        Self {
+            data_dir: resolved.data_dir.clone(),
+            path: Some(resolved.path.clone()),
+            secondary_path: Some(resolved.secondary_path.clone()),
+            raw_blob_policy: Some(resolved.expected_raw_blob_retention),
+            full_blocks: resolved.full_blocks,
+            secondary_catchup_interval_ms: Some(duration_as_millis_u64(
+                resolved.secondary_catchup_interval,
+            )),
+            initial_catchup_timeout_ms: Some(duration_as_millis_u64(
+                resolved.initial_catchup_timeout,
+            )),
+            secondary_replica_lag_threshold_chain_epochs: Some(
+                resolved.secondary_replica_lag_threshold_chain_epochs,
+            ),
+            serving_pair_staleness_ceiling_ms: Some(duration_as_millis_u64(
+                resolved.serving_pair_staleness_ceiling,
+            )),
+            canonical: StorageRoleSection::from_resolved(resolved.canonical_rocksdb_budget),
+            materialized_views: StorageRoleSection::default(),
+        }
+    }
+}
+
+/// Unified `[wallet]` config section shared across wallet writer and readers.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct CanonicalSecondaryStorageSection {
-    /// Base data directory from which unset storage and wallet paths are
-    /// derived.
-    pub data_dir: Option<PathBuf>,
-    /// Filesystem path of the canonical primary instance the reader opens
-    /// as a `RocksDB` secondary.
+pub struct WalletSection {
+    /// Filesystem path of the wallet projection primary store.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    /// Reader-local secondary metadata path; must be unique per reader
-    /// process per ADR-0003.
+    /// Reader-local wallet projection secondary metadata path.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub secondary_path: Option<PathBuf>,
-    /// Orthogonal opt-in to require full raw-block retention alongside any preset.
-    pub full_blocks: Option<bool>,
-    /// Minimum raw-blob coverage required from the canonical primary.
-    pub raw_blob_policy: Option<RawBlobRetention>,
-    /// Catchup tick cadence in milliseconds.
-    pub secondary_catchup_interval_ms: Option<u64>,
-    /// Maximum startup catchup duration in milliseconds before the reader
-    /// proceeds with the opened secondary and lets readiness report lag.
-    pub initial_catchup_timeout_ms: Option<u64>,
-    /// Replica-lag threshold in chain epochs. Crossing this threshold
-    /// flips readiness to [`crate::ReadinessCause::ReplicaLagging`].
-    pub secondary_replica_lag_threshold_chain_epochs: Option<u64>,
-    /// Longest a wallet-serving pair keeps admitting traffic in milliseconds
-    /// after the last writer attestation. Crossing it replaces
-    /// [`crate::ReadinessCause::ServingPairStale`] with the fail-closed cause
-    /// of the failure that stopped the refresh.
-    pub serving_pair_staleness_ceiling_ms: Option<u64>,
-    /// Canonical store role budget.
-    pub canonical: StorageRoleSection,
+    /// `RocksDB` resource budget overrides for the wallet projection store.
+    #[serde(
+        default,
+        skip_serializing_if = "RocksDbResourceBudgetSection::is_empty"
+    )]
+    pub rocksdb: RocksDbResourceBudgetSection,
+}
+
+impl WalletSection {
+    /// Reports whether every field in `[wallet]` is unset.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.path.is_none() && self.secondary_path.is_none() && self.rocksdb.is_empty()
+    }
+
+    /// Builds a `[wallet]` projection for a wallet projection writer.
+    #[must_use]
+    pub fn from_resolved_writer(path: PathBuf, budget: RocksDbResourceBudget) -> Self {
+        Self {
+            path: Some(path),
+            secondary_path: None,
+            rocksdb: RocksDbResourceBudgetSection::from_resolved(budget),
+        }
+    }
+
+    /// Builds a `[wallet]` projection for a wallet projection reader.
+    #[must_use]
+    pub fn from_resolved_reader(
+        path: PathBuf,
+        secondary_path: PathBuf,
+        budget: RocksDbResourceBudget,
+    ) -> Self {
+        Self {
+            path: Some(path),
+            secondary_path: Some(secondary_path),
+            rocksdb: RocksDbResourceBudgetSection::from_resolved(budget),
+        }
+    }
 }
 
 /// Resolved secondary storage location with catchup cadence.
@@ -222,16 +378,11 @@ pub struct ResolvedCanonicalSecondaryStorage {
     pub canonical_rocksdb_budget: RocksDbResourceBudget,
 }
 
-/// Rejects an explicit blank `storage.data_dir` and returns `Ok(None)` when unset.
+/// Rejects an explicit blank or `[REDACTED]` `storage.data_dir` and returns `Ok(None)` when unset.
 pub fn validate_optional_data_dir(
     data_dir: Option<PathBuf>,
 ) -> Result<Option<PathBuf>, ConfigError> {
-    match data_dir {
-        Some(directory) if directory.as_os_str().to_string_lossy().trim().is_empty() => {
-            Err(ConfigError::invalid("storage.data_dir must not be empty"))
-        }
-        other => Ok(other),
-    }
+    validate_optional_path(data_dir, "storage.data_dir")
 }
 
 /// Derives `<data_dir>/canonical`.
@@ -307,12 +458,6 @@ pub fn resolve_wallet_projection_writer_rocksdb_budget(
 }
 
 /// Merges canonical-role overrides onto container-aware reader defaults.
-///
-/// The base defaults derive `block_cache_bytes` as `min(container_memory / 8, 512 MiB)`
-/// (floor 128 MiB when no cgroup limit is detectable) and `max_open_files`
-/// proportionally. All other fields come from
-/// [`RocksDbResourceBudget::canonical_reader_defaults`]. Explicit overrides in
-/// `section` win over the derived values.
 pub fn resolve_canonical_reader_rocksdb_budget(
     section: RocksDbResourceBudgetSection,
 ) -> Result<RocksDbResourceBudget, ConfigError> {
@@ -357,35 +502,28 @@ pub fn resolve_wallet_projection_reader_rocksdb_budget(
     )
 }
 
-/// Validates and resolves a [`SecondaryStorageSection`], applying
-/// per-field defaults for `secondary_catchup_interval_ms` and
-/// `secondary_replica_lag_threshold_chain_epochs`.
+/// Validates and resolves a [`StorageSection`] for a dual-store reader.
+///
+/// Applies per-field defaults for `secondary_catchup_interval_ms`,
+/// `initial_catchup_timeout_ms`, and `secondary_replica_lag_threshold_chain_epochs`.
 pub fn resolve_secondary_storage(
-    section: SecondaryStorageSection,
+    section: StorageSection,
 ) -> Result<ResolvedSecondaryStorage, ConfigError> {
     let data_dir = validate_optional_data_dir(section.data_dir)?;
-    let path = section
-        .path
+    let path = validate_optional_path(section.path, "storage.path")?
         .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
-    let secondary_path = section
-        .secondary_path
+    let secondary_path = validate_optional_path(section.secondary_path, "storage.secondary_path")?
         .ok_or_else(|| ConfigError::missing_field("storage.secondary_path"))?;
-    let catchup_ms = section
-        .secondary_catchup_interval_ms
-        .unwrap_or(DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS);
-    if catchup_ms == 0 {
-        return Err(ConfigError::invalid(
-            "storage.secondary_catchup_interval_ms must be greater than zero",
-        ));
-    }
-    let initial_catchup_timeout_ms = section
-        .initial_catchup_timeout_ms
-        .unwrap_or(DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS);
-    if initial_catchup_timeout_ms == 0 {
-        return Err(ConfigError::invalid(
-            "storage.initial_catchup_timeout_ms must be greater than zero",
-        ));
-    }
+    let catchup_ms = positive_u64_or(
+        section.secondary_catchup_interval_ms,
+        DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS,
+        "storage.secondary_catchup_interval_ms must be greater than zero",
+    )?;
+    let initial_catchup_timeout_ms = positive_u64_or(
+        section.initial_catchup_timeout_ms,
+        DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS,
+        "storage.initial_catchup_timeout_ms must be greater than zero",
+    )?;
     let secondary_replica_lag_threshold_chain_epochs = section
         .secondary_replica_lag_threshold_chain_epochs
         .unwrap_or(DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS);
@@ -405,51 +543,40 @@ pub fn resolve_secondary_storage(
     })
 }
 
-/// Validates and resolves a [`CanonicalSecondaryStorageSection`].
+/// Validates and resolves a [`StorageSection`] for a canonical-only reader.
 ///
 /// Applies per-field defaults for `secondary_catchup_interval_ms`,
-/// `secondary_replica_lag_threshold_chain_epochs`, and
-/// `serving_pair_staleness_ceiling_ms`.
+/// `initial_catchup_timeout_ms`, `secondary_replica_lag_threshold_chain_epochs`,
+/// and `serving_pair_staleness_ceiling_ms`.
 pub fn resolve_canonical_secondary_storage(
-    section: CanonicalSecondaryStorageSection,
+    section: StorageSection,
 ) -> Result<ResolvedCanonicalSecondaryStorage, ConfigError> {
     let data_dir = validate_optional_data_dir(section.data_dir)?;
-    let path = section
-        .path
+    let path = validate_optional_path(section.path, "storage.path")?
         .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
-    let secondary_path = section
-        .secondary_path
+    let secondary_path = validate_optional_path(section.secondary_path, "storage.secondary_path")?
         .ok_or_else(|| ConfigError::missing_field("storage.secondary_path"))?;
     let expected_raw_blob_retention =
         resolve_manual_raw_blob_retention(section.full_blocks, section.raw_blob_policy)?
             .unwrap_or(DEFAULT_CANONICAL_SECONDARY_RAW_BLOB_RETENTION);
-    let catchup_ms = section
-        .secondary_catchup_interval_ms
-        .unwrap_or(DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS);
-    if catchup_ms == 0 {
-        return Err(ConfigError::invalid(
-            "storage.secondary_catchup_interval_ms must be greater than zero",
-        ));
-    }
-    let initial_catchup_timeout_ms = section
-        .initial_catchup_timeout_ms
-        .unwrap_or(DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS);
-    if initial_catchup_timeout_ms == 0 {
-        return Err(ConfigError::invalid(
-            "storage.initial_catchup_timeout_ms must be greater than zero",
-        ));
-    }
+    let catchup_ms = positive_u64_or(
+        section.secondary_catchup_interval_ms,
+        DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS,
+        "storage.secondary_catchup_interval_ms must be greater than zero",
+    )?;
+    let initial_catchup_timeout_ms = positive_u64_or(
+        section.initial_catchup_timeout_ms,
+        DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS,
+        "storage.initial_catchup_timeout_ms must be greater than zero",
+    )?;
     let secondary_replica_lag_threshold_chain_epochs = section
         .secondary_replica_lag_threshold_chain_epochs
         .unwrap_or(DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS);
-    let serving_pair_staleness_ceiling_ms = section
-        .serving_pair_staleness_ceiling_ms
-        .unwrap_or(DEFAULT_SERVING_PAIR_STALENESS_CEILING_MS);
-    if serving_pair_staleness_ceiling_ms == 0 {
-        return Err(ConfigError::invalid(
-            "storage.serving_pair_staleness_ceiling_ms must be greater than zero",
-        ));
-    }
+    let serving_pair_staleness_ceiling_ms = positive_u64_or(
+        section.serving_pair_staleness_ceiling_ms,
+        DEFAULT_SERVING_PAIR_STALENESS_CEILING_MS,
+        "storage.serving_pair_staleness_ceiling_ms must be greater than zero",
+    )?;
     let canonical_rocksdb_budget =
         resolve_canonical_reader_rocksdb_budget(section.canonical.rocksdb)?;
     Ok(ResolvedCanonicalSecondaryStorage {
@@ -466,165 +593,16 @@ pub fn resolve_canonical_secondary_storage(
     })
 }
 
-/// Redacted TOML projection of a role-scoped `rocksdb` resource budget.
-#[derive(Debug, Serialize)]
-pub struct RocksDbResourceBudgetToml {
-    /// Resolved [`RocksDbResourceBudget::block_cache_bytes`].
-    pub block_cache_bytes: u64,
-    /// Resolved [`RocksDbResourceBudget::max_wal_bytes`].
-    pub max_wal_bytes: u64,
-    /// Resolved [`RocksDbResourceBudget::max_open_files`].
-    pub max_open_files: i32,
-    /// Resolved [`RocksDbResourceBudget::write_buffer_bytes`].
-    pub write_buffer_bytes: u64,
-    /// Resolved [`RocksDbResourceBudget::max_write_buffer_count`].
-    pub max_write_buffer_count: i32,
-    /// Resolved primary-writer [`RocksDbResourceBudget::max_background_jobs`]
-    /// limit. Secondary opens do not apply it.
-    pub max_background_jobs: i32,
-    /// Resolved [`RocksDbResourceBudget::memtable_budget_bytes`].
-    pub memtable_budget_bytes: u64,
-    /// Resolved [`RocksDbResourceBudget::statistics_level`]: `off`,
-    /// `tickers`, or `full`.
-    pub statistics_level: &'static str,
-}
-
-impl RocksDbResourceBudgetToml {
-    /// Builds a [`RocksDbResourceBudgetToml`] from a resolved budget.
-    #[must_use]
-    pub const fn from_resolved(budget: RocksDbResourceBudget) -> Self {
-        Self {
-            block_cache_bytes: budget.block_cache_bytes,
-            max_wal_bytes: budget.max_wal_bytes,
-            max_open_files: budget.max_open_files,
-            write_buffer_bytes: budget.write_buffer_bytes,
-            max_write_buffer_count: budget.max_write_buffer_count,
-            max_background_jobs: budget.max_background_jobs,
-            memtable_budget_bytes: budget.memtable_budget_bytes,
-            statistics_level: budget.statistics_level.as_str(),
-        }
+fn positive_u64_or(
+    configured: Option<u64>,
+    default_ms: u64,
+    zero_error: &'static str,
+) -> Result<u64, ConfigError> {
+    let resolved = configured.unwrap_or(default_ms);
+    if resolved == 0 {
+        return Err(ConfigError::invalid(zero_error));
     }
-}
-
-/// Redacted TOML projection of a storage role section.
-#[derive(Debug, Serialize)]
-pub struct StorageRoleToml {
-    /// Resolved `RocksDB` budget projection.
-    pub rocksdb: RocksDbResourceBudgetToml,
-}
-
-impl StorageRoleToml {
-    /// Builds a [`StorageRoleToml`] from a resolved budget.
-    #[must_use]
-    pub const fn from_resolved(budget: RocksDbResourceBudget) -> Self {
-        Self {
-            rocksdb: RocksDbResourceBudgetToml::from_resolved(budget),
-        }
-    }
-}
-
-/// Redacted TOML projection of the reader-side `[storage]` section.
-#[derive(Debug, Serialize)]
-pub struct SecondaryStorageToml {
-    /// Configured base data directory, when explicitly set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data_dir: Option<String>,
-    /// Canonical primary path.
-    pub path: String,
-    /// Reader-local secondary metadata path.
-    pub secondary_path: String,
-    /// Catchup tick cadence in milliseconds.
-    pub secondary_catchup_interval_ms: u64,
-    /// Initial catchup timeout in milliseconds.
-    pub initial_catchup_timeout_ms: u64,
-    /// Replica-lag threshold in chain epochs.
-    pub secondary_replica_lag_threshold_chain_epochs: u64,
-    /// Canonical store role projection.
-    pub canonical: StorageRoleToml,
-    /// Materialized-view store role projection.
-    pub materialized_views: StorageRoleToml,
-}
-
-impl SecondaryStorageToml {
-    /// Builds a [`SecondaryStorageToml`] from a resolved reader storage
-    /// configuration.
-    #[must_use]
-    pub fn from_resolved(resolved: &ResolvedSecondaryStorage) -> Self {
-        Self {
-            data_dir: resolved
-                .data_dir
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            path: resolved.path.display().to_string(),
-            secondary_path: resolved.secondary_path.display().to_string(),
-            secondary_catchup_interval_ms: duration_as_millis_u64(
-                resolved.secondary_catchup_interval,
-            ),
-            initial_catchup_timeout_ms: duration_as_millis_u64(resolved.initial_catchup_timeout),
-            secondary_replica_lag_threshold_chain_epochs: resolved
-                .secondary_replica_lag_threshold_chain_epochs,
-            canonical: StorageRoleToml::from_resolved(resolved.canonical_rocksdb_budget),
-            materialized_views: StorageRoleToml::from_resolved(
-                resolved.materialized_view_rocksdb_budget,
-            ),
-        }
-    }
-}
-
-/// Redacted TOML projection of a canonical-secondary `[storage]` section.
-#[derive(Debug, Serialize)]
-pub struct CanonicalSecondaryStorageToml {
-    /// Configured base data directory, when explicitly set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data_dir: Option<String>,
-    /// Canonical primary path.
-    pub path: String,
-    /// Reader-local secondary metadata path.
-    pub secondary_path: String,
-    /// Explicit full-block retention flag, when set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub full_blocks: Option<bool>,
-    /// Minimum raw-blob coverage required from the canonical primary.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_blob_policy: Option<RawBlobRetention>,
-    /// Catchup tick cadence in milliseconds.
-    pub secondary_catchup_interval_ms: u64,
-    /// Initial catchup timeout in milliseconds.
-    pub initial_catchup_timeout_ms: u64,
-    /// Replica-lag threshold in chain epochs.
-    pub secondary_replica_lag_threshold_chain_epochs: u64,
-    /// Serving-pair staleness ceiling in milliseconds.
-    pub serving_pair_staleness_ceiling_ms: u64,
-    /// Canonical store role projection.
-    pub canonical: StorageRoleToml,
-}
-
-impl CanonicalSecondaryStorageToml {
-    /// Builds a [`CanonicalSecondaryStorageToml`] from a resolved
-    /// canonical-secondary storage configuration.
-    #[must_use]
-    pub fn from_resolved(resolved: &ResolvedCanonicalSecondaryStorage) -> Self {
-        Self {
-            data_dir: resolved
-                .data_dir
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            path: resolved.path.display().to_string(),
-            secondary_path: resolved.secondary_path.display().to_string(),
-            full_blocks: resolved.full_blocks,
-            raw_blob_policy: Some(resolved.expected_raw_blob_retention),
-            secondary_catchup_interval_ms: duration_as_millis_u64(
-                resolved.secondary_catchup_interval,
-            ),
-            initial_catchup_timeout_ms: duration_as_millis_u64(resolved.initial_catchup_timeout),
-            secondary_replica_lag_threshold_chain_epochs: resolved
-                .secondary_replica_lag_threshold_chain_epochs,
-            serving_pair_staleness_ceiling_ms: duration_as_millis_u64(
-                resolved.serving_pair_staleness_ceiling,
-            ),
-            canonical: StorageRoleToml::from_resolved(resolved.canonical_rocksdb_budget),
-        }
-    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -633,9 +611,9 @@ mod tests {
 
     #[test]
     fn secondary_storage_requires_both_paths() {
-        let only_primary = SecondaryStorageSection {
+        let only_primary = StorageSection {
             path: Some(PathBuf::from("/tmp/store")),
-            ..SecondaryStorageSection::default()
+            ..StorageSection::default()
         };
         assert!(matches!(
             resolve_secondary_storage(only_primary),
@@ -644,9 +622,9 @@ mod tests {
             })
         ));
 
-        let only_secondary = SecondaryStorageSection {
+        let only_secondary = StorageSection {
             secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
-            ..SecondaryStorageSection::default()
+            ..StorageSection::default()
         };
         assert!(matches!(
             resolve_secondary_storage(only_secondary),
@@ -658,10 +636,10 @@ mod tests {
 
     #[test]
     fn secondary_storage_applies_defaults() -> Result<(), ConfigError> {
-        let resolved = resolve_secondary_storage(SecondaryStorageSection {
+        let resolved = resolve_secondary_storage(StorageSection {
             path: Some(PathBuf::from("/tmp/store")),
             secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
-            ..SecondaryStorageSection::default()
+            ..StorageSection::default()
         })?;
         assert_eq!(
             resolved.secondary_catchup_interval,
@@ -692,7 +670,7 @@ mod tests {
 
     #[test]
     fn canonical_secondary_storage_applies_canonical_budget_only() -> Result<(), ConfigError> {
-        let resolved = resolve_canonical_secondary_storage(CanonicalSecondaryStorageSection {
+        let resolved = resolve_canonical_secondary_storage(StorageSection {
             path: Some(PathBuf::from("/tmp/store")),
             secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
             canonical: StorageRoleSection {
@@ -701,7 +679,7 @@ mod tests {
                     ..RocksDbResourceBudgetSection::default()
                 },
             },
-            ..CanonicalSecondaryStorageSection::default()
+            ..StorageSection::default()
         })?;
         assert_eq!(resolved.path, PathBuf::from("/tmp/store"));
         assert_eq!(
@@ -717,9 +695,7 @@ mod tests {
             resolved.serving_pair_staleness_ceiling,
             Duration::from_millis(DEFAULT_SERVING_PAIR_STALENESS_CEILING_MS)
         );
-        // max_open_files override (128) wins over the container-derived value.
         assert_eq!(resolved.canonical_rocksdb_budget.max_open_files, 128);
-        // block_cache_bytes has no override, so it takes the container-derived value.
         assert_eq!(
             resolved.canonical_rocksdb_budget.block_cache_bytes,
             crate::canonical_reader_block_cache_bytes()
@@ -729,11 +705,11 @@ mod tests {
 
     #[test]
     fn canonical_secondary_storage_rejects_a_zero_staleness_ceiling() {
-        let resolved = resolve_canonical_secondary_storage(CanonicalSecondaryStorageSection {
+        let resolved = resolve_canonical_secondary_storage(StorageSection {
             path: Some(PathBuf::from("/tmp/store")),
             secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
             serving_pair_staleness_ceiling_ms: Some(0),
-            ..CanonicalSecondaryStorageSection::default()
+            ..StorageSection::default()
         });
         assert!(matches!(resolved, Err(ConfigError::Invalid { .. })));
     }
@@ -741,11 +717,11 @@ mod tests {
     #[test]
     fn canonical_secondary_storage_applies_a_staleness_ceiling_override() -> Result<(), ConfigError>
     {
-        let resolved = resolve_canonical_secondary_storage(CanonicalSecondaryStorageSection {
+        let resolved = resolve_canonical_secondary_storage(StorageSection {
             path: Some(PathBuf::from("/tmp/store")),
             secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
             serving_pair_staleness_ceiling_ms: Some(30_000),
-            ..CanonicalSecondaryStorageSection::default()
+            ..StorageSection::default()
         })?;
         assert_eq!(
             resolved.serving_pair_staleness_ceiling,
@@ -756,22 +732,22 @@ mod tests {
 
     #[test]
     fn secondary_storage_rejects_zero_catchup_interval() {
-        let outcome = resolve_secondary_storage(SecondaryStorageSection {
+        let outcome = resolve_secondary_storage(StorageSection {
             path: Some(PathBuf::from("/tmp/store")),
             secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
             secondary_catchup_interval_ms: Some(0),
-            ..SecondaryStorageSection::default()
+            ..StorageSection::default()
         });
         assert!(matches!(outcome, Err(ConfigError::Invalid { .. })));
     }
 
     #[test]
     fn secondary_storage_rejects_zero_initial_catchup_timeout() {
-        let outcome = resolve_secondary_storage(SecondaryStorageSection {
+        let outcome = resolve_secondary_storage(StorageSection {
             path: Some(PathBuf::from("/tmp/store")),
             secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
             initial_catchup_timeout_ms: Some(0),
-            ..SecondaryStorageSection::default()
+            ..StorageSection::default()
         });
         assert!(matches!(outcome, Err(ConfigError::Invalid { .. })));
     }
@@ -803,8 +779,6 @@ mod tests {
     -> Result<(), ConfigError> {
         let resolved =
             resolve_canonical_reader_rocksdb_budget(RocksDbResourceBudgetSection::default())?;
-        // block_cache and max_open_files come from the container budget helpers;
-        // other fields fall through to canonical_reader_defaults().
         assert_eq!(
             resolved.block_cache_bytes,
             crate::canonical_reader_block_cache_bytes()
@@ -958,8 +932,11 @@ mod tests {
     }
 
     #[test]
-    fn blank_data_dir_is_rejected() {
-        let outcome = validate_optional_data_dir(Some(std::path::PathBuf::from("   ")));
-        assert!(matches!(outcome, Err(ConfigError::Invalid { .. })));
+    fn blank_data_dir_and_redacted_paths_are_rejected() {
+        let blank_dir = validate_optional_data_dir(Some(PathBuf::from("   ")));
+        assert!(matches!(blank_dir, Err(ConfigError::Invalid { .. })));
+        let redacted_path =
+            validate_optional_path(Some(PathBuf::from("[REDACTED]")), "storage.path");
+        assert!(matches!(redacted_path, Err(ConfigError::Invalid { .. })));
     }
 }

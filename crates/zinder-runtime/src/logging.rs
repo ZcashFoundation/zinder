@@ -104,13 +104,13 @@ pub fn install_runtime_tracing_subscriber(
     config_path: Option<&Path>,
 ) -> Result<RuntimeTracing, TracingSubscriberError> {
     let env_filter = log_filter()?;
-    let (merged, _) = ConfigLoader::new()
+    let merged = ConfigLoader::new()
         .with_file(config_path.map(Path::to_path_buf))
         .with_zinder_env()
         .and_then(ConfigLoader::merge_sources)
         .map_err(|_| TracingSubscriberError::ConfigLoad)?;
     let config: ProcessObservability = merged
-        .try_deserialize()
+        .deserialize()
         .map_err(|_| TracingSubscriberError::ObservabilityConfig)?;
     let provider = trace_provider(service.binary_name(), &config.observability)?;
     if let Some(provider) = provider.as_ref() {

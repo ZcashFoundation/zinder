@@ -8,7 +8,7 @@ use zinder_core::{
     BlockHeight,
     wire::{decode_internal_block_hash, encode_height_key_ascending},
 };
-use zinder_store::CanonicalBlockLoadEvidence;
+use zinder_store::{CanonicalBlockLoadEvidence, SEGMENTS_MANIFEST_FILE_NAME};
 
 const BLOCK_HEADER_COLUMN_FAMILY: &str = "block_header";
 const BLOCK_HASH_INDEX_COLUMN_FAMILY: &str = "block_hash_index";
@@ -21,7 +21,6 @@ const LIVE_TAIL_MAGIC: &[u8; 8] = b"ZSLVTL01";
 const LIVE_TAIL_FORMAT_VERSION_V1: u16 = 1;
 const LIVE_TAIL_HEADER_MIN_LEN: usize = 123;
 const LIVE_TAIL_TRAILER_LEN: usize = 32;
-const SEGMENTS_MANIFEST_FILE_NAME: &str = "canonical-segments-manifest.v2.json";
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PersistedFamilyEvidence {

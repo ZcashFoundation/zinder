@@ -544,7 +544,7 @@ within each process.
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `zinder_store_block_cache_capacity_bytes` | gauge | `store_role` | Block cache capacity. Excludes canonical settled-segment (`ZSHRNG02` / `ZSTSUP01` / `ZSBLKB01`) file reads, which use OS buffered I/O and rely on the Linux OS page cache. |
-| `zinder_store_block_cache_usage_bytes` | gauge | `store_role` | Block cache use. It can exceed capacity by pinned index and filter blocks. Excludes signed-history catalog page-cache residency. |
+| `zinder_store_block_cache_usage_bytes` | gauge | `store_role` | Block cache use. It can exceed capacity by pinned index and filter blocks. Settled-segment file pages are accounted for by the OS. |
 | `zinder_store_block_cache_pinned_usage_bytes` | gauge | `store_role` | Pinned block cache use. |
 | `zinder_store_block_cache_entries` | gauge | `store_role`, `entry_role` | Serving readers only. Number of cached entries by RocksDB role, such as `DataBlock`, `IndexBlock`, or `FilterBlock`. |
 | `zinder_store_block_cache_entry_bytes` | gauge | `store_role`, `entry_role` | Serving readers only. Approximate cache charge by entry role. RocksDB rounds each role's charge before export. |
@@ -557,16 +557,6 @@ within each process.
 | `zinder_store_rocksdb_io_mode` | gauge | `store_role`, `mode` | 1 for the I/O mode: `direct` or `buffered`. |
 | `zinder_store_rocksdb_property` | gauge | `store_role`, `cf`, `property` | RocksDB properties, such as pending compaction bytes and per-family live SST size (`rocksdb.live-sst-files-size`). |
 | `zinder_store_rocksdb_ticker` | gauge | `store_role`, `ticker` | RocksDB statistics tickers, when statistics are on. |
-
-> **Diagnosing canonical settled-segment cgroup v2 page-cache thrashing:**
-> Canonical settled-segment reads (`ZSHRNG02`, `ZSTSUP01`, `ZSBLKB01`) use OS
-> buffered I/O outside RocksDB, so `zinder_store_block_cache_*` and
-> `rocksdb.block.cache.miss` stay at zero even when the reader repeatedly
-> re-reads settled segments from disk. Under Linux cgroup v2, OS page cache for
-> those files is charged to the reader's `MemoryMax` (systemd) or `mem_limit`
-> (Docker). If `zinder_compat_block_range_stream_refusals_total{reason="wait_timeout"}`
-> rises alongside disk read saturation under concurrent range syncs, raise the
-> reader's cgroup memory limit to hold the settled shielded segment working set.
 
 Ingest samples the canonical primary after bulk loads, while following the
 tip, and after checkpoint densification commits. The projector samples the
@@ -615,6 +605,55 @@ The store's `statistics_level` must be `tickers` or `full`.
 | Where point reads hit | `rocksdb.memtable.hit`, `rocksdb.l0.hit`, `rocksdb.l1.hit`, `rocksdb.l2andup.hit` |
 | Iterator work | `rocksdb.number.db.seek`, `rocksdb.number.db.next`, `rocksdb.db.iter.bytes.read` |
 | Readahead | `rocksdb.prefetch.bytes`, `rocksdb.prefetch.bytes.useful`, `rocksdb.readahead.trimmed` |
+
+### Settled-segment readers
+
+The `kind` label is `shielded` for `ZSHRNG02`, `supplement` for `ZSTSUP01`,
+and `block_blob` for `ZSBLKB01`. Cache metrics sum across the process's
+canonical settled-segment reader caches.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `zinder_store_settled_segment_cache_open_readers` | gauge | `kind` | Resident reader entries. Each holds one open segment file descriptor. |
+| `zinder_store_settled_segment_cache_index_heap_bytes` | gauge | `kind` | Estimated heap bytes of decoded index arrays and page digests in resident readers. |
+| `zinder_store_settled_segment_cache_hits_total` | counter | `kind` | Lookups that found a resident reader. |
+| `zinder_store_settled_segment_cache_misses_total` | counter | `kind` | Lookups that needed a file open or joined an open already in flight. |
+| `zinder_store_settled_segment_cache_evictions_total` | counter | `kind` | Reader entries removed by LRU capacity eviction. Each removed segment can contribute one entry per kind. |
+| `zinder_store_settled_segment_pread_bytes_total` | counter | `kind` | Bytes returned by successful positional file reads, including headers and indexes read during admission. |
+| `zinder_store_settled_segment_pread_duration_seconds` | histogram | `kind` | Wall time per non-empty positional file read, including failed reads and retries within the operation. |
+
+The cache gauges count only resident entries. Requests can hold a reader after
+eviction, in which case its file and index stay live until the last reference
+drops. The heap estimate excludes reader objects, cache bookkeeping, and
+allocator overhead. Positional read metrics include OS page-cache hits and
+measure file I/O as seen by the process. The latency histogram has finite
+buckets from 1 microsecond to 1 second. Use host disk metrics for physical I/O.
+
+For a serving target, use the Linux `zinder_process_rss_anon_bytes` gauge
+alongside RocksDB block-cache use, memtable use, table-reader memory, and
+settled-segment index heap. The PromQL expression below estimates residual
+anonymous RSS after subtracting those reported components.
+
+```promql
+zinder_process_rss_anon_bytes
+  - sum without (store_role) (zinder_store_block_cache_usage_bytes)
+  - sum without (store_role) (zinder_store_memtable_budget_usage_bytes)
+  - sum without (store_role) (zinder_store_table_reader_memory_bytes)
+  - sum without (kind) (zinder_store_settled_segment_cache_index_heap_bytes)
+```
+
+The residual includes other process memory such as allocator overhead, request
+buffers, and in-flight readers outside the cache. The component gauges estimate
+allocations or cache charge. They can include nonresident memory and can be
+sampled at different times. The expression requires all component series and
+can return negative estimates.
+
+Canonical segment files use OS buffered I/O. Under Linux cgroup v2, file pages
+count toward the reader's cgroup memory limit. To diagnose page-cache churn,
+compare per-kind positional-read latency and volume with disk read saturation
+and `zinder_compat_block_range_stream_refusals_total{reason="wait_timeout"}`.
+The cgroup memory limit needs to accommodate the segment working set as well
+as anonymous memory.
 
 ## Structured logs
 

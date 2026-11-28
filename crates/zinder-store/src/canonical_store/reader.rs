@@ -60,6 +60,9 @@ pub type LocatedTransactionBlob = (TransactionLocation, Option<TransactionBlobAr
 pub(super) trait CanonicalServingRead {
     fn serving_open(&self) -> &BoundedRocksDbOpen;
     fn serving_context(&self) -> SegmentStoreContext<'_>;
+    fn serving_live_tail_cache(&self) -> Option<&super::live_tail_cache::LiveTailShieldedCache> {
+        None
+    }
     fn serving_stored_set(&self) -> super::CanonicalStoredSet;
     fn serving_network(&self) -> Network;
     fn serving_build_plan(&self) -> &super::CanonicalStoreBuildPlan;
@@ -122,6 +125,10 @@ impl CanonicalServingRead for RocksDbCanonicalSecondary {
 
     fn serving_context(&self) -> SegmentStoreContext<'_> {
         self.segment_context()
+    }
+
+    fn serving_live_tail_cache(&self) -> Option<&super::live_tail_cache::LiveTailShieldedCache> {
+        self.live_tail_cache()
     }
 
     fn serving_stored_set(&self) -> super::CanonicalStoredSet {
@@ -824,10 +831,16 @@ fn read_compact_blocks_up_to<Row>(
         project: &project,
     };
     while !state.is_budget_spent() {
-        let batch_len = bounded_batch_len(
-            max_bytes.saturating_sub(state.kept_bytes),
-            state.largest_row_bytes,
-        );
+        // An exact-fit artifact prefix must not depend on later SSTs that a
+        // secondary's primary may have compacted away.
+        let batch_len = if state.largest_row_bytes == 0 {
+            1
+        } else {
+            bounded_batch_len(
+                max_bytes.saturating_sub(state.kept_bytes),
+                state.largest_row_bytes,
+            )
+        };
         let batch = std::iter::from_fn(&mut next_height)
             .take(batch_len)
             .collect::<Vec<_>>();
@@ -1016,8 +1029,8 @@ fn visit_compact_block_batches(
 /// Rows the next batch of a byte-bounded read fetches.
 ///
 /// That is as many as `remaining_bytes` holds at the size of the largest row
-/// read so far, from one to [`BOUNDED_COMPACT_BLOCK_BATCH_SIZE`], and one
-/// before any row is read.
+/// read so far, from one to [`BOUNDED_COMPACT_BLOCK_BATCH_SIZE`]. Start
+/// with up to 16 rows while no row-size estimate is available.
 ///
 /// A batch pins every row it fetches until the read has walked it, including
 /// the rows past the point where the budget stops the read. Sizing each batch
@@ -1026,7 +1039,7 @@ fn visit_compact_block_batches(
 pub(super) fn bounded_batch_len(remaining_bytes: usize, largest_row_bytes: usize) -> usize {
     remaining_bytes
         .checked_div(largest_row_bytes)
-        .unwrap_or(1)
+        .unwrap_or(16)
         .clamp(1, BOUNDED_COMPACT_BLOCK_BATCH_SIZE)
 }
 
@@ -1855,9 +1868,13 @@ mod tests {
 
     #[test]
     fn a_bounded_batch_fits_the_budget_left_at_the_largest_row_read() {
-        // Before any row is read, a batch fetches one row to learn its size.
-        assert_eq!(bounded_batch_len(2 * 1024 * 1024, 0), 1);
-        assert_eq!(bounded_batch_len(0, 0), 1);
+        // Before row sizes are known, the initial batch uses a fixed row count.
+        for remaining_bytes in [0, 3, 2 * 1024 * 1024] {
+            assert_eq!(
+                bounded_batch_len(remaining_bytes, 0),
+                16.min(BOUNDED_COMPACT_BLOCK_BATCH_SIZE)
+            );
+        }
         // Small rows fill the largest batch.
         assert_eq!(
             bounded_batch_len(2 * 1024 * 1024, 1_000),

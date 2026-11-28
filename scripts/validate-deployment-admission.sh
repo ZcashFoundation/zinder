@@ -165,6 +165,12 @@ if [[ -n "$compose_contract" ]]; then
       ] | length > 0;
     def allowed_profile($value):
       ($value == "light-wallet" or $value == "wallet" or $value == "explorer");
+    def profile_matches($index_env; $serve_env):
+      (($index_env.ZINDER_DEPLOYMENT__PROFILE // null) as $ip
+       | ($serve_env.ZINDER_DEPLOYMENT__PROFILE // null) as $sp
+       | ($ip == $sp) and ($ip == null or allowed_profile($ip)));
+    def clean_runtime_env($env):
+      (($env // {}) | keys | all((startswith("DEPLOY_") | not) and . != "ZINDER_PRESET"));
     volume_mounts_at("state-init"; "/var/lib/zinder") as $state_data
     | volume_mounts_at("state-init"; "/var/lib/zinder/checkpoints") as $state_checkpoint
     | volume_mounts_at("zinder-index"; "/var/lib/zinder/checkpoints") as $index_checkpoint
@@ -224,16 +230,12 @@ if [[ -n "$compose_contract" ]]; then
     and (has_checkpoint_secret_source("zinder-serve") | not)
     and exact_read_only_bind("zinder-index"; "/var/run/zinder-control/ingest.token"; "/ingest.token")
     and exact_read_only_bind("zinder-serve"; "/var/run/zinder-control/ingest.token"; "/ingest.token")
-    and ($services["zinder-index"].command[0] == "index")
-    and ($services["zinder-index"].command[1] == "--preset")
-    and allowed_profile($services["zinder-index"].command[2])
-    and ($services["zinder-index"].environment.ZINDER_DEPLOYMENT__PROFILE == $services["zinder-index"].command[2])
+    and ($services["zinder-index"].command == ["index"])
+    and ($services["zinder-serve"].command == ["serve", "--readers-only"])
+    and clean_runtime_env($services["zinder-index"].environment)
+    and clean_runtime_env($services["zinder-serve"].environment)
+    and profile_matches($services["zinder-index"].environment; $services["zinder-serve"].environment)
     and ($services["zinder-index"].environment.ZINDER_STORAGE__DATA_DIR == "/var/lib/zinder")
-    and ($services["zinder-index"].environment | has("ZINDER_NODE__INDEXER_GRPC_ADDR"))
-    and ($services["zinder-index"].environment | has("ZINDER_NODE__INDEXER_TLS__SERVER_NAME"))
-    and ($services["zinder-index"].environment | has("ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM"))
-    and ($services["zinder-index"].environment | has("ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM"))
-    and ($services["zinder-index"].environment | has("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM"))
     and ($services["zinder-index"].environment.ZINDER_INGEST_CONTROL__LISTEN_ADDR == "127.0.0.1:9100")
     and ($services["zinder-index"].environment.ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH == "/var/run/zinder-control/ingest.token")
     and ($services["zinder-index"].environment.ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH == "/var/run/zinder-checkpoint/checkpoint.token")
@@ -241,21 +243,15 @@ if [[ -n "$compose_contract" ]]; then
     and ($services["zinder-index"].environment.ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH == "/var/run/zinder-checkpoint/checkpoint.token")
     and ($services["zinder-index"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9105")
     and ($services["zinder-index"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
-    and (($services["zinder-index"].environment.ZINDER_INGEST__SOURCE | type) == "string"
-      and ($services["zinder-index"].environment.ZINDER_INGEST__SOURCE | length) > 0)
     and ($services["zinder-index"].healthcheck | exact_healthcheck("127.0.0.1:9105"))
-    and ($services["zinder-serve"].command[0] == "serve")
-    and ($services["zinder-serve"].command[1] == "--readers-only")
-    and ($services["zinder-serve"].command[2] == "--preset")
-    and allowed_profile($services["zinder-serve"].command[3])
-    and ($services["zinder-serve"].environment.ZINDER_DEPLOYMENT__PROFILE == $services["zinder-serve"].command[3])
     and ($services["zinder-serve"].environment.ZINDER_STORAGE__DATA_DIR == "/var/lib/zinder")
     and ($services["zinder-serve"].environment.ZINDER_INGEST_CONTROL__ADDR == "http://127.0.0.1:9100")
     and ($services["zinder-serve"].environment.ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH == "/var/run/zinder-control/ingest.token")
-    and (($services["zinder-serve"].environment // {}) | has("ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH") | not)
-    and ((($services["zinder-serve"].environment // {}) | keys | all(startswith("ZINDER_PROJECTOR_CONTROL__") | not)))
+    and (($services["zinder-serve"].environment // {}) | keys | all(startswith("ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN") | not))
+    and (($services["zinder-serve"].environment // {}) | keys | all(startswith("ZINDER_PROJECTOR_CONTROL__") | not))
     and (($services["zinder-serve"].environment // {}) | has("ZINDER_INGEST__SOURCE") | not)
-    and ((($services["zinder-serve"].environment // {}) | keys | all(startswith("ZINDER_NODE__INDEXER_TLS__") | not)))
+    and (($services["zinder-serve"].environment // {}) | keys | all(startswith("ZINDER_NODE__INDEXER_TLS__") | not))
+    and (($services["zinder-serve"].environment // {}) | keys | all(test("^ZINDER_NODE_FALLBACKS__.*__INDEXER_TLS__") | not))
     and ($services["zinder-serve"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9108")
     and ($services["zinder-serve"].environment.ZINDER_COMPAT__LISTEN_ADDR == "[::]:9067")
     and ($services["zinder-serve"].environment.ZINDER_QUERY__LISTEN_ADDR == "[::]:9102")
@@ -370,6 +366,9 @@ if [[ -n "$kubernetes_manifest" ]]; then
   }
 
   if ! grep -Fq 'kind: StatefulSet' "$kubernetes_manifest" \
+    || ! grep -Fq 'kind: ConfigMap' "$kubernetes_manifest" \
+    || ! grep -Fq 'name: zinder-config' "$kubernetes_manifest" \
+    || ! grep -Fq 'configMapRef:' "$kubernetes_manifest" \
     || ! grep -Fq 'runAsNonRoot: true' "$kubernetes_manifest" \
     || ! grep -Fq 'runAsUser: 10001' "$kubernetes_manifest" \
     || ! grep -Fq 'runAsGroup: 10001' "$kubernetes_manifest" \
@@ -378,11 +377,12 @@ if [[ -n "$kubernetes_manifest" ]]; then
     || ! grep -Fq 'allowPrivilegeEscalation: false' "$kubernetes_manifest" \
     || ! grep -Fq -- '- ALL' "$kubernetes_manifest" \
     || ! grep -Fq '/usr/local/bin/zinder' "$kubernetes_manifest" \
-    || grep -Eq ':latest\b|/etc/zinder/config\.toml|deploy/config/' "$kubernetes_manifest"; then
+    || grep -Eq ':latest\b|/etc/zinder/config\.toml|deploy/config/|--preset' "$kubernetes_manifest"; then
     cat >&2 <<'EOF'
 release admission rejected: Kubernetes StatefulSet manifest must enforce
 non-root UID/GID 10001, readOnlyRootFilesystem, dropped capabilities,
-/usr/local/bin/zinder probes, and zero :latest tags or TOML config mounts.
+ConfigMap configuration, /usr/local/bin/zinder probes, and zero :latest tags,
+hardcoded --preset args, or TOML config mounts.
 EOF
     exit 1
   fi

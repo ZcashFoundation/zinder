@@ -20,8 +20,8 @@ Run with the `explorer` preset (`--preset explorer` or `ZINDER_DEPLOYMENT__PROFI
 
 | Deployment | What to run |
 | --- | --- |
-| Docker Compose | Set `ZINDER_PRESET=explorer` (or `ZINDER_DEPLOYMENT__PROFILE=explorer`) with `deploy/docker-compose.yml`. `zinder-index` enables `explorer_views = true`, and `zinder-serve --readers-only --preset explorer` runs `zinder-explorer` (`:9068`) and `zinder-compat-cipherscan` (`:9070`) alongside wallet readers. |
-| Single-volume container or Kubernetes | Run `ghcr.io/zcashfoundation/zinder` with `zinder serve --preset explorer` (or set `ZINDER_DEPLOYMENT__PROFILE=explorer` when no `--preset` flag is set; [Kubernetes StatefulSet](../../deploy/kubernetes/statefulset.yaml) passes `args: ["serve", "--preset", "wallet"]`, which overrides env vars and must be changed to `--preset explorer`; see also [Single-volume deployment](../runbooks/deploying-single-volume.md)). |
+| Docker Compose | Set `ZINDER_DEPLOYMENT__PROFILE=explorer` in your runtime `zinder.env` (referenced by `DEPLOY_ZINDER_ENV`) with `deploy/docker-compose.yml`. `zinder-index` enables `explorer_views = true`, and `zinder-serve --readers-only` runs `zinder-explorer` (`:9068`) and `zinder-compat-cipherscan` (`:9070`) alongside wallet readers. |
+| Single-volume container or Kubernetes | Run `ghcr.io/zcashfoundation/zinder` with `ZINDER_DEPLOYMENT__PROFILE=explorer` (for example in the `zinder-config` `ConfigMap` in [Kubernetes StatefulSet](../../deploy/kubernetes/statefulset.yaml), whose `args: ["serve"]` defers to `ZINDER_DEPLOYMENT__PROFILE`; or pass `zinder serve --preset explorer` on standalone CLI runs; see also [Single-volume deployment](../runbooks/deploying-single-volume.md)). |
 | Standalone roles | Run `zinder run explorer` (or `zinder-explorer`) against `storage.path` (or `storage.data_dir`) via `ZINDER_*` environment variables or an optional `--config` TOML file; [Deploying on a VM](../runbooks/deploying-on-a-vm.md) lists what a non-container host needs. |
 
 The Explorer reads these settings. [Configuration](../reference/configuration.md) lists them with their environment variables.

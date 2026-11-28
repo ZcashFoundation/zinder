@@ -7,27 +7,24 @@ use std::{
     time::Duration,
 };
 
-use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_query::{
     DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
     ForwardedReadConfig, MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
 };
+pub use zinder_runtime::CompatServing;
 use zinder_runtime::{
-    BearerToken, BearerTokenError, BrowserOrigins, CanonicalSecondaryStorageSection,
-    CanonicalSecondaryStorageToml, ClientAddressSource, ConfigError, ConfigLoader,
-    DeploymentProfile, DeploymentSection, DeploymentToml, GrpcProxyProtocol, GrpcRangeAdmission,
-    IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml, NodeFallbacksToml,
-    NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader,
-    RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, RuntimeService, SecuritySection,
-    SecurityToml, derive_canonical_path, derive_canonical_secondary_path, derive_wallet_path,
-    derive_wallet_secondary_path, guard_optional_serving_bind, guard_serving_bind,
-    parse_socket_addr, require_field, resolve_allow_public_bind,
-    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
-    resolve_wallet_projection_reader_rocksdb_budget, section_defaults::DEFAULT_DATA_DIR,
-    validate_optional_data_dir,
+    BearerToken, BearerTokenError, BrowserOrigins, ClientAddressSource, CompatSection, ConfigError,
+    ConfigLoader, DEFAULT_ALLOW_PUBLIC_BIND, DeploymentProfile, DeploymentSection,
+    GrpcProxyProtocol, GrpcRangeAdmission, IngestControlSection, NetworkSection, OpsSection,
+    RedactedCidrs, ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, RuntimeService,
+    SecuritySection, StorageSection, WalletSection, ZinderConfig, derive_canonical_path,
+    derive_canonical_secondary_path, derive_wallet_path, derive_wallet_secondary_path,
+    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
+    resolve_allow_public_bind, resolve_canonical_secondary_storage, resolve_ingest_control_reader,
+    resolve_ops_listen_addr, resolve_wallet_projection_reader_rocksdb_budget,
+    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir, validate_optional_path,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 use zinder_store::{
@@ -40,31 +37,6 @@ use crate::{
     DEFAULT_TIP_WAIT_MAX_BLOCKS, DEFAULT_TIP_WAIT_MAX_WAITERS, LightwalletdAdmissionError,
     StaleTipLimit,
 };
-
-/// Operator-selected lightwalletd compatibility capability.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum CompatServing {
-    /// Full wallet-compatible serving over an admitted canonical and wallet pair.
-    #[default]
-    Wallet,
-    /// Canonical compact-block serving without wallet storage.
-    CompactBlocks,
-    /// Canonical wallet reads with node-backed transparent methods.
-    LightWallet,
-}
-
-impl CompatServing {
-    /// Returns the kebab-case configuration representation of this serving mode.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Wallet => "wallet",
-            Self::CompactBlocks => "compact-blocks",
-            Self::LightWallet => "light-wallet",
-        }
-    }
-}
 
 /// Resolved lightwalletd compatibility runtime configuration.
 #[derive(Clone, Debug)]
@@ -281,23 +253,18 @@ pub fn load_lightwalletd_config_with_env<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    resolve_lightwalletd_config(load_raw_config(config_path, overrides, environment)?)
+    resolve_lightwalletd_config_from_raw(load_raw_config(config_path, overrides, environment)?)
 }
 
 fn load_raw_config<I>(
     config_path: Option<PathBuf>,
     overrides: LightwalletdConfigOverrides,
     environment: I,
-) -> Result<LightwalletdRawConfig, ConfigError>
+) -> Result<ZinderConfig, ConfigError>
 where
     I: IntoIterator<Item = (String, String)>,
 {
     ConfigLoader::new()
-        .with_default("compat.listen_addr", "127.0.0.1:9067")?
-        .with_default(
-            "compat.reorg_window_blocks",
-            zinder_store::DEFAULT_REORG_WINDOW_BLOCKS,
-        )?
         .with_ops_section(RuntimeService::CompatLightwalletd)?
         .with_security_section()?
         .with_file(config_path)
@@ -337,66 +304,98 @@ where
 pub fn lightwalletd_config_toml(
     config: &LightwalletdConfig,
 ) -> Result<String, LightwalletdConfigError> {
-    let rendered = toml::to_string(&LightwalletdConfigToml::from_lightwalletd_config(config))
-        .map_err(|source| ConfigError::Render { source })?;
+    let mut storage = StorageSection::from_canonical_secondary(&config.storage);
+    if config.profile.is_some() {
+        storage.raw_blob_policy = None;
+    }
+    let toml_config = ZinderConfig {
+        deployment: DeploymentSection::from_resolved(config.profile),
+        network: NetworkSection::from_network(config.network),
+        ops: OpsSection::from_resolved(config.ops_listen_addr),
+        observability: config.observability.clone(),
+        security: SecuritySection::from_resolved(config.allow_public_bind),
+        storage,
+        wallet: config
+            .wallet_primary_path
+            .as_ref()
+            .zip(config.wallet_secondary_root.as_ref())
+            .zip(config.wallet_rocksdb_budget)
+            .map_or_default(|((path, secondary_path), rocksdb)| {
+                WalletSection::from_resolved_reader(path.clone(), secondary_path.clone(), rocksdb)
+            }),
+        ingest_control: IngestControlSection::from_reader(&ResolvedIngestControlReader {
+            addr: config.ingest_control_addr.clone(),
+            bearer_token_path: config.ingest_control_bearer_token_path.clone(),
+            bearer_token: config.ingest_control_bearer_token.clone(),
+        }),
+        compat: build_compat_section(config),
+        node: config
+            .broadcaster
+            .as_ref()
+            .map_or_default(NodeSection::from_resolved),
+        node_fallbacks: NodeFallbackSections::from_resolved(&config.node_fallbacks),
+        ..ZinderConfig::default()
+    };
+    let rendered =
+        toml::to_string(&toml_config).map_err(|source| ConfigError::Render { source })?;
     Ok(rendered)
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct LightwalletdRawConfig {
-    deployment: DeploymentSection,
-    network: NetworkSection,
-    ops: OpsSection,
-    observability: zinder_runtime::ObservabilityConfig,
-    storage: CanonicalSecondaryStorageSection,
-    wallet: Option<WalletSection>,
-    ingest_control: IngestControlSection,
-    compat: CompatSection,
-    node: Option<NodeSection>,
-    node_fallbacks: NodeFallbackSections,
-    security: SecuritySection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct CompatSection {
-    listen_addr: Option<String>,
-    browser_origins: BrowserOrigins,
-    reorg_window_blocks: Option<u32>,
-    pair_convergence_attempts: Option<u8>,
-    max_concurrent_block_range_streams: Option<u32>,
-    tree_state_replay_wait_ms: Option<u64>,
-    tree_state_replay_waiters_per_slot: Option<u32>,
-    forwarded_read_max_concurrent: Option<u32>,
-    forwarded_read_wait_ms: Option<u64>,
-    forwarded_read_waiters_per_slot: Option<u32>,
-    forwarded_transaction_cache_bytes: Option<u64>,
-    stale_tip_limit_ms: Option<u64>,
-    tip_wait_ms: Option<u64>,
-    tip_wait_max_blocks: Option<u32>,
-    tip_wait_max_waiters: Option<u32>,
-    ping_very_insecure: Option<bool>,
-    serving: Option<CompatServing>,
-    trust_proxy_client_address: Option<bool>,
-    proxy_protocol_trusted_cidrs: Option<String>,
-    range_admission: GrpcRangeAdmission,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct WalletSection {
-    path: Option<PathBuf>,
-    secondary_path: Option<PathBuf>,
-    rocksdb: RocksDbResourceBudgetSection,
+fn build_compat_section(config: &LightwalletdConfig) -> CompatSection {
+    CompatSection {
+        listen_addr: Some(config.listen_addr.to_string()),
+        browser_origins: config.browser_origins.clone(),
+        reorg_window_blocks: Some(config.canonical_reorg_policy.reorg_window_blocks()),
+        pair_convergence_attempts: Some(config.pair_convergence_attempts.get()),
+        max_concurrent_block_range_streams: Some(config.max_concurrent_block_range_streams.get()),
+        tree_state_replay_wait_ms: config
+            .tree_state_replay_wait
+            .map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+        tree_state_replay_waiters_per_slot: config
+            .tree_state_replay_waiters_per_slot
+            .map(NonZeroU32::get),
+        forwarded_read_max_concurrent: config
+            .forwarded_reads
+            .map(|reads| reads.max_concurrent().get()),
+        forwarded_read_wait_ms: config
+            .forwarded_reads
+            .map(|reads| u64::try_from(reads.wait().as_millis()).unwrap_or(u64::MAX)),
+        forwarded_read_waiters_per_slot: config
+            .forwarded_reads
+            .map(|reads| reads.waiters_per_slot().get()),
+        forwarded_transaction_cache_bytes: config
+            .forwarded_reads
+            .map(|reads| reads.transaction_cache_bytes()),
+        stale_tip_limit_ms: Some(config.stale_tip_limit.limit().map_or(0, |limit| {
+            u64::try_from(limit.as_millis()).unwrap_or(u64::MAX)
+        })),
+        tip_wait_ms: Some(u64::try_from(config.tip_wait.as_millis()).unwrap_or(u64::MAX)),
+        tip_wait_max_blocks: Some(config.tip_wait_max_blocks.get()),
+        tip_wait_max_waiters: Some(config.tip_wait_max_waiters.get()),
+        ping_very_insecure: Some(config.ping_very_insecure),
+        serving: config.profile.is_none().then_some(config.serving),
+        trust_proxy_client_address: Some(config.client_address_source.trust_proxy_client_address()),
+        proxy_protocol_trusted_cidrs: RedactedCidrs::from_resolved(
+            config.proxy_protocol.is_enabled(),
+        ),
+        range_admission: config.range_admission,
+    }
 }
 
 fn derive_storage_paths(
     serving: CompatServing,
-    storage: &mut CanonicalSecondaryStorageSection,
+    storage: &mut StorageSection,
     wallet: Option<&mut WalletSection>,
 ) -> Result<(), ConfigError> {
     storage.data_dir = validate_optional_data_dir(storage.data_dir.take())?;
+    let mut wallet = wallet;
+    if let Some(wallet_section) = wallet.as_deref_mut() {
+        wallet_section.path = validate_optional_path(wallet_section.path.take(), "wallet.path")?;
+        wallet_section.secondary_path = validate_optional_path(
+            wallet_section.secondary_path.take(),
+            "wallet.secondary_path",
+        )?;
+    }
     let all_wallet_unset = wallet
         .as_deref()
         .is_none_or(|section| section.path.is_none() && section.secondary_path.is_none());
@@ -428,22 +427,24 @@ fn derive_storage_paths(
     Ok(())
 }
 
+/// Validates and resolves an already-deserialized unified [`ZinderConfig`] for
+/// `zinder-compat-lightwalletd`.
 #[allow(
     clippy::too_many_lines,
     reason = "lightwalletd config resolution keeps storage, wallet, and serving admission in one function"
 )]
-fn resolve_lightwalletd_config(
-    mut config: LightwalletdRawConfig,
+pub fn resolve_lightwalletd_config_from_raw(
+    mut config: ZinderConfig,
 ) -> Result<LightwalletdConfig, LightwalletdConfigError> {
     let serving = resolve_serving(&mut config)?;
-    let wallet = config.wallet;
-    if serving != CompatServing::Wallet && wallet.is_some() {
+    let wallet_present = !config.wallet.is_empty();
+    if serving != CompatServing::Wallet && wallet_present {
         return Err(ConfigError::invalid(format!(
             "compat.serving = \"{}\" does not accept wallet.path, wallet.secondary_path, or wallet.rocksdb settings; remove the wallet section or select compat.serving = \"wallet\"", serving.as_str()
         ))
         .into());
     }
-    let mut wallet = wallet.unwrap_or_default();
+    let mut wallet = config.wallet;
     let network = config.network.resolve()?;
     derive_storage_paths(
         serving,
@@ -465,10 +466,20 @@ fn resolve_lightwalletd_config(
         bearer_token: ingest_control_bearer_token,
     } = resolve_ingest_control_reader(config.ingest_control)?;
     let canonical_reorg_policy = resolve_reorg_policy(&config.compat)?;
-    let listen_addr_string = require_field(config.compat.listen_addr, "compat.listen_addr")?;
+    let listen_addr_string = config
+        .compat
+        .listen_addr
+        .unwrap_or_else(|| "127.0.0.1:9067".to_owned());
     let listen_addr = parse_socket_addr("compat.listen_addr", &listen_addr_string)?;
     let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
-    let allow_public_bind = resolve_allow_public_bind(config.security)?;
+    let allow_public_bind = resolve_allow_public_bind(SecuritySection {
+        allow_public_bind: Some(
+            config
+                .security
+                .allow_public_bind
+                .unwrap_or(DEFAULT_ALLOW_PUBLIC_BIND),
+        ),
+    })?;
     let pair_convergence_attempts =
         require_pair_convergence_attempts(config.compat.pair_convergence_attempts)?;
     let max_concurrent_block_range_streams = require_max_concurrent_block_range_streams(
@@ -477,8 +488,9 @@ fn resolve_lightwalletd_config(
     let stale_tip_limit = resolve_stale_tip_limit(config.compat.stale_tip_limit_ms)?;
     guard_serving_bind("compat.listen_addr", listen_addr, allow_public_bind)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
+    let node = (!config.node.is_empty()).then_some(config.node);
     let (broadcaster, node_fallbacks) =
-        resolve_node_list(serving, network, config.node, config.node_fallbacks)?;
+        resolve_node_list(serving, network, node, config.node_fallbacks)?;
 
     if let Some(profile) = config.deployment.profile
         && matches!(
@@ -495,6 +507,7 @@ fn resolve_lightwalletd_config(
         .into());
     }
 
+    let browser_origins = config.compat.browser_origins;
     let client_address_source = ClientAddressSource::from_trust_proxy_client_address(
         config.compat.trust_proxy_client_address.unwrap_or(false),
     );
@@ -515,7 +528,7 @@ fn resolve_lightwalletd_config(
         ingest_control_bearer_token_path,
         ingest_control_bearer_token,
         listen_addr,
-        browser_origins: config.compat.browser_origins,
+        browser_origins,
         ops_listen_addr,
         observability: config.observability,
         allow_public_bind,
@@ -541,13 +554,14 @@ fn resolve_lightwalletd_config(
 fn resolve_reorg_policy(
     compat: &CompatSection,
 ) -> Result<CanonicalReorgPolicy, LightwalletdConfigError> {
-    Ok(CanonicalReorgPolicy::new(require_field(
-        compat.reorg_window_blocks,
-        "compat.reorg_window_blocks",
-    )?)?)
+    Ok(CanonicalReorgPolicy::new(
+        compat
+            .reorg_window_blocks
+            .unwrap_or(zinder_store::DEFAULT_REORG_WINDOW_BLOCKS),
+    )?)
 }
 
-fn resolve_serving(config: &mut LightwalletdRawConfig) -> Result<CompatServing, ConfigError> {
+fn resolve_serving(config: &mut ZinderConfig) -> Result<CompatServing, ConfigError> {
     let Some(profile) = config.deployment.profile else {
         return Ok(config.compat.serving.unwrap_or_default());
     };
@@ -636,137 +650,6 @@ fn resolve_node_list(
     let node_fallbacks = NodeTarget::resolve_fallbacks(network, node_fallbacks)?;
     NodeTarget::require_primary_for_fallbacks(broadcaster.as_ref(), &node_fallbacks)?;
     Ok((broadcaster, node_fallbacks))
-}
-
-#[derive(Serialize)]
-struct LightwalletdConfigToml {
-    #[serde(skip_serializing_if = "DeploymentToml::is_empty")]
-    deployment: DeploymentToml,
-    network: NetworkToml,
-    ops: OpsToml,
-    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
-    observability: zinder_runtime::ObservabilityConfig,
-    security: SecurityToml,
-    storage: CanonicalSecondaryStorageToml,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    wallet: Option<WalletToml>,
-    ingest_control: IngestControlReaderToml,
-    compat: CompatToml,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    node: Option<NodeToml>,
-    #[serde(skip_serializing_if = "NodeFallbacksToml::is_empty")]
-    node_fallbacks: NodeFallbacksToml,
-}
-
-impl LightwalletdConfigToml {
-    fn from_lightwalletd_config(config: &LightwalletdConfig) -> Self {
-        let mut storage = CanonicalSecondaryStorageToml::from_resolved(&config.storage);
-        if config.profile.is_some() {
-            storage.raw_blob_policy = None;
-        }
-        Self {
-            deployment: DeploymentToml::from_resolved(config.profile),
-            network: NetworkToml::from_network(config.network),
-            ops: OpsToml::from_resolved(config.ops_listen_addr),
-            observability: config.observability.clone(),
-            security: SecurityToml::from_resolved(config.allow_public_bind),
-            storage,
-            wallet: config
-                .wallet_primary_path
-                .as_ref()
-                .zip(config.wallet_secondary_root.as_ref())
-                .zip(config.wallet_rocksdb_budget)
-                .map(|((path, secondary_path), rocksdb)| WalletToml {
-                    path: path.clone(),
-                    secondary_path: secondary_path.clone(),
-                    rocksdb: RocksDbResourceBudgetToml::from_resolved(rocksdb),
-                }),
-            ingest_control: IngestControlReaderToml::from_reader(&ResolvedIngestControlReader {
-                addr: config.ingest_control_addr.clone(),
-                bearer_token_path: config.ingest_control_bearer_token_path.clone(),
-                bearer_token: config.ingest_control_bearer_token.clone(),
-            }),
-            compat: CompatToml {
-                listen_addr: config.listen_addr.to_string(),
-                browser_origins: config.browser_origins.clone(),
-                reorg_window_blocks: config.canonical_reorg_policy.reorg_window_blocks(),
-                pair_convergence_attempts: config.pair_convergence_attempts.get(),
-                max_concurrent_block_range_streams: config.max_concurrent_block_range_streams.get(),
-                tree_state_replay_wait_ms: config
-                    .tree_state_replay_wait
-                    .map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
-                tree_state_replay_waiters_per_slot: config
-                    .tree_state_replay_waiters_per_slot
-                    .map(NonZeroU32::get),
-                forwarded_read_max_concurrent: config
-                    .forwarded_reads
-                    .map(|reads| reads.max_concurrent().get()),
-                forwarded_read_wait_ms: config
-                    .forwarded_reads
-                    .map(|reads| u64::try_from(reads.wait().as_millis()).unwrap_or(u64::MAX)),
-                forwarded_read_waiters_per_slot: config
-                    .forwarded_reads
-                    .map(|reads| reads.waiters_per_slot().get()),
-                forwarded_transaction_cache_bytes: config
-                    .forwarded_reads
-                    .map(|reads| reads.transaction_cache_bytes()),
-                stale_tip_limit_ms: config.stale_tip_limit.limit().map_or(0, |limit| {
-                    u64::try_from(limit.as_millis()).unwrap_or(u64::MAX)
-                }),
-                tip_wait_ms: u64::try_from(config.tip_wait.as_millis()).unwrap_or(u64::MAX),
-                tip_wait_max_blocks: config.tip_wait_max_blocks.get(),
-                tip_wait_max_waiters: config.tip_wait_max_waiters.get(),
-                ping_very_insecure: config.ping_very_insecure,
-                serving: config.profile.is_none().then_some(config.serving),
-                trust_proxy_client_address: config
-                    .client_address_source
-                    .trust_proxy_client_address(),
-                proxy_protocol_trusted_cidrs: config.proxy_protocol.redacted_cidrs(),
-                range_admission: config.range_admission,
-            },
-            node: config.broadcaster.as_ref().map(NodeToml::from_node_target),
-            node_fallbacks: NodeFallbacksToml::from_node_targets(&config.node_fallbacks),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct CompatToml {
-    listen_addr: String,
-    browser_origins: BrowserOrigins,
-    reorg_window_blocks: u32,
-    pair_convergence_attempts: u8,
-    max_concurrent_block_range_streams: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tree_state_replay_wait_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tree_state_replay_waiters_per_slot: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    forwarded_read_max_concurrent: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    forwarded_read_wait_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    forwarded_read_waiters_per_slot: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    forwarded_transaction_cache_bytes: Option<u64>,
-    stale_tip_limit_ms: u64,
-    tip_wait_ms: u64,
-    tip_wait_max_blocks: u32,
-    tip_wait_max_waiters: u32,
-    ping_very_insecure: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    serving: Option<CompatServing>,
-    trust_proxy_client_address: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    proxy_protocol_trusted_cidrs: Option<&'static str>,
-    range_admission: GrpcRangeAdmission,
-}
-
-#[derive(Serialize)]
-struct WalletToml {
-    path: PathBuf,
-    secondary_path: PathBuf,
-    rocksdb: RocksDbResourceBudgetToml,
 }
 
 const DEFAULT_PAIR_CONVERGENCE_ATTEMPTS: u8 = 12;

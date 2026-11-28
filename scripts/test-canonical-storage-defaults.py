@@ -45,7 +45,7 @@ class CanonicalStorageDefaults(unittest.TestCase):
             "--lease-duration-seconds", "14400",
         )
 
-        canonical = projector["canonical_path"]
+        canonical = projector["path"]
         self.assertEqual(canonical, "/var/lib/zinder/canonical")
         for role, path in (
             ("ingest", ingest["path"]), ("explorer", explorer["path"]),
@@ -57,7 +57,7 @@ class CanonicalStorageDefaults(unittest.TestCase):
             with self.subTest(subcommand=subcommand):
                 storage = unified_storage_config(subcommand)
                 self.assertEqual(storage["path"], canonical)
-                self.assertEqual(storage["canonical_path"], canonical)
+                self.assertNotIn("canonical_path", storage)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,17 @@ A name for a deployment shape must not become a second source of truth. Capabili
    The encoding of transaction evidence, the construction of prefix evidence, and the length of retained replay belong to the format specification.
 6. **Wallet and Explorer presets retain complete history.** `wallet` runs the projector, native query, and wallet compatibility without raw blobs (`raw_blob_policy = "none"` unless `--full-blocks` / `storage.full_blocks = true` is set, requiring a verified primary node byte source). `explorer` enables `ingest.explorer_views = true` alongside the full `wallet` stack plus `zinder-explorer` and `zinder-compat-cipherscan`. Combining `--full-blocks` (`storage.full_blocks = true`) with any preset sets `raw_blob_policy = "all"` cleanly without requiring a separate `wallet-archive` profile.
 
+7. **Upstream retention and the local stored set are independent.** The ratified policy admits pruned following for an existing, verified `READY` Schema v2 store under any admitted preset or explicit composition, including lean and `--full-blocks`, when the horizon and recovery conditions in [ADR-0006](0006-node-source-boundary.md) hold. Fresh construction still requires archive history. Local full retention supplies historical transaction bodies. A lean store backed solely by pruned validators cannot promise those bodies. Discovery and errors follow [ADR-0015](0015-wallet-runtime-composition.md) and [ADR-0018](0018-transaction-facts-status-and-broadcast.md).
+
+8. **Shifted-key hints are outside the canonical stored set.** The optional rebuildable sidecar in [ADR-0014](0014-consumer-neutral-wallet-data-plane.md) decision 10 adds no default storage cost to any preset. Production implementation remains gated on independent client safety, a measured end-to-end mobile win, and a committed consumer.
+
+9. **Light-client proofs are an opt-in canonical stored-set module.** `storage.light_client_proofs` defaults to off. The minimal `light-wallet` stored set stays small and the default `CompactBlock.header` stays empty. After G1 freezes the format (decision 10), the module keeps reversible and settled ZIP 221 Merkle mountain range nodes and `hashAuthDataRoot`. When `full_blocks` is enabled, read 1,487-byte consensus headers from `ZSBLKB01` or `live_tail_raw_block`. Persist separate Equihash solutions only when `full_blocks` is disabled. The native-first release boundary is in [ADR-0014](0014-consumer-neutral-wallet-data-plane.md) decision 11. This module is ratified and pending implementation.
+
+10. **Qualify Schema v2 before depending on the settled format.** The canonical Schema v2 code cutover shipped in `v0.28.0`. Mainnet rebuild and consumer qualification remain tracked in [#384](https://github.com/ZcashFoundation/zinder/issues/384).
+
+    - **G1 (format freeze).** From-empty Mainnet builds on Zebra and Zakura must reach `READY`, pass cold certification, and produce matching canonical sequence digests. G1 unblocks [#705](https://github.com/ZcashFoundation/zinder/issues/705) and format-dependent [#697](https://github.com/ZcashFoundation/zinder/issues/697) work.
+    - **G2 (consumer qualification).** Representative wallet restores, an Explorer rebuild, and epoch and cursor renewals must pass qualification. G2 closes #384 and unblocks [#385](https://github.com/ZcashFoundation/zinder/issues/385).
+
 [Configuration](../reference/configuration.md) lists the settings, and [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#runtime-serving-selection) describes each serving mode.
 
 ## Evidence
@@ -49,6 +60,10 @@ A name for a deployment shape must not become a second source of truth. Capabili
 - Decision 5, the location and digest of every mined transaction: measured. Node bytes that differ from the recorded digest fail with `DATA_LOSS`, and the wrong-bytes and wrong-block tests fail with their guards disabled ([#481](https://github.com/ZcashFoundation/zinder/pull/481)).
 - Decision 5, authenticated settled prefix storage: implemented in Canonical Schema v2. `ZSHRNG02`, `ZSTSUP01`, and optional `ZSBLKB01` settled segments authenticate settled history via per-segment `index_sha256` / payload digests recorded in `settled_segment_index` and bound into `canonical-construction-manifest.v2.json` ([#381](https://github.com/ZcashFoundation/zinder/issues/381)), retiring the ~20 GiB Schema v1 replay redundancy ([#364](https://github.com/ZcashFoundation/zinder/issues/364)).
 - Decision 6, fixed stored sets for the wallet profiles: judgment. Mainnet disk and rebuild measurements for Schema v2 are tracked in [#364](https://github.com/ZcashFoundation/zinder/issues/364).
+- Decision 7: Judgment. [ADR-0006](0006-node-source-boundary.md#evidence) decision 9 records the horizon constraint and recovery evidence that would reopen admission.
+- Decision 8: Judgment. Rebuildable hints can evolve without changing the canonical segment format. A qualified client that cannot consume a rebuildable sidecar would reopen placement. The safety and mobile evidence is in [ADR-0014](0014-consumer-neutral-wallet-data-plane.md#evidence).
+- Decision 9: Judgment. Opt-in storage bounds the default footprint, and full-block deployments can reuse headers they already store. Reopen placement if format qualification shows reuse cannot supply byte-identical headers or meet measured proof-serving latency.
+- Decision 10: Judgment. Matching cold-certified Mainnet digests establish a common format baseline, and consumer qualification checks the workflows that rely on it. A digest mismatch or a failed consumer workflow reopens the corresponding gate.
 
 ## Consequences
 
@@ -65,9 +80,12 @@ A name for a deployment shape must not become a second source of truth. Capabili
 - **Ship the light-wallet composition only behind a build feature.** Releases ship one reproducible build of `bin/zinder` ([ADR-0022](0022-release-artifacts.md)), so a feature-gated composition never reaches operators.
 - **Forward every read the store lacks.** It is the node fallback that [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) and [ADR-0014](0014-consumer-neutral-wallet-data-plane.md) reject. Each node-backed method is declared, and each has its own binding to the served tip.
 - **Forward transparent reads in the wallet deployment.** Its consumers need exact transparent history and spend status at one epoch, which a local index gives and the node does not.
+- **Require raw block retention before admitting any pruned validator.** The recovery interval governs live-follow safety. Body availability has its own contract.
+- **Store Equihash solutions twice on full-block deployments.** The raw block already contains the required consensus header.
 
 ## Revision history
 
+- 2026-11-28. Decisions 7 through 10 specify pruned following, optional shifted-key hints, the opt-in proof stored set, and Schema v2 qualification gates.
 - 2026-11-27. Removed `storage.raw_blob_policy = "transactions"` carry-forward guidance and reconciled evidence with shipped Canonical Schema v2 (`none | all`).
 - 2026-11-27. Replaced `wallet-archive` with orthogonal `--full-blocks` (`storage.full_blocks`), elevated `explorer` as a preset across unified `zinder serve` / `zinder index`, and dropped references to the removed `zinder-wallet-serving*` images.
 - 2026-11-26. Consequences reflect that `zinder-wallet-serving` defaults `deployment.profile` to `wallet`, accepts `wallet-archive`, omits the profile when `storage.raw_blob_policy` is set for legacy `transactions` stores or when Explorer views are enabled, and rejects `light-wallet`.

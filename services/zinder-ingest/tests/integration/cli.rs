@@ -285,7 +285,7 @@ fn startup_fails_before_connecting_when_the_indexer_ca_file_is_missing()
     fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
     let output = zinder_ingest_command()
         .args(["--config", path_str(&config_path)?])
-        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .env("ZINDER_OPS__LISTEN_ADDR", "none")
         .env("ZINDER_NODE__INDEXER_GRPC_ADDR", "https://127.0.0.1:1")
         .env(
             "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
@@ -386,7 +386,7 @@ fn run_ingest_against(node: &JsonRpcTestServer) -> Result<(Output, bool), Box<dy
     )?;
     let output = zinder_ingest_command()
         .args(["--config", path_str(&config_path)?])
-        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .env("ZINDER_OPS__LISTEN_ADDR", "none")
         .output()?;
     Ok((output, storage_path.exists()))
 }
@@ -399,7 +399,7 @@ fn startup_fails_before_opening_storage_when_rust_log_is_invalid() -> Result<(),
     fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
     let output = zinder_ingest_command()
         .args(["--config", path_str(&config_path)?])
-        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .env("ZINDER_OPS__LISTEN_ADDR", "none")
         .env("RUST_LOG", "zinder=bogus")
         .output()?;
 
@@ -546,12 +546,27 @@ fn print_config_output_round_trips() -> Result<(), Box<dyn Error>> {
     assert!(first_output.status.success(), "{first_output:?}");
     fs::write(&rendered_config_path, &first_output.stdout)?;
 
+    let rejected_redacted = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&rendered_config_path)?,
+        ])
+        .output()?;
+    assert!(!rejected_redacted.status.success(), "{rejected_redacted:?}");
+    let rejected_stderr = String::from_utf8(rejected_redacted.stderr)?;
+    assert!(
+        rejected_stderr.contains("literal `[REDACTED]` is not a valid secret"),
+        "{rejected_stderr}"
+    );
+
     let second_output = zinder_ingest_command()
         .args([
             "--print-config",
             "--config",
             path_str(&rendered_config_path)?,
         ])
+        .env("ZINDER_NODE__AUTH__PASSWORD", "rpcpassword")
         .output()?;
     assert!(second_output.status.success(), "{second_output:?}");
 
@@ -580,8 +595,8 @@ fn print_config_allows_disabled_ingest_control_for_one_shot_runs() -> Result<(),
     let storage_path = tempdir.path().join("disabled-ingest-control-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     let config = ingest_config_toml(&storage_path)?
-        .replace("listen_addr = \"127.0.0.1:9100\"", "listen_addr = \"\"");
-    fs::write(&config_path, config)?;
+        .replace("listen_addr = \"127.0.0.1:9100\"", "listen_addr = \"none\"");
+    fs::write(&config_path, &config)?;
 
     let output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&config_path)?])
@@ -590,7 +605,14 @@ fn print_config_allows_disabled_ingest_control_for_one_shot_runs() -> Result<(),
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("[ingest_control]"));
-    assert!(stdout.contains("listen_addr = \"\""));
+    assert!(stdout.contains("listen_addr = \"none\""));
+
+    let empty_config = config.replace("listen_addr = \"none\"", "listen_addr = \"\"");
+    fs::write(&config_path, empty_config)?;
+    let rejected = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+    assert!(!rejected.status.success(), "{rejected:?}");
 
     Ok(())
 }
@@ -961,7 +983,7 @@ fn wallet_serving_allows_default_none_retention_and_rejects_legacy_transactions(
         },
         &[],
         &[],
-        "does not have variant constructor transactions",
+        "unknown variant `transactions`, expected `none` or `all`",
     )
 }
 
@@ -1019,9 +1041,11 @@ fn assert_profile_print_and_conflict(
         !legacy_transactions.status.success(),
         "{legacy_transactions:?}"
     );
+    let legacy_stderr = String::from_utf8(legacy_transactions.stderr)?;
     assert!(
-        String::from_utf8(legacy_transactions.stderr)?
-            .contains("does not have variant constructor transactions")
+        legacy_stderr.contains("ZINDER_STORAGE__RAW_BLOB_POLICY")
+            && legacy_stderr.contains("expected `none` or `all`"),
+        "{legacy_stderr}"
     );
     Ok(())
 }
@@ -1583,7 +1607,8 @@ fn assert_single_volume_legacy_transactions_fails_closed(
     assert!(!rejected.status.success(), "{rejected:?}");
     let stderr = String::from_utf8(rejected.stderr)?;
     assert!(
-        stderr.contains("does not have variant constructor transactions"),
+        stderr.contains("ZINDER_STORAGE__RAW_BLOB_POLICY")
+            && stderr.contains("expected `none` or `all`"),
         "{stderr}"
     );
     Ok(())
@@ -1802,7 +1827,6 @@ fn data_dir_derives_checkpoint_staging_root_and_rejects_sibling_typo() -> Result
         concat!(
             "[deployment]\nprofile = \"wallet-archive\"\n",
             "[storage]\n",
-            "canonical_path = \"/unused/by/ingest\"\n",
             "secondary_path = \"/unused/by/ingest/secondary\"\n",
             "[wallet]\n",
             "path = \"/unused/wallet\"\n",
@@ -1818,7 +1842,6 @@ fn data_dir_derives_checkpoint_staging_root_and_rejects_sibling_typo() -> Result
         .env("ZINDER_NETWORK__NAME", "zcash-regtest")
         .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:39232")
         .env("ZINDER_STORAGE__DATA_DIR", &custom_dir)
-        .env("ZINDER_STORAGE__CANONICAL_PATH", "/unused/by/ingest/env")
         .env(
             "ZINDER_STORAGE__SECONDARY_PATH",
             "/unused/by/ingest/sec-env",
@@ -1834,6 +1857,14 @@ fn data_dir_derives_checkpoint_staging_root_and_rejects_sibling_typo() -> Result
         )),
         "{stdout}"
     );
+
+    let removed_canonical_env = zinder_ingest_command()
+        .arg("--print-config")
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:39232")
+        .env("ZINDER_STORAGE__CANONICAL_PATH", "/removed/field")
+        .output()?;
+    assert!(!removed_canonical_env.status.success());
 
     let sibling_env_typo = zinder_ingest_command()
         .arg("--print-config")

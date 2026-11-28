@@ -1,7 +1,7 @@
 # Caddy v2 template for the public lightwalletd compatibility endpoint.
 #
 # Set every variable in the Caddy service environment before adapting this
-# file. The certificate must contain a SAN for ZINDER_COMPAT_PUBLIC_FQDN.
+# file. The certificate must contain a SAN for DEPLOY_COMPAT_PUBLIC_FQDN.
 # Caddy never obtains or renews a certificate from this template.
 {
 	auto_https off
@@ -10,14 +10,14 @@
 	}
 }
 
-https://{$ZINDER_COMPAT_PUBLIC_FQDN}:443 {
-	tls {$ZINDER_COMPAT_TLS_CERT_FILE} {$ZINDER_COMPAT_TLS_KEY_FILE}
+https://{$DEPLOY_COMPAT_PUBLIC_FQDN}:443 {
+	tls {$DEPLOY_COMPAT_TLS_CERT_FILE} {$DEPLOY_COMPAT_TLS_KEY_FILE}
 
 	route {
 		# Use the ordinary HTTP ops listener for every new gRPC RPC. A 2xx
 		# /readyz response admits the request; a non-2xx response reaches the
 		# client and the h2c gRPC upstream is not called.
-		forward_auth 127.0.0.1:{$ZINDER_COMPAT_OPS_HOST_PORT} {
+		forward_auth 127.0.0.1:{$DEPLOY_SERVE_OPS_HOST_PORT} {
 			uri /readyz
 			# Release the probe connection before the wallet response streams.
 			method HEAD
@@ -31,7 +31,7 @@ https://{$ZINDER_COMPAT_PUBLIC_FQDN}:443 {
 		# Name the wallet's own connection, so that Zinder's receive limit
 		# tells wallets apart over Caddy's pooled upstream connections. Set
 		# ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true on Zinder to use it.
-		reverse_proxy h2c://127.0.0.1:{$ZINDER_COMPAT_HOST_PORT} {
+		reverse_proxy h2c://127.0.0.1:{$DEPLOY_COMPAT_HOST_PORT} {
 			header_up X-Zinder-Client-Address {http.request.remote}
 		}
 	}
