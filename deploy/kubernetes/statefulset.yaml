@@ -66,8 +66,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: zinder
-          # Replace v0.28.0 with an immutable release tag or @sha256 digest.
-          image: ghcr.io/zcashfoundation/zinder:v0.28.0
+          # Replace v0.29.0 with an immutable release tag or @sha256 digest.
+          image: ghcr.io/zcashfoundation/zinder:v0.29.0
           args:
             - serve
           envFrom:

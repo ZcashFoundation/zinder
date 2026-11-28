@@ -6247,7 +6247,7 @@ dependencies = [
 
 [[package]]
 name = "zinder"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -6301,7 +6301,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-bench"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -6349,7 +6349,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-client"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -6387,7 +6387,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-compat-cipherscan"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "axum",
  "clap",
@@ -6422,7 +6422,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-compat-lightwalletd"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -6478,7 +6478,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-core"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "base16ct",
  "blake2b_simd",
@@ -6500,7 +6500,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-explorer"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -6536,7 +6536,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-ingest"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -6581,7 +6581,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-materialized-views"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "eyre",
  "metrics",
@@ -6600,7 +6600,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-projector"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "clap",
  "eyre",
@@ -6634,7 +6634,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-proto"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "eyre",
  "http-body",
@@ -6649,14 +6649,14 @@ dependencies = [
 
 [[package]]
 name = "zinder-proto-codegen"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "tonic-prost-build",
 ]
 
 [[package]]
 name = "zinder-query"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -6697,7 +6697,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-rocksdb-bulk-load"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "parking_lot 0.13.0",
  "rust-rocksdb",
@@ -6709,7 +6709,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-runtime"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -6776,7 +6776,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-source"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -6821,7 +6821,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-store"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -6857,7 +6857,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-testkit"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-trait",
  "color-eyre",
@@ -6896,7 +6896,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-wallet-projection"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "blake2b_simd",
  "hex",
@@ -6906,7 +6906,7 @@ dependencies = [
 
 [[package]]
 name = "zinder-wallet-rocksdb"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "metrics",
  "parking_lot 0.13.0",

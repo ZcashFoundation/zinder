@@ -1,7 +1,0 @@
-kind: changed
-body: 'Bump the wallet projection RocksDB store to schema v2 (adding block_hash_by_height, compacting transparent output and address-history row encodings, and tuning per-CF compression and block sizes) to reduce on-disk footprint; upgrading the wallet projection requires a fresh rebuild in a clean path from the canonical store, and rollback requires restoring a prior v1 wallet snapshot or rebuilding with the previous release.'
-time: 2026-11-28T00:19:02Z
-custom:
-  Bump: minor
-  PR: "742"
-  Upgrade: projection-layout

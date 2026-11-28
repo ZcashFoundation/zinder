@@ -1,7 +1,0 @@
-kind: added
-body: Record the resolved tree-state checkpoint policy in the canonical construction manifest and surface it in READY logs and store-properties reports. Pre-change stores remain readable in place, while older binaries reject newly built manifests; to roll back, restore a pre-change store or backup, or rebuild the canonical store and dependent projections in clean paths with the previous release.
-time: 2026-11-28T09:38:14.845430623Z
-custom:
-    Bump: minor
-    Upgrade: canonical-layout
-    PR: "750"

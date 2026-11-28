@@ -1,7 +1,0 @@
-kind: fixed
-body: Include the vendored Darkside test-control schema in the standalone protobuf contract archive's Buf workspace, combined descriptor, and archive verification checks.
-time: 2026-11-28T10:50:15.000000000Z
-custom:
-    Bump: patch
-    Upgrade: compatible
-    PR: "760"

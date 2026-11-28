@@ -1,7 +1,0 @@
-kind: added
-body: Expose Prometheus metrics for settled-segment reader cache residency, cache hits and evictions, and positional file I/O attributed by segment kind, along with RSS attribution guidance.
-time: 2026-11-28T10:02:01.571915467Z
-custom:
-    Bump: minor
-    Upgrade: compatible
-    PR: "753"
