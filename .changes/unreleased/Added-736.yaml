@@ -1,7 +1,0 @@
-kind: added
-body: Add typed Rust client calls for compact scans, nullifier streams, transparent address batches, and the verified recommended fee.
-time: 2026-11-27T23:23:43.465238077Z
-custom:
-    Bump: minor
-    Upgrade: compatible
-    PR: "736"

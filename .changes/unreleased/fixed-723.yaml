@@ -1,7 +1,0 @@
-kind: fixed
-body: Run disposable wallet Regtest fixtures on macOS and Windows with Docker Desktop or on native Linux with Docker Engine.
-time: 2026-11-27T22:45:08.745236225Z
-custom:
-    Bump: patch
-    Upgrade: compatible
-    PR: "723"

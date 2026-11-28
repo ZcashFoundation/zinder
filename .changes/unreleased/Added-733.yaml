@@ -1,7 +1,0 @@
-kind: added
-body: Wallet and explorer gRPC clients can negotiate gzip or zstd message compression. Admission and readiness refusals include retry pushback guidance.
-time: 2026-11-27T23:16:09.736445857Z
-custom:
-    Bump: minor
-    Upgrade: compatible
-    PR: "733"

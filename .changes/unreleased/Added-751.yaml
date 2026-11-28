@@ -1,7 +1,0 @@
-kind: added
-body: GNU/Linux release archives include hardened native systemd units, loopback-only defaults, and VM deployment guidance for running Zinder wallet and opt-in Explorer services directly on hosts with systemd 254 or newer.
-time: 2026-11-28T09:41:16.525672261Z
-custom:
-    Bump: minor
-    Upgrade: compatible
-    PR: "751"

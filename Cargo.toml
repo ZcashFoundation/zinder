@@ -24,7 +24,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.28.0"
+version = "0.29.0"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -135,16 +135,16 @@ zcash_transparent = { version = "0.11.1", default-features = false }
 zebra-chain = "16.0.0"
 zip32 = "0.3.0"
 zstd = "0.14"
-zinder-core = { version = "0.28.0", path = "crates/zinder-core" }
+zinder-core = { version = "0.29.0", path = "crates/zinder-core" }
 zinder-rocksdb-bulk-load = { path = "crates/zinder-rocksdb-bulk-load" }
-zinder-client = { version = "0.28.0", path = "crates/zinder-client" }
+zinder-client = { version = "0.29.0", path = "crates/zinder-client" }
 zinder-compat-cipherscan = { path = "services/zinder-compat-cipherscan" }
 zinder-compat-lightwalletd = { path = "services/zinder-compat-lightwalletd" }
 zinder-explorer = { path = "services/zinder-explorer" }
 zinder-materialized-views = { path = "crates/zinder-materialized-views" }
 zinder-ingest = { path = "services/zinder-ingest" }
 zinder-projector = { path = "services/zinder-projector" }
-zinder-proto = { version = "0.28.0", path = "crates/zinder-proto" }
+zinder-proto = { version = "0.29.0", path = "crates/zinder-proto" }
 zinder-query = { path = "services/zinder-query" }
 zinder-runtime = { path = "crates/zinder-runtime" }
 zinder-source = { path = "crates/zinder-source" }
