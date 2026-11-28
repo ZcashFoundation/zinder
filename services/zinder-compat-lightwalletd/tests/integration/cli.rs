@@ -7,6 +7,19 @@ use std::{fs, path::Path, process::Command};
 
 use tempfile::tempdir;
 
+#[tokio::test]
+async fn explicit_args_use_the_callers_tracing_subscriber() -> eyre::Result<()> {
+    const BINARY: &str = "zinder-compat-lightwalletd";
+    zinder_runtime::install_tracing_subscriber()?;
+    let exit = zinder_compat_lightwalletd::runtime::run_from_args(
+        BINARY,
+        [BINARY, "--print-config", "--network", "zcash-regtest"],
+    )
+    .await;
+    assert_eq!(exit, std::process::ExitCode::SUCCESS);
+    Ok(())
+}
+
 #[test]
 fn version_reports_the_product_version() -> eyre::Result<()> {
     let output = zinder_compat_command().arg("--version").output()?;

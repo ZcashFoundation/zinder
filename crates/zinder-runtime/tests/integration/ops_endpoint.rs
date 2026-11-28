@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use eyre::Result;
+use eyre::{OptionExt as _, Result};
 use http_body_util::BodyExt;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use tokio::net::TcpListener;
@@ -472,4 +472,86 @@ fn installing_the_recorder_starts_its_upkeep_thread() -> Result<()> {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+#[tokio::test]
+async fn status_reports_only_public_fields_and_served_epoch() -> Result<()> {
+    use zinder_core::{BlockHeight, ChainEpochId, Network};
+    use zinder_runtime::{ActiveNodeEndpoint, NodeUnavailableDetail};
+    use zinder_testkit::ChainFixture;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    drop(listener);
+    let readiness = Readiness::default();
+    let server = spawn_ops_endpoint(
+        listen_addr,
+        OpsServer {
+            service_name: "zinder-query",
+            service_version: "0.0.0",
+            network_name: "zcash-regtest",
+            advertised_capabilities: Arc::from(["private-capability"]),
+        },
+        readiness.clone(),
+    )
+    .await?;
+    let (code, starting) = get_json(listen_addr, "/status").await?;
+    let mut expected = serde_json::json!({
+        "status": "not_ready",
+        "service": "zinder-query",
+        "version": "0.0.0",
+        "git_commit": zinder_runtime::BUILD_GIT_COMMIT,
+        "network": "zcash-regtest",
+        "cause": "starting",
+    });
+    assert_eq!(code, 200);
+    assert_eq!(starting, expected);
+
+    let mut epoch = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(7)
+        .chain_epoch(ChainEpochId::new(3))
+        .ok_or_eyre("fixture must include a chain epoch")?;
+    epoch.settled_tip_height = BlockHeight::new(2);
+    readiness.set_served_chain_epoch(&epoch);
+    readiness.set_active_node(Some(ActiveNodeEndpoint { position: 1 }));
+    readiness.set_materialized_view_identities(vec!["/var/lib/private-zinder/view".to_owned()]);
+    readiness.set(ReadinessState::node_unavailable_with_detail(
+        NodeUnavailableDetail::first_iteration(
+            "node_unreachable",
+            "http://test:private-token@192.0.2.5:8232 /var/lib/private-zinder/node.cookie",
+        ),
+        Some(99),
+    ));
+
+    let (code, body) = get_text(listen_addr, "/status").await?;
+    assert_eq!(code, 200);
+    for private in [
+        "private-token",
+        "://",
+        "/var/lib",
+        "192.0.2.5",
+        "private-capability",
+    ] {
+        assert!(!body.contains(private));
+    }
+    let mut status: serde_json::Value = serde_json::from_str(&body)?;
+    let age = status
+        .as_object_mut()
+        .and_then(|fields| fields.remove("served_epoch_age_seconds"))
+        .and_then(|age| age.as_u64())
+        .ok_or_eyre("status must include a numeric age")?;
+    assert!(age > 0);
+    expected["cause"] = serde_json::json!("node_unavailable");
+    expected["served_visible_tip_height"] = serde_json::json!(epoch.visible_tip_height.value());
+    expected["served_settled_tip_height"] = serde_json::json!(2);
+    assert_eq!(status, expected);
+
+    readiness.set(ReadinessState::ready(Some(
+        epoch.visible_tip_height.value(),
+    )));
+    let (_, recovered) = get_json(listen_addr, "/status").await?;
+    assert_eq!(recovered["status"], "ready");
+    assert_eq!(recovered["cause"], "ready");
+    server.shutdown().await?;
+    Ok(())
 }

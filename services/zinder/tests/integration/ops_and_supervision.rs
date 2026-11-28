@@ -82,6 +82,23 @@ async fn t0_ops_and_healthcheck_track_readiness_transitions() -> eyre::Result<()
     );
     let handle = spawn_supervisor_ops(ops_addr, shared.clone()).await?;
 
+    let (code, body) = http_get(ops_addr, "/status").await?;
+    let status: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(code, 200);
+    assert_eq!(
+        status,
+        serde_json::json!({
+            "status": "not_ready",
+            "service": "zinder",
+            "version": env!("CARGO_PKG_VERSION"),
+            "git_commit": zinder_runtime::BUILD_GIT_COMMIT,
+            "network": "zcash-regtest",
+            "cause": "bootstrapping_canonical",
+            "mode": "serve",
+            "preset": "wallet",
+        })
+    );
+
     let healthz_probe = clean_zinder_command(&["healthcheck", "--addr", &ops_str]).output()?;
     assert!(
         healthz_probe.status.success(),

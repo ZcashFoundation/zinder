@@ -62,24 +62,40 @@ pub struct Cli {
 
 /// Runs the standalone `zinder-compat-cipherscan` CLI from process arguments.
 pub async fn main_from_env(binary_name: &str) -> ExitCode {
-    let cli = Cli::parse();
-    if let Err(error) = install_tracing_subscriber() {
-        return emit_tracing_subscriber_error(binary_name, &error);
-    }
-
-    run_parsed_cli(cli).await
+    dispatch_cli(binary_name, Cli::try_parse(), true).await
 }
 
-/// Runs the `zinder-compat-cipherscan` CLI from explicit arguments when tracing
-/// is already initialized by a caller such as `zinder run`.
+/// Runs this role as the process entry point, owning its tracing subscriber.
+pub async fn run_process_from_args<I, T>(binary_name: &str, args: I) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    dispatch_cli(binary_name, Cli::try_parse_from(args), true).await
+}
+
+/// Runs this role from explicit arguments using the caller's tracing subscriber.
 pub async fn run_from_args<I, T>(args: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    match Cli::try_parse_from(args) {
-        Ok(cli) => run_parsed_cli(cli).await,
-        Err(error) => print_clap_error(&error),
+    dispatch_cli("zinder-compat-cipherscan", Cli::try_parse_from(args), false).await
+}
+
+async fn dispatch_cli(
+    binary_name: &str,
+    parsed: Result<Cli, clap::Error>,
+    owns_process_tracing: bool,
+) -> ExitCode {
+    let cli = match parsed {
+        Ok(cli) => cli,
+        Err(error) => return print_clap_error(&error),
+    };
+    if owns_process_tracing {
+        run_with_process_tracing(binary_name, cli).await
+    } else {
+        run_parsed_cli(cli).await
     }
 }
 
@@ -95,6 +111,25 @@ pub async fn serve_supervised(
 ) -> Result<(), CipherscanConfigError> {
     config.ops_listen_addr = None;
     serve_adapter_with_ops(config, None, readiness, cancel).await
+}
+
+async fn run_with_process_tracing(binary_name: &str, cli: Cli) -> ExitCode {
+    if cli.print_config {
+        if let Err(error) = install_tracing_subscriber() {
+            return emit_tracing_subscriber_error(binary_name, &error);
+        }
+        return run_parsed_cli(cli).await;
+    }
+    let tracing = match zinder_runtime::install_runtime_tracing_subscriber(
+        RuntimeService::CompatCipherscan,
+        cli.config_path.as_deref(),
+    ) {
+        Ok(tracing) => tracing,
+        Err(error) => return emit_tracing_subscriber_error(binary_name, &error),
+    };
+    let exit = run_parsed_cli(cli).await;
+    tracing.shutdown().await;
+    exit
 }
 
 async fn run_parsed_cli(cli: Cli) -> ExitCode {
@@ -334,6 +369,7 @@ mod tests {
             network: Network::ZcashRegtest,
             listen_addr: "127.0.0.1:9070".parse()?,
             ops_listen_addr: None,
+            observability: zinder_runtime::ObservabilityConfig::default(),
             allow_public_bind: false,
             explorer_query_endpoint: "http://reader:hunter2@127.0.0.1:9068/?token=s3cret"
                 .to_owned(),

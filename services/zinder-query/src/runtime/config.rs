@@ -60,6 +60,8 @@ pub struct QueryConfig {
     pub listen_addr: SocketAddr,
     /// Operational HTTP endpoint listen address, or `None` when disabled.
     pub ops_listen_addr: Option<SocketAddr>,
+    /// Optional trace export settings.
+    pub observability: zinder_runtime::ObservabilityConfig,
     /// Whether public or unspecified bind addresses are permitted.
     pub allow_public_bind: bool,
     /// How the gRPC listener tells clients apart for its receive limit.
@@ -230,6 +232,7 @@ struct QueryRawConfig {
     deployment: DeploymentSection,
     network: NetworkSection,
     ops: OpsSection,
+    observability: zinder_runtime::ObservabilityConfig,
     storage: CanonicalSecondaryStorageSection,
     wallet: WalletSection,
     ingest_control: IngestControlSection,
@@ -327,7 +330,6 @@ fn derive_query_storage_paths(config: &mut QueryRawConfig) -> Result<(), ConfigE
 fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, QueryConfigError> {
     apply_deployment_profile(&mut config)?;
     derive_query_storage_paths(&mut config)?;
-    let profile = config.deployment.profile;
     let network = config.network.resolve()?;
     let storage = resolve_canonical_secondary_storage(config.storage)?;
     let wallet_primary_path = require_field(config.wallet.path, "wallet.path")?;
@@ -383,7 +385,7 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
     )?;
 
     Ok(QueryConfig {
-        profile,
+        profile: config.deployment.profile,
         network,
         storage,
         wallet_primary_path,
@@ -394,6 +396,7 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         ingest_control_bearer_token,
         listen_addr,
         ops_listen_addr,
+        observability: config.observability,
         allow_public_bind,
         client_address_source,
         proxy_protocol,
@@ -531,6 +534,8 @@ struct QueryConfigToml {
     deployment: DeploymentToml,
     network: NetworkToml,
     ops: OpsToml,
+    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
+    observability: zinder_runtime::ObservabilityConfig,
     security: SecurityToml,
     storage: CanonicalSecondaryStorageToml,
     wallet: WalletToml,
@@ -551,6 +556,7 @@ impl QueryConfigToml {
         Self {
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
+            observability: config.observability.clone(),
             security: SecurityToml::from_resolved(config.allow_public_bind),
             deployment: DeploymentToml::from_resolved(config.profile),
             storage,

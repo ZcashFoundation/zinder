@@ -114,6 +114,36 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Coordinates the consumer preset (`light-wallet`, `wallet`, or `explorer`; defaults to `wallet` when configuring a preset). Combine with `ZINDER_STORAGE__FULL_BLOCKS=true` to retain full raw blocks. See [deployment profiles](#deployment-profiles).",
     },
     EnvVarDoc {
+        name: "ZINDER_OBSERVABILITY__OTLP_ENDPOINT",
+        toml_path: "observability.otlp_endpoint",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+            "zinder-compat-cipherscan",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: true,
+        description: "OTLP gRPC collector origin. An unset or blank value disables trace export. See [trace export](#trace-export).",
+    },
+    EnvVarDoc {
+        name: "ZINDER_OBSERVABILITY__SAMPLING_RATE",
+        toml_path: "observability.sampling_rate",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+            "zinder-compat-cipherscan",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Fraction of new traces to sample when OTLP export is enabled. Accepts 0 through 1 and defaults to 0.1.",
+    },
+    EnvVarDoc {
         name: "ZINDER_NETWORK__NAME",
         toml_path: "network.name",
         used_by: &[

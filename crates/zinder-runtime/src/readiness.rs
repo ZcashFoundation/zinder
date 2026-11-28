@@ -617,6 +617,7 @@ struct RuntimeReadiness {
     state: ReadinessState,
     dependencies: Vec<ReadinessDependency>,
     served_epoch_committed_at: Option<UnixTimestampMillis>,
+    served_tip_heights: Option<(u32, u32)>,
 }
 
 impl Default for Readiness {
@@ -638,6 +639,7 @@ impl Readiness {
                 state,
                 dependencies: Vec::new(),
                 served_epoch_committed_at: None,
+                served_tip_heights: None,
             })),
             materialized_view_identities: Arc::new(Mutex::new(Vec::new())),
             active_node: Arc::new(Mutex::new(None)),
@@ -674,7 +676,45 @@ impl Readiness {
     /// serves, from which reports derive
     /// [`ReadinessReport::served_epoch_age_seconds`].
     pub fn set_served_epoch_committed_at(&self, committed_at: UnixTimestampMillis) {
-        self.inner.lock().served_epoch_committed_at = Some(committed_at);
+        let mut guard = self.inner.lock();
+        guard.served_epoch_committed_at = Some(committed_at);
+        guard.served_tip_heights = None;
+    }
+
+    /// Publishes both tip heights and the commit time of the epoch this reader serves.
+    pub fn set_served_chain_epoch(&self, epoch: &zinder_core::ChainEpoch) {
+        let mut guard = self.inner.lock();
+        guard.served_tip_heights = Some((
+            epoch.visible_tip_height.value(),
+            epoch.settled_tip_height.value(),
+        ));
+        guard.served_epoch_committed_at = Some(epoch.created_at);
+    }
+
+    pub(crate) fn ops_status(&self, server: &crate::OpsServer) -> crate::OpsStatus {
+        let guard = self.inner.lock();
+        let cause = &guard.state.cause;
+        crate::OpsStatus {
+            status: if cause.permits_traffic() {
+                "ready"
+            } else {
+                "not_ready"
+            },
+            service: server.service_name,
+            version: server.service_version,
+            git_commit: crate::BUILD_GIT_COMMIT,
+            network: server.network_name,
+            cause: cause.metric_label(),
+            mode: None,
+            preset: None,
+            served_chain: crate::ServedChainStatus {
+                served_visible_tip_height: guard.served_tip_heights.map(|(visible, _)| visible),
+                served_settled_tip_height: guard.served_tip_heights.map(|(_, settled)| settled),
+                served_epoch_age_seconds: guard
+                    .served_epoch_committed_at
+                    .map(served_epoch_age_seconds),
+            },
+        }
     }
 
     /// Replaces the state and dependency causes with one composition's
@@ -772,6 +812,7 @@ impl Readiness {
             state,
             dependencies,
             served_epoch_committed_at,
+            ..
         } = self.inner.lock().clone();
         let materialized_view_identities = self.materialized_view_identities.lock().clone();
         let active_node = *self.active_node.lock();
@@ -782,12 +823,7 @@ impl Readiness {
             target_height: state.target_height,
             phase: state.phase,
             materialized_view_identities,
-            served_epoch_age_seconds: served_epoch_committed_at.map(|committed_at| {
-                UnixTimestampMillis::now()
-                    .value()
-                    .saturating_sub(committed_at.value())
-                    / 1_000
-            }),
+            served_epoch_age_seconds: served_epoch_committed_at.map(served_epoch_age_seconds),
             degraded: dependencies
                 .into_iter()
                 .filter(ReadinessDependency::is_degraded)
@@ -795,6 +831,13 @@ impl Readiness {
             active_node,
         }
     }
+}
+
+fn served_epoch_age_seconds(committed_at: UnixTimestampMillis) -> u64 {
+    UnixTimestampMillis::now()
+        .value()
+        .saturating_sub(committed_at.value())
+        / 1_000
 }
 
 /// Rejects new gRPC requests while the shared runtime readiness state blocks traffic.

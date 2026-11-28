@@ -32,6 +32,8 @@ pub struct CipherscanConfig {
     pub listen_addr: SocketAddr,
     /// Operational HTTP endpoint address, or `None` when disabled.
     pub ops_listen_addr: Option<SocketAddr>,
+    /// Optional trace export settings.
+    pub observability: zinder_runtime::ObservabilityConfig,
     /// Whether public or unspecified bind addresses are permitted.
     pub allow_public_bind: bool,
     /// `ExplorerQuery` gRPC endpoint URL.
@@ -194,6 +196,7 @@ struct CipherscanRawConfig {
     network: NetworkSection,
     cipherscan: CipherscanSection,
     ops: OpsSection,
+    observability: zinder_runtime::ObservabilityConfig,
     security: SecuritySection,
 }
 
@@ -234,6 +237,8 @@ impl std::fmt::Debug for CipherscanSection {
 struct CipherscanConfigToml {
     network: NetworkToml,
     ops: OpsToml,
+    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
+    observability: zinder_runtime::ObservabilityConfig,
     security: SecurityToml,
     cipherscan: CipherscanToml,
 }
@@ -256,6 +261,7 @@ impl CipherscanConfigToml {
         Self {
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
+            observability: config.observability.clone(),
             security: SecurityToml::from_resolved(config.allow_public_bind),
             cipherscan: CipherscanToml {
                 listen_addr: config.listen_addr.to_string(),
@@ -334,6 +340,7 @@ fn resolve_cipherscan_config(
         network,
         listen_addr,
         ops_listen_addr,
+        observability: raw.observability,
         allow_public_bind,
         explorer_query_endpoint,
         wallet_query_endpoint,

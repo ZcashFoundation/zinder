@@ -32,6 +32,8 @@ pub struct ExplorerConfig {
     pub listen_addr: SocketAddr,
     /// Operational HTTP endpoint address, or `None` when disabled.
     pub ops_listen_addr: Option<SocketAddr>,
+    /// Optional trace export settings.
+    pub observability: zinder_runtime::ObservabilityConfig,
     /// Whether public or unspecified bind addresses are permitted.
     pub allow_public_bind: bool,
     /// How the gRPC listener tells clients apart for its receive limit.
@@ -167,6 +169,7 @@ struct ExplorerRawConfig {
     storage: SecondaryStorageSection,
     explorer: ExplorerSection,
     ops: OpsSection,
+    observability: zinder_runtime::ObservabilityConfig,
     node: NodeSection,
     node_fallbacks: NodeFallbackSections,
     security: SecuritySection,
@@ -205,6 +208,8 @@ impl std::fmt::Debug for ExplorerSection {
 struct ExplorerConfigToml {
     network: NetworkToml,
     ops: OpsToml,
+    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
+    observability: zinder_runtime::ObservabilityConfig,
     security: SecurityToml,
     storage: SecondaryStorageToml,
     explorer: ExplorerToml,
@@ -226,6 +231,7 @@ impl ExplorerConfigToml {
         Self {
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
+            observability: config.observability.clone(),
             security: SecurityToml::from_resolved(config.allow_public_bind),
             storage: SecondaryStorageToml::from_resolved(&config.storage),
             explorer: ExplorerToml {
@@ -292,6 +298,7 @@ fn resolve_explorer_config(
         storage,
         listen_addr,
         ops_listen_addr,
+        observability: raw.observability,
         allow_public_bind,
         client_address_source: ClientAddressSource::from_trust_proxy_client_address(
             raw.explorer.trust_proxy_client_address.unwrap_or(false),

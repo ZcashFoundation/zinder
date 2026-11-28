@@ -109,31 +109,44 @@ pub enum Command {
 
 /// Runs the standalone `zinder-compat-lightwalletd` CLI from process arguments.
 pub async fn main_from_env(binary_name: &str) -> ExitCode {
-    let cli = Cli::parse();
-    if let Some(Command::Healthcheck(healthcheck)) = &cli.command {
-        return run_healthcheck(binary_name, healthcheck, cli.config_path.as_deref());
-    }
-    if let Err(error) = install_tracing_subscriber() {
-        return emit_tracing_subscriber_error(binary_name, &error);
-    }
-    run_parsed_cli(cli).await
+    dispatch_cli(binary_name, Cli::try_parse(), true).await
 }
 
-/// Runs `zinder-compat-lightwalletd` from explicit CLI arguments when tracing
-/// is already initialized by a caller such as `zinder run`.
+/// Runs this role as the process entry point, owning its tracing subscriber.
+pub async fn run_process_from_args<I, T>(binary_name: &str, args: I) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    dispatch_cli(binary_name, Cli::try_parse_from(args), true).await
+}
+
+/// Runs this role from explicit arguments using the caller's tracing subscriber.
 pub async fn run_from_args<I, T>(binary_name: &str, args: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = match Cli::try_parse_from(args) {
+    dispatch_cli(binary_name, Cli::try_parse_from(args), false).await
+}
+
+async fn dispatch_cli(
+    binary_name: &str,
+    parsed: Result<Cli, clap::Error>,
+    owns_process_tracing: bool,
+) -> ExitCode {
+    let cli = match parsed {
         Ok(cli) => cli,
         Err(error) => return print_clap_error(&error),
     };
     if let Some(Command::Healthcheck(healthcheck)) = &cli.command {
         return run_healthcheck(binary_name, healthcheck, cli.config_path.as_deref());
     }
-    run_parsed_cli(cli).await
+    if owns_process_tracing {
+        run_with_process_tracing(binary_name, cli).await
+    } else {
+        run_parsed_cli(cli).await
+    }
 }
 
 /// Supervises the lightwalletd compatibility adapter inside a parent runtime.
@@ -161,6 +174,25 @@ pub async fn serve_supervised(
 
 fn cpu_meets_baseline() -> bool {
     host_cpu_meets_compiled_baseline() && host_cpu_meets_pasta_backend_baseline()
+}
+
+async fn run_with_process_tracing(binary_name: &str, cli: Cli) -> ExitCode {
+    if cli.print_config {
+        if let Err(error) = install_tracing_subscriber() {
+            return emit_tracing_subscriber_error(binary_name, &error);
+        }
+        return run_parsed_cli(cli).await;
+    }
+    let tracing = match zinder_runtime::install_runtime_tracing_subscriber(
+        RuntimeService::CompatLightwalletd,
+        cli.config_path.as_deref(),
+    ) {
+        Ok(tracing) => tracing,
+        Err(error) => return emit_tracing_subscriber_error(binary_name, &error),
+    };
+    let exit = run_parsed_cli(cli).await;
+    tracing.shutdown().await;
+    exit
 }
 
 async fn run_parsed_cli(cli: Cli) -> ExitCode {

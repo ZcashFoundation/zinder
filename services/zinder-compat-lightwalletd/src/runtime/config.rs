@@ -96,6 +96,8 @@ pub struct LightwalletdConfig {
     pub browser_origins: Vec<HeaderValue>,
     /// Operational HTTP endpoint address, or `None` when disabled.
     pub ops_listen_addr: Option<SocketAddr>,
+    /// Optional trace export settings.
+    pub observability: zinder_runtime::ObservabilityConfig,
     /// Whether non-loopback binds are permitted.
     pub allow_public_bind: bool,
     /// How the gRPC listener tells clients apart for its receive limit.
@@ -348,6 +350,7 @@ struct LightwalletdRawConfig {
     deployment: DeploymentSection,
     network: NetworkSection,
     ops: OpsSection,
+    observability: zinder_runtime::ObservabilityConfig,
     storage: CanonicalSecondaryStorageSection,
     wallet: Option<WalletSection>,
     ingest_control: IngestControlSection,
@@ -576,6 +579,7 @@ fn resolve_lightwalletd_config(
         listen_addr,
         browser_origins: config.compat.browser_origins,
         ops_listen_addr,
+        observability: config.observability,
         allow_public_bind,
         client_address_source,
         proxy_protocol,
@@ -702,6 +706,8 @@ struct LightwalletdConfigToml {
     deployment: DeploymentToml,
     network: NetworkToml,
     ops: OpsToml,
+    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
+    observability: zinder_runtime::ObservabilityConfig,
     security: SecurityToml,
     storage: CanonicalSecondaryStorageToml,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -724,6 +730,7 @@ impl LightwalletdConfigToml {
             deployment: DeploymentToml::from_resolved(config.profile),
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
+            observability: config.observability.clone(),
             security: SecurityToml::from_resolved(config.allow_public_bind),
             storage,
             wallet: config

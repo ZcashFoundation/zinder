@@ -4,13 +4,14 @@ This page lists what each Zinder runtime reports on its health and readiness
 endpoints, what every readiness cause means, and what you should do about it.
 It is for operators who wire probes and alerts or who triage an incident.
 
-Each runtime serves three routes on its operational endpoint,
+Each runtime serves these routes on its operational endpoint,
 `ops.listen_addr`:
 
 | Route | Answers | Status code |
 | --- | --- | --- |
 | `/healthz` | Whether the process is alive, with its identity. | Always 200 while the process answers HTTP. |
 | `/readyz` | Whether the runtime should receive traffic, and why not. | 200 when the cause admits traffic, 503 otherwise. |
+| `/status` | Public JSON summary of readiness, build identity, and known served heights. | 200 while the process answers HTTP. |
 | `/metrics` | Prometheus metrics. See [Metrics](metrics.md). | 200 |
 
 A live process is not always ready. A writer can be alive while it catches
@@ -72,6 +73,27 @@ A wallet-serving reader during a node outage answers like this:
 `degraded` entries use the key `dependency_cause`, and the list follows
 `cause`. A script that reads the first `"cause"` key therefore gets the
 runtime's own cause.
+
+## Public status
+
+`GET /status` returns JSON from the existing ops listener. Read `status` to
+determine whether the runtime is ready. You can expose this summary publicly
+by configuring your reverse proxy to forward the exact `/status` path to the
+private ops listener. Keep the remaining ops routes on the private network.
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `ready` or `not_ready`, using the same admission decision as `/readyz`. |
+| `cause` | A readiness cause label for a standalone role or a startup-stage label for the supervisor. |
+| `service`, `version`, `git_commit`, `network` | Role and build identity and the configured network. |
+| `mode`, `preset` | Supervisor command and deployment preset. Standalone roles omit these fields. |
+| `served_visible_tip_height`, `served_settled_tip_height` | Heights from the same served chain epoch. Omitted until a reader publishes a chain epoch. |
+| `served_epoch_age_seconds` | Seconds since the writer committed the served epoch. Omitted when unknown. |
+
+The supervisor reports the chain epoch of its native wallet query role when
+available, followed by its compact-block compatibility role. The last
+published epoch can still appear while a role is degraded. Status includes
+only the fields listed above.
 
 ## Supervisor endpoint (`zinder serve` / `zinder index`)
 

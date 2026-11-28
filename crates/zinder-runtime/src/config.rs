@@ -722,10 +722,19 @@ impl ConfigLoader {
     /// with the original `ZINDER_…` name and a suggested correction.
     /// Otherwise returns [`ConfigError::Load`] wrapping the underlying
     /// `config-rs` error.
-    pub fn load<T>(mut self) -> Result<T, ConfigError>
+    pub fn load<T>(self) -> Result<T, ConfigError>
     where
         T: DeserializeOwned,
     {
+        let (merged, reverse_index) = self.merge_sources()?;
+        merged.try_deserialize::<T>().map_err(|inner| {
+            ConfigError::from_inner_with_env_diagnostics(inner, reverse_index.as_ref())
+        })
+    }
+
+    pub(crate) fn merge_sources(
+        mut self,
+    ) -> Result<(Config, Option<HashMap<String, String>>), ConfigError> {
         let mut reverse_index: Option<HashMap<String, String>> = None;
         for source in self.sources {
             match source {
@@ -743,9 +752,7 @@ impl ConfigLoader {
         let built = self.builder.build().map_err(|inner| {
             ConfigError::from_inner_with_env_diagnostics(inner, reverse_index.as_ref())
         })?;
-        built.try_deserialize::<T>().map_err(|inner| {
-            ConfigError::from_inner_with_env_diagnostics(inner, reverse_index.as_ref())
-        })
+        Ok((built, reverse_index))
     }
 }
 
