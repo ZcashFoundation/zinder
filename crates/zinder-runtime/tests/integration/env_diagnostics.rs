@@ -496,3 +496,36 @@ fn whitespace_only_env_string_is_rejected_while_nonblank_preserves_bytes() -> Re
     assert_eq!(kept_padded.typed.secret.as_deref(), Some("  keep-me  "));
     Ok(())
 }
+
+#[test]
+fn blank_scalar_env_error_does_not_recommend_none() -> Result<()> {
+    for env_pair in [
+        ("ZINDER_TYPED__FLAG", ""),
+        ("ZINDER_TYPED__COUNT_U64", ""),
+        ("ZINDER_TYPED__TIMEOUT_SECS", "   "),
+    ] {
+        let Err(error) = load_toy_env(env_pair) else {
+            return Err(eyre!(
+                "expected blank env var {} to be rejected",
+                env_pair.0
+            ));
+        };
+        assert!(
+            matches!(error, ConfigError::InvalidEnvValue { .. }),
+            "expected InvalidEnvValue for {}: {error:?}",
+            env_pair.0
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("unset the variable to use the default or supply a valid value"),
+            "missing type-agnostic guidance for {}: {rendered}",
+            env_pair.0
+        );
+        assert!(
+            !rendered.contains("none"),
+            "scalar blank error for {} must not recommend \"none\": {rendered}",
+            env_pair.0
+        );
+    }
+    Ok(())
+}

@@ -340,7 +340,7 @@ const fn toml_kind_label(toml_val: &toml::Value) -> &'static str {
 fn empty_env_error(origin: &EnvOrigin) -> DeserError {
     DeserError::invalid_env(
         origin,
-        "empty value is not allowed; unset the variable to use the default or set it to \"none\" to disable",
+        "empty value is not allowed; unset the variable to use the default or supply a valid value",
     )
 }
 
