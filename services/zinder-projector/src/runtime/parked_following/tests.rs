@@ -52,11 +52,16 @@ use zinder_wallet_rocksdb::{
 };
 
 use super::super::{
-    ProjectorControlTasks, acquire_following_retention_lease, bootstrap_resumed_wallet_following,
+    CanonicalSecondarySlot, NextWalletTransition, ProjectorControlTasks,
+    RetainedEventPageValidation, TransitionLease, WalletTransitionOutcome,
+    acquire_following_retention_lease, apply_next_wallet_transition,
+    bootstrap_first_retained_event_source, bootstrap_resumed_wallet_following,
     canonical_writer_control::{CanonicalWriterControlClient, CanonicalWriterControlError},
     config::{ProjectorBuildConfig, ProjectorConfig, ProjectorError, ProjectorFollowConfig},
-    run_continuous_wallet_following,
+    fetch_retained_event_page_to_target, plan_next_wallet_transition, recover_wallet_transition,
+    reopen_secondary_until, run_continuous_wallet_following,
     tests::{baseline_writer, empty_canonical_block, writer_retained_event},
+    wallet_transition_outcome,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -73,6 +78,222 @@ const PROJECTOR_CONTROL_TOKEN: &str = "parked-following-test-token";
 const CAPTURE_RETRIES: u32 = 8;
 /// Long enough that each renewal extends the lease by a whole millisecond.
 const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+#[tokio::test]
+async fn recovery_replans_an_append_overwritten_by_a_reorg() -> TestResult {
+    recover_after_reorg(false, false).await
+}
+
+#[tokio::test]
+async fn recovery_replans_an_overwritten_reconciliation_after_another_reorg() -> TestResult {
+    recover_after_reorg(true, false).await
+}
+
+#[tokio::test]
+async fn recovery_fails_closed_if_the_replanned_transition_is_also_missing_replay() -> TestResult {
+    recover_after_reorg(false, true).await
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the regression verifies planning, real writer attestation, retained-event replacement, and wallet publication in order"
+)]
+async fn recover_after_reorg(initial_reconciliation: bool, retry_missing: bool) -> TestResult {
+    let Some(listener) = bind_loopback().await? else {
+        return Ok(());
+    };
+    let root = TempDir::new()?;
+    let ParkFixture {
+        writer,
+        mut secondary,
+        mut wallet,
+    } = ParkFixture::build(root.path())?;
+    let cancel = CancellationToken::new();
+    let budget = NonZeroU64::new(16 * 1024 * 1024).ok_or("missing test replay budget")?;
+    let baseline = WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+    let cursor = baseline.source_position().event_cursor.as_bytes();
+    let events = secondary.canonical_event_history(CanonicalEventHistoryRequest::new(
+        Some(&cursor),
+        NonZeroU32::MIN,
+    ))?;
+    let transition = plan_next_wallet_transition(&secondary, &events)?;
+    let wallet_source = apply_next_wallet_transition(
+        &mut wallet,
+        &secondary,
+        baseline,
+        &transition,
+        REORG_WINDOW_BLOCKS,
+        budget,
+        &cancel,
+    )?
+    .ok_or("fixture wallet must advance to height two")?;
+
+    let writer = RecordingCanonicalControl::new(writer);
+    writer.append(empty_canonical_block(3, [0x22; 32], [0x33; 32])?)?;
+    if initial_reconciliation {
+        writer.replace_from_height_two(vec![
+            empty_canonical_block(2, [0x11; 32], [0x42; 32])?,
+            empty_canonical_block(3, [0x42; 32], [0x43; 32])?,
+        ])?;
+    }
+    secondary.try_catch_up_following()?;
+    let server_cancel = CancellationToken::new();
+    let _server_guard = server_cancel.clone().drop_guard();
+    let endpoint = spawn_canonical_control(listener, writer.clone(), server_cancel)?;
+    let mut control = CanonicalWriterControlClient::connect(&endpoint, None, None).await?;
+    let config = park_config(root.path(), &endpoint, "127.0.0.1:0".parse()?)?;
+    let RetainedEventPageValidation::Events(events) = fetch_retained_event_page_to_target(
+        &mut control,
+        &secondary,
+        wallet_source,
+        secondary.event_fence(),
+    )
+    .await?
+    else {
+        return Err("the initial page must match the secondary".into());
+    };
+    let initial = plan_next_wallet_transition(&secondary, &events)?;
+    assert_eq!(
+        matches!(initial, NextWalletTransition::ReconcileOverwritten { .. }),
+        initial_reconciliation,
+    );
+    let first_retained_event_sequence =
+        initial_reconciliation.then_some(events[0].cursor().event_sequence());
+    let anchor = match first_retained_event_sequence {
+        Some(sequence) => bootstrap_first_retained_event_source(&secondary, &events, sequence)?,
+        None => wallet_source,
+    };
+    let mut lease =
+        acquire_following_retention_lease(&mut control, anchor, config.lease_duration).await?;
+
+    writer.replace_from_height_two(vec![
+        empty_canonical_block(2, [0x11; 32], [0x52; 32])?,
+        empty_canonical_block(3, [0x52; 32], [0x53; 32])?,
+    ])?;
+    let expected = writer.with_writer(|writer| Ok(writer.event_fence()))?;
+    let height = initial.resulting_fence().visible_tip().height;
+    let mut canonical = CanonicalSecondarySlot(Some(secondary));
+    let outcome = recover_wallet_transition(
+        &mut canonical,
+        &mut control,
+        wallet_source,
+        TransitionLease {
+            lease: &mut lease,
+            first_retained_event_sequence,
+        },
+        &config,
+        &cancel,
+        height,
+        |canonical, transition| {
+            assert!(matches!(
+                transition,
+                NextWalletTransition::ReconcileOverwritten { .. }
+            ));
+            assert_eq!(transition.resulting_fence(), expected);
+            if retry_missing {
+                return Err(
+                    zinder_store::CanonicalStoreError::MissingLiveTailReplay { height }.into(),
+                );
+            }
+            wallet_transition_outcome(
+                transition,
+                apply_next_wallet_transition(
+                    &mut wallet,
+                    canonical,
+                    wallet_source,
+                    transition,
+                    REORG_WINDOW_BLOCKS,
+                    budget,
+                    &cancel,
+                ),
+            )
+        },
+    )
+    .await;
+    let calls = writer.calls.snapshot();
+    assert_eq!(calls.writer_statuses, 1);
+    assert_eq!(calls.event_pages, 2);
+    assert_eq!(canonical.get()?.event_fence(), expected);
+    if retry_missing {
+        assert!(matches!(
+            outcome,
+            Err(ProjectorError::CanonicalStore(zinder_store::CanonicalStoreError::MissingLiveTailReplay { height: missing }))
+                if missing == height
+        ));
+        assert_eq!(
+            WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence()),
+            wallet_source
+        );
+    } else {
+        let WalletTransitionOutcome::Applied(applied) = outcome? else {
+            return Err("the replacement branch must be applied".into());
+        };
+        assert_eq!(applied.source_position().tip, expected.visible_tip());
+        assert_eq!(
+            applied.source_position().event_sequence,
+            expected.chain_event_sequence()
+        );
+        assert_eq!(applied.source_sequence_digest(), expected.sequence_digest());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_secondary_reopen_drains_and_restores_the_slot() -> TestResult {
+    interrupted_secondary_reopen_restores_slot(true).await
+}
+
+#[tokio::test]
+async fn timed_out_secondary_reopen_drains_and_restores_the_slot() -> TestResult {
+    interrupted_secondary_reopen_restores_slot(false).await
+}
+
+async fn interrupted_secondary_reopen_restores_slot(cancelled: bool) -> TestResult {
+    let root = TempDir::new()?;
+    let ParkFixture { secondary, .. } = ParkFixture::build(root.path())?;
+    let fence = secondary.event_fence();
+    let height = fence.visible_tip().height;
+    let mut canonical = CanonicalSecondarySlot(Some(secondary));
+    let config = park_config(root.path(), "http://127.0.0.1:1", "127.0.0.1:0".parse()?)?;
+    let cancel = CancellationToken::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let mut pending = Box::pin(reopen_secondary_until(
+        &mut canonical,
+        &config,
+        &cancel,
+        deadline,
+        move |_| {
+            let _ = entered.send(());
+            let _ = released.recv();
+            Err(zinder_store::CanonicalStoreError::MissingLiveTailReplay { height })
+        },
+    ));
+    tokio::select! {
+        outcome = &mut pending => return Err(format!("reopen completed before the worker was released: {outcome:?}").into()),
+        started = started => started?,
+    }
+    if cancelled {
+        cancel.cancel();
+    }
+    tokio::select! {
+        biased;
+        outcome = &mut pending => return Err(format!("interrupted reopen returned before the worker was drained: {outcome:?}").into()),
+        () = tokio::time::sleep_until(deadline + Duration::from_millis(10)) => {}
+    }
+    release.send(())?;
+    let outcome = pending.await;
+    if cancelled {
+        assert!(!outcome?);
+    } else {
+        assert!(matches!(outcome, Err(ProjectorError::CanonicalStore(
+            zinder_store::CanonicalStoreError::AdmissionRefused { path, .. }
+        )) if path == config.canonical_path));
+    }
+    assert_eq!(canonical.get()?.event_fence(), fence);
+    Ok(())
+}
 
 #[tokio::test]
 async fn fresh_and_resumed_wallets_complete_startup_at_the_writer_fence() -> TestResult {

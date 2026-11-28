@@ -11,11 +11,12 @@
 
 use tokio_util::sync::CancellationToken;
 use zinder_runtime::{Readiness, ReadinessState};
-use zinder_store::{CanonicalEventFence, RocksDbCanonicalSecondary};
+use zinder_store::CanonicalEventFence;
 use zinder_wallet_projection::WalletCanonicalSourceIdentity;
 
 use super::{
-    ConvergenceLease, NextWalletTransition, ProjectorControlTasks, RetainedEventPageValidation,
+    CanonicalSecondarySlot, ConvergenceLease, NextWalletTransition, ProjectorControlTasks,
+    RetainedEventPageValidation,
     canonical_writer_control::{CanonicalRetentionLease, CanonicalWriterControlClient},
     config::{ProjectorConfig, ProjectorError},
     converge_on_writer_fence, fetch_retained_event_page_to_target,
@@ -109,11 +110,11 @@ pub(crate) struct ParkedLease<'a> {
     clippy::too_many_arguments,
     reason = "the park keeps the storage owners, the held lease, the refusal, and cancellation explicit, as the follow loop does"
 )]
-pub(crate) async fn park_on_refused_transition(
+pub(super) async fn park_on_refused_transition(
     config: &ProjectorConfig,
     readiness: &Readiness,
     cancel: &CancellationToken,
-    canonical: &mut RocksDbCanonicalSecondary,
+    canonical: &mut CanonicalSecondarySlot,
     canonical_control: &mut CanonicalWriterControlClient,
     control: &mut ProjectorControlTasks,
     lease: ParkedLease<'_>,
@@ -132,7 +133,8 @@ pub(crate) async fn park_on_refused_transition(
     // cause stays published until following resumes.
     let unserved = Readiness::default();
     let mut convergence_readiness = FollowingReadiness::for_wallet(&unserved, wallet_height);
-    let mut planned_at_writer_sequence = Some(canonical.event_fence().chain_event_sequence());
+    let mut planned_at_writer_sequence =
+        Some(canonical.get()?.event_fence().chain_event_sequence());
     loop {
         // A refused command falls through to renewal and the writer poll, so
         // a client that retries faster than the poll interval cannot starve
@@ -176,9 +178,9 @@ pub(crate) async fn park_on_refused_transition(
         };
         let retained_events = match fetch_retained_event_page_to_target(
             canonical_control,
-            canonical,
+            canonical.get()?,
             wallet_source,
-            canonical.event_fence(),
+            canonical.get()?.event_fence(),
         )
         .await
         {
@@ -189,8 +191,8 @@ pub(crate) async fn park_on_refused_transition(
             }
             Err(error) => return Err(rebuild_required_for_expired_cursor(error)),
         };
-        let next = plan_next_wallet_transition(canonical, &retained_events)?;
-        planned_at_writer_sequence = Some(canonical.event_fence().chain_event_sequence());
+        let next = plan_next_wallet_transition(canonical.get()?, &retained_events)?;
+        planned_at_writer_sequence = Some(canonical.get()?.event_fence().chain_event_sequence());
         if !refused.is_planned_again(&next) {
             tracing::info!(
                 target: "zinder::projector",
