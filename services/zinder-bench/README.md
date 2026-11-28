@@ -1418,9 +1418,8 @@ campaign case's `match` list when comparing reports that expose this flag.
 - `contract_identity`: exact benchmark report contract identity. The current identity is
   `benchmark-report`; missing or earlier identities are rejected.
 - `report_format_version`: machine-readable report contract version.
-  `canonical-replay-storage` reports use version 4,
-  `rocksdb-canonical-fixture-replay` reports version 5, and
-  `rocksdb-storage-lifecycle` reports version 6.
+  `canonical-replay-storage`, `rocksdb-canonical-fixture-replay`, and
+  `rocksdb-storage-lifecycle` reports all use version 1.
 - `measurement_kind`: `rocksdb-canonical-fixture-replay`,
   `canonical-replay-storage`, or `rocksdb-storage-lifecycle`. The tagged shape
   prevents block-local replay evidence from acquiring placeholder lifecycle or
@@ -1452,7 +1451,7 @@ campaign case's `match` list when comparing reports that expose this flag.
   budget used by the run.
 - Storage-lifecycle `resource_limits.tree_state_checkpoint_coverage`,
   `resource_limits.canonical_publication_mode`, and
-  `canonical_storage_ready.tree_state_checkpoint_count` (versions 5 and 6): the actual
+  `canonical_storage_ready.tree_state_checkpoint_count` (version 1): the actual
   construction checkpoint coverage, its resolved commitment budget in
   `resource_limits.tree_state_commitment_budget`, the canonical publication mode (`trusted-fresh` or `cold-certified`), and the
   persisted checkpoint row count (including the predecessor checkpoint).
