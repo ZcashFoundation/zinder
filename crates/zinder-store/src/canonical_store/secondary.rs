@@ -28,6 +28,7 @@ use super::{
     construction_manifest::validate_ready_construction_manifest,
     event_lifecycle::{canonical_event_history_from_db, canonical_event_retention_floor_from_db},
     live_commit::event_fence_from_ready,
+    live_tail_cache::LiveTailShieldedCache,
     mempool_lifecycle::validate_mempool_lifecycle_admission,
     publication::{follow_ready_replay_tail, validate_ready_publication},
     replay_tail::AuthenticatedReplayTail,
@@ -90,8 +91,13 @@ pub struct RocksDbCanonicalSecondary {
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
     reorg_policy: super::CanonicalReorgPolicy,
     pub(super) replay_tail: AuthenticatedReplayTail,
-    pub(super) segment_cache: Arc<SettledSegmentReaderCache>,
+    read_caches: Box<SecondaryReadCaches>,
     pub(super) sealed_segments: Vec<SettledSegmentIndexEntry>,
+}
+
+struct SecondaryReadCaches {
+    settled: Arc<SettledSegmentReaderCache>,
+    live_tail: Option<LiveTailShieldedCache>,
 }
 
 impl RocksDbCanonicalSecondary {
@@ -295,7 +301,10 @@ impl RocksDbCanonicalSecondary {
             activation_schedule,
             reorg_policy,
             replay_tail,
-            segment_cache,
+            read_caches: Box::new(SecondaryReadCaches {
+                settled: segment_cache,
+                live_tail: Some(live_tail_cache_for(&ready_evidence)),
+            }),
             sealed_segments,
         })
     }
@@ -403,6 +412,21 @@ impl RocksDbCanonicalSecondary {
     pub fn try_catch_up(
         &mut self,
     ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
+        // RocksDB can advance before admission fails. Only restore cached rows
+        // after a successful barrier that retains the same READY evidence.
+        let mut cache = self.read_caches.live_tail.take();
+        let previous_ready = self.ready_evidence;
+        let outcome = self.catch_up();
+        if outcome.is_ok() {
+            if previous_ready != self.ready_evidence || cache.is_none() {
+                cache = Some(live_tail_cache_for(&self.ready_evidence));
+            }
+            self.read_caches.live_tail = cache;
+        }
+        outcome
+    }
+
+    fn catch_up(&mut self) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
         let before = self.event_fence();
         self.bounded_open
             .db
@@ -452,7 +476,7 @@ impl RocksDbCanonicalSecondary {
                 .unwrap_or(&self.sealed_segments);
             let ctx = SegmentStoreContext {
                 db: &self.bounded_open.db,
-                segment_cache: Some(&self.segment_cache),
+                segment_cache: Some(&self.read_caches.settled),
                 sealed_segments: Some(active_sealed),
             };
             follow_ready_replay_tail(
@@ -561,7 +585,7 @@ impl RocksDbCanonicalSecondary {
             }
             store_access::open_replay_segment_readers(
                 &self.bounded_open.db,
-                Some(&self.segment_cache),
+                Some(&self.read_caches.settled),
                 entry,
             )
             .map_err(|err| CanonicalStoreError::admission(&self.primary_path, err.to_string()))?;
@@ -607,10 +631,14 @@ impl RocksDbCanonicalSecondary {
         Ok(())
     }
 
+    pub(super) fn live_tail_cache(&self) -> Option<&LiveTailShieldedCache> {
+        self.read_caches.live_tail.as_ref()
+    }
+
     pub(super) fn segment_context(&self) -> SegmentStoreContext<'_> {
         SegmentStoreContext {
             db: &self.bounded_open.db,
-            segment_cache: Some(&self.segment_cache),
+            segment_cache: Some(&self.read_caches.settled),
             sealed_segments: Some(&self.sealed_segments),
         }
     }
@@ -798,6 +826,13 @@ impl RocksDbCanonicalSecondary {
     pub const fn io_mode(&self) -> RocksDbIoMode {
         self.bounded_open.io_mode
     }
+}
+
+fn live_tail_cache_for(evidence: &CanonicalStoreReadyEvidence) -> LiveTailShieldedCache {
+    LiveTailShieldedCache::new(
+        evidence.sequence_checkpoint.through().height,
+        evidence.visible_tip.height,
+    )
 }
 
 fn require_exact_primary_column_family_metadata(

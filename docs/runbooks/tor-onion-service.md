@@ -15,8 +15,7 @@ Run the commands from the repository root. Use the same Compose project
 name and env file as your deployment when switching an existing stack.
 
 ```bash
-export ZINDER_PRESET=wallet
-env_file=deploy/.env.mainnet  # Use your deployment's env file.
+env_file=deploy/profiles/mainnet/deploy.env  # Uses ZINDER_DEPLOYMENT__PROFILE=wallet in its zinder.env.
 compose=(docker compose --env-file "$env_file" -f deploy/docker-compose.yml
   -f deploy/docker-compose.tor.yml --profile tor)
 
@@ -30,9 +29,12 @@ Wait for the readiness probe to succeed before serving wallets. The overlay
 in `deploy/docker-compose.tor.yml` shares the writer's network
 namespace with the readers and Tor. It binds the listeners there to
 `127.0.0.1`, sets `security.allow_public_bind = false` on both Zinder
-processes, and removes the base file's host port mappings. Leave the
-observability profile off and run operational probes inside the namespace.
-The base Compose host-port overrides do not change onion ports.
+processes, forces `PROXY` protocol allowlists to `none` on `zinder-serve`
+(`ZINDER_COMPAT__PROXY_PROTOCOL_TRUSTED_CIDRS=none` and
+`ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS=none`), and removes the base
+file's host port mappings. Leave the observability profile off and run
+operational probes inside the namespace. The base Compose host-port
+overrides do not change onion ports.
 
 The reference config in `deploy/tor/torrc` uses `HiddenServiceVersion 3`
 and maps onion ports `9067` and `9102` to the respective loopback wallet
@@ -208,7 +210,7 @@ the requested address and range. See [Node-forwarded reads](../reference/lightwa
 
 To keep those lookups within your own infrastructure, use upstream nodes you
 operate, including any fallbacks. If you use a third-party node, set
-`ZINDER_STORAGE__FULL_BLOCKS=true` in the Compose env file and build a store
+`ZINDER_STORAGE__FULL_BLOCKS=true` in your Compose runtime `zinder.env` file and build a store
 that retains the transaction bodies. Zinder can then serve those mined reads
 locally. Changing retention requires a new store. See [Configuration](../reference/configuration.md#deployment-profiles).
 

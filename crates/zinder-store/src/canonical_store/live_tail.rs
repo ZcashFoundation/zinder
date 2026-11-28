@@ -25,15 +25,14 @@ use crate::{
         RawBlockTransactionSlice, SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES,
     },
     settled_shielded_segment::{
-        ExpectedShieldedBlock, PoolPresenceMask, SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES,
-        validate_live_tail_shielded_block_wire,
+        PoolPresenceMask, SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES, SettledShieldedSegmentError,
     },
     settled_supplement_segment::{
         BlockSupplementRecord, CanonicalBlockSupplement, CanonicalTransactionSupplement,
         CompactTransparentSupplementTx, SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
         SupplementShieldedAnchors, SupplementTxFeeAndBurn,
         exact_zip317_logical_actions_from_outputs, reconstruct_compact_block_artifact,
-        transparent_supplement_from_compact,
+        transparent_supplement_from_compact, validate_and_inspect_shielded_block_wire,
     },
 };
 
@@ -47,7 +46,13 @@ pub(crate) const LIVE_TAIL_RAW_BLOCK_VERSION_V1: u16 = 1;
 const LIVE_TAIL_MAGIC: &[u8; 8] = b"ZSLVTL01";
 const LIVE_TAIL_FLAG_SUPPLEMENT: u8 = 1 << 0;
 const LIVE_TAIL_FLAG_CANONICAL_FACTS: u8 = 1 << 1;
-const LIVE_TAIL_KNOWN_FLAGS: u8 = LIVE_TAIL_FLAG_SUPPLEMENT | LIVE_TAIL_FLAG_CANONICAL_FACTS;
+// Bit 2 is reserved for the retired inline raw-block layout.
+const LIVE_TAIL_FLAG_WIDE_FEE_KNOWN: u8 = 1 << 3;
+const LIVE_TAIL_FLAG_HAS_WIDE_FEE: u8 = 1 << 4;
+const LIVE_TAIL_KNOWN_FLAGS: u8 = LIVE_TAIL_FLAG_SUPPLEMENT
+    | LIVE_TAIL_FLAG_CANONICAL_FACTS
+    | LIVE_TAIL_FLAG_WIDE_FEE_KNOWN
+    | LIVE_TAIL_FLAG_HAS_WIDE_FEE;
 const LIVE_TAIL_HEADER_MIN_LEN: usize = 8 + 2 + 1 + 1 + 4 + 32 + 32 + 4 + 1 + 4 + 32;
 const LIVE_TAIL_TRAILER_LEN: usize = 32;
 const MAX_LIVE_TAIL_RECORD_BYTES: usize = 64 * 1024 * 1024;
@@ -515,18 +520,27 @@ impl LiveTailBlockRecord {
             SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES,
             "live_tail.shielded",
         )?;
-        let has_unrepresentable_wire_fee = if (header.flags & LIVE_TAIL_FLAG_SUPPLEMENT) != 0 {
-            scan_supplement_for_wide_fee(&mut cursor)?
+        let has_unrepresentable_wire_fee = if header.flags & LIVE_TAIL_FLAG_SUPPLEMENT != 0
+            && header.flags & LIVE_TAIL_FLAG_WIDE_FEE_KNOWN != 0
+        {
+            // The authenticated suffix contains only supplement and facts, which this
+            // read does not consume. Their own readers still validate their framing.
+            header.flags & LIVE_TAIL_FLAG_HAS_WIDE_FEE != 0
         } else {
-            false
+            let wide = if header.flags & LIVE_TAIL_FLAG_SUPPLEMENT != 0 {
+                scan_supplement_for_wide_fee(&mut cursor)?
+            } else {
+                false
+            };
+            if header.flags & LIVE_TAIL_FLAG_CANONICAL_FACTS != 0 {
+                let _ = cursor.read_len_prefixed_slice(
+                    SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
+                    "live_tail.facts",
+                )?;
+            }
+            cursor.finish("LiveTailBlockRecord")?;
+            wide
         };
-        if (header.flags & LIVE_TAIL_FLAG_CANONICAL_FACTS) != 0 {
-            let _ = cursor.read_len_prefixed_slice(
-                SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
-                "live_tail.facts",
-            )?;
-        }
-        cursor.finish("LiveTailBlockRecord")?;
         validate_shielded_payload_wire_zero_alloc(&header, shielded_payload)?;
         Ok(LiveTailShieldedWire {
             block_id: header.block_id,
@@ -649,9 +663,12 @@ impl LiveTailBlockRecord {
         &self,
         replay_envelope: Option<CanonicalBlockReplayEnvelope>,
     ) -> Result<Vec<u8>, SettledSegmentsError> {
-        let mut flags = 0_u8;
-        if self.supplement.is_some() {
+        let mut flags = LIVE_TAIL_FLAG_WIDE_FEE_KNOWN;
+        if let Some(supplement) = &self.supplement {
             flags |= LIVE_TAIL_FLAG_SUPPLEMENT;
+            if supplement_has_wide_fee(supplement) {
+                flags |= LIVE_TAIL_FLAG_HAS_WIDE_FEE;
+            }
         }
         if replay_envelope.is_some() {
             flags |= LIVE_TAIL_FLAG_CANONICAL_FACTS;
@@ -871,11 +888,7 @@ impl LiveTailBlockRecord {
             )));
         }
         let flags = cursor.read_u8("live_tail.flags")?;
-        if (flags & !LIVE_TAIL_KNOWN_FLAGS) != 0 {
-            return Err(SettledSegmentsError::InvalidFormat(format!(
-                "unsupported live-tail flag bits {flags:#04x}"
-            )));
-        }
+        validate_live_tail_flags(flags)?;
         let reserved = cursor.read_u8("live_tail.reserved")?;
         if reserved != 0 {
             return Err(SettledSegmentsError::InvalidFormat(format!(
@@ -1057,20 +1070,24 @@ fn validate_shielded_payload_wire_zero_alloc(
             "live-tail shielded payload exceeds size bound".to_owned(),
         ));
     }
-    crate::settled_supplement_segment::validate_shielded_block_wire(shielded_payload)?;
-    let block_hash_wire = encode_internal_block_hash(header.block_id.hash);
-    let prev_hash_wire = encode_internal_block_hash(header.previous_block_hash);
-    validate_live_tail_shielded_block_wire(
-        shielded_payload,
-        ExpectedShieldedBlock {
-            height: header.block_id.height,
-            block_hash_wire: &block_hash_wire,
-            prev_hash_wire: &prev_hash_wire,
-            block_time: header.block_time,
-            pool_presence: header.pool_presence,
-        },
-    )?;
-    Ok(())
+    let observed = validate_and_inspect_shielded_block_wire(shielded_payload)?;
+    let reason = if observed.height != u64::from(header.block_id.height.value())
+        || observed.hash != encode_internal_block_hash(header.block_id.hash)
+        || observed.prev_hash != encode_internal_block_hash(header.previous_block_hash)
+        || observed.time != u64::from(header.block_time)
+        || !observed.header.is_empty()
+    {
+        "live-tail shielded payload identity disagrees with record"
+    } else if observed.pool_presence != header.pool_presence {
+        "live-tail shielded payload pool_presence disagrees with record"
+    } else if !observed.has_chain_metadata {
+        "live-tail shielded payload is missing chain_metadata"
+    } else if observed.has_empty_tx {
+        "live-tail DEFAULT_RANGE transaction carries neither Sapling, Orchard, nor Ironwood fields"
+    } else {
+        return Ok(());
+    };
+    Err(SettledShieldedSegmentError::PayloadIntegrity(reason.to_owned()).into())
 }
 
 fn decode_and_validate_shielded_payload(
@@ -1117,6 +1134,19 @@ struct LiveTailHeader {
     pool_presence: PoolPresenceMask,
 }
 
+fn validate_live_tail_flags(flags: u8) -> Result<(), SettledSegmentsError> {
+    let wide_fee_prerequisites = LIVE_TAIL_FLAG_WIDE_FEE_KNOWN | LIVE_TAIL_FLAG_SUPPLEMENT;
+    if flags & !LIVE_TAIL_KNOWN_FLAGS != 0
+        || (flags & LIVE_TAIL_FLAG_HAS_WIDE_FEE != 0
+            && flags & wide_fee_prerequisites != wide_fee_prerequisites)
+    {
+        return Err(SettledSegmentsError::InvalidFormat(format!(
+            "unsupported live-tail flag bits {flags:#04x}"
+        )));
+    }
+    Ok(())
+}
+
 fn parse_authenticated_header_v1(
     bytes: &[u8],
     expected_height: BlockHeight,
@@ -1136,11 +1166,7 @@ fn parse_authenticated_header_v1(
         )));
     }
     let flags = cursor.read_u8("live_tail.flags")?;
-    if (flags & !LIVE_TAIL_KNOWN_FLAGS) != 0 {
-        return Err(SettledSegmentsError::InvalidFormat(format!(
-            "unsupported live-tail flag bits {flags:#04x}"
-        )));
-    }
+    validate_live_tail_flags(flags)?;
     let reserved = cursor.read_u8("live_tail.reserved")?;
     if reserved != 0 {
         return Err(SettledSegmentsError::InvalidFormat(format!(
@@ -1591,7 +1617,6 @@ fn validate_canonical_tx_zip317_actions(
     Ok(())
 }
 
-#[cfg(test)]
 fn supplement_has_wide_fee(sup: &BlockSupplementRecord) -> bool {
     sup.transparent_transactions
         .iter()
@@ -2689,6 +2714,7 @@ mod tests {
     };
     use crate::canonical_store::settled_segments::ByteReader;
     use crate::settled_supplement_segment::ExplicitTransparentFacts;
+    use zinder_proto::compat::lightwalletd;
 
     fn roundtrip_test_transaction(
         txid: TransactionId,
@@ -2848,6 +2874,60 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn wide_fee_flags_match_the_legacy_supplement_scan() -> Result<(), Box<dyn std::error::Error>> {
+        use sha2::{Digest as _, Sha256};
+
+        use super::{
+            LIVE_TAIL_FLAG_HAS_WIDE_FEE, LIVE_TAIL_FLAG_WIDE_FEE_KNOWN, LIVE_TAIL_TRAILER_LEN,
+        };
+
+        let (fixture, facts) = roundtrip_test_fixture()?;
+        for is_wide in [false, true] {
+            let mut transactions = fixture.transactions().to_vec();
+            if is_wide {
+                transactions[0].data.fee_zat = Some(u64::from(u32::MAX) + 1);
+            }
+            let compact = CompactBlockArtifact::new(
+                BlockId::new(fixture.height(), fixture.block_hash()),
+                fixture.previous_block_hash(),
+                fixture.time(),
+                transactions,
+                fixture.chain_metadata(),
+            )?;
+            let height = compact.height();
+            let record =
+                LiveTailBlockRecord::from_compact_block(&compact, true, Some(facts.clone()))?;
+            let encoded = record.encode_v1()?;
+            let flags_offset = super::LIVE_TAIL_MAGIC.len() + size_of::<u16>();
+            assert_ne!(encoded[flags_offset] & LIVE_TAIL_FLAG_WIDE_FEE_KNOWN, 0);
+            assert_eq!(
+                encoded[flags_offset] & LIVE_TAIL_FLAG_HAS_WIDE_FEE != 0,
+                is_wide
+            );
+
+            // v0.28.0 uses the same layout with both of these bits clear.
+            let mut legacy = encoded[..encoded.len() - LIVE_TAIL_TRAILER_LEN].to_vec();
+            legacy[flags_offset] &= !(LIVE_TAIL_FLAG_WIDE_FEE_KNOWN | LIVE_TAIL_FLAG_HAS_WIDE_FEE);
+            let digest = Sha256::digest(&legacy);
+            legacy.extend_from_slice(&digest);
+            let current_wire = LiveTailBlockRecord::decode_shielded_wire_v1(&encoded, height)?;
+            let legacy_wire = LiveTailBlockRecord::decode_shielded_wire_v1(&legacy, height)?;
+            assert_eq!(current_wire, legacy_wire);
+            assert_eq!(legacy_wire.has_unrepresentable_wire_fee, is_wide);
+            assert_eq!(LiveTailBlockRecord::decode_v1(&legacy)?, record);
+            assert_eq!(
+                LiveTailBlockRecord::decode_compact_block_v1(&legacy, height)?.0,
+                compact,
+            );
+            assert_eq!(
+                LiveTailBlockRecord::decode_canonical_facts_v1(&legacy, height)?,
+                Some(facts.clone()),
+            );
+        }
+        Ok(())
+    }
+
     fn sample_shielded_live_tail_record() -> Result<LiveTailBlockRecord, Box<dyn std::error::Error>>
     {
         use zinder_core::{CompactSaplingOutput, CompactSaplingSpend};
@@ -2902,7 +2982,6 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         use super::build_raw_v1_record_with_outer_checksum;
         use prost::Message as _;
-        use zinder_proto::compat::lightwalletd;
 
         use crate::settled_shielded_segment::PoolPresenceMask;
 
@@ -2970,6 +3049,40 @@ mod tests {
             &[0xff, 0xff, 0xff],
         )?;
         assert_wire_decoders_reject(&malformed_proto_row, height, "malformed protobuf");
+        Ok(())
+    }
+    #[test]
+    fn shielded_wire_still_rejects_invalid_nested_fields_and_tag_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use prost::Message as _;
+
+        let record = sample_shielded_live_tail_record()?;
+        let proto = lightwalletd::CompactBlock::decode(record.shielded_payload.as_slice())?;
+        let mut missing_txid = proto.clone();
+        missing_txid.vtx[0].txid.clear();
+        let mut short_ciphertext = proto.clone();
+        short_ciphertext.vtx[0].outputs[0].ciphertext.pop();
+        let mut missing_nullifier = proto.clone();
+        missing_nullifier.vtx[0].spends[0].nf.clear();
+        let mut out_of_order = proto.encode_to_vec();
+        out_of_order.extend_from_slice(&[0x08, 0x01]);
+        let mut duplicate_metadata = proto.encode_to_vec();
+        duplicate_metadata.extend_from_slice(&[0x42, 0x00]);
+
+        for (label, payload) in [
+            ("missing transaction ID", missing_txid.encode_to_vec()),
+            ("short ciphertext", short_ciphertext.encode_to_vec()),
+            ("missing nullifier", missing_nullifier.encode_to_vec()),
+            ("out-of-order unknown tag", out_of_order),
+            ("duplicate chain metadata", duplicate_metadata),
+        ] {
+            let row = super::build_raw_v1_record_with_outer_checksum(
+                &record,
+                record.pool_presence,
+                &payload,
+            )?;
+            assert_wire_decoders_reject(&row, record.block_id.height, label);
+        }
         Ok(())
     }
 }

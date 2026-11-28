@@ -14,7 +14,6 @@ publish.workspace = true
 [dependencies]
 axum = { workspace = true, features = ["ws"] }
 clap = { workspace = true, features = ["derive"] }
-config.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }

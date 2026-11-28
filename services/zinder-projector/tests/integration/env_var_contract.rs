@@ -1,35 +1,32 @@
-//! Keeps `zinder_runtime::ENVIRONMENT_VARIABLES` aligned with the variables
-//! the `zinder-projector` loader accepts.
+//! Binary smoke checks for unified `ZinderConfig` environment parsing on `zinder-projector`.
 
-use zinder_runtime::ENVIRONMENT_VARIABLES;
-use zinder_testkit::EnvVarContractProbe;
+use std::process::Command;
 
-const BINARY: &str = "zinder-projector";
-
-// `[ingest_control]` is a shared section type; the projector only dials the
-// control endpoint.
-const ACCEPTED_BUT_UNCONSUMED: &[&str] = &[
-    "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH",
-    "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN",
-    "ZINDER_INGEST_CONTROL__CHECKPOINT_STAGING_ROOT",
-    "ZINDER_INGEST_CONTROL__LISTEN_ADDR",
-];
-
-fn documented_variables() -> impl Iterator<Item = &'static str> {
-    ENVIRONMENT_VARIABLES
-        .iter()
-        .filter(|env_var| env_var.is_used_by(BINARY))
-        .map(|env_var| env_var.name)
+fn print_config_with_env(pairs: &[(&str, &str)]) -> eyre::Result<std::process::Output> {
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-projector"));
+    command.env_clear().arg("--print-config");
+    command
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_PROJECTOR__LEASE_DURATION_SECONDS", "14400");
+    for (name, env_val) in pairs {
+        command.env(name, env_val);
+    }
+    Ok(command.output()?)
 }
 
 #[test]
-fn every_documented_variable_is_accepted_by_the_loader() -> eyre::Result<()> {
-    EnvVarContractProbe::new(zinder_testkit::bin_exe!("zinder-projector"))
-        .check_documented_variables_are_accepted(documented_variables())
-}
+fn shared_schema_env_vars_are_accepted_and_empty_or_unknown_keys_are_rejected() -> eyre::Result<()>
+{
+    let ok = print_config_with_env(&[("ZINDER_INGEST__SOURCE", "zebra-json-rpc")])?;
+    assert!(ok.status.success(), "{ok:?}");
 
-#[test]
-fn every_variable_the_loader_accepts_is_documented() -> eyre::Result<()> {
-    EnvVarContractProbe::new(zinder_testkit::bin_exe!("zinder-projector"))
-        .check_accepted_variables_are_documented(documented_variables(), ACCEPTED_BUT_UNCONSUMED)
+    let unknown = print_config_with_env(&[("ZINDER_UNKNOWN_SECTION__PATH", "x")])?;
+    assert!(!unknown.status.success(), "{unknown:?}");
+
+    let nested = print_config_with_env(&[("ZINDER_OPS__LISTEN_ADDR__PORT", "9109")])?;
+    assert!(!nested.status.success(), "{nested:?}");
+
+    let empty = print_config_with_env(&[("ZINDER_OPS__LISTEN_ADDR", "")])?;
+    assert!(!empty.status.success(), "{empty:?}");
+    Ok(())
 }

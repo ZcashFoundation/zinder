@@ -8,7 +8,7 @@ use zinder_core::{
 };
 
 use crate::{
-    positional_source::{ByteRange, PositionalByteSource},
+    positional_source::{ByteRange, PositionalByteSource, SegmentSource},
     segment_verity,
 };
 
@@ -965,7 +965,7 @@ impl SettledRawBlockSegmentIndex {
 /// Authenticated reader over one settled `ZSBLKB01` raw block segment backed
 /// by a [`PositionalByteSource`] (default [`File`]).
 pub struct SettledRawBlockSegmentReader<S = File> {
-    source: S,
+    source: SegmentSource<S>,
     index: SettledRawBlockSegmentIndex,
 }
 
@@ -1013,7 +1013,12 @@ impl SettledRawBlockSegmentReader<File> {
         if options.require_fs_verity && !kernel_verified {
             return Err(SettledRawBlockSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(file, expected, options, kernel_verified)
+        Self::admit_with_verity(
+            SegmentSource::file(file, "block_blob"),
+            expected,
+            options,
+            kernel_verified,
+        )
     }
 }
 
@@ -1034,11 +1039,25 @@ impl<S: PositionalByteSource> SettledRawBlockSegmentReader<S> {
         if options.require_fs_verity {
             return Err(SettledRawBlockSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(source, expected, options, false)
+        Self::admit_with_verity(SegmentSource::unmeasured(source), expected, options, false)
+    }
+
+    pub(crate) fn index_heap_bytes(&self) -> usize {
+        std::mem::size_of_val(self.index.rows.as_ref())
+            + self
+                .index
+                .row_index_page_digests
+                .as_deref()
+                .map_or(0, std::mem::size_of_val)
+            + self
+                .index
+                .tx_table_page_digests
+                .as_deref()
+                .map_or(0, std::mem::size_of_val)
     }
 
     fn admit_with_verity(
-        source: S,
+        source: SegmentSource<S>,
         expected: &RawBlockSegmentIdentity,
         options: SettledRawBlockSegmentOpenOptions,
         kernel_verified: bool,

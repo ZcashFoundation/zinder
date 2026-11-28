@@ -1,4 +1,17 @@
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zinder-config
+  labels:
+    app.kubernetes.io/name: zinder
+data:
+  ZINDER_DEPLOYMENT__PROFILE: wallet
+  ZINDER_NETWORK__NAME: zcash-mainnet
+  ZINDER_NODE__JSON_RPC_ADDR: http://zcash-node:8232
+  ZINDER_NODE__AUTH__METHOD: cookie
+  ZINDER_NODE__AUTH__PATH: /var/run/auth/.cookie
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: zinder
@@ -18,6 +31,9 @@ spec:
     - name: explorer-grpc
       port: 9068
       targetPort: explorer-grpc
+    - name: cipherscan-http
+      port: 9070
+      targetPort: cipherscan-http
     - name: ops
       port: 9108
       targetPort: ops
@@ -50,21 +66,14 @@ spec:
           type: RuntimeDefault
       containers:
         - name: zinder
-          # Replace v0.27.0 with an immutable release tag or @sha256 digest.
-          image: ghcr.io/zcashfoundation/zinder:v0.27.0
+          # Replace v0.28.0 with an immutable release tag or @sha256 digest.
+          image: ghcr.io/zcashfoundation/zinder:v0.28.0
           args:
             - serve
-            - --preset
-            - wallet
+          envFrom:
+            - configMapRef:
+                name: zinder-config
           env:
-            - name: ZINDER_NETWORK__NAME
-              value: zcash-mainnet
-            - name: ZINDER_NODE__JSON_RPC_ADDR
-              value: http://zcash-node:8232
-            - name: ZINDER_NODE__AUTH__METHOD
-              value: cookie
-            - name: ZINDER_NODE__AUTH__PATH
-              value: /var/run/auth/.cookie
             - name: ZINDER_STORAGE__DATA_DIR
               value: /var/lib/zinder
             - name: ZINDER_OPS__LISTEN_ADDR
@@ -75,6 +84,8 @@ spec:
               value: "[::]:9102"
             - name: ZINDER_EXPLORER__LISTEN_ADDR
               value: "[::]:9068"
+            - name: ZINDER_CIPHERSCAN__LISTEN_ADDR
+              value: "[::]:9070"
             - name: ZINDER_SECURITY__ALLOW_PUBLIC_BIND
               value: "true"
           ports:
@@ -82,6 +93,8 @@ spec:
               containerPort: 9067
             - name: explorer-grpc
               containerPort: 9068
+            - name: cipherscan-http
+              containerPort: 9070
             - name: query-grpc
               containerPort: 9102
             - name: ops

@@ -84,7 +84,7 @@ sed -e 's/^ZINDER_NETWORK__NAME=.*/ZINDER_NETWORK__NAME=zcash-regtest/' \
   "$scratch/systemd/zinder.env" > "$scratch/regtest.env"
 grep -Fxq 'ZINDER_DEPLOYMENT__PROFILE=wallet' "$scratch/regtest.env" \
   || { echo >&2 "Expected the archive to default to the wallet profile"; exit 1; }
-echo 'ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES=1073741824' >> "$scratch/regtest.env"
+echo 'ZINDER_NODE__AUTH__METHOD=none' >> "$scratch/regtest.env"
 sudo install -m 0600 "$scratch/regtest.env" "$config/zinder.env"
 for token in ingest checkpoint; do
   openssl rand -hex 32 | sudo install -m 0440 -o root -g zinder /dev/stdin "$config/$token.token"
@@ -131,6 +131,7 @@ sudo systemctl stop "$target"
 sudo rm -rf -- "${retry_dropins[@]}"
 sed 's/^ZINDER_DEPLOYMENT__PROFILE=wallet$/ZINDER_DEPLOYMENT__PROFILE=explorer/' \
   "$scratch/regtest.env" > "$scratch/explorer.env"
+echo 'ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES=1073741824' >> "$scratch/explorer.env"
 sudo install -m 0600 "$scratch/explorer.env" "$config/zinder.env"
 sudo systemctl enable --runtime "${optional_units[@]}"
 timeout 180 sudo systemctl start "$target"

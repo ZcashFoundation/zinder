@@ -3,10 +3,12 @@
 use http::Uri;
 use serde::{Deserialize, Serialize, Serializer};
 
+use crate::config::Toggle;
+
 const DEFAULT_SAMPLING_RATE: f64 = 0.1;
 
 /// Resolved `[observability]` settings. Debug and TOML output redact the collector address.
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
 #[serde(try_from = "ObservabilitySection")]
 pub struct ObservabilityConfig {
     #[serde(
@@ -50,7 +52,7 @@ fn redact_endpoint<S: Serializer>(_: &Option<Uri>, serializer: S) -> Result<S::O
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ObservabilitySection {
-    otlp_endpoint: Option<String>,
+    otlp_endpoint: Toggle<String>,
     sampling_rate: Option<f64>,
 }
 
@@ -58,13 +60,10 @@ impl TryFrom<ObservabilitySection> for ObservabilityConfig {
     type Error = &'static str;
 
     fn try_from(section: ObservabilitySection) -> Result<Self, Self::Error> {
-        let otlp_endpoint = section
-            .otlp_endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|endpoint| !endpoint.is_empty())
-            .map(parse_collector_endpoint)
-            .transpose()?;
+        let otlp_endpoint = match section.otlp_endpoint {
+            Toggle::Defaulted | Toggle::Disabled => None,
+            Toggle::Enabled(endpoint) => Some(parse_collector_endpoint(endpoint.trim())?),
+        };
         if section
             .sampling_rate
             .is_some_and(|rate| !(0.0..=1.0).contains(&rate))

@@ -23,7 +23,7 @@ epoch-bound read and secondary model.
 | Wallet | `zinder-projector` | `wallet.path` | Transparent address indexes | The canonical store |
 | Materialized views | `zinder-ingest`, when `ingest.explorer_views = true` | `materialized-views` under `storage.path` | Explorer aggregates | The canonical store |
 
-The canonical and wallet paths must be separate directories. When running through the unified `zinder` CLI (`zinder serve` or `zinder index`), setting `storage.data_dir` (`ZINDER_STORAGE__DATA_DIR`, defaulting to `/var/lib/zinder`) automatically derives isolated subdirectories (`canonical`, `canonical-secondary/<role>`, `wallet`, `wallet-secondary/<role>`, `checkpoints`, and `materialized-views` under `canonical`). When configuring standalone binaries explicitly, each reader needs its own secondary metadata path: `storage.secondary_path` in `zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer`, `storage.canonical_secondary_path` and `storage.canonical_path` in the projector, and `wallet.secondary_path` for wallet-serving readers. The [configuration reference](../reference/configuration.md) lists every key.
+The canonical and wallet paths must be separate directories. When running through the unified `zinder` CLI (`zinder serve` or `zinder index`), setting `storage.data_dir` (`ZINDER_STORAGE__DATA_DIR`, defaulting to `/var/lib/zinder`) automatically derives isolated subdirectories (`canonical`, `canonical-secondary/<role>`, `wallet`, `wallet-secondary/<role>`, `checkpoints`, and `materialized-views` under `canonical`). When configuring standalone binaries explicitly, each reader (including `zinder-projector`) needs its own `storage.secondary_path` metadata directory and shares `storage.path`, with `wallet.secondary_path` added for wallet-serving readers. The [configuration reference](../reference/configuration.md) lists every key.
 
 New RocksDB SSTs use block-based table format 7, the bundled engine's current
 default. The explicit setting keeps SST output at format 7 if a future engine
@@ -56,6 +56,15 @@ under `<store_root>/segments/`:
 | `chain_event` | Authenticated append and reorg history |
 | `mempool_event` | Retained mempool history |
 | `displaced_block_facts` | Full `CanonicalBlockFacts` archived for blocks replaced by a reorg |
+
+`ZSLVTL01` header flag bit 3 records that the writer checked the supplement
+for fees wider than the lightwalletd `u32` field. Bit 4 records that at least
+one such fee is present. A shielded read verifies the whole row digest and
+uses these bits to skip parsing the supplement and facts when a supplement is
+present. Readers scan the supplement in older rows with bit 3 clear. New
+releases can open existing Schema v2 stores in place. To roll back to a release
+that predates the flags, restore a backup or snapshot made before the upgrade,
+or rebuild the canonical store and its dependent projections in clean paths.
 
 At `READY` publication, fresh construction stages SSTs for the seven bulk
 families (`block_hash_index`, `block_header`, `live_tail_block`,
@@ -137,10 +146,8 @@ presplit deterministically):
   `zip317_logical_actions`, `paid_fee`, and `burn_zat`), with `O(index)`
   `index_sha256` reader opening and sans-I/O `ByteRange` planning. Together with
   `ZSHRNG02` `Slab 0`, `splice_compact_block_wire` yields byte-identical
-  transparent-inclusive `CompactBlock` frames and
-  `reconstruct_compact_block_artifact` / `reconstruct_canonical_block_facts`
-  recover full canonical records for native query, wallet projection, and
-  Explorer views.
+  transparent-inclusive `CompactBlock` frames. The supplement also provides
+  the transaction facts for canonical replay.
 - **`ZSBLKB01` (`segments/raw_block/<start:010>-<end:010>.zsblkb01`, when `raw_blob_policy = "all"`):**
   single-copy full consensus block vault storing each block once (`Zstd` level 3
   or uncompressed), a flat `40`-byte per-transaction slice table `(tx_offset,
@@ -193,20 +200,30 @@ unsealed heights `> sealed_tip`):
   (`encoded_compact_block_range_up_to`) reads `ZSHRNG02` `Slab 0` through
   `SettledSegmentReaderCache` (using sans-I/O `ByteRange` plans) and
   `live_tail_block`, verifying frame lengths, digests, and `(height, block_hash,
-  previous_block_hash)` linkage across segment and tail boundaries.
-- Full `CompactBlockArtifact` and `CanonicalBlockFacts` reads splice `ZSHRNG02`
-  plus `ZSTSUP01` for settled heights and decode `ZSLVTL01` rows in `MultiGet`
-  batches for unsealed tail heights:
+  previous_block_hash)` linkage across segment and tail boundaries. Each
+  secondary lazily caches validated shielded frames above `settled_tip` for
+  its current READY generation. The cache retains up to 5 MiB and serves
+  admitted rows without another MultiGet. A changed READY generation starts
+  with an empty cache. Before row sizes are known, encoded range reads
+  request up to 16 rows in their first batch.
+- Settled `CompactBlockArtifact` reads combine `ZSHRNG02` and `ZSTSUP01`.
+- Settled canonical replay reconstructs `CanonicalBlockFacts` from
+  `block_header` and `ZSTSUP01`. Range replay scans consecutive headers
+  in batches of up to 256 blocks and checks each header's height, hash,
+  parent hash, and timestamp against the authenticated supplement envelope.
+- Unsealed compact-block and canonical-facts reads decode `ZSLVTL01` rows
+  in `MultiGet` batches:
   - An unbounded range read fetches up to `1,024` unsealed tail heights per batch.
   - Tree-state replay fetches up to `16` heights per batch and checks for
     cancellation after each block. Wallet queries at the same height and chain
     fence share a reconstruction; the last caller to leave cancels the work.
     Each query runtime caches up to `256` settled answers scoped to the epoch,
     sequence digest, and retained history.
-  - A byte-bounded read fetches one row first, then adapts subsequent batch sizes
-    from `1` to `16` within the remaining byte budget. For settled segments with
-    a supplement, it charges the native length recorded in the index. For
-    shielded-only segments, it measures the reconstructed block.
+  - A byte-bounded artifact read fetches one row to learn its size, then
+    adapts subsequent batches from `1` to `16` within the remaining budget.
+    For settled segments with a supplement, it charges the native length
+    recorded in the index. For shielded-only segments, it measures the
+    reconstructed block.
 
 Reads verify block height linkage across every decoded row and fail on missing
 rows inside retained history as store damage. Compact-block payload range reads
@@ -285,7 +302,7 @@ be rebuilt.
 
 The row digest and the UTXO set commitment are sums of per-row hashes, so they
 do not depend on the order rows are hashed in. Construction also scans the
-settled canonical prefix (`ZSHRNG02` + `ZSTSUP01` segments) in `4,096`-block
+settled canonical replay prefix in `4,096`-block
 height chunks across
 `projector.build.accumulator_hashing_workers` threads into sharded outpoint
 sorters that split `projector.build.max_outpoint_sort_memory_bytes` evenly

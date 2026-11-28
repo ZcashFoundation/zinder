@@ -241,6 +241,13 @@ fn prometheus_builder() -> Result<PrometheusBuilder, BuildError> {
             ],
         )?
         .set_buckets_for_metric(
+            Matcher::Full("zinder_store_settled_segment_pread_duration_seconds".to_owned()),
+            &[
+                0.000_001, 0.000_005, 0.000_01, 0.000_05, 0.000_1, 0.000_5, 0.001, 0.005, 0.01,
+                0.05, 0.1, 0.5, 1.0,
+            ],
+        )?
+        .set_buckets_for_metric(
             Matcher::Suffix("_duration_seconds".to_owned()),
             DURATION_SECONDS_BUCKETS,
         )?

@@ -14,6 +14,8 @@ use zinder_core::{
 };
 use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
 
+use crate::settled_shielded_segment::PoolPresenceMask;
+
 use super::{
     SettledSupplementSegmentError,
     section::{
@@ -147,6 +149,7 @@ struct WireTxMeta<'a> {
     index: u64,
     txid_bytes: &'a [u8],
     fee: u32,
+    pool_presence: PoolPresenceMask,
 }
 
 const HEADER_SEEN_HEIGHT: u8 = 1 << 0;
@@ -1179,65 +1182,71 @@ fn check_unique_presence_mask(
 pub(crate) fn validate_shielded_block_wire(
     raw_payload: &[u8],
 ) -> Result<(), SettledSupplementSegmentError> {
+    validate_and_inspect_shielded_block_wire(raw_payload).map(|_| ())
+}
+
+#[derive(Default)]
+pub(crate) struct ShieldedWireBlock<'a> {
+    pub(crate) height: u64,
+    pub(crate) time: u64,
+    pub(crate) hash: &'a [u8],
+    pub(crate) prev_hash: &'a [u8],
+    pub(crate) header: &'a [u8],
+    pub(crate) pool_presence: PoolPresenceMask,
+    pub(crate) has_chain_metadata: bool,
+    pub(crate) has_empty_tx: bool,
+}
+
+pub(crate) fn validate_and_inspect_shielded_block_wire(
+    raw_payload: &[u8],
+) -> Result<ShieldedWireBlock<'_>, SettledSupplementSegmentError> {
     let mut cursor = raw_payload;
     let mut presence = BlockHeaderPresence::empty();
+    let mut observed = ShieldedWireBlock::default();
     while !cursor.is_empty() {
         let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
         check_ascending_tag(&mut presence.prev_tag, tag, "CompactBlock")?;
         match tag {
-            COMPACT_BLOCK_TAG_HEIGHT => {
-                check_unique_presence_mask(
-                    &mut presence.flags,
-                    HEADER_SEEN_HEIGHT,
-                    "CompactBlock.height",
-                )?;
-                expect_wire_type(wire_type, WireType::Varint, "CompactBlock.height")?;
-                decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
+            COMPACT_BLOCK_TAG_HEIGHT | COMPACT_BLOCK_TAG_TIME => {
+                let (scalar, flag, label) = if tag == COMPACT_BLOCK_TAG_HEIGHT {
+                    (
+                        &mut observed.height,
+                        HEADER_SEEN_HEIGHT,
+                        "CompactBlock.height",
+                    )
+                } else {
+                    (&mut observed.time, HEADER_SEEN_TIME, "CompactBlock.time")
+                };
+                check_unique_presence_mask(&mut presence.flags, flag, label)?;
+                expect_wire_type(wire_type, WireType::Varint, label)?;
+                *scalar = decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
             }
-            COMPACT_BLOCK_TAG_TIME => {
-                check_unique_presence_mask(
-                    &mut presence.flags,
-                    HEADER_SEEN_TIME,
-                    "CompactBlock.time",
-                )?;
-                expect_wire_type(wire_type, WireType::Varint, "CompactBlock.time")?;
-                decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
-            }
-            COMPACT_BLOCK_TAG_HASH => {
-                check_unique_presence_mask(
-                    &mut presence.flags,
-                    HEADER_SEEN_HASH,
-                    "CompactBlock.hash",
-                )?;
-                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock.hash")?;
-                let _bytes = take_length_delimited(&mut cursor)?;
-            }
-            COMPACT_BLOCK_TAG_PREV_HASH => {
-                check_unique_presence_mask(
-                    &mut presence.flags,
-                    HEADER_SEEN_PREV_HASH,
-                    "CompactBlock.prev_hash",
-                )?;
-                expect_wire_type(
-                    wire_type,
-                    WireType::LengthDelimited,
-                    "CompactBlock.prev_hash",
-                )?;
-                let _bytes = take_length_delimited(&mut cursor)?;
-            }
-            COMPACT_BLOCK_TAG_HEADER => {
-                check_unique_presence_mask(
-                    &mut presence.flags,
-                    HEADER_SEEN_HEADER,
-                    "CompactBlock.header",
-                )?;
-                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock.header")?;
-                let _bytes = take_length_delimited(&mut cursor)?;
+            COMPACT_BLOCK_TAG_HASH | COMPACT_BLOCK_TAG_PREV_HASH | COMPACT_BLOCK_TAG_HEADER => {
+                let (field, flag, label) = match tag {
+                    COMPACT_BLOCK_TAG_HASH => {
+                        (&mut observed.hash, HEADER_SEEN_HASH, "CompactBlock.hash")
+                    }
+                    COMPACT_BLOCK_TAG_PREV_HASH => (
+                        &mut observed.prev_hash,
+                        HEADER_SEEN_PREV_HASH,
+                        "CompactBlock.prev_hash",
+                    ),
+                    _ => (
+                        &mut observed.header,
+                        HEADER_SEEN_HEADER,
+                        "CompactBlock.header",
+                    ),
+                };
+                check_unique_presence_mask(&mut presence.flags, flag, label)?;
+                expect_wire_type(wire_type, WireType::LengthDelimited, label)?;
+                *field = take_length_delimited(&mut cursor)?;
             }
             COMPACT_BLOCK_TAG_VTX => {
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock.vtx")?;
-                let tx_bytes = take_length_delimited(&mut cursor)?;
-                inspect_and_validate_shielded_tx(tx_bytes, false)?;
+                let tx =
+                    inspect_and_validate_shielded_tx(take_length_delimited(&mut cursor)?, false)?;
+                observed.has_empty_tx |= tx.pool_presence.is_empty();
+                observed.pool_presence = observed.pool_presence.union(tx.pool_presence);
             }
             COMPACT_BLOCK_TAG_CHAIN_METADATA => {
                 check_unique_presence_mask(
@@ -1246,13 +1255,13 @@ pub(crate) fn validate_shielded_block_wire(
                     "CompactBlock.chain_metadata",
                 )?;
                 expect_wire_type(wire_type, WireType::LengthDelimited, "chain_metadata")?;
-                let meta_bytes = take_length_delimited(&mut cursor)?;
-                validate_chain_metadata_wire(meta_bytes)?;
+                validate_chain_metadata_wire(take_length_delimited(&mut cursor)?)?;
+                observed.has_chain_metadata = true;
             }
             _ => skip_wire_field(wire_type, &mut cursor)?,
         }
     }
-    Ok(())
+    Ok(observed)
 }
 
 fn inspect_and_validate_shielded_tx(
@@ -1267,6 +1276,7 @@ fn inspect_and_validate_shielded_tx(
     let mut seen_index = false;
     let mut seen_txid = false;
     let mut seen_fee = false;
+    let mut pool_presence = PoolPresenceMask::EMPTY;
     while !cursor.is_empty() {
         let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
         check_ascending_tag(&mut prev_tag, tag, "CompactTx")?;
@@ -1298,14 +1308,22 @@ fn inspect_and_validate_shielded_tx(
             }
             COMPACT_TX_TAG_SPENDS => {
                 validate_nested_field(wire_type, &mut cursor, validate_sapling_spend_wire)?;
+                pool_presence = pool_presence.union(PoolPresenceMask::SAPLING_SPEND);
             }
             COMPACT_TX_TAG_OUTPUTS => {
                 validate_nested_field(wire_type, &mut cursor, validate_sapling_output_wire)?;
+                pool_presence = pool_presence.union(PoolPresenceMask::SAPLING_OUTPUT);
             }
             COMPACT_TX_TAG_ACTIONS | COMPACT_TX_TAG_IRONWOOD_ACTIONS => {
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactTx nested")?;
                 let nested = take_length_delimited(&mut cursor)?;
                 validate_action_wire(nested, allow_nullifier_only_actions)?;
+                let pool = if tag == COMPACT_TX_TAG_ACTIONS {
+                    PoolPresenceMask::ORCHARD
+                } else {
+                    PoolPresenceMask::IRONWOOD
+                };
+                pool_presence = pool_presence.union(pool);
             }
             COMPACT_TX_TAG_VIN | COMPACT_TX_TAG_VOUT => {
                 return Err(SettledSupplementSegmentError::PayloadIntegrity(
@@ -1324,6 +1342,7 @@ fn inspect_and_validate_shielded_tx(
         index,
         txid_bytes,
         fee,
+        pool_presence,
     })
 }
 

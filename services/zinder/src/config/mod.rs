@@ -1,13 +1,14 @@
-//! Unified configuration loading, role filtering, validation, and redacted rendering.
+//! Unified configuration loading, supervision planning, validation, and redacted rendering.
 
-mod filter;
+mod plan;
 mod validate;
 
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
+use std::{collections::BTreeMap, fmt, net::SocketAddr, path::PathBuf};
 
+use secrecy::SecretString;
 use thiserror::Error;
 use zinder_core::Network;
-use zinder_runtime::DeploymentProfile;
+use zinder_runtime::{DeploymentProfile, ZinderConfig};
 
 use crate::cli::{ConfigScopeArgs, Preset, ServiceRole};
 
@@ -76,17 +77,31 @@ impl ConfigScope {
     }
 }
 
-/// Filtered per-role configuration material ready for validation or child launch.
-#[derive(Clone, Debug)]
+/// Prepared per-role configuration material ready for validation or child launch.
+#[derive(Clone)]
 pub struct RoleLaunchSpec {
     /// Service role identifier.
     pub role: ServiceRole,
-    /// Filtered TOML document rendered cleanly for this role.
-    pub filtered_toml: String,
-    /// Filtered `ZINDER_*` environment pairs scoped to this role.
-    pub filtered_env: BTreeMap<String, String>,
+    /// Non-secret TOML document rendered cleanly for this role.
+    pub non_secret_toml: String,
+    /// Secret `ZINDER_*` environment pairs scoped to this role.
+    pub secret_env: BTreeMap<String, SecretString>,
     /// Whether supervisor `/readyz` requires this role to be ready.
     pub required_for_readyz: bool,
+    pub(crate) validation_config: ZinderConfig,
+}
+
+impl fmt::Debug for RoleLaunchSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secret_keys: Vec<&str> = self.secret_env.keys().map(String::as_str).collect();
+        formatter
+            .debug_struct("RoleLaunchSpec")
+            .field("role", &self.role)
+            .field("non_secret_toml", &self.non_secret_toml)
+            .field("secret_env_keys", &secret_keys)
+            .field("required_for_readyz", &self.required_for_readyz)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Complete validated supervision plan across all active preset roles.
@@ -112,22 +127,14 @@ pub struct SupervisionPlan {
     pub query_listen_addr: Option<SocketAddr>,
     /// `ExplorerQuery` socket address when cipherscan depends on it.
     pub explorer_listen_addr: Option<SocketAddr>,
-    /// Ordered per-role filtered configurations matching active startup sequence.
+    /// Ordered per-role prepared configurations matching active startup sequence.
     pub roles: Vec<RoleLaunchSpec>,
     pub(crate) redacted_sections: validate::ValidatedRoleRenderings,
 }
 
-/// Error returned while loading, filtering, or validating unified `zinder` configuration.
+/// Error returned while loading, planning, or validating unified `zinder` configuration.
 #[derive(Debug, Error)]
 pub enum UnifiedConfigError {
-    /// Failed to read or parse the `--config` TOML file.
-    #[error("failed to load configuration file {path}: {detail}")]
-    ReadConfigFile {
-        /// File path that could not be read or parsed.
-        path: String,
-        /// Underlying failure reason.
-        detail: String,
-    },
     /// Layered `zinder-runtime` config loader failure.
     #[error(transparent)]
     Config(#[from] zinder_runtime::ConfigError),
@@ -142,12 +149,9 @@ pub enum UnifiedConfigError {
         /// Authoritative error message emitted by the role crate.
         detail: String,
     },
-    /// Temporary directory creation failed during validation.
-    #[error("failed to create temporary validation config directory: {0}")]
-    TempIo(#[from] std::io::Error),
 }
 
-/// Loads, filters, cross-validates, and renders configuration for every active role.
+/// Loads, plans, cross-validates, and renders configuration for every active role.
 pub fn prepare_supervision_plan(
     scope: &ConfigScope,
 ) -> Result<SupervisionPlan, UnifiedConfigError> {
@@ -163,7 +167,7 @@ where
     I: IntoIterator<Item = (String, String)>,
 {
     let env_entries: Vec<(String, String)> = environment.into_iter().collect();
-    let mut plan = filter::build_supervision_plan(scope, &env_entries)?;
+    let mut plan = plan::build_supervision_plan(scope, &env_entries)?;
     plan.redacted_sections = validate::validate_all_roles(&plan)?;
     Ok(plan)
 }

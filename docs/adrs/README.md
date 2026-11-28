@@ -56,7 +56,7 @@ stop the debate from being repeated.
 | [0003](0003-epoch-bound-reads-and-storage-roles.md) | Epoch-bound reads and storage roles | Indexed lookups bind to one chain epoch or event fence, compatibility block ranges join chunks by hash, node-backed reads bind to the served tip, and each store has exactly one writer with secondary readers. |
 | [0004](0004-storage-and-deployment-topologies.md) | Storage and deployment topologies | Canonical and projection storage stay separate, and each deployment runs one topology. Single-host RocksDB (including RWO Kubernetes `StatefulSet`) is supported; horizontal `Deployment`/serverless topologies wait on PostgreSQL. |
 | [0005](0005-bounded-process-memory.md) | Bounded process memory | Process memory is bounded independently of store size, and service binaries allocate through jemalloc. |
-| [0006](0006-node-source-boundary.md) | Node source boundary | Node adapters sit behind one source boundary, separate from the protocols Zinder serves. |
+| [0006](0006-node-source-boundary.md) | Node source boundary | Admitted validator RPCs are the upstream authority. Archive construction and pruned live following have distinct admission rules. |
 | [0007](0007-node-failure-recovery-and-transport-policy.md) | Node failure recovery and transport policy | Ingest recovers from node failures, and each upstream transport owns its own policy. |
 | [0008](0008-consensus-parameters-from-the-node.md) | Consensus parameters from the node | Network-upgrade parameters come from the running node and are admitted by the canonical writer. |
 | [0009](0009-ingest-lifecycle-and-construction.md) | Ingest lifecycle and construction | One ingest process builds the store, then follows the tip. |
@@ -72,9 +72,11 @@ stop the debate from being repeated.
 | [0019](0019-explorer-plane.md) | Explorer plane | The Explorer is an optional runtime over canonical data with explicit freshness and typed privacy refusals. |
 | [0020](0020-materialized-views.md) | Materialized views | Explorer views are rebuildable projections with exact per-view schema admission and explicit coverage. |
 | [0021](0021-shared-configuration-sections.md) | Shared configuration sections | Shared configuration sections live in `zinder-runtime` with zero-TOML `ZINDER_*` env-first loading, `storage.data_dir` derivation, sibling-section tolerance, and inline secret injection. |
-| [0022](0022-release-artifacts.md) | Release artifacts | Releases ship a single reproducible GNU/Linux `zinder` binary archive and single distroless OCI image with signatures, provenance, and SBOMs. |
+| [0022](0022-release-artifacts.md) | Release artifacts | Reproducible native archives and one OCI image ship with provenance. SDK distribution follows the versioned wire contract. |
 | [0023](0023-deployment-profiles.md) | Deployment profiles | Presets (`light-wallet`, `wallet`, `explorer`) plus orthogonal `--full-blocks` coordinate what Zinder's writers store and what its readers serve. |
-| [0024](0024-verified-edge-snapshot-bootstrap.md) | Verified edge snapshot bootstrap | Publisher signatures and validator attestation admit a private canonical checkpoint before it becomes a writer. |
+| [0024](0024-verified-edge-snapshot-bootstrap.md) | Verified edge snapshot bootstrap | Publisher signatures and validator attestation admit a private checkpoint. The ratified shared settled-segment pool uses a signed HTTPS catalog. |
+| [0025](0025-oblivious-http-gateway-boundary.md) | Oblivious HTTP gateway boundary | An external gateway terminates bounded wallet calls and keeps HPKE keys outside Zinder. |
+| [0026](0026-private-information-retrieval-sidecar-boundary.md) | Single-server PIR sidecar boundary | An external PIR service consumes immutable sealed segments after a scheme and wallet agree on shard records. |
 
 ## Earlier numbering
 

@@ -1,52 +1,30 @@
-//! Keeps `zinder_runtime::ENVIRONMENT_VARIABLES` aligned with the variables
-//! the `zinder-explorer` loader accepts.
+//! Binary smoke checks for unified `ZinderConfig` environment parsing on `zinder-explorer`.
 
-use zinder_runtime::ENVIRONMENT_VARIABLES;
-use zinder_testkit::EnvVarContractProbe;
+use std::process::Command;
 
-const BINARY: &str = "zinder-explorer";
-
-// `[storage]` and `[node]` are shared section types; the explorer fixes its
-// catchup cadence, never gates startup on catchup, and does not read the
-// indexer stream.
-const ACCEPTED_BUT_UNCONSUMED: &[&str] = &[
-    "ZINDER_NODE__INDEXER_GRPC_ADDR",
-    "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
-    "ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM",
-    "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH",
-    "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM",
-    "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH",
-    "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM",
-    "ZINDER_NODE__INDEXER_TLS__SERVER_NAME",
-    "ZINDER_NODE_FALLBACKS__<N>__INDEXER_GRPC_ADDR",
-    "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CA_CERT_PATH",
-    "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CA_CERT_PEM",
-    "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PATH",
-    "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PEM",
-    "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PATH",
-    "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PEM",
-    "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__SERVER_NAME",
-    "ZINDER_STORAGE__FULL_BLOCKS",
-    "ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS",
-    "ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS",
-    "ZINDER_STORAGE__SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS",
-];
-
-fn documented_variables() -> impl Iterator<Item = &'static str> {
-    ENVIRONMENT_VARIABLES
-        .iter()
-        .filter(|env_var| env_var.is_used_by(BINARY))
-        .map(|env_var| env_var.name)
+fn print_config_with_env(pairs: &[(&str, &str)]) -> eyre::Result<std::process::Output> {
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-explorer"));
+    command.env_clear().arg("--print-config");
+    command.env("ZINDER_NETWORK__NAME", "zcash-regtest");
+    for (name, env_val) in pairs {
+        command.env(name, env_val);
+    }
+    Ok(command.output()?)
 }
 
 #[test]
-fn every_documented_variable_is_accepted_by_the_loader() -> eyre::Result<()> {
-    EnvVarContractProbe::new(zinder_testkit::bin_exe!("zinder-explorer"))
-        .check_documented_variables_are_accepted(documented_variables())
-}
+fn shared_schema_env_vars_are_accepted_and_empty_or_unknown_keys_are_rejected() -> eyre::Result<()>
+{
+    let ok = print_config_with_env(&[("ZINDER_INGEST__SOURCE", "zebra-json-rpc")])?;
+    assert!(ok.status.success(), "{ok:?}");
 
-#[test]
-fn every_variable_the_loader_accepts_is_documented() -> eyre::Result<()> {
-    EnvVarContractProbe::new(zinder_testkit::bin_exe!("zinder-explorer"))
-        .check_accepted_variables_are_documented(documented_variables(), ACCEPTED_BUT_UNCONSUMED)
+    let unknown = print_config_with_env(&[("ZINDER_UNKNOWN_SECTION__PATH", "x")])?;
+    assert!(!unknown.status.success(), "{unknown:?}");
+
+    let nested = print_config_with_env(&[("ZINDER_OPS__LISTEN_ADDR__PORT", "9069")])?;
+    assert!(!nested.status.success(), "{nested:?}");
+
+    let empty = print_config_with_env(&[("ZINDER_OPS__LISTEN_ADDR", "")])?;
+    assert!(!empty.status.success(), "{empty:?}");
+    Ok(())
 }

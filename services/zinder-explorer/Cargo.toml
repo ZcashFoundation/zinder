@@ -13,10 +13,8 @@ publish.workspace = true
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
-config.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
-serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }

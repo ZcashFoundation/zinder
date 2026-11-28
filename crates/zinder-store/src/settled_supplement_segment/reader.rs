@@ -15,13 +15,13 @@ use std::{
 
 use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
-use zinder_core::{BlockHash, BlockHeight, CompactBlockArtifact};
+use zinder_core::{BlockHash, BlockHeaderArtifact, BlockHeight, CompactBlockArtifact};
 use zinder_proto::compat::lightwalletd::EncodedBlock;
 use zstd::bulk::Decompressor;
 
 use crate::{
     HeightOrder,
-    positional_source::{ByteRange, PositionalByteSource},
+    positional_source::{ByteRange, PositionalByteSource, SegmentSource},
     segment_verity,
 };
 
@@ -942,7 +942,7 @@ impl ChunkCache {
 
 /// Authenticated positional reader for one settled `ZSTSUP01` supplement segment.
 pub struct SettledSupplementSegmentReader<S = File> {
-    source: S,
+    source: SegmentSource<S>,
     index: SettledSupplementSegmentIndex,
     cache_id: Arc<()>,
 }
@@ -990,7 +990,12 @@ impl SettledSupplementSegmentReader<File> {
         if options.require_fs_verity && !verity_verified {
             return Err(SettledSupplementSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(file, expected, options, verity_verified)
+        Self::admit_with_verity(
+            SegmentSource::file(file, "supplement"),
+            expected,
+            options,
+            verity_verified,
+        )
     }
 }
 
@@ -1010,11 +1015,21 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         if options.require_fs_verity {
             return Err(SettledSupplementSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(source, expected, options, false)
+        Self::admit_with_verity(SegmentSource::unmeasured(source), expected, options, false)
+    }
+
+    pub(crate) fn index_heap_bytes(&self) -> usize {
+        std::mem::size_of_val(self.index.rows.as_ref())
+            + std::mem::size_of_val(self.index.chunks.as_ref())
+            + self
+                .index
+                .row_index_page_digests
+                .as_deref()
+                .map_or(0, std::mem::size_of_val)
     }
 
     fn admit_with_verity(
-        source: S,
+        source: SegmentSource<S>,
         expected: &SupplementSegmentIdentity,
         options: SettledSupplementSegmentOpenOptions,
         kernel_verified: bool,
@@ -1302,6 +1317,27 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         start_height: BlockHeight,
         end_height: BlockHeight,
     ) -> Result<Vec<BlockSupplementRecord>, SettledSupplementSegmentError> {
+        self.read_range_checked(start_height, end_height, None)
+    }
+
+    /// Reads supplements whose authenticated envelopes match the given contiguous headers.
+    pub(crate) fn read_range_for_headers(
+        &self,
+        headers: &[BlockHeaderArtifact],
+    ) -> Result<Vec<BlockSupplementRecord>, SettledSupplementSegmentError> {
+        let Some(first) = headers.first() else {
+            return Ok(Vec::new());
+        };
+        let end_height = self.end_height_for_count(first.height, headers.len())?;
+        self.read_range_checked(first.height, end_height, Some(headers))
+    }
+
+    fn read_range_checked(
+        &self,
+        start_height: BlockHeight,
+        end_height: BlockHeight,
+        headers: Option<&[BlockHeaderArtifact]>,
+    ) -> Result<Vec<BlockSupplementRecord>, SettledSupplementSegmentError> {
         let plan = self.index.plan_block_range(start_height, end_height)?;
         let row_range = plan.row_index_range();
         let raw_row_index = self
@@ -1316,6 +1352,19 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
                     row_range.offset,
                     &raw_row_index,
                 ))?;
+        if let Some(headers) = headers {
+            for (offset, header) in headers.iter().enumerate() {
+                let row_idx = plan.first_row() + offset;
+                let entry = verified_rows.entry(row_idx)?;
+                let envelope = expected_envelope_from_slice(
+                    &self.index.header,
+                    row_idx,
+                    &entry,
+                    verified_rows,
+                )?;
+                verify_header_identity(envelope, header)?;
+            }
+        }
         let mut records = Vec::with_capacity(plan.last_row() - plan.first_row() + 1);
         for step in plan.chunks() {
             records.extend(self.read_chunk_rows(step, verified_rows)?);
@@ -1941,6 +1990,23 @@ fn expected_envelope_from_slice(
         prev_hash_wire,
         block_time: entry.block_time,
     })
+}
+
+fn verify_header_identity(
+    envelope: BlockEnvelopeIdentity,
+    header: &BlockHeaderArtifact,
+) -> Result<(), SettledSupplementSegmentError> {
+    if header.height != envelope.height
+        || header.block_hash != block_hash_wire_to_domain(&envelope.block_hash_wire)?
+        || header.parent_hash != block_hash_wire_to_domain(&envelope.prev_hash_wire)?
+        || header.block_time != i64::from(envelope.block_time)
+    {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(format!(
+            "block_header at height {} disagrees with ZSTSUP01 envelope",
+            header.height.value()
+        )));
+    }
+    Ok(())
 }
 
 fn verify_reconstructed_identity(

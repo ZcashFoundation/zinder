@@ -771,18 +771,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "config"
-version = "0.15.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38e9fbc53afcec54441422f1c596cd054655b32e70e1cbac956651b7b175a404"
-dependencies = [
- "pathdiff",
- "serde_core",
- "toml",
- "winnow 1.0.5",
-]
-
-[[package]]
 name = "const-hex"
 version = "1.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3047,12 +3035,6 @@ dependencies = [
  "subtle",
  "zeroize",
 ]
-
-[[package]]
-name = "pathdiff"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "pem"
@@ -6284,6 +6266,7 @@ dependencies = [
  "prost",
  "reqwest",
  "rustix",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -6408,7 +6391,6 @@ version = "0.28.0"
 dependencies = [
  "axum",
  "clap",
- "config",
  "eyre",
  "hex",
  "parking_lot 0.13.0",
@@ -6446,7 +6428,6 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "clap",
- "config",
  "eyre",
  "futures-util",
  "hex",
@@ -6523,12 +6504,10 @@ version = "0.28.0"
 dependencies = [
  "async-trait",
  "clap",
- "config",
  "eyre",
  "hex",
  "parking_lot 0.13.0",
  "prost",
- "serde",
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
@@ -6561,7 +6540,6 @@ version = "0.28.0"
 dependencies = [
  "async-trait",
  "clap",
- "config",
  "eyre",
  "futures-util",
  "hex",
@@ -6683,7 +6661,6 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "clap",
- "config",
  "eyre",
  "futures-util",
  "hex",
@@ -6694,7 +6671,6 @@ dependencies = [
  "prost",
  "reqwest",
  "rust-rocksdb",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -6739,7 +6715,6 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "clap",
- "config",
  "eyre",
  "flate2",
  "futures-util",

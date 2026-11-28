@@ -1,23 +1,15 @@
-use std::path::Path;
-
-use tempfile::TempDir;
 use toml::Value as TomlValue;
 use zinder_compat_cipherscan::runtime::{
-    CipherscanConfigOverrides, cipherscan_config_toml, load_cipherscan_config_with_env,
+    cipherscan_config_toml, resolve_cipherscan_config_from_raw,
 };
 use zinder_compat_lightwalletd::runtime::{
-    LightwalletdConfigOverrides, lightwalletd_config_toml, load_lightwalletd_config_with_env,
+    lightwalletd_config_toml, resolve_lightwalletd_config_from_raw,
 };
-use zinder_explorer::runtime::{
-    ExplorerConfigOverrides, explorer_config_toml, load_explorer_config_with_env,
-};
-use zinder_ingest::runtime::{
-    IngestConfigOverrides, load_ingest_config_with_env, redacted_ingest_config_toml,
-};
-use zinder_projector::runtime::{
-    ProjectorConfigOverrides, load_projector_config_with_env, projector_config_toml,
-};
-use zinder_query::runtime::{QueryConfigOverrides, load_query_config_with_env, query_config_toml};
+use zinder_explorer::runtime::{explorer_config_toml, resolve_explorer_config_from_raw};
+use zinder_ingest::runtime::{redacted_ingest_config_toml, resolve_ingest_config_from_raw};
+use zinder_projector::runtime::{projector_config_toml, resolve_projector_config_from_raw};
+use zinder_query::runtime::{query_config_toml, resolve_query_config_from_raw};
+use zinder_runtime::OpsSection;
 
 use crate::cli::ServiceRole;
 
@@ -26,14 +18,12 @@ use super::{RoleLaunchSpec, SupervisionPlan, UnifiedConfigError};
 /// Collected per-role redacted TOML outputs produced during validation.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ValidatedRoleRenderings {
-    pub(super) ops_listen_addr: String,
     pub(super) role_tomls: Vec<(ServiceRole, String)>,
 }
 
 pub(super) fn validate_all_roles(
     plan: &SupervisionPlan,
 ) -> Result<ValidatedRoleRenderings, UnifiedConfigError> {
-    let dir = TempDir::new()?;
     let mut role_tomls = Vec::with_capacity(plan.roles.len());
     let has_wallet_query_consumers = plan.roles.iter().any(|spec| {
         matches!(
@@ -42,70 +32,34 @@ pub(super) fn validate_all_roles(
         )
     });
 
-    for (idx, spec) in plan.roles.iter().enumerate() {
-        let toml_path = write_validation_toml(dir.path(), idx, spec)?;
-        let env_pairs = validation_env_for(spec);
-        let rendered =
-            validate_single_role(spec.role, &toml_path, env_pairs, has_wallet_query_consumers)?;
+    for spec in &plan.roles {
+        let rendered = validate_single_role(spec, has_wallet_query_consumers)?;
         role_tomls.push((spec.role, rendered));
     }
 
-    Ok(ValidatedRoleRenderings {
-        ops_listen_addr: plan
-            .ops_listen_addr
-            .map_or_else(String::new, |addr| addr.to_string()),
-        role_tomls,
-    })
-}
-
-fn write_validation_toml(
-    dir: &Path,
-    index: usize,
-    spec: &RoleLaunchSpec,
-) -> Result<std::path::PathBuf, UnifiedConfigError> {
-    let path = dir.join(format!("{index}-{}.toml", spec.role.label()));
-    std::fs::write(&path, &spec.filtered_toml)?;
-    Ok(path)
-}
-
-fn validation_env_for(spec: &RoleLaunchSpec) -> Vec<(String, String)> {
-    let mut env_pairs: Vec<(String, String)> = spec
-        .filtered_env
-        .iter()
-        .map(|(key, env_val)| (key.clone(), env_val.clone()))
-        .collect();
-    // Validation disables child ops listeners so role validation never reflects stale ports.
-    env_pairs.push(("ZINDER_OPS__LISTEN_ADDR".to_owned(), String::new()));
-    env_pairs
+    Ok(ValidatedRoleRenderings { role_tomls })
 }
 
 fn validate_single_role(
-    role: ServiceRole,
-    toml_path: &Path,
-    env_pairs: Vec<(String, String)>,
+    spec: &RoleLaunchSpec,
     has_wallet_query_consumers: bool,
 ) -> Result<String, UnifiedConfigError> {
-    let path_opt = Some(toml_path.to_path_buf());
+    let role = spec.role;
+    let raw = spec.validation_config.clone();
     match role {
         ServiceRole::Ingest => {
-            let loaded =
-                load_ingest_config_with_env(path_opt, IngestConfigOverrides::default(), env_pairs)
-                    .map_err(|err| role_err(role, &err.to_string()))?;
+            let loaded = resolve_ingest_config_from_raw(raw)
+                .map_err(|err| role_err(role, &err.to_string()))?;
             redacted_ingest_config_toml(&loaded).map_err(|err| role_err(role, &err.to_string()))
         }
         ServiceRole::Projector => {
-            let loaded = load_projector_config_with_env(
-                path_opt,
-                ProjectorConfigOverrides::default(),
-                env_pairs,
-            )
-            .map_err(|err| role_err(role, &err.to_string()))?;
+            let loaded = resolve_projector_config_from_raw(raw)
+                .map_err(|err| role_err(role, &err.to_string()))?;
             projector_config_toml(&loaded).map_err(|err| role_err(role, &err.to_string()))
         }
         ServiceRole::Query => {
-            let loaded =
-                load_query_config_with_env(path_opt, QueryConfigOverrides::default(), env_pairs)
-                    .map_err(|err| role_err(role, &err.to_string()))?;
+            let loaded = resolve_query_config_from_raw(raw)
+                .map_err(|err| role_err(role, &err.to_string()))?;
             if has_wallet_query_consumers && loaded.proxy_protocol.is_enabled() {
                 return Err(role_err(
                     role,
@@ -115,30 +69,18 @@ fn validate_single_role(
             query_config_toml(&loaded).map_err(|err| role_err(role, &err.to_string()))
         }
         ServiceRole::CompatLightwalletd => {
-            let loaded = load_lightwalletd_config_with_env(
-                path_opt,
-                LightwalletdConfigOverrides::default(),
-                env_pairs,
-            )
-            .map_err(|err| role_err(role, &err.to_string()))?;
+            let loaded = resolve_lightwalletd_config_from_raw(raw)
+                .map_err(|err| role_err(role, &err.to_string()))?;
             lightwalletd_config_toml(&loaded).map_err(|err| role_err(role, &err.to_string()))
         }
         ServiceRole::Explorer => {
-            let loaded = load_explorer_config_with_env(
-                path_opt,
-                ExplorerConfigOverrides::default(),
-                env_pairs,
-            )
-            .map_err(|err| role_err(role, &err.to_string()))?;
+            let loaded = resolve_explorer_config_from_raw(raw)
+                .map_err(|err| role_err(role, &err.to_string()))?;
             explorer_config_toml(&loaded).map_err(|err| role_err(role, &err.to_string()))
         }
         ServiceRole::CompatCipherscan => {
-            let loaded = load_cipherscan_config_with_env(
-                path_opt,
-                CipherscanConfigOverrides::default(),
-                env_pairs,
-            )
-            .map_err(|err| role_err(role, &err.to_string()))?;
+            let loaded = resolve_cipherscan_config_from_raw(raw)
+                .map_err(|err| role_err(role, &err.to_string()))?;
             cipherscan_config_toml(&loaded).map_err(|err| role_err(role, &err.to_string()))
         }
     }
@@ -160,12 +102,10 @@ pub fn render_combined_redacted_toml(plan: &SupervisionPlan) -> String {
             merge_role_rendered_table(&mut combined, *role, parsed);
         }
     }
-    let mut ops_tbl = toml::Table::new();
-    ops_tbl.insert(
-        "listen_addr".to_owned(),
-        TomlValue::String(plan.redacted_sections.ops_listen_addr.clone()),
-    );
-    combined.insert("ops".to_owned(), TomlValue::Table(ops_tbl));
+    let ops_section = OpsSection::from_resolved(plan.ops_listen_addr);
+    if let Ok(ops_tbl) = toml::Table::try_from(ops_section) {
+        combined.insert("ops".to_owned(), TomlValue::Table(ops_tbl));
+    }
 
     toml::to_string_pretty(&combined).unwrap_or_default()
 }
