@@ -284,7 +284,52 @@ fn a_bounded_read_its_first_block_fills_fetches_only_that_block()
                 "a {order:?} read with a {max_bytes}-byte budget must fetch one row"
             );
         }
+        assert_encoded_prefix_on_stale_secondary(&store, secondary, *order, *first)?;
     }
+    Ok(())
+}
+
+fn assert_encoded_prefix_on_stale_secondary(
+    primary: &RocksDbCanonicalStore,
+    secondary: &RocksDbCanonicalSecondary,
+    order: HeightOrder,
+    first: BlockHeight,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::{
+        EncodedCompactBlockOutput, EncodedCompactBlockPayload, EncodedCompactBlockRangeRequest,
+        ShieldedProjectionSelection,
+    };
+
+    let mut request = EncodedCompactBlockRangeRequest {
+        range: BlockHeightRange::inclusive(first, first),
+        order,
+        selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+        include_transparent: false,
+        output: EncodedCompactBlockOutput::Blocks,
+        max_bytes: usize::MAX,
+        enforce_wire_fee_limit: true,
+    };
+    let expected = primary
+        .encoded_compact_block_range_up_to(request, None)?
+        .ok_or("expected encoded prefix from the primary")?;
+    let EncodedCompactBlockPayload::Blocks(frames) = expected.payload else {
+        return Err("expected individual frames".into());
+    };
+    request.range = split_heights();
+    request.max_bytes = frames.first().ok_or("expected first frame")?.payload_len();
+    let prefix = secondary
+        .encoded_compact_block_range_up_to(request, None)?
+        .ok_or("expected encoded prefix from the stale secondary")?;
+    assert_eq!(prefix.block_count, 1);
+    assert_eq!(prefix.first_link, expected.first_link);
+    assert_eq!(prefix.last_link, expected.last_link);
+
+    request.max_bytes = usize::MAX;
+    assert!(
+        secondary
+            .encoded_compact_block_range_up_to(request, None)
+            .is_err_and(|error| error.is_missing_table_file())
+    );
     Ok(())
 }
 
@@ -3470,7 +3515,11 @@ fn encoded_range_and_unary_reads_have_bounded_lookups_and_zero_table_scans()
     )?;
 
     // 1. Settled-only shielded range (1..=4,096): zero RocksDB MultiGet/seek/next/prev, zero ZSTSUP01 opens.
-    secondary.segment_cache.clear();
+    let segment_cache = secondary
+        .segment_context()
+        .segment_cache
+        .ok_or("secondary segment cache is missing")?;
+    segment_cache.clear();
     let before = range_read_tickers(&secondary);
     let scan_before = capture_db_scan_ticker(&secondary);
     let settled_shielded = secondary
@@ -3492,18 +3541,8 @@ fn encoded_range_and_unary_reads_have_bounded_lookups_and_zero_table_scans()
     let delta = range_read_tickers(&secondary).since(before);
     assert_eq!(delta.multi_get_calls, 0);
     assert_eq!(delta.multi_get_keys, 0);
-    assert_eq!(
-        secondary
-            .segment_cache
-            .open_count(SettledSegmentKind::Shielded),
-        1
-    );
-    assert_eq!(
-        secondary
-            .segment_cache
-            .open_count(SettledSegmentKind::Supplement),
-        0
-    );
+    assert_eq!(segment_cache.open_count(SettledSegmentKind::Shielded), 1);
+    assert_eq!(segment_cache.open_count(SettledSegmentKind::Supplement), 0);
 
     assert_boundary_range_tickers(&secondary)?;
     assert_unary_lookup_tickers(&secondary)?;
@@ -3541,8 +3580,7 @@ fn assert_boundary_range_tickers(
         assert_eq!(boundary.block_count, 10);
         assert_zero_table_scans(secondary, before, scan_before);
         let delta = range_read_tickers(secondary).since(before);
-        // Probe batch (1 key) learns largest_live_row_bytes; second MultiGet fetches the remaining 7 keys.
-        assert_eq!(delta.multi_get_calls, 2);
+        assert_eq!(delta.multi_get_calls, 1);
         assert_eq!(delta.multi_get_keys, 8);
     }
 

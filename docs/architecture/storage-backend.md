@@ -57,6 +57,15 @@ under `<store_root>/segments/`:
 | `mempool_event` | Retained mempool history |
 | `displaced_block_facts` | Full `CanonicalBlockFacts` archived for blocks replaced by a reorg |
 
+`ZSLVTL01` header flag bit 3 records that the writer checked the supplement
+for fees wider than the lightwalletd `u32` field. Bit 4 records that at least
+one such fee is present. A shielded read verifies the whole row digest and
+uses these bits to skip parsing the supplement and facts when a supplement is
+present. Readers scan the supplement in older rows with bit 3 clear. New
+releases can open existing Schema v2 stores in place. To roll back to a release
+that predates the flags, restore a backup or snapshot made before the upgrade,
+or rebuild the canonical store and its dependent projections in clean paths.
+
 At `READY` publication, fresh construction stages SSTs for the seven bulk
 families (`block_hash_index`, `block_header`, `live_tail_block`,
 `live_tail_raw_block`, `settled_segment_index`, `transaction_location`,
@@ -186,7 +195,12 @@ unsealed heights `> sealed_tip`):
   (`encoded_compact_block_range_up_to`) reads `ZSHRNG02` `Slab 0` through
   `SettledSegmentReaderCache` (using sans-I/O `ByteRange` plans) and
   `live_tail_block`, verifying frame lengths, digests, and `(height, block_hash,
-  previous_block_hash)` linkage across segment and tail boundaries.
+  previous_block_hash)` linkage across segment and tail boundaries. Each
+  secondary lazily caches validated shielded frames above `settled_tip` for
+  its current READY generation. The cache retains up to 5 MiB and serves
+  admitted rows without another MultiGet. A changed READY generation starts
+  with an empty cache. Before row sizes are known, encoded range reads
+  request up to 16 rows in their first batch.
 - Full `CompactBlockArtifact` and `CanonicalBlockFacts` reads splice `ZSHRNG02`
   plus `ZSTSUP01` for settled heights and decode `ZSLVTL01` rows in `MultiGet`
   batches for unsealed tail heights:
@@ -196,8 +210,8 @@ unsealed heights `> sealed_tip`):
     fence share a reconstruction; the last caller to leave cancels the work.
     Each query runtime caches up to `256` settled answers scoped to the epoch,
     sequence digest, and retained history.
-  - A byte-bounded read fetches one row first, then adapts subsequent batch sizes
-    from `1` to `16` within the remaining byte budget.
+  - A byte-bounded artifact read fetches one row to learn its size, then
+    adapts subsequent batches from `1` to `16` within the remaining budget.
 
 Reads verify block height linkage across every decoded row and fail on missing
 rows inside retained history as store damage. Compact-block payload range reads
