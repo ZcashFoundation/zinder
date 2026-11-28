@@ -823,7 +823,14 @@ fn try_drain_projector_batch(
     transitions: &mut u32,
     active_writer: bool,
 ) -> Result<(usize, bool), BenchError> {
-    if let Err(err) = catch_up_canonical_secondary(secondary) {
+    let catch_up = if active_writer {
+        secondary
+            .try_catch_up_following()
+            .and_then(|_| secondary.chain_epoch())
+    } else {
+        catch_up_canonical_secondary(secondary)
+    };
+    if let Err(err) = catch_up {
         if err.is_missing_table_file() {
             return Ok((0, true));
         }

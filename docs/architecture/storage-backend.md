@@ -378,12 +378,12 @@ flush them itself. Its memory can therefore exceed `memtable_budget_bytes`.
 For each store role, the reader reports the sum of the budgets and the sum of
 usage across its open generations.
 
-During active-writer following, the wallet projector retries a replay
-transition once if its canonical secondary cannot see a live-tail row at or
-below the admitted tip. It opens a fresh secondary, validates READY and the
-previous fence, and checks the writer's attestation before retrying. If
-admission or the retry fails, the projector stops without publishing the
-transition.
+During active-writer following, a missing live-tail row can trigger one
+canonical secondary reopen during catch-up or wallet replay. The fresh
+secondary shares the projector's block cache and must validate READY and the
+previous fence. The projector checks the writer's fence and network upgrade
+schedule before it applies replay. If recovery fails, it stops without
+publishing the transition.
 
 ## Read interfaces
 

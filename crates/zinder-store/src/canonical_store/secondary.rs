@@ -329,9 +329,18 @@ impl RocksDbCanonicalSecondary {
         &mut self,
         height: BlockHeight,
     ) -> Result<(), CanonicalStoreError> {
+        *self = self.open_live_tail_recovery(height, &self.ready_evidence)?;
+        Ok(())
+    }
+
+    fn open_live_tail_recovery(
+        &self,
+        height: BlockHeight,
+        observed_ready: &CanonicalStoreReadyEvidence,
+    ) -> Result<Self, CanonicalStoreError> {
         let before = self.event_fence();
-        if height < self.ready_evidence.first_retained_block.height
-            || height > before.visible_tip().height
+        if height < observed_ready.first_retained_block.height
+            || height > observed_ready.visible_tip.height
         {
             return Err(CanonicalStoreError::MissingLiveTailReplay { height });
         }
@@ -340,6 +349,7 @@ impl RocksDbCanonicalSecondary {
             event = "canonical_secondary_live_tail_reopen",
             missing_height = height.value(),
             visible_height = before.visible_tip().height.value(),
+            replay_tip_height = observed_ready.visible_tip.height.value(),
             event_sequence = before.chain_event_sequence(),
             "reopening canonical secondary after an admitted live-tail replay row was missing"
         );
@@ -360,13 +370,20 @@ impl RocksDbCanonicalSecondary {
             self.open_settings.column_families,
         )?;
         self.validate_reopened_fence(&fresh, before)?;
+        if fresh.ready_evidence.visible_event_sequence <= observed_ready.visible_event_sequence
+            && fresh.ready_evidence != *observed_ready
+        {
+            return Err(CanonicalStoreError::admission(
+                self.primary_path(),
+                "reopened secondary did not reach the READY fence observed during replay",
+            ));
+        }
         fresh
             .open_settings
             .secondary_path
             .clone_from(&self.open_settings.secondary_path);
         fresh.open_settings.recovery_directory = Some(directory);
-        *self = fresh;
-        Ok(())
+        Ok(fresh)
     }
 
     fn validate_reopened_fence(
@@ -508,6 +525,24 @@ impl RocksDbCanonicalSecondary {
     pub fn try_catch_up(
         &mut self,
     ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
+        self.catch_up(false)
+    }
+
+    /// Catches up an active writer follower, reopening once if a live replay
+    /// row needed to authenticate the newly visible READY fence is absent.
+    ///
+    /// The reopen must independently admit READY at or past the observed
+    /// fence and preserve continuity with the last admitted fence.
+    pub fn try_catch_up_following(
+        &mut self,
+    ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
+        self.catch_up(true)
+    }
+
+    fn catch_up(
+        &mut self,
+        recover_missing_live_tail: bool,
+    ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
         let before = self.event_fence();
         self.bounded_open
             .db
@@ -551,22 +586,20 @@ impl RocksDbCanonicalSecondary {
         let updated_sealed_segments = self.sync_settled_segments_on_catch_up(&ready_evidence)?;
         // Unchanged READY evidence is still explained by the tail this reader
         // already authenticated; otherwise re-derive only what changed.
-        if ready_changed {
-            let active_sealed = updated_sealed_segments
-                .as_deref()
-                .unwrap_or(&self.sealed_segments);
-            let ctx = SegmentStoreContext {
-                db: &self.bounded_open.db,
-                segment_cache: Some(&self.segment_cache),
-                sealed_segments: Some(active_sealed),
-            };
-            follow_ready_replay_tail(
-                ctx,
-                self.reorg_policy,
-                &self.ready_evidence,
-                &ready_evidence,
-                &mut self.replay_tail,
-            )?;
+        if ready_changed
+            && let Err(error) =
+                self.authenticate_catch_up_tail(&ready_evidence, updated_sealed_segments.as_deref())
+        {
+            if recover_missing_live_tail
+                && let CanonicalStoreError::MissingLiveTailReplay { height } = error
+            {
+                self.reopen_during_catch_up(height, &ready_evidence)?;
+                return Ok(CanonicalSecondaryCatchupOutcome {
+                    before,
+                    after: self.event_fence(),
+                });
+            }
+            return Err(error);
         }
         self.ready_evidence = ready_evidence;
         if let Some(entries) = updated_sealed_segments {
@@ -589,6 +622,44 @@ impl RocksDbCanonicalSecondary {
             before,
             after: self.event_fence(),
         })
+    }
+
+    fn authenticate_catch_up_tail(
+        &mut self,
+        ready_evidence: &CanonicalStoreReadyEvidence,
+        updated_sealed_segments: Option<&[SettledSegmentIndexEntry]>,
+    ) -> Result<(), CanonicalStoreError> {
+        let ctx = SegmentStoreContext {
+            db: &self.bounded_open.db,
+            segment_cache: Some(&self.segment_cache),
+            sealed_segments: Some(updated_sealed_segments.unwrap_or(&self.sealed_segments)),
+        };
+        follow_ready_replay_tail(
+            ctx,
+            self.reorg_policy,
+            &self.ready_evidence,
+            ready_evidence,
+            &mut self.replay_tail,
+        )
+    }
+
+    fn reopen_during_catch_up(
+        &mut self,
+        height: BlockHeight,
+        ready_evidence: &CanonicalStoreReadyEvidence,
+    ) -> Result<(), CanonicalStoreError> {
+        *self = self
+            .open_live_tail_recovery(height, ready_evidence)
+            .map_err(|error| {
+                // Followers retry missing SSTs on ordinary catch-up. A failed
+                // recovery open must end this attempt.
+                if error.is_missing_table_file() {
+                    CanonicalStoreError::admission(self.primary_path(), error.to_string())
+                } else {
+                    error
+                }
+            })?;
+        Ok(())
     }
 
     fn sync_settled_segments_on_catch_up(

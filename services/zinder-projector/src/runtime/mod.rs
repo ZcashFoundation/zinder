@@ -37,9 +37,10 @@ use zinder_runtime::{
     writer_attests_network_upgrade_schedule,
 };
 use zinder_store::{
-    CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalReorgPolicy,
-    CanonicalRetainedEvent, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    RocksDbCanonicalSecondary,
+    CanonicalActivationSchedule, CanonicalEventCursor, CanonicalEventFence,
+    CanonicalEventHistoryRequest, CanonicalReorgPolicy, CanonicalRetainedEvent,
+    CanonicalStoreError, CanonicalStoreReadyEvidence, RocksDbCanonicalSecondary,
+    SharedSecondaryResources,
 };
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
@@ -1530,7 +1531,12 @@ async fn attest_reopened_secondary(
 ) -> Result<(), ProjectorError> {
     let fence = expected_writer_fence(canonical.event_fence());
     let status = control.writer_status().await?;
-    match classify_canonical_writer_fence(&status, canonical.network(), &fence) {
+    match classify_reopened_writer_status(
+        &status,
+        canonical.network(),
+        &fence,
+        canonical.network_upgrade_schedule(),
+    )? {
         CanonicalFenceRelation::Matches => Ok(()),
         CanonicalFenceRelation::Diverged(error) => {
             Err(ProjectorError::CanonicalFenceDiverged(error))
@@ -1563,6 +1569,20 @@ async fn attest_reopened_secondary(
             Ok(())
         }
     }
+}
+
+fn classify_reopened_writer_status(
+    status: &zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+    network: zinder_core::Network,
+    fence: &zinder_proto::v1::ingest::CanonicalWriterFence,
+    schedule: Option<&CanonicalActivationSchedule>,
+) -> Result<CanonicalFenceRelation, ProjectorError> {
+    if !writer_attests_network_upgrade_schedule(status, schedule) {
+        return Err(ProjectorError::CanonicalEventPageInvalid {
+            reason: "writer did not attest the reopened secondary's network upgrade schedule",
+        });
+    }
+    Ok(classify_canonical_writer_fence(status, network, fence))
 }
 
 /// Executes one next retained-event transition.
@@ -2012,13 +2032,14 @@ fn open_canonical_secondary(
             source,
         }
     })?;
+    let resources = SharedSecondaryResources::new(config.canonical_rocksdb_budget);
     let canonical = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
         &config.canonical_path,
         &config.canonical_secondary_path,
         config.network,
         config.canonical_requirements(),
         reorg_policy,
-        config.canonical_rocksdb_budget,
+        &resources,
     )
     .map_err(|source| ProjectorError::CanonicalSecondaryOpen {
         primary_path: config.canonical_path.clone(),
@@ -2200,7 +2221,7 @@ impl CanonicalFenceProbe for LiveWriterFenceProbe<'_, '_> {
     > {
         std::future::ready(
             self.canonical
-                .try_catch_up()
+                .try_catch_up_following()
                 .map(|_| Some(expected_writer_fence(self.canonical.event_fence())))
                 .map_err(ProjectorError::from),
         )
@@ -3925,6 +3946,54 @@ mod tests {
             tip_unconfirmed: false,
             canonical_store_damaged: None,
         }
+    }
+
+    #[test]
+    fn reopened_secondary_requires_an_attested_schedule_for_both_fence_relations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let construction_fingerprint = activations
+            .fingerprint(zinder_core::NetworkUpgradeActivationsFingerprintVersion::CURRENT);
+        let schedule = super::CanonicalActivationSchedule::first_revision(
+            activations,
+            construction_fingerprint,
+            block_id(2, 0x44),
+        )?;
+        let attested_schedule = zinder_proto::wire::encode_canonical_network_upgrade_schedule(
+            schedule.activations(),
+            schedule.revision(),
+        );
+        let mut other_revision = attested_schedule.clone();
+        other_revision.revision += 1;
+        let fence = scripted_writer_fence(2);
+        for writer_sequence in [2, 3] {
+            let mut status = writer_status(source_identity(writer_sequence, 2));
+            status.fence = Some(scripted_writer_fence(writer_sequence));
+            status.network_upgrade_schedule = Some(attested_schedule.clone());
+            assert!(matches!(
+                super::classify_reopened_writer_status(
+                    &status,
+                    test_network(),
+                    &fence,
+                    Some(&schedule)
+                )?,
+                super::CanonicalFenceRelation::Matches
+                    | super::CanonicalFenceRelation::SecondaryBehind(_)
+            ));
+            status.network_upgrade_schedule = Some(other_revision.clone());
+            assert!(matches!(
+                super::classify_reopened_writer_status(
+                    &status,
+                    test_network(),
+                    &fence,
+                    Some(&schedule)
+                ),
+                Err(ProjectorError::CanonicalEventPageInvalid {
+                    reason: "writer did not attest the reopened secondary's network upgrade schedule"
+                })
+            ));
+        }
+        Ok(())
     }
 
     fn retention_lease(source: WalletCanonicalSourceIdentity) -> CanonicalRetentionLease {

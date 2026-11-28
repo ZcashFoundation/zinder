@@ -93,6 +93,47 @@ fn missing_live_tail_replay_fails_closed_when_a_reopen_cannot_admit_it()
     Ok(())
 }
 
+#[test]
+fn catch_up_attempts_one_reopen_when_the_new_ready_tip_row_is_missing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let mut secondary = open_adopting_secondary(&store_path, temporary.path().join("secondary"))??;
+    let before = secondary.event_fence();
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = append_block_five(store, &activations)?;
+    let height = store.event_fence().visible_tip().height;
+    assert!(height > before.visible_tip().height);
+    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    store.bounded_open.db.delete_cf(
+        &family,
+        zinder_core::wire::encode_height_key_ascending(height),
+    )?;
+    drop(family);
+
+    let capture = zinder_testkit::LogCapture::install_for_target("zinder::store");
+    assert!(matches!(
+        secondary.try_catch_up_following(),
+        Err(CanonicalStoreError::MissingLiveTailReplay { height: missing }) if missing == height
+    ));
+    let events = capture.events();
+    let attempts = events
+        .iter()
+        .filter(|event| event.field("event") == Some("canonical_secondary_live_tail_reopen"))
+        .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].field("visible_height"), Some("4"));
+    assert_eq!(attempts[0].field("replay_tip_height"), Some("5"));
+    assert_eq!(secondary.event_fence(), before);
+    Ok(())
+}
+
 fn hide_admitted_live_tail_row(
     root: &Path,
 ) -> Result<(RocksDbCanonicalStore, RocksDbCanonicalSecondary, Vec<u8>), Box<dyn std::error::Error>>
