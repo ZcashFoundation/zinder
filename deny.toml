@@ -6,6 +6,7 @@
 all-features = true
 
 [advisories]
+unmaintained = "all"
 ignore = [
     # Unmaintained notices with no known vulnerability. Both crates are
     # unconditional dependencies of the pinned zebra-chain 16.0.0. Remove each

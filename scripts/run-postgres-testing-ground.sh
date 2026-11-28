@@ -165,7 +165,7 @@ trap 'FAIL_EXIT_CODE=143; exit 143' TERM
 image_for_pg_version() {
   case "$1" in
     18)
-      echo "postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402"
+      echo "postgres:18.7-bookworm@sha256:e742a2668255221388004f3a42b6150a2103f5054ab3a4a93ae9e4f01e551c35"
       ;;
     17)
       echo "postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f"

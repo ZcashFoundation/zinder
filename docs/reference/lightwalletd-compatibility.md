@@ -464,8 +464,8 @@ For `GetMempoolTx`, both servers return `INVALID_ARGUMENT` for 20,001 through 40
 The vendored protocol and the images the parity suite runs are:
 
 - `lightwallet-protocol` `v0.6.0` (`299805c19011a027d2c48c5e912dd05041f76156`);
-- `lightwalletd` `v0.6.2` (`f8fe2cca7ede03b1f06b1d637a2ab467d151b79d`) as the source reference, which parses the version-6 transactions that NU6.3 introduced;
-- `electriccoinco/lightwalletd:v0.6.2@sha256:75e5742df686094556abef66e69c37bc114de23a0706712aee324f332ca52951`;
+- `lightwalletd` `v0.6.3` (`becbf995922d54a778ca360bfc3c743677679ab1`) as the source reference, which parses the version-6 transactions that NU6.3 introduced;
+- `electriccoinco/lightwalletd:v0.6.3@sha256:40d72a159150e152e099f888c154077273babb21ade60b2281ab932b7d2c752e`;
 - `docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba`, started on Regtest with `deploy/zebra/regtest.toml`, which activates every upgrade through NU7 (see [Regtest through NU7](../runbooks/testing.md#regtest-through-nu7));
 - `docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50`, started on Regtest with `deploy/zakura/regtest.toml`, which uses the same schedule.
 
