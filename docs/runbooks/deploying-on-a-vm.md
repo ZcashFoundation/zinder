@@ -206,6 +206,8 @@ Starting at `v0.28.0`, every release declares an `**Upgrade class:**` line at th
 
 Single-volume `rocksdb` hosts still restart every runtime at each release, whatever the class. For layout changes on `rocksdb`, keeping old and new store paths side by side for rollback is optional (~2x disk until you delete the old path); fallback rollback otherwise requires restoring a matching backup or snapshot ([Backups and Edge Snapshots](private-backups.md)) or rebuilding from empty in a clean path with the previous release. Seven-day superseded-schema retention applies strictly to future hosted `postgres` (planned M3, not yet implemented).
 
+> Hosts installed with the legacy single `/etc/zinder/env` file must complete the one-time [Migrate from legacy `/etc/zinder/env`](#migrate-from-legacy-etczinderenv) procedure before using the steady-state `/etc/zinder/deploy.env` upgrade steps below.
+
 1. Fetch tags, check out the release, and update `DEPLOY_VERSION` in `/etc/zinder/deploy.env`:
 
    ```bash
@@ -214,16 +216,89 @@ Single-volume `rocksdb` hosts still restart every runtime at each release, whate
    sudo sed -i 's/^DEPLOY_VERSION=.*/DEPLOY_VERSION=vX.Y.Z/' /etc/zinder/deploy.env
    ```
 
-2. Pull the new image before restarting:
+2. Pull the new image before restarting (add `-f /etc/zinder/docker-compose.override.yml` if you maintain an override file, or configure `COMPOSE_FILE` in `/etc/zinder/deploy.env`):
 
    ```bash
    cd /opt/zinder
    docker compose --env-file /etc/zinder/deploy.env -f deploy/docker-compose.yml pull
    ```
 
-3. Restart `sudo systemctl restart zinder` (or restart `zinder-index` then `zinder-serve` cleanly; readers stop serving 5 minutes after `zinder-index` stops).
+3. If the checked-out unit changed, reinstall `/opt/zinder/deploy/systemd/zinder.service` and reload systemd (`sudo cp /opt/zinder/deploy/systemd/zinder.service /etc/systemd/system/zinder.service && sudo systemctl daemon-reload`), keeping any `/etc/systemd/system/zinder.service.d/` drop-in aligned with your `/etc/zinder/docker-compose.override.yml`. Then restart `sudo systemctl restart zinder` (or restart `zinder-index` then `zinder-serve` cleanly; readers stop serving 5 minutes after `zinder-index` stops).
 
-To roll back across releases on `rocksdb`, apply the same multi-release rule across every version stepped back over: if all intervening releases are `compatible` or `additive-schema`, redeploy the earlier release against the existing store; if any intervening release between the running version and the rollback target is `projection-layout` or `canonical-layout`, start the earlier release against an optionally retained separate store path, restore a matching backup or snapshot, or rebuild the affected stores from empty in clean paths.
+To roll back across releases on `rocksdb`, apply the same multi-release rule across every version stepped back over: if all intervening releases are `compatible` or `additive-schema`, redeploy the earlier release against the existing store; if any intervening release between the running version and the rollback target is `projection-layout` or `canonical-layout`, start the earlier release against an optionally retained separate store path, restore a matching backup or snapshot, or rebuild the affected stores from empty in clean paths. If you are rolling back across the env-file split to a pre-split `/etc/zinder/env` release, follow [Roll back to a pre-split `/etc/zinder/env` release](#roll-back-to-a-pre-split-etczinderenv-release).
+
+### Migrate from legacy `/etc/zinder/env`
+
+Perform this one-time migration when upgrading a host whose installed systemd unit and configuration still use `/etc/zinder/env` (`ZINDER_DEPLOY_NETWORK` / `ZINDER_SOURCE_*`):
+
+1. Stop the legacy unit **before** updating `/opt/zinder`, while the running unit and `ExecStop` still match `/etc/zinder/env`, and leave `/etc/zinder/env` intact (plus backups of any `/etc/zinder/docker-compose.override.yml` and `/etc/systemd/system/zinder.service.d/` drop-ins) for rollback:
+
+   ```bash
+   sudo systemctl stop zinder
+   sudo cp -a /etc/zinder /etc/zinder.pre-split.bak
+   if [[ -d /etc/systemd/system/zinder.service.d ]]; then
+     sudo cp -a /etc/systemd/system/zinder.service.d /etc/zinder.pre-split.bak/zinder.service.d
+   fi
+   ```
+
+2. Fetch tags and check out the target release in `/opt/zinder`, then seed `/etc/zinder/deploy.env` and `/etc/zinder/zinder.env` from the matching `deploy/profiles/<name>/` pair (`mainnet`, `testnet`, `regtest`, `zakura-mainnet`, or `zakura-testnet`):
+
+   ```bash
+   sudo git -C /opt/zinder fetch --tags
+   sudo git -C /opt/zinder checkout vX.Y.Z
+   sudo cp /opt/zinder/deploy/profiles/mainnet/deploy.env /etc/zinder/deploy.env
+   sudo cp /opt/zinder/deploy/profiles/mainnet/zinder.env /etc/zinder/zinder.env
+   sudo sed -i 's|^DEPLOY_ZINDER_ENV=.*|DEPLOY_ZINDER_ENV=/etc/zinder/zinder.env|' /etc/zinder/deploy.env
+   echo 'DEPLOY_VERSION=vX.Y.Z' | sudo tee -a /etc/zinder/deploy.env >/dev/null
+   ```
+
+3. Split your custom overrides from legacy `/etc/zinder/env` into `/etc/zinder/deploy.env`, `/etc/zinder/zinder.env`, and optional writer-only `/etc/zinder/index.env` (preserving the Compose project and Docker volume names):
+
+   | Legacy `/etc/zinder/env` key | New destination and key |
+   | --- | --- |
+   | `ZINDER_DEPLOY_NETWORK` | `/etc/zinder/deploy.env`: `DEPLOY_NETWORK` |
+   | `ZINDER_SOURCE_NETWORK_NAME` | `/etc/zinder/deploy.env`: `DEPLOY_NODE_NETWORK` |
+   | `ZINDER_SOURCE_COOKIE_VOLUME_NAME` | `/etc/zinder/deploy.env`: `DEPLOY_NODE_COOKIE_VOLUME` |
+   | `ZINDER_OBSERVABILITY_NETWORK_NAME` | `/etc/zinder/deploy.env`: `DEPLOY_OBSERVABILITY_NETWORK` |
+   | `ZINDER_SINGLE_HOST_DATA_VOLUME_NAME`, `ZINDER_CHECKPOINT_STAGING_VOLUME_NAME`, `ZINDER_PROMETHEUS_VOLUME_NAME`, `ZINDER_GRAFANA_VOLUME_NAME` | `/etc/zinder/deploy.env`: `DEPLOY_DATA_VOLUME`, `DEPLOY_CHECKPOINT_STAGING_VOLUME`, `DEPLOY_PROMETHEUS_VOLUME`, `DEPLOY_GRAFANA_VOLUME` |
+   | `ZINDER_VERSION`, `ZINDER_IMAGE`, `ZINDER_PASTA_ASM`, `ZINDER_CONTROL_SECRETS_DIR` | `/etc/zinder/deploy.env`: `DEPLOY_VERSION`, `DEPLOY_IMAGE`, `DEPLOY_PASTA_ASM`, `DEPLOY_CONTROL_SECRETS_DIR` |
+   | `ZINDER_INGEST_OPS_HOST_PORT` (legacy), `ZINDER_COMPAT_OPS_HOST_PORT` (legacy), other `ZINDER_*_HOST_PORT` | `/etc/zinder/deploy.env`: `DEPLOY_INDEX_OPS_HOST_PORT`, `DEPLOY_SERVE_OPS_HOST_PORT`, `DEPLOY_*_HOST_PORT` |
+   | `ZINDER_*_MEMORY_LIMIT`, `ZINDER_NOFILE_{SOFT,HARD}_LIMIT`, `ZINDER_PROMETHEUS_RETENTION`, `ZINDER_GRAFANA_ADMIN_PASSWORD` | `/etc/zinder/deploy.env`: `DEPLOY_*_MEMORY_LIMIT`, `DEPLOY_NOFILE_{SOFT,HARD}_LIMIT`, `DEPLOY_PROMETHEUS_RETENTION`, `DEPLOY_GRAFANA_ADMIN_PASSWORD` |
+   | `COMPOSE_PROFILES`, `COMPOSE_FILE` | Keep in `/etc/zinder/deploy.env` as-is |
+   | `ZINDER_PRESET` | `/etc/zinder/zinder.env`: `ZINDER_DEPLOYMENT__PROFILE` |
+   | Non-writer `ZINDER_*__*` (`ZINDER_NETWORK__NAME`, `ZINDER_NODE__JSON_RPC_ADDR`, `ZINDER_NODE__AUTH__*`, non-empty `ZINDER_NODE__INDEXER_GRPC_ADDR`, non-TLS `ZINDER_NODE_FALLBACKS__*`, `ZINDER_STORAGE__FULL_BLOCKS`, `ZINDER_COMPAT__*`, `ZINDER_QUERY__*`, `ZINDER_EXPLORER__*`, `ZINDER_PROJECTOR__*`) | `/etc/zinder/zinder.env` (delete empty `ZINDER_*=` placeholders such as `ZINDER_NODE__INDEXER_GRPC_ADDR=`; omit unset optional keys or set `ZINDER_NODE__INDEXER_GRPC_ADDR=none`) |
+   | Writer-only `ZINDER_INGEST__*`, `ZINDER_NODE__INDEXER_TLS__*`, `ZINDER_NODE_FALLBACKS__*__INDEXER_TLS__*` | Writer-only `/etc/zinder/index.env` (`root:root`, mode `0640` or `0600`), with `DEPLOY_INDEX_ENV=/etc/zinder/index.env` set in `/etc/zinder/deploy.env` |
+
+   - If you use `/etc/zinder/docker-compose.override.yml`, update any `${ZINDER_*}` Compose interpolations (or legacy `zinder-ingest` / `zinder-query` service names if targeting single-host services) to the current Compose names and `DEPLOY_*` variables.
+   - If you use a drop-in under `/etc/systemd/system/zinder.service.d/` overriding `ExecStart=` / `ExecStop=`, update `--env-file /etc/zinder/env` to `--env-file /etc/zinder/deploy.env`.
+
+4. Validate the rendered Compose project name and Docker volume names against `docker volume ls` before starting (add `-f /etc/zinder/docker-compose.override.yml` if present), pull the release image, reinstall `deploy/systemd/zinder.service`, reload systemd, and start `zinder`:
+
+   ```bash
+   docker volume ls
+   cd /opt/zinder
+   docker compose --env-file /etc/zinder/deploy.env -f deploy/docker-compose.yml config -q
+   docker compose --env-file /etc/zinder/deploy.env -f deploy/docker-compose.yml config \
+     | awk '/^name:/ {print; next} /^volumes:/ {in_vol=1} in_vol && /^[^ ]/ && !/^volumes:/ {in_vol=0} in_vol {print}'
+   docker compose --env-file /etc/zinder/deploy.env -f deploy/docker-compose.yml pull
+   sudo cp /opt/zinder/deploy/systemd/zinder.service /etc/systemd/system/zinder.service
+   sudo systemctl daemon-reload
+   sudo systemctl start zinder
+   ```
+
+### Roll back to a pre-split `/etc/zinder/env` release
+
+First satisfy the multi-release store compatibility rules above for every release stepped back over. Then stop `zinder`, restore the pre-split release checkout and any backed-up `/etc/zinder/docker-compose.override.yml` or `/etc/systemd/system/zinder.service.d/` drop-ins, reinstall the pre-split `deploy/systemd/zinder.service` pointing at the preserved `/etc/zinder/env`, reload systemd, pull with `--env-file /etc/zinder/env` (adding `-f /etc/zinder/docker-compose.override.yml` if used), and start `zinder`:
+
+```bash
+sudo systemctl stop zinder
+sudo git -C /opt/zinder checkout vPREV.Y.Z
+sudo cp /opt/zinder/deploy/systemd/zinder.service /etc/systemd/system/zinder.service
+sudo systemctl daemon-reload
+cd /opt/zinder
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml pull
+sudo systemctl start zinder
+```
 
 ## Inspect a runtime container
 
