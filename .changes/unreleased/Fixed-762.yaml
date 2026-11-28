@@ -1,0 +1,7 @@
+kind: fixed
+body: Recover RocksDB secondary catch-up and projector replay when an advancing READY fence briefly misses a live_tail_block row, using a bounded reopen with continuity and network-upgrade attestation checks.
+time: 2026-11-28T10:57:56.000000000Z
+custom:
+    Bump: patch
+    Upgrade: compatible
+    PR: "762"
