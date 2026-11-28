@@ -58,30 +58,48 @@ use super::{
     tree_state_replay::recorded_tree_sizes,
 };
 
-/// Required tree-state checkpoint coverage for a fresh canonical build.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TreeStateCheckpointCoverage {
+/// Policy used to place tree-state checkpoints during fresh canonical construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[non_exhaustive]
+#[serde(
+    tag = "selection",
+    content = "commitment_budget",
+    rename_all = "kebab-case",
+    deny_unknown_fields
+)]
+pub enum ConstructionTreeStateCheckpointPolicy {
     /// Store checkpoints on the global cadence and at the build tip.
     CadenceAndTip,
-    /// Add checkpoints according to the selected policy.
-    Selected(TreeStateCheckpointSelection),
+    /// Store a checkpoint for every loaded block.
+    EveryBlock,
+    /// Also store a checkpoint when this many note commitments have been appended.
+    CommitmentBudget(std::num::NonZeroU32),
 }
 
-impl TreeStateCheckpointCoverage {
+impl ConstructionTreeStateCheckpointPolicy {
+    pub(super) const fn from_selection(selection: TreeStateCheckpointSelection) -> Self {
+        match selection {
+            TreeStateCheckpointSelection::EveryBlock => Self::EveryBlock,
+            TreeStateCheckpointSelection::CommitmentBudget(budget) => {
+                Self::CommitmentBudget(budget)
+            }
+        }
+    }
+
     pub(super) const fn selection(self) -> Option<TreeStateCheckpointSelection> {
         match self {
             Self::CadenceAndTip => None,
-            Self::Selected(selection) => Some(selection),
+            Self::EveryBlock => Some(TreeStateCheckpointSelection::EveryBlock),
+            Self::CommitmentBudget(budget) => {
+                Some(TreeStateCheckpointSelection::CommitmentBudget(budget))
+            }
         }
     }
 
     const fn max_persisted_gap(self) -> u32 {
         match self {
-            Self::Selected(TreeStateCheckpointSelection::EveryBlock) => 1,
-            Self::CadenceAndTip
-            | Self::Selected(TreeStateCheckpointSelection::CommitmentBudget(_)) => {
-                TREE_STATE_CHECKPOINT_STRIDE
-            }
+            Self::EveryBlock => 1,
+            Self::CadenceAndTip | Self::CommitmentBudget(_) => TREE_STATE_CHECKPOINT_STRIDE,
         }
     }
 }
@@ -223,7 +241,7 @@ pub(super) struct CanonicalBlockSstConfig<'options> {
     /// The activation table the build plan fingerprints, which decides the
     /// pools each checkpoint carries a frontier for.
     pub(super) network_upgrade_activations: &'options NetworkUpgradeActivations,
-    pub(super) tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    pub(super) tree_state_checkpoint_policy: ConstructionTreeStateCheckpointPolicy,
     pub(super) sst_target_logical_bytes: u64,
     pub(super) reverse_index_sort_memory_bytes: usize,
 }
@@ -407,7 +425,7 @@ impl<'options> CanonicalBlockSstStager<'options> {
             self.config.build_plan.build_tip().height,
         ) || self
             .config
-            .tree_state_checkpoint_coverage
+            .tree_state_checkpoint_policy
             .selection()
             .is_some_and(|selection| {
                 selection.requires_checkpoint_since(self.checkpoint_tree_sizes, block.tip_metadata)
@@ -797,13 +815,13 @@ pub(super) fn canonical_block_families_are_empty(db: &DB) -> Result<bool, Canoni
 pub(super) fn validate_persisted_commitment_tree_families(
     ctx: SegmentStoreContext<'_>,
     build_plan: &CanonicalStoreBuildPlan,
-    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    tree_state_checkpoint_policy: ConstructionTreeStateCheckpointPolicy,
     evidence: &CanonicalBlockLoadEvidence,
 ) -> Result<(), CanonicalStoreError> {
     validate_persisted_tree_state_checkpoints(
         ctx,
         build_plan,
-        tree_state_checkpoint_coverage,
+        tree_state_checkpoint_policy,
         evidence,
     )
 }
@@ -897,7 +915,7 @@ pub(super) fn read_persisted_tip_checkpoint(
 fn validate_persisted_tree_state_checkpoints(
     ctx: SegmentStoreContext<'_>,
     build_plan: &CanonicalStoreBuildPlan,
-    coverage: TreeStateCheckpointCoverage,
+    coverage: ConstructionTreeStateCheckpointPolicy,
     evidence: &CanonicalBlockLoadEvidence,
 ) -> Result<(), CanonicalStoreError> {
     let db = ctx.db;
@@ -974,7 +992,7 @@ fn validate_persisted_tree_state_checkpoints(
 }
 
 fn validate_persisted_checkpoint_step(
-    coverage: TreeStateCheckpointCoverage,
+    coverage: ConstructionTreeStateCheckpointPolicy,
     previous: BlockHeight,
     height: BlockHeight,
     build_tip_height: BlockHeight,
@@ -997,7 +1015,7 @@ fn validate_persisted_checkpoint_step(
         != (height.value() - 1) / TREE_STATE_CHECKPOINT_STRIDE;
     if crossed_cadence
         || height > build_tip_height
-        || (coverage == TreeStateCheckpointCoverage::CadenceAndTip
+        || (coverage == ConstructionTreeStateCheckpointPolicy::CadenceAndTip
             && !tree_state_checkpoint_required(height, build_tip_height))
     {
         return Err(CanonicalStoreError::block_load_sequence(format!(

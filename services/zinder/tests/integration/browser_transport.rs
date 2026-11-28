@@ -31,13 +31,11 @@ use zinder_runtime::{Readiness, expected_writer_fence};
 use zinder_store::{RocksDbCanonicalStore, RocksDbResourceBudget};
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, IngestControlFixtureService,
-    sample_regtest_upgrade_activations,
+    grpc_web::encode_grpc_web_frame, sample_regtest_upgrade_activations,
 };
 use zinder_wallet_rocksdb::{RocksDbWalletBuildOptions, build_wallet_from_canonical};
 
-use super::stateless_topology_conformance::{
-    build_fixture_chain, encode_grpc_web_frame, prepare_materialized_views,
-};
+use super::stateless_topology_conformance::{build_fixture_chain, prepare_materialized_views};
 
 const ALLOWED_ORIGIN: &str = "https://wallet.example";
 const DENIED_ORIGIN: &str = "https://elsewhere.example";

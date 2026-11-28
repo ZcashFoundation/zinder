@@ -35,6 +35,7 @@ fn subcommand_help_and_version_succeed() -> eyre::Result<()> {
         &["backup", "--help"],
         &["config", "--help"],
         &["healthcheck", "--help"],
+        &["dev", "darkside", "--help"],
         &["snapshot", "export", "--help"],
         &["snapshot", "import", "--help"],
         &["backup", "create", "--help"],

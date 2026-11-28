@@ -78,6 +78,7 @@ const fn crash_point(_name: &str) {}
 pub use activation_schedule::{CanonicalActivationSchedule, InadmissibleActivationSchedule};
 pub use stored_set::{CanonicalStoreRequirements, CanonicalStoredData, CanonicalStoredSet};
 
+pub use block_load::ConstructionTreeStateCheckpointPolicy;
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
 pub use block_replay::{
     CanonicalReplayRangeScan, CanonicalReplayScan, CanonicalReplaySliceScan,
@@ -205,6 +206,9 @@ impl CanonicalReorgPolicy {
 /// where it is the network's height-zero block. The fixed tip prevents an
 /// exhausted or failed source stream from publishing a contiguous prefix as a
 /// complete build.
+///
+/// The builder applies the tree-state checkpoint policy to this range and
+/// records the selection in the construction manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalStoreBuildPlan {
     network: zinder_core::Network,

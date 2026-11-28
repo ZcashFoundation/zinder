@@ -137,10 +137,8 @@ presplit deterministically):
   `zip317_logical_actions`, `paid_fee`, and `burn_zat`), with `O(index)`
   `index_sha256` reader opening and sans-I/O `ByteRange` planning. Together with
   `ZSHRNG02` `Slab 0`, `splice_compact_block_wire` yields byte-identical
-  transparent-inclusive `CompactBlock` frames and
-  `reconstruct_compact_block_artifact` / `reconstruct_canonical_block_facts`
-  recover full canonical records for native query, wallet projection, and
-  Explorer views.
+  transparent-inclusive `CompactBlock` frames. The supplement also provides
+  the transaction facts for canonical replay.
 - **`ZSBLKB01` (`segments/raw_block/<start:010>-<end:010>.zsblkb01`, when `raw_blob_policy = "all"`):**
   single-copy full consensus block vault storing each block once (`Zstd` level 3
   or uncompressed), a flat `40`-byte per-transaction slice table `(tx_offset,
@@ -155,6 +153,13 @@ presplit deterministically):
 `1,024` entries) keyed by `(start_height, SettledSegmentKind)` with miss
 singleflight deduplication. Opening `ZSHRNG02` never touches `ZSTSUP01` or
 `ZSBLKB01`, and opening `ZSTSUP01` never touches `ZSBLKB01`.
+
+Supplement readers reuse a Zstd decompressor on each reader thread. They share
+an LRU that retains up to 4 MiB of decompressed chunk payloads across the
+process. Each reader verifies the compressed chunk from its own source before
+caching it. Reads continue to authenticate row-index bytes and verify the
+requested row payload. Explicit full-payload verification reads the source
+directly.
 
 During cold store admission (`verify_pinned_segments_into_cache`), storage
 admission checks `kernel_verified()` on each pinned `ZSHRNG02`, `ZSTSUP01`, and
@@ -187,9 +192,13 @@ unsealed heights `> sealed_tip`):
   `SettledSegmentReaderCache` (using sans-I/O `ByteRange` plans) and
   `live_tail_block`, verifying frame lengths, digests, and `(height, block_hash,
   previous_block_hash)` linkage across segment and tail boundaries.
-- Full `CompactBlockArtifact` and `CanonicalBlockFacts` reads splice `ZSHRNG02`
-  plus `ZSTSUP01` for settled heights and decode `ZSLVTL01` rows in `MultiGet`
-  batches for unsealed tail heights:
+- Settled `CompactBlockArtifact` reads combine `ZSHRNG02` and `ZSTSUP01`.
+- Settled canonical replay reconstructs `CanonicalBlockFacts` from
+  `block_header` and `ZSTSUP01`. Range replay scans consecutive headers
+  in batches of up to 256 blocks and checks each header's height, hash,
+  parent hash, and timestamp against the authenticated supplement envelope.
+- Unsealed compact-block and canonical-facts reads decode `ZSLVTL01` rows
+  in `MultiGet` batches:
   - An unbounded range read fetches up to `1,024` unsealed tail heights per batch.
   - Tree-state replay fetches up to `16` heights per batch and checks for
     cancellation after each block. Wallet queries at the same height and chain
@@ -197,7 +206,9 @@ unsealed heights `> sealed_tip`):
     Each query runtime caches up to `256` settled answers scoped to the epoch,
     sequence digest, and retained history.
   - A byte-bounded read fetches one row first, then adapts subsequent batch sizes
-    from `1` to `16` within the remaining byte budget.
+    from `1` to `16` within the remaining byte budget. For settled segments with
+    a supplement, it charges the native length recorded in the index. For
+    shielded-only segments, it measures the reconstructed block.
 
 Reads verify block height linkage across every decoded row and fail on missing
 rows inside retained history as store damage. Compact-block payload range reads
@@ -276,7 +287,7 @@ be rebuilt.
 
 The row digest and the UTXO set commitment are sums of per-row hashes, so they
 do not depend on the order rows are hashed in. Construction also scans the
-settled canonical prefix (`ZSHRNG02` + `ZSTSUP01` segments) in `4,096`-block
+settled canonical replay prefix in `4,096`-block
 height chunks across
 `projector.build.accumulator_hashing_workers` threads into sharded outpoint
 sorters that split `projector.build.max_outpoint_sort_memory_bytes` evenly
@@ -526,6 +537,12 @@ build plan as the control record and carry evidence for the full family
 inventory, including zero-row checks on post-publication families (`chain_epoch`,
 `chain_event`, `mempool_event`, `displaced_block_facts`) and on
 `live_tail_raw_block` when `raw_blob_policy = "none"`.
+
+The v2 manifest records the construction `tree_state_checkpoint_policy` as
+`cadence-and-tip`, `every-block`, or `commitment-budget` with its resolved
+budget. READY authenticates the original manifest file bytes. Older v2
+manifests without this field open with an unknown policy. Background
+densification can add checkpoint rows without rewriting the manifest.
 
 `CanonicalStoredSet` derives retained block data and its history floor from
 the build plan. Readers specify minimum data and a starting height with

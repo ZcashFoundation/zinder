@@ -3,6 +3,7 @@ mod capability_descriptor_drift;
 mod capability_docs;
 mod capability_registry;
 mod capability_string_uniqueness;
+mod darkside_protocol;
 mod error_reason_policy_drift;
 mod explorer_protocol;
 mod hermetic_artifacts;
