@@ -35,7 +35,7 @@ use super::{
 /// incremental path back into an unbounded historical scan.
 pub const MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS: u32 = 4_096;
 
-const MAX_SETTLED_REPLAY_BATCH_BLOCKS: u32 = 255;
+const MAX_SETTLED_REPLAY_BATCH_BLOCKS: u32 = 256;
 
 /// One cache-bypassing, forward scan of the READY canonical replay state.
 ///
@@ -641,10 +641,10 @@ fn next_buffered_replay(
                 .saturating_add(MAX_SETTLED_REPLAY_BATCH_BLOCKS - 1),
         );
         let batch_end = range.end.min(entry.end_block.height).min(batch_limit);
-        let readers = store_access::open_replay_segment_readers(ctx.db, ctx.segment_cache, &entry)?;
+        let supplement = store_access::open_replay_supplement_reader(ctx, &entry)?;
         let rows = store_access::reconstruct_replay_range_from_segment(
             ctx.db,
-            &readers,
+            &supplement,
             BlockHeightRange::inclusive(range.start, batch_end),
         )?;
         *remaining_range = batch_end
@@ -816,7 +816,7 @@ fn validate_single_settled_segment_replay(
     entry: &SettledSegmentIndexEntry,
     state: &mut ReplayValidationState,
 ) -> Result<(), CanonicalStoreError> {
-    let readers = store_access::open_replay_segment_readers(ctx.db, ctx.segment_cache, entry)?;
+    let supplement = store_access::open_replay_supplement_reader(ctx, entry)?;
     let mut next_height = Some(entry.start_height);
     while let Some(chunk_start) = next_height.filter(|height| *height <= entry.end_block.height) {
         let limit = BlockHeight::new(
@@ -827,7 +827,7 @@ fn validate_single_settled_segment_replay(
         let chunk_end = entry.end_block.height.min(limit);
         let rows = store_access::reconstruct_replay_range_from_segment(
             ctx.db,
-            &readers,
+            &supplement,
             BlockHeightRange::inclusive(chunk_start, chunk_end),
         )?;
         for (height, replay) in rows {
@@ -1006,12 +1006,14 @@ where
                 visit_live_tail_facts_batch(ctx.db, &live_batch, &uncached, &mut visit)?;
                 live_batch.clear();
             }
-            let readers =
-                store_access::open_replay_segment_readers(ctx.db, ctx.segment_cache, &entry)?;
+            let supplement = store_access::open_replay_supplement_reader(ctx, &entry)?;
             while cursor < retained.len() && retained[cursor].0 <= entry.end_block.height {
                 let (target_height, orig_index) = retained[cursor];
-                let replay =
-                    store_access::reconstruct_replay_from_segment(ctx.db, &readers, target_height)?;
+                let replay = store_access::reconstruct_replay_from_segment(
+                    ctx.db,
+                    &supplement,
+                    target_height,
+                )?;
                 visit(orig_index, Some(replay.into_facts()))?;
                 cursor += 1;
             }
