@@ -71,6 +71,11 @@ impl FixtureTx {
         }
     }
 
+    /// Returns the serialized transaction as staged in the fixture chain.
+    pub(super) fn raw_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     pub(super) fn txid_bytes(&self) -> &[u8] {
         &self.compact.txid
     }

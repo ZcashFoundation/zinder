@@ -20,11 +20,12 @@ use zinder_core::{
     },
 };
 use zinder_proto::compat::lightwalletd::{
-    BlockId, BlockRange, ChainSpec, CompactBlock, CompactTxIn, DarksideBlock, DarksideBlocksUrl,
-    DarksideEmptyBlocks, DarksideHeight, DarksideMetaState, DarksideSubtreeRoots,
-    DarksideTransactionsUrl, Duration as PingDuration, Empty, GetAddressUtxosArg,
-    GetAddressUtxosReply, GetMempoolTxRequest, GetSubtreeRootsArg, PingResponse, PoolType,
-    RawTransaction, SendResponse, SubtreeRoot, TreeState, TxFilter,
+    BlockId, BlockRange, ChainSpec, CompactBlock, CompactTxIn, DarksideAddressTransaction,
+    DarksideBlock, DarksideBlocksUrl, DarksideEmptyBlocks, DarksideHeight, DarksideMetaState,
+    DarksideSubtreeRoots, DarksideTransactionsUrl, Duration as PingDuration, Empty,
+    GetAddressUtxosArg, GetAddressUtxosReply, GetMempoolTxRequest, GetSubtreeRootsArg,
+    PingResponse, PoolType, RawTransaction, SendResponse, SubtreeRoot,
+    TransparentAddressBlockFilter, TreeState, TxFilter,
     compact_tx_streamer_client::CompactTxStreamerClient,
     darkside_streamer_client::DarksideStreamerClient,
 };
@@ -313,9 +314,9 @@ async fn darkside_address_utxos_page_only_at_height_boundaries() -> Result<()> {
     assert_utxo_page(&mut wallet, request(100, 2), std::slice::from_ref(&first)).await?;
     assert_utxo_page(&mut wallet, request(101, 2), &next_height).await?;
 
-    let extra = utxo(101, 4, 0);
+    let extra = utxo(101, 0, 0);
     control.add_address_utxo(extra.clone()).await?;
-    next_height.push(extra);
+    next_height.insert(0, extra);
     let unary = wallet
         .get_address_utxos(request(101, 2))
         .await
@@ -414,6 +415,91 @@ fn broadcast_fixture(previous_output_index: u32) -> Result<(RawTransaction, Tran
         },
         txid,
     ))
+}
+
+#[tokio::test]
+async fn darkside_address_history_clamps_ranges_and_follows_block_order() -> Result<()> {
+    let process = TestProcess::start(&[]).await?;
+    let (mut control, mut wallet) = process.clients().await?;
+    control.reset(metadata(100)).await?;
+    stage_blocks(&mut control, 100, 10, 2).await?;
+
+    let (mut earlier, _) = broadcast_fixture(0)?;
+    earlier.height = 100;
+    let (first_at_tip, _) = broadcast_fixture(1)?;
+    let (second_at_tip, _) = broadcast_fixture(2)?;
+    let mut tip_transactions = [first_at_tip, second_at_tip];
+    tip_transactions.sort_unstable_by(|left, right| right.data.cmp(&left.data));
+    for tx in &mut tip_transactions {
+        tx.height = 101;
+    }
+    control
+        .stage_transactions_stream(tokio_stream::iter(tip_transactions.clone()))
+        .await?;
+    control.apply_staged(DarksideHeight { height: 101 }).await?;
+
+    let address = "test-address";
+    let [first_at_tip, second_at_tip] = tip_transactions;
+    let expected = [earlier, first_at_tip, second_at_tip];
+    for tx in expected.iter().rev() {
+        control
+            .add_address_transaction(DarksideAddressTransaction {
+                address: address.to_owned(),
+                data: tx.data.clone(),
+                height: tx.height,
+            })
+            .await?;
+    }
+
+    let range = |start: Option<u64>, end: Option<u64>| BlockRange {
+        start: start.map(at),
+        end: end.map(at),
+        ..BlockRange::default()
+    };
+    let request = |range| TransparentAddressBlockFilter {
+        address: address.to_owned(),
+        range,
+    };
+    for (start, end, expected) in [
+        (100, None, expected.as_slice()),
+        (100, Some(0), expected.as_slice()),
+        (100, Some(u64::MAX), expected.as_slice()),
+        (u64::MAX, Some(102), &expected[1..]),
+    ] {
+        let filter = request(Some(range(Some(start), end)));
+        for mut stream in [
+            wallet
+                .get_taddress_transactions(filter.clone())
+                .await?
+                .into_inner(),
+            wallet.get_taddress_txids(filter).await?.into_inner(),
+        ] {
+            for tx in expected {
+                assert_eq!(stream.message().await?.as_ref(), Some(tx));
+            }
+            assert_eq!(stream.message().await?, None);
+        }
+    }
+
+    for (range, message) in [
+        (None, "range is required"),
+        (Some(range(None, None)), "range.start is required"),
+        (
+            Some(range(Some(101), Some(100))),
+            "range.start.height must not exceed range.end.height",
+        ),
+    ] {
+        let filter = request(range);
+        for status in [
+            wallet.get_taddress_transactions(filter.clone()).await.err(),
+            wallet.get_taddress_txids(filter).await.err(),
+        ] {
+            let status = status.wrap_err("address history accepted an invalid range")?;
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert_eq!(status.message(), message);
+        }
+    }
+    Ok(())
 }
 
 fn successful_broadcast(txid: TransactionId) -> SendResponse {

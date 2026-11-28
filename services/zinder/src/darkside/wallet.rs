@@ -39,6 +39,20 @@ fn tip(scenario: &Scenario) -> Result<&FixtureBlock, Status> {
         .ok_or_else(|| Status::failed_precondition("no visible blocks"))
 }
 
+fn block_transaction_positions(
+    visible: &[Arc<FixtureBlock>],
+    height: u64,
+    key_bytes: fn(&FixtureTx) -> &[u8],
+) -> BTreeMap<&[u8], usize> {
+    let mut positions = BTreeMap::new();
+    if let Ok(block_index) = visible.binary_search_by_key(&height, |block| block.height) {
+        for (position, tx) in visible[block_index].transactions.iter().enumerate() {
+            positions.entry(key_bytes(tx)).or_insert(position);
+        }
+    }
+    positions
+}
+
 fn find_block<'scenario>(
     scenario: &'scenario Scenario,
     id: &BlockId,
@@ -214,26 +228,54 @@ impl Darkside {
         let range = filter
             .range
             .as_ref()
-            .ok_or_else(|| Status::invalid_argument("missing address transaction range"))?;
-        let (start, end) = range_heights(range)?;
+            .ok_or_else(|| Status::invalid_argument("range is required"))?;
+        let start = range
+            .start
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("range.start is required"))?;
         let scenario = self.scenario.lock();
         let tip = tip(&scenario)?.height;
+        let start_height = start.height.min(tip);
+        let end_height = match range.end.as_ref().map(|end| end.height) {
+            None | Some(0) => tip,
+            Some(height) => height.min(tip),
+        };
+        if start_height > end_height {
+            return Err(Status::invalid_argument(
+                "range.start.height must not exceed range.end.height",
+            ));
+        }
         let mut transactions: Vec<_> = scenario
             .address_transactions
             .iter()
             .filter(|tx| {
-                tx.address == filter.address
-                    && (start.min(end)..=start.max(end).min(tip)).contains(&tx.height)
+                tx.address == filter.address && (start_height..=end_height).contains(&tx.height)
             })
             .map(|tx| RawTransaction {
                 data: tx.data.clone(),
                 height: tx.height,
             })
             .collect();
+        let visible = scenario.chain.visible().to_vec();
         drop(scenario);
-        transactions.sort_by_key(|tx| tx.height);
-        if start > end {
-            transactions.reverse();
+        transactions.sort_unstable_by_key(|tx| tx.height);
+        for at_height in transactions.chunk_by_mut(|left, right| left.height == right.height) {
+            if at_height.len() == 1 {
+                continue;
+            }
+            let positions =
+                block_transaction_positions(&visible, at_height[0].height, FixtureTx::raw_bytes);
+            // Standalone fixtures follow in-block transactions and sort by their serialized bytes.
+            let transaction_position = |tx: &RawTransaction| {
+                positions
+                    .get(tx.data.as_slice())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            };
+            at_height.sort_unstable_by(|left, right| {
+                (transaction_position(left), &left.data)
+                    .cmp(&(transaction_position(right), &right.data))
+            });
         }
         Ok(stream_reply(self.stream_slot()?, transactions.into_iter()))
     }
@@ -291,16 +333,8 @@ impl Darkside {
             if outputs.len() == 1 {
                 continue;
             }
-            let mut transaction_positions = BTreeMap::new();
-            if let Ok(block_index) =
-                visible.binary_search_by_key(&outputs[0].height, |block| block.height)
-            {
-                for (position, tx) in visible[block_index].transactions.iter().enumerate() {
-                    transaction_positions
-                        .entry(tx.txid_bytes())
-                        .or_insert(position);
-                }
-            }
+            let transaction_positions =
+                block_transaction_positions(&visible, outputs[0].height, FixtureTx::txid_bytes);
             // Standalone outputs follow mined transactions and sort by outpoint.
             let transaction_position = |utxo: &GetAddressUtxosReply| {
                 transaction_positions
