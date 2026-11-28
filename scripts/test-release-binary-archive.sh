@@ -122,6 +122,27 @@ jq -e '.rust_target == "aarch64-apple-darwin" and .cpu_baseline == "armv8-a"
   and .libc == {family:"libSystem", minimum_macos_version:"11.0", dynamic_libcxx:true}' \
   < <(tar -xOzf "$mac_output/$mac_root.tar.gz" "$mac_root/BUILD-INFO.json") >/dev/null
 
+mac_tools="$temporary_directory/macos-tools"
+mkdir -p "$mac_tools"
+cat > "$mac_tools/inspect-mach-o" <<'FIXTURE'
+#!/usr/bin/env bash
+case "${0##*/}" in
+  lipo) printf '%s\n' arm64 ;;
+  vtool) printf '%s\n' '      platform MACOS' '         minos 11.0' ;;
+  otool)
+    printf '%s\n' "$2:" \
+      '  /usr/lib/libSystem.B.dylib (compatibility version 1.0.0)' \
+      '  /usr/lib/libc++.1.dylib (compatibility version 1.0.0)'
+    ;;
+esac
+FIXTURE
+chmod 0755 "$mac_tools/inspect-mach-o"
+for tool in lipo vtool otool; do
+  ln -s inspect-mach-o "$mac_tools/$tool"
+done
+PATH="$mac_tools:$PATH" "$checker" "$mac_output/$mac_root.tar.gz" \
+  "${archive_options[@]}" --target aarch64-apple-darwin
+
 arm_output="$temporary_directory/arm"
 mkdir -p "$arm_output"
 "$builder" \

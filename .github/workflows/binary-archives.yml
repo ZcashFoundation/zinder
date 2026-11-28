@@ -219,10 +219,19 @@ jobs:
           ZINDER_NODE__JSON_RPC_ADDR: http://127.0.0.1:8232
           ZINDER_NODE__AUTH__METHOD: none
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-user
-          qemu-x86_64 -cpu qemu64 "$RUNNER_TEMP/binary-export/bin/zinder" \
-            run ingest --print-config >/dev/null
+          # The runner may ship an amd64v3 loader that uses AVX before Zinder starts.
+          docker run --rm --platform linux/amd64 \
+            --env ZINDER_NETWORK__NAME \
+            --env ZINDER_NODE__JSON_RPC_ADDR \
+            --env ZINDER_NODE__AUTH__METHOD \
+            --volume "${RUNNER_TEMP}/binary-export/bin:/opt/zinder/bin:ro" \
+            debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 \
+            sh -ec '
+              apt-get update >/dev/null
+              apt-get install -y --no-install-recommends libstdc++6 qemu-user >/dev/null
+              ulimit -c 0
+              qemu-x86_64 -cpu qemu64 /opt/zinder/bin/zinder run ingest --print-config >/dev/null
+            '
 
       - name: Save the BuildKit Cargo cache
         if: github.ref == 'refs/heads/main' && runner.os == 'Linux' && matrix.platform.cpu_baseline == ''

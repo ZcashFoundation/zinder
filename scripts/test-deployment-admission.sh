@@ -106,7 +106,7 @@ personal_compose_env=(
     and any(.services.zinder.volumes[]; .source == "zebra-auth" and .read_only == true)
   ' >/dev/null || fail "personal Compose changed its default configuration"
 
-"${personal_compose_env[@]}" ZINDER_SERVE_MEMORY_LIMIT=4g ZINDER_IMAGE=zinder:local \
+"${personal_compose_env[@]}" ZINDER_SERVE_MEMORY_LIMIT=4g ZINDER_IMAGE=zinder:local ZINDER_VERSION=local \
   ZINDER_NETWORK__NAME=zcash-testnet ZEBRA_NETWORK__NETWORK=Testnet \
   ZINDER_NODE__JSON_RPC_ADDR=http://zebra:18232 \
   docker compose --env-file /dev/null -f "$personal_compose" config --format json \

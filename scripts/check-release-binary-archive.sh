@@ -196,10 +196,10 @@ while IFS= read -r binary_name; do
     '
     otool -L "$binary_path" | awk '
       NR == 1 { next }
-      $1 == "/usr/lib/libSystem.B.dylib" { system = 1 }
+      $1 == "/usr/lib/libSystem.B.dylib" { has_libsystem = 1 }
       $1 == "/usr/lib/libc++.1.dylib" { cxx = 1 }
       $1 !~ /^\/(usr\/lib|System\/Library)\// { external = 1 }
-      END { exit !(system && cxx && !external) }
+      END { exit !(has_libsystem && cxx && !external) }
     '
   elif [[ "${ZINDER_RELEASE_SKIP_ELF_CHECKS:-false}" != true ]]; then
     grep -Fq 'ELF 64-bit' <<< "$(file "$binary_path")"
