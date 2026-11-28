@@ -35,11 +35,18 @@ pub(super) fn validate_all_roles(
 ) -> Result<ValidatedRoleRenderings, UnifiedConfigError> {
     let dir = TempDir::new()?;
     let mut role_tomls = Vec::with_capacity(plan.roles.len());
+    let has_wallet_query_consumers = plan.roles.iter().any(|spec| {
+        matches!(
+            spec.role,
+            ServiceRole::Explorer | ServiceRole::CompatCipherscan
+        )
+    });
 
     for (idx, spec) in plan.roles.iter().enumerate() {
         let toml_path = write_validation_toml(dir.path(), idx, spec)?;
         let env_pairs = validation_env_for(spec);
-        let rendered = validate_single_role(spec.role, &toml_path, env_pairs)?;
+        let rendered =
+            validate_single_role(spec.role, &toml_path, env_pairs, has_wallet_query_consumers)?;
         role_tomls.push((spec.role, rendered));
     }
 
@@ -76,6 +83,7 @@ fn validate_single_role(
     role: ServiceRole,
     toml_path: &Path,
     env_pairs: Vec<(String, String)>,
+    has_wallet_query_consumers: bool,
 ) -> Result<String, UnifiedConfigError> {
     let path_opt = Some(toml_path.to_path_buf());
     match role {
@@ -98,6 +106,12 @@ fn validate_single_role(
             let loaded =
                 load_query_config_with_env(path_opt, QueryConfigOverrides::default(), env_pairs)
                     .map_err(|err| role_err(role, &err.to_string()))?;
+            if has_wallet_query_consumers && loaded.proxy_protocol.is_enabled() {
+                return Err(role_err(
+                    role,
+                    "query.proxy_protocol_trusted_cidrs is incompatible with the combined explorer preset. Remove the query setting and unset ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS, or run the roles separately with both wallet_query_endpoint settings pointing to a proxy that sends a PROXY preface.",
+                ));
+            }
             query_config_toml(&loaded).map_err(|err| role_err(role, &err.to_string()))
         }
         ServiceRole::CompatLightwalletd => {

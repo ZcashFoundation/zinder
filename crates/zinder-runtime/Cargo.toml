@@ -21,6 +21,7 @@ http.workspace = true
 http-body.workspace = true
 hyper = { workspace = true, features = ["http2"] }
 hyper-util = { workspace = true, features = ["http2", "server-auto"] }
+ipnet.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
@@ -33,7 +34,7 @@ serde_json.workspace = true
 slab.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls.workspace = true
 tokio-util.workspace = true
 toml.workspace = true

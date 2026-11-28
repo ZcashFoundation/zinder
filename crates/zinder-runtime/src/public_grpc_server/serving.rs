@@ -13,7 +13,7 @@
 //! no progress for the listener's write stall timeout closes, because its
 //! client has stopped reading every stream on it.
 
-use std::{convert::Infallible, future::Future, io, net::SocketAddr, time::Duration};
+use std::{convert::Infallible, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use hyper::body::Incoming;
@@ -21,7 +21,10 @@ use hyper_util::{
     rt::{TokioIo, TokioTimer},
     server::conn::auto,
 };
-use tokio::net::TcpListener;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::Semaphore,
+};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tonic::{
     body::Body,
@@ -35,8 +38,9 @@ use tower::{
 };
 
 use super::{
-    GrpcDeadline, HTTP2_KEEPALIVE_INTERVAL, HTTP2_KEEPALIVE_TIMEOUT, HTTP2_MAX_LOCAL_ERROR_RESETS,
-    HTTP2_MAX_SEND_BUF_SIZE, MAX_CONCURRENT_STREAMS_PER_CONNECTION, grpc_timeout,
+    GrpcDeadline, GrpcProxyProtocol, HTTP2_KEEPALIVE_INTERVAL, HTTP2_KEEPALIVE_TIMEOUT,
+    HTTP2_MAX_LOCAL_ERROR_RESETS, HTTP2_MAX_SEND_BUF_SIZE, MAX_CONCURRENT_STREAMS_PER_CONNECTION,
+    grpc_timeout, proxy_protocol,
     release_gate::{GateObserver, ReleaseGate},
     stream_reset::{ResettableStreams, resettable},
 };
@@ -45,6 +49,7 @@ use crate::http_listener::{accept_failure_needs_backoff, connection_io::Connecti
 /// Pause after a failed `accept` so descriptor exhaustion does not spin the
 /// loop.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_PENDING_PROXY_HEADERS: usize = 128;
 
 /// A public gRPC listener's transport policy and the layers around its
 /// services.
@@ -58,6 +63,7 @@ pub struct PublicGrpcServer<L = Identity, T = Identity> {
     accept_http1: bool,
     send_stall_timeout: Duration,
     write_stall_timeout: Duration,
+    proxy_protocol: GrpcProxyProtocol,
     gate_observer: GateObserver,
 }
 
@@ -72,6 +78,7 @@ impl PublicGrpcServer {
             accept_http1: false,
             send_stall_timeout,
             write_stall_timeout: send_stall_timeout,
+            proxy_protocol: GrpcProxyProtocol::default(),
             gate_observer: GateObserver::default(),
         }
     }
@@ -103,6 +110,15 @@ impl<L, T> PublicGrpcServer<L, T> {
         self
     }
 
+    /// Requires PROXY prefaces from the configured TCP proxies. Use this with
+    /// [`super::ClientAddressSource::Connection`] so requests use the forwarded
+    /// connection address.
+    #[must_use]
+    pub fn with_proxy_protocol(mut self, protocol: GrpcProxyProtocol) -> Self {
+        self.proxy_protocol = protocol;
+        self
+    }
+
     /// Wraps every service in `layer`, inside the deadline and the layers added before it.
     #[must_use]
     pub fn layer<NewLayer>(self, layer: NewLayer) -> PublicGrpcServer<Stack<NewLayer, L>, T> {
@@ -112,6 +128,7 @@ impl<L, T> PublicGrpcServer<L, T> {
             accept_http1: self.accept_http1,
             send_stall_timeout: self.send_stall_timeout,
             write_stall_timeout: self.write_stall_timeout,
+            proxy_protocol: self.proxy_protocol,
             gate_observer: self.gate_observer,
         }
     }
@@ -130,6 +147,7 @@ impl<L, T> PublicGrpcServer<L, T> {
             accept_http1: self.accept_http1,
             send_stall_timeout: self.send_stall_timeout,
             write_stall_timeout: self.write_stall_timeout,
+            proxy_protocol: self.proxy_protocol,
             gate_observer: self.gate_observer,
         }
     }
@@ -269,6 +287,8 @@ where
             builder: connection_builder(self.server.accept_http1, self.server.send_stall_timeout),
             send_stall_timeout: self.server.send_stall_timeout,
             write_stall_timeout: self.server.write_stall_timeout,
+            pending_proxy_headers: Arc::new(Semaphore::new(MAX_PENDING_PROXY_HEADERS)),
+            proxy_protocol: self.server.proxy_protocol,
             gate_observer: self.server.gate_observer,
         };
         connections.serve(listener, service, signal).await;
@@ -281,6 +301,8 @@ struct Connections {
     builder: auto::Builder<ResettableStreams>,
     send_stall_timeout: Duration,
     write_stall_timeout: Duration,
+    pending_proxy_headers: Arc<Semaphore>,
+    proxy_protocol: GrpcProxyProtocol,
     gate_observer: GateObserver,
 }
 
@@ -311,7 +333,7 @@ impl Connections {
                 accepted = listener.accept() => accepted,
                 () = &mut shutdown => break,
             };
-            let (stream, remote_addr) = match accepted {
+            let (stream, peer) = match accepted {
                 Ok(accepted) => accepted,
                 Err(error) => {
                     if !accept_failure_needs_backoff(&error, "grpc_accept_failed") {
@@ -323,31 +345,83 @@ impl Connections {
                     }
                 }
             };
-            if let Err(error) = stream.set_nodelay(true) {
-                tracing::debug!(
-                    target: "zinder::runtime",
-                    event = "grpc_nodelay_failed",
-                    error = %error,
-                    "failed to disable Nagle's algorithm on a gRPC connection"
-                );
-            }
-            let connect_info = TcpConnectInfo {
-                local_addr: stream.local_addr().ok(),
-                remote_addr: Some(remote_addr),
-            };
-            let io = ConnectionIo::new(TokioIo::new(stream), self.write_stall_timeout, None);
-            let requests =
-                connection_service(service.clone(), connect_info, self.gate_observer.clone());
-            connections.spawn(resettable(
-                serve_connection(self.builder.clone(), io, requests, drain.clone()),
-                self.send_stall_timeout,
-            ));
+            self.spawn(&connections, (stream, peer), service.clone(), &drain);
         }
 
         drop(listener);
         drain.cancel();
         connections.close();
         connections.wait().await;
+    }
+
+    fn spawn<S, ResponseBody>(
+        &self,
+        tracker: &TaskTracker,
+        (mut stream, peer): (TcpStream, SocketAddr),
+        service: S,
+        drain: &CancellationToken,
+    ) where
+        S: Service<http::Request<Body>, Response = http::Response<ResponseBody>>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send + 'static,
+        S::Error: Into<axum::BoxError>,
+        ResponseBody: http_body::Body<Data = Bytes> + Send + 'static,
+        ResponseBody::Error: Into<axum::BoxError>,
+    {
+        let proxy_header = if self.proxy_protocol.is_enabled() {
+            if !self.proxy_protocol.trusts(peer.ip()) {
+                return;
+            }
+            let Ok(permit) = Arc::clone(&self.pending_proxy_headers).try_acquire_owned() else {
+                return;
+            };
+            Some(permit)
+        } else {
+            None
+        };
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::debug!(
+                target: "zinder::runtime",
+                event = "grpc_nodelay_failed",
+                error = %error,
+                "failed to disable Nagle's algorithm on a gRPC connection"
+            );
+        }
+        let connection_drain = drain.clone();
+        let builder = self.builder.clone();
+        let gate_observer = self.gate_observer.clone();
+        let write_stall_timeout = self.write_stall_timeout;
+        tracker.spawn(resettable(
+            async move {
+                let remote_addr = if let Some(permit) = proxy_header {
+                    let client = tokio::select! {
+                        client = Box::pin(proxy_protocol::read_client(&mut stream, peer)) => client,
+                        () = connection_drain.cancelled() => return,
+                    };
+                    drop(permit);
+                    let Ok(client) = client else {
+                        return;
+                    };
+                    client
+                } else {
+                    peer
+                };
+                let connect_info = TcpConnectInfo {
+                    local_addr: stream.local_addr().ok(),
+                    remote_addr: Some(remote_addr),
+                };
+                serve_connection(
+                    builder,
+                    ConnectionIo::new(TokioIo::new(stream), write_stall_timeout, None),
+                    connection_service(service, connect_info, gate_observer),
+                    connection_drain,
+                )
+                .await;
+            },
+            self.send_stall_timeout,
+        ));
     }
 }
 

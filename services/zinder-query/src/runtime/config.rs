@@ -13,8 +13,8 @@ use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
     ClientAddressSource, ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection,
-    DeploymentToml, IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml,
-    NodeFallbacksToml, NodeToml, OpsSection, OpsServerError, OpsToml,
+    DeploymentToml, GrpcProxyProtocol, IngestControlReaderToml, IngestControlSection,
+    NetworkSection, NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsServerError, OpsToml,
     ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, RocksDbResourceBudgetSection,
     RocksDbResourceBudgetToml, RuntimeService, SecuritySection, SecurityToml,
     derive_canonical_path, derive_canonical_secondary_path, derive_wallet_path,
@@ -64,6 +64,8 @@ pub struct QueryConfig {
     pub allow_public_bind: bool,
     /// How the gRPC listener tells clients apart for its receive limit.
     pub client_address_source: ClientAddressSource,
+    /// Trusted TCP proxy peers for a listener requiring PROXY protocol.
+    pub proxy_protocol: GrpcProxyProtocol,
     /// Canonical reorg-window identity enforced on admitted stores.
     pub canonical_reorg_policy: CanonicalReorgPolicy,
     /// Maximum bounded attempts to converge the serving read pair.
@@ -248,6 +250,7 @@ struct QuerySection {
     forwarded_read_waiters_per_slot: Option<u32>,
     forwarded_transaction_cache_bytes: Option<u64>,
     trust_proxy_client_address: Option<bool>,
+    proxy_protocol_trusted_cidrs: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -366,15 +369,15 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         config.query.forwarded_transaction_cache_bytes,
     )
     .map_err(|error| ConfigError::invalid(format!("query.{error}")))?;
-    let node = config
-        .node
-        .map(|section| NodeTarget::resolve(network, section))
-        .transpose()
-        .map_err(ConfigError::from)?;
-    let node_fallbacks =
-        NodeTarget::resolve_fallbacks(network, config.node_fallbacks).map_err(ConfigError::from)?;
-    NodeTarget::require_primary_for_fallbacks(node.as_ref(), &node_fallbacks)
-        .map_err(ConfigError::from)?;
+    let (node, node_fallbacks) = resolve_query_nodes(network, config.node, config.node_fallbacks)?;
+
+    let client_address_source = ClientAddressSource::from_trust_proxy_client_address(
+        config.query.trust_proxy_client_address.unwrap_or(false),
+    );
+    let proxy_protocol = GrpcProxyProtocol::resolve(
+        config.query.proxy_protocol_trusted_cidrs.as_deref(),
+        client_address_source,
+    )?;
 
     Ok(QueryConfig {
         profile,
@@ -389,9 +392,8 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         listen_addr,
         ops_listen_addr,
         allow_public_bind,
-        client_address_source: ClientAddressSource::from_trust_proxy_client_address(
-            config.query.trust_proxy_client_address.unwrap_or(false),
-        ),
+        client_address_source,
+        proxy_protocol,
         canonical_reorg_policy,
         pair_convergence_attempts,
         tree_state_replay_wait,
@@ -400,6 +402,21 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         node,
         node_fallbacks,
     })
+}
+
+fn resolve_query_nodes(
+    network: Network,
+    node: Option<NodeSection>,
+    fallbacks: NodeFallbackSections,
+) -> Result<(Option<NodeTarget>, Vec<NodeTarget>), ConfigError> {
+    let node = node
+        .map(|section| NodeTarget::resolve(network, section))
+        .transpose()
+        .map_err(ConfigError::from)?;
+    let fallbacks = NodeTarget::resolve_fallbacks(network, fallbacks).map_err(ConfigError::from)?;
+    NodeTarget::require_primary_for_fallbacks(node.as_ref(), &fallbacks)
+        .map_err(ConfigError::from)?;
+    Ok((node, fallbacks))
 }
 
 const DEFAULT_PAIR_CONVERGENCE_ATTEMPTS: u8 = 12;
@@ -558,6 +575,7 @@ impl QueryConfigToml {
                 trust_proxy_client_address: config
                     .client_address_source
                     .trust_proxy_client_address(),
+                proxy_protocol_trusted_cidrs: config.proxy_protocol.redacted_cidrs(),
             },
             node: config.node.as_ref().map(NodeToml::from_node_target),
             node_fallbacks: NodeFallbacksToml::from_node_targets(&config.node_fallbacks),
@@ -577,6 +595,8 @@ struct QueryToml {
     forwarded_read_waiters_per_slot: u32,
     forwarded_transaction_cache_bytes: u64,
     trust_proxy_client_address: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proxy_protocol_trusted_cidrs: Option<&'static str>,
 }
 
 #[derive(Serialize)]
