@@ -232,7 +232,7 @@ exercises it.
 | --- | --- | --- |
 | `ci-pr` | Every pull request, pushes to `main`, and weekly | The Rust jobs below, `dependency hygiene` (changelog, runbook, alignment, and release-policy scripts, `cargo deny`, and `cargo machete`), and the vendored protocols. `ci gate` passes only when all of them do. Coverage and mutation run only on the weekly schedule or a manual run. |
 | `protocol-contracts` | Pull requests and `main` pushes that touch the protocol | Checked-in generated code, `proto breaking` (pull requests only), and capability coverage |
-| `live-tests` | Node-facing pull requests, nightly Regtest, weekly Testnet, and manual Mainnet | The T3 suite, once against Zebra and once against Zakura on Regtest |
+| `live-tests` | Node-facing pull requests, nightly Regtest, weekly Testnet, and manual Mainnet | The T3 suite against Zebra and Zakura on Regtest. The Zebra job also installs a release-shaped GNU/Linux archive and probes the native systemd services. |
 | `parity-compat` | Node-facing pull requests and nightly | Live parity against a reference lightwalletd and a pinned CBB light client, on both nodes, from binaries that `build parity binaries` compiles once |
 | `binary-archives` | Pull requests and `main` pushes that touch build inputs | Release binary archives for both platforms |
 | `build-images` | Pull requests and `main` pushes that touch images or deployment files | Deployment admission and runtime image smoke builds |

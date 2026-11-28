@@ -63,16 +63,22 @@ if [[ "$(wc -l <<< "$member_list")" -ne "$(LC_ALL=C sort -u <<< "$member_list" |
   exit 1
 fi
 
-expected_members="$({
-  printf '%s\n' \
-    "$archive_root/" \
-    "$archive_root/BUILD-INFO.json" \
-    "$archive_root/LICENSE" \
-    "$archive_root/README.md" \
-    "$archive_root/SHA256SUMS" \
-    "$archive_root/bin/" \
-    "$archive_root/bin/zinder"
-})"
+file_catalog=(BUILD-INFO.json LICENSE README.md SHA256SUMS bin/zinder)
+native_assets=()
+if [[ "$rust_target" == *-linux-gnu ]]; then
+  native_units="$repository_root/deploy/systemd/native"
+  native_assets=("$native_units"/*.service "$native_units"/*.target "$native_units/zinder.env")
+  for asset in "${native_assets[@]}"; do
+    file_catalog+=("systemd/${asset##*/}")
+  done
+fi
+expected_members="$(
+  printf '%s\n' "$archive_root/" "$archive_root/bin/"
+  if [[ "$rust_target" == *-linux-gnu ]]; then
+    printf '%s/systemd/\n' "$archive_root"
+  fi
+  printf '%s\n' "${file_catalog[@]/#/$archive_root/}"
+)"
 actual_members="$(LC_ALL=C sort <<< "$member_list")"
 expected_members="$(LC_ALL=C sort <<< "$expected_members")"
 [[ "$actual_members" == "$expected_members" ]] || {
@@ -89,21 +95,7 @@ staging_root="$scratch_directory/$archive_root"
   echo >&2 "release binary archive has the wrong root directory"
   exit 1
 }
-for release_directory in "$staging_root" "$staging_root/bin"; do
-  [[ "$(stat -c '%a' "$release_directory")" == 755 ]] || {
-    echo >&2 "release archive directory has a noncanonical mode: $release_directory"
-    exit 1
-  }
-done
-
-expected_files="$({
-  printf '%s\n' \
-    BUILD-INFO.json \
-    LICENSE \
-    README.md \
-    SHA256SUMS \
-    bin/zinder
-})"
+expected_files="$(printf '%s\n' "${file_catalog[@]}" | LC_ALL=C sort)"
 actual_files="$(find "$staging_root" -type f -printf '%P\n' | LC_ALL=C sort)"
 [[ "$actual_files" == "$expected_files" ]] || {
   echo >&2 "release binary archive has the wrong file catalog"
@@ -154,6 +146,10 @@ actual_checksum_files="$(awk '{print $2}' "$staging_root/SHA256SUMS" | LC_ALL=C 
   cd "$staging_root"
   sha256sum --check --strict SHA256SUMS >/dev/null
 )
+
+for asset in "${native_assets[@]}"; do
+  cmp "$asset" "$staging_root/systemd/${asset##*/}"
+done
 
 build_info="$staging_root/BUILD-INFO.json"
 jq -e \

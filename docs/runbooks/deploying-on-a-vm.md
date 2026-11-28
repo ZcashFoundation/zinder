@@ -1,6 +1,7 @@
 # Deploying on a VM
 
-This runbook sets up the zero-TOML single-host Zinder topology on a Linux VM with Docker Compose and `systemd`, plus production procedures for Zakura, node failover, indexer mTLS, signed wallet history, Explorer, upgrades, and the standalone `zinder` binary. Read [Deploying Zinder](deploying.md) first for preset selection, host sizing, and the canonical port matrix.
+Deploy Zinder on a Linux VM with Docker Compose or [native systemd services](#run-the-release-binary-without-docker).
+Read [Deploying Zinder](deploying.md) first for presets, host sizing, and ports.
 
 ## Before you start
 
@@ -290,15 +291,96 @@ gh release download "$release" --repo ZcashFoundation/zinder \
 ```
 
 On macOS, run the verified `bin/zinder` from the extracted directory.
-To install it system-wide on Linux, run:
+### Install the GNU/Linux archive
+
+Use a systemd host with an archive Zebra or Zakura node reachable from the VM.
+Keep `/var/lib/zinder` on a single local filesystem sized for all primary and
+secondary stores. Stop any existing Zinder deployment that uses the same ports
+or data before starting the native services.
+
+From the directory where you extracted the verified archive, run:
 
 ```bash
-sudo install -m 0755 "zinder-${release#v}-${platform}"/bin/zinder /usr/local/bin/zinder
+release_dir="zinder-${release#v}-${platform}"
+sudo useradd --system --user-group --home-dir /var/lib/zinder \
+  --no-create-home --shell /usr/sbin/nologin zinder
+sudo install -o root -g root -m 0755 "$release_dir/bin/zinder" /usr/local/bin/zinder
+sudo install -o root -g root -m 0644 "$release_dir"/systemd/*.service \
+  "$release_dir"/systemd/*.target /etc/systemd/system/
+sudo install -d -o root -g zinder -m 0750 /etc/zinder/native
+sudo install -o root -g root -m 0600 "$release_dir/systemd/zinder.env" /etc/zinder/native/zinder.env
+for token in ingest checkpoint; do
+  openssl rand -hex 32 | sudo install -o root -g zinder -m 0440 \
+    /dev/stdin "/etc/zinder/native/$token.token"
+done
 ```
 
-Run `zinder serve --preset wallet --data-dir /var/lib/zinder` (or split `zinder index` + `zinder serve --readers-only`, or invoke individual roles via `zinder run <role>`) configured through `ZINDER_*` environment variables (or an optional combined `--config` TOML file). When supervising native units under `systemd`:
+Run `sudoedit /etc/zinder/native/zinder.env`. Set `ZINDER_NETWORK__NAME` and
+`ZINDER_NODE__JSON_RPC_ADDR` for your node. The sample selects Mainnet and
+reads its RPC cookie from `/etc/zinder/native/node.cookie`. Set
+`ZINDER_NODE__AUTH__PATH` to a current cookie file readable by `zinder`
+after every node restart. Keep it outside home directories and `/tmp` so
+the service sandbox can access it. Alternatively, set
+`ZINDER_NODE__AUTH__METHOD=basic`, remove the cookie path, and set
+`ZINDER_NODE__AUTH__USERNAME` and `ZINDER_NODE__AUTH__PASSWORD` in the
+root-only env file. See the [node configuration reference](../reference/configuration.md#environment-variables).
 
-- Keep one local filesystem (`--data-dir`) for all stores, and give separate `zinder serve` instances distinct `--data-dir` or per-reader `secondary_path` directories if running multiple readers.
-- Run under an account that can read the node's mode-0600 cookie (or supply `ZINDER_NODE__AUTH__COOKIE` / `basic` auth).
-- Set `LimitNOFILE=65536` in each Zinder `[Service]` unit, because readers keep up to 2,048 SST handles open per store generation alongside segment files and sockets.
-- Keep serving listeners bound to loopback (`127.0.0.1:...`, the default outside Docker) behind a host reverse proxy.
+The services run as `zinder:zinder`. Systemd creates and grants write access
+to `/var/lib/zinder`. Each reader derives a distinct RocksDB secondary path
+under that directory. Keep the listener and control addresses on loopback.
+Use a host reverse proxy for external wallet traffic, as described in
+[Exposing over TLS](exposing-over-tls.md).
+
+### Start and verify the wallet services
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable zinder-native.target
+sudo systemctl start --no-block zinder-native.target
+sudo journalctl -u zinder-native-index.service -u zinder-native-projector.service -f
+```
+
+The target starts ingest, then the projector, then WalletQuery and
+lightwalletd compatibility. Each dependent unit waits for its prerequisite's
+`/readyz` to return HTTP 200. The first sync can take hours. While a service
+is syncing, systemd shows it as `activating`. Check progress using
+[Initial sync](initial-sync.md).
+
+```bash
+systemctl status 'zinder-native-*'
+for port in 9105 9110 9106 9107; do
+  /usr/local/bin/zinder healthcheck --ready --addr "127.0.0.1:$port"
+done
+grpcurl -plaintext -d '{}' 127.0.0.1:9102 zinder.v1.wallet.WalletQuery/ServerInfo
+grpcurl -plaintext -d '{}' 127.0.0.1:9067 cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
+```
+
+### Add Explorer and Cipherscan
+
+Stop `zinder-native.target`, set `ZINDER_DEPLOYMENT__PROFILE=explorer` in
+`/etc/zinder/native/zinder.env`, and enable the extra services before starting
+the target again:
+
+```bash
+sudo systemctl enable zinder-native-explorer.service zinder-native-compat-cipherscan.service
+sudo systemctl start --no-block zinder-native.target
+```
+
+ExplorerQuery listens on `127.0.0.1:9068` and Cipherscan on `127.0.0.1:9070`.
+Check their `/readyz` endpoints on `9069` and `9108`, respectively. Check
+Explorer's `ServerInfo` for available capabilities while views backfill.
+See [Explorer plane](../architecture/explorer-plane.md#what-it-needs) for
+storage and coverage requirements.
+
+### Restart, stop, and upgrade the native services
+
+Use `sudo systemctl restart --no-block zinder-native.target` to apply env
+changes to the full deployment. To stop the deployment and keep it disabled
+at boot, run `sudo systemctl disable --now zinder-native.target`.
+
+For an upgrade, verify the new archive and check each intervening release's
+upgrade class using [Upgrade, restart, and roll back](#upgrade-restart-and-roll-back).
+Stop the target, install the new binary and units using the commands above,
+and run `sudo systemctl daemon-reload` before starting the target. Keep your
+existing account, env file, and tokens. Follow the applicable store upgrade
+instructions before reusing or replacing data.

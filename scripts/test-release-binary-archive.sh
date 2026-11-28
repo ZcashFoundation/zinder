@@ -223,13 +223,8 @@ mv \
   "$cpu_baseline_root/$root_name/BUILD-INFO.json"
 (
   cd "$cpu_baseline_root/$root_name"
-  find bin -maxdepth 1 -type f -printf '%p\n' \
-    | LC_ALL=C sort \
-    | xargs sha256sum
-  printf '%s\n' BUILD-INFO.json LICENSE README.md \
-    | LC_ALL=C sort \
-    | xargs sha256sum
-) | LC_ALL=C sort -k2 > "$cpu_baseline_root/$root_name/SHA256SUMS"
+  find . -type f ! -path './SHA256SUMS' -printf '%P\n' | LC_ALL=C sort | xargs sha256sum
+) > "$cpu_baseline_root/$root_name/SHA256SUMS"
 chmod 0644 \
   "$cpu_baseline_root/$root_name/BUILD-INFO.json" \
   "$cpu_baseline_root/$root_name/SHA256SUMS"
@@ -268,13 +263,8 @@ mv \
   "$cpu_features_root/$root_name/BUILD-INFO.json"
 (
   cd "$cpu_features_root/$root_name"
-  find bin -maxdepth 1 -type f -printf '%p\n' \
-    | LC_ALL=C sort \
-    | xargs sha256sum
-  printf '%s\n' BUILD-INFO.json LICENSE README.md \
-    | LC_ALL=C sort \
-    | xargs sha256sum
-) | LC_ALL=C sort -k2 > "$cpu_features_root/$root_name/SHA256SUMS"
+  find . -type f ! -path './SHA256SUMS' -printf '%P\n' | LC_ALL=C sort | xargs sha256sum
+) > "$cpu_features_root/$root_name/SHA256SUMS"
 chmod 0644 \
   "$cpu_features_root/$root_name/BUILD-INFO.json" \
   "$cpu_features_root/$root_name/SHA256SUMS"
