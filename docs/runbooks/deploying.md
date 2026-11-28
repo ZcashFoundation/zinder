@@ -48,13 +48,13 @@ You need an archive Zebra or Zakura node on the same network. Ingest reads every
 
 ### Private or standard Mainnet VM
 
-- **CPU:** 8+ vCPUs (Broadwell+/Zen+ `x86-64` supporting `x86-64-v3` + `ADX`, or `AArch64`). The AMD64 image uses the optimized archive; choose the baseline GNU/Linux archive if your CPU lacks the optimized build's features (pass `DEPLOY_PASTA_ASM=0` only when building Compose images from source for pre-Broadwell/Haswell `x86-64` hosts without `ADX`). Optimized wallet accumulators can use AVX-512F/VL when available. Hosts with fewer than 8 logical CPUs take longer to sync; see [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
+- **CPU:** 8+ vCPUs (Broadwell+/Zen+ `x86-64` supporting `x86-64-v3` + `ADX`, or `AArch64`). The AMD64 image uses the optimized archive; choose the baseline GNU/Linux archive if your CPU lacks the optimized build's features (pass `DEPLOY_PASTA_ASM=0` only when building Compose images from source for `x86-64-v3` CPUs without `ADX` such as Haswell, and pair `DEPLOY_PASTA_ASM=0` with `DEPLOY_X86_64_CPU_BASELINE=x86-64` for pre-Haswell CPUs without `AVX2`). Optimized wallet accumulators can use AVX-512F/VL when available. Hosts with fewer than 8 logical CPUs take longer to sync; see [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
 - **RAM:** 32 GiB RAM. Give `zinder-index` enough memory for canonical + wallet construction (`14g`–`24g` on Mainnet), keep `4g`+ on `zinder-serve` for private endpoints (raise for high-concurrency range reads), and give single-volume containers (`zinder serve`) at least 8–16 GB.
 - **Disk:** Fast local SSD/NVMe formatted **`ext4 -O verity`** (when protecting canonical settled segments with optional Linux fs-verity). Reserve **240+ GB free** for `wallet` (pre-v2 Schema `v1` steady-state was ~102 GB canonical + wallet at Mainnet height 3,593,347 and growing, plus ~130 GB temporary sort spill headroom during initial wallet construction). Enabling `--full-blocks` (`storage.full_blocks = true`, `raw_blob_policy = "all"`) stores a single Zstd-compressed copy of full consensus blocks plus 40-byte transaction slice descriptors (`ZSBLKB01` + `live_tail_raw_block`), so budget additional free NVMe capacity beyond the ~250+ GiB raw chain data and wallet sort spill headroom.
 
 ### Public high-concurrency Mainnet endpoint
 
-- **CPU:** 8–16+ vCPUs (Broadwell+/Zen+ `x86-64` with `BMI2 + ADX`, or `AArch64`). Release images and optimized binary archives enable `pasta_curves/asm` (pass `--features pasta_curves/asm` when compiling directly with Cargo; `DEPLOY_PASTA_ASM=0` disables it in source Compose builds), saving ~6.7–8.2% on Orchard Merkle hashing and canonical construction benchmarks while failing closed at startup if `ADX` is missing.
+- **CPU:** 8–16+ vCPUs (Broadwell+/Zen+ `x86-64` with `BMI2 + ADX`, or `AArch64`). Release images and optimized binary archives enable `pasta_curves/asm` (pass `--features pasta_curves/asm` when compiling directly with Cargo; `DEPLOY_PASTA_ASM=0` disables it in source Compose builds for `x86-64-v3` CPUs without `ADX`, paired with `DEPLOY_X86_64_CPU_BASELINE=x86-64` for pre-Haswell CPUs without `AVX2`), saving ~6.7–8.2% on Orchard Merkle hashing and canonical construction benchmarks while failing closed at startup if `ADX` is missing.
 - **RAM:** **64+ GiB RAM** and size `zinder-serve`'s cgroup memory limit above **32 GiB** (`DEPLOY_SERVE_MEMORY_LIMIT`). Allow room for the active settled-segment working set and the rest of the process. If range-stream `wait_timeout` refusals rise alongside disk read saturation, check the [settled-segment memory gauges](../reference/metrics.md#storage) and raise the limit to accommodate the serving workload.
 - **Node feed:** Set `ZINDER_NODE__INDEXER_GRPC_ADDR` in `zinder.env` (and `ZINDER_INGEST__SOURCE=zebra-indexer-grpc`, plus any `ZINDER_NODE__INDEXER_TLS__*` PEMs, in writer-only `index.env` pointed to by `DEPLOY_INDEX_ENV`) to stream mempool events and fetch blocks as binary protobufs instead of polling the full mempool over JSON-RPC on every block.
 - **Edge proxy:** Put a TLS proxy with per-client connection, request, and stream limits in front of the listeners ([Exposing over TLS](exposing-over-tls.md)).
@@ -77,10 +77,10 @@ disabled speculative readahead and drop-behind of consumed payload pages.
 
 Use Docker Engine with the Compose plugin on AMD64 Linux that supports the
 optimized CPU baseline, ARM64 Linux, or Apple Silicon with Docker Desktop.
-The bundle starts an archive Zebra node and `zinder serve --preset light-wallet`.
+The bundle starts an archive Zebra node and `zinder serve` with `ZINDER_DEPLOYMENT__PROFILE=light-wallet`.
 Give the stack at least 12 GiB of container memory plus headroom for the host
 or Docker VM. The manifest caps Zebra at 4 GiB and Zinder at 8 GiB by default.
-Use `ZINDER_SERVE_MEMORY_LIMIT=4g` for a small Regtest stack. For Mainnet,
+Use `DEPLOY_SERVE_MEMORY_LIMIT=4g` for a small Regtest stack. For Mainnet,
 reserve the [Zinder disk space above](#choose-a-profile), plus initial-sync
 headroom and [Zebra's separate disk budget](https://zebra.zfnd.org/user/requirements.html).
 
@@ -219,7 +219,7 @@ This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](h
 
 ### Build from source
 
-To run an unreleased checkout instead of published images, leave `DEPLOY_VERSION` unset (export `DEPLOY_PASTA_ASM=0` only if building for a pre-Broadwell/Haswell `x86-64` host without `ADX`) and run:
+To run an unreleased checkout instead of published images, leave `DEPLOY_VERSION` unset (export `DEPLOY_PASTA_ASM=0` only if building for an `x86-64-v3` CPU without `ADX` such as Haswell, plus `DEPLOY_X86_64_CPU_BASELINE=x86-64` for pre-Haswell CPUs without `AVX2`) and run:
 
 ```bash
 docker compose --env-file deploy/profiles/testnet/deploy.env \

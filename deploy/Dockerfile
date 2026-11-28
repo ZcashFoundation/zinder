@@ -137,6 +137,7 @@ ARG TARGETARCH
 ARG TARGETVARIANT
 ARG RELEASE_CACHE_SCOPE=shared
 ARG ZINDER_PASTA_ASM=1
+ARG ZINDER_X86_64_CPU_BASELINE
 
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
@@ -146,6 +147,11 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
     && case "${ZINDER_PASTA_ASM}" in \
         0|1) ;; \
         *) printf '%s\n' "ZINDER_PASTA_ASM must be 0 or 1, got '${ZINDER_PASTA_ASM}'" >&2; exit 1 ;; \
+    esac \
+    && case "${ZINDER_X86_64_CPU_BASELINE}:${TARGETARCH}:${ZINDER_PASTA_ASM}" in \
+        x86-64-v3:*) ;; \
+        x86-64:amd64:0) export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64 --remap-path-prefix=/workspace=/usr/src/zinder --remap-path-prefix=/usr/local/cargo=/cargo" ;; \
+        *) printf '%s\n' 'x86-64 baseline requires amd64 and ZINDER_PASTA_ASM=0' >&2; exit 1 ;; \
     esac \
     && pasta_asm_flag="$(if [ "${ZINDER_PASTA_ASM}" = "1" ]; then printf '%s' '--features pasta_curves/asm'; else printf '%s' ''; fi)" \
     && rustup target add "$rust_target" \
@@ -213,7 +219,7 @@ COPY --from=zinder-binaries-selected /zinder-binaries/zinder /usr/local/bin/zind
 USER 10001:10001
 WORKDIR /var/lib/zinder
 
-EXPOSE 9067 9068 9070 9102 9108
+EXPOSE 9067 9068 9070 9102 9105 9108
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["/usr/local/bin/zinder", "healthcheck"]

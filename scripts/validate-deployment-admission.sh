@@ -308,6 +308,14 @@ if [[ -n "$build_images_workflow" ]]; then
       "$build_images_workflow" \
     || ! grep -Fq 'docker run --rm "${image_name}:${PR_TAG}" config validate --help >/dev/null' \
       "$build_images_workflow" \
+    || ! grep -Fq 'docker run --rm "${image_name}:${PR_TAG}" dev darkside --help >/dev/null' \
+      "$build_images_workflow" \
+    || ! grep -Fq 'find deploy/profiles -mindepth 2 -maxdepth 2 -name zinder.env -type f | LC_ALL=C sort' \
+      "$build_images_workflow" \
+    || ! grep -Eq '^[[:space:]]*docker run --rm --env-file "\$profile_env" "\$\{image_name\}:\$\{PR_TAG\}" config validate$' \
+      "$build_images_workflow" \
+    || ! grep -Fq 'ZINDER_UNKNOWN__SMOKE_KEY=1' "$build_images_workflow" \
+    || ! grep -Fq '[[ "$unknown_key_status" -ne 1 ]]' "$build_images_workflow" \
     || ! grep -Fq 'docker run --rm "${image_name}:${PR_TAG}" healthcheck --addr 127.0.0.1:1' \
       "$build_images_workflow" \
     || ! grep -Fq '10001:10001' "$build_images_workflow" \
@@ -917,7 +925,7 @@ EOF
       <<< "$zinder_stage_body" \
     || ! grep -Fqx 'USER 10001:10001' <<< "$zinder_stage_body" \
     || ! grep -Fqx 'WORKDIR /var/lib/zinder' <<< "$zinder_stage_body" \
-    || ! grep -Fqx 'EXPOSE 9067 9068 9070 9102 9108' <<< "$zinder_stage_body" \
+    || ! grep -Fqx 'EXPOSE 9067 9068 9070 9102 9105 9108' <<< "$zinder_stage_body" \
     || ! grep -Fqx '    CMD ["/usr/local/bin/zinder", "healthcheck"]' <<< "$zinder_stage_body" \
     || ! grep -Fqx 'ENTRYPOINT ["/usr/local/bin/zinder"]' <<< "$zinder_stage_body" \
     || ! grep -Fqx 'CMD ["serve"]' <<< "$zinder_stage_body" \
@@ -927,7 +935,7 @@ EOF
     cat >&2 <<'EOF'
 release admission rejected: the unified zinder release stage must build on the
 digest-pinned distroless zinder-service-base as UID/GID 10001 with zero ENV or
-TOML configs, carry only /usr/local/bin/zinder, expose ports 9067/9068/9070/9102/9108,
+TOML configs, carry only /usr/local/bin/zinder, expose ports 9067/9068/9070/9102/9105/9108,
 and use ["/usr/local/bin/zinder", "healthcheck"], while internal CI/benchmark
 stages use UID/GID 10001 on zinder-runtime-base.
 EOF
@@ -1118,6 +1126,11 @@ EOF
     || ! grep -Fq -- '--entrypoint "$binary_name" "$smoke_image" --version' "$image_packager" \
     || ! grep -Fq -- '--entrypoint "$binary_name" "$smoke_image" healthcheck --addr 127.0.0.1:1 \' "$image_packager" \
     || ! grep -Fq '[[ "$healthcheck_status" -eq 1 ]]' "$image_packager" \
+    || ! grep -Fq -- '--entrypoint "$binary_name" "$smoke_image" dev darkside --help >/dev/null' "$image_packager" \
+    || ! grep -Fq 'find "${repository_root}/deploy/profiles"' "$image_packager" \
+    || ! grep -Eq '^[[:space:]]*--env-file "\$profile_env" --entrypoint "\$binary_name" "\$smoke_image" config validate$' "$image_packager" \
+    || ! grep -Fq 'ZINDER_UNKNOWN__SMOKE_KEY=1' "$image_packager" \
+    || ! grep -Fq '[[ "$unknown_key_status" -eq 1 ]]' "$image_packager" \
     || ! grep -Fq "jq -r '.[]' <<< \"\$images_json\"" "$image_packager" \
     || ! grep -Fq -- '--build-context "zinder-archived-binaries=${binary_context}"' "$image_packager" \
     || ! grep -Fq -- '--build-arg "ZINDER_BINARIES_SOURCE=zinder-archived-binaries"' "$image_packager" \

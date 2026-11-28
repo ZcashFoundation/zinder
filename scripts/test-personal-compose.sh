@@ -5,13 +5,13 @@ set -euo pipefail
 
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/zinder-personal-compose.XXXXXX")"
-export ZINDER_IMAGE="$1"
+export DEPLOY_IMAGE="$1"
 # Compose v2 evaluates the nested tag requirement even with an image override.
-export ZINDER_VERSION=local
+export DEPLOY_VERSION=local
 export ZINDER_NETWORK__NAME=zcash-regtest
 export ZEBRA_NETWORK__NETWORK=Regtest
 export ZINDER_NODE__JSON_RPC_ADDR=http://zebra:8232
-export ZINDER_SERVE_MEMORY_LIMIT=4g
+export DEPLOY_SERVE_MEMORY_LIMIT=4g
 compose=(
   docker compose --project-name "zinder-personal-smoke-$$"
   --env-file /dev/null

@@ -83,13 +83,17 @@ fi
 
 personal_compose="$repository_root/deploy/personal/compose.yaml"
 personal_compose_env=(
-  env -u ZINDER_IMAGE -u ZINDER_VERSION -u ZINDER_SERVE_MEMORY_LIMIT
-  -u ZINDER_NETWORK__NAME -u ZEBRA_NETWORK__NETWORK -u ZINDER_NODE__JSON_RPC_ADDR
+  env -u DEPLOY_IMAGE -u DEPLOY_VERSION -u DEPLOY_SERVE_MEMORY_LIMIT
+  -u ZINDER_DEPLOYMENT__PROFILE -u ZINDER_NETWORK__NAME
+  -u ZEBRA_NETWORK__NETWORK -u ZINDER_NODE__JSON_RPC_ADDR
 )
-"${personal_compose_env[@]}" ZINDER_VERSION=v0.27.0 \
+"${personal_compose_env[@]}" DEPLOY_VERSION=v0.27.0 \
   docker compose --env-file /dev/null -f "$personal_compose" config --format json \
   | jq -e '
-    .services.zinder.command == ["serve", "--preset", "light-wallet"]
+    .services.zinder.command == ["serve"]
+    and .services.zinder.environment.ZINDER_DEPLOYMENT__PROFILE == "light-wallet"
+    and .services.zinder.environment.ZINDER_COMPAT__LISTEN_ADDR == "[::]:9067"
+    and .services.zinder.environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9108"
     and (.services.zinder.mem_limit | tonumber) == 8589934592
     and .services.zinder.stop_grace_period == "30s"
     and .services.zinder.image == "ghcr.io/zcashfoundation/zinder:v0.27.0"
@@ -106,13 +110,15 @@ personal_compose_env=(
     and any(.services.zinder.volumes[]; .source == "zebra-auth" and .read_only == true)
   ' >/dev/null || fail "personal Compose changed its default configuration"
 
-"${personal_compose_env[@]}" ZINDER_SERVE_MEMORY_LIMIT=4g ZINDER_IMAGE=zinder:local ZINDER_VERSION=local \
+"${personal_compose_env[@]}" DEPLOY_SERVE_MEMORY_LIMIT=4g DEPLOY_IMAGE=zinder:local DEPLOY_VERSION=local \
+  ZINDER_DEPLOYMENT__PROFILE=wallet \
   ZINDER_NETWORK__NAME=zcash-testnet ZEBRA_NETWORK__NETWORK=Testnet \
   ZINDER_NODE__JSON_RPC_ADDR=http://zebra:18232 \
   docker compose --env-file /dev/null -f "$personal_compose" config --format json \
   | jq -e '
     (.services.zinder.mem_limit | tonumber) == 4294967296
     and .services.zinder.image == "zinder:local"
+    and .services.zinder.environment.ZINDER_DEPLOYMENT__PROFILE == "wallet"
     and .services.zinder.environment.ZINDER_NETWORK__NAME == "zcash-testnet"
     and .services.zinder.environment.ZINDER_NODE__JSON_RPC_ADDR == "http://zebra:18232"
     and .services.zebra.environment.ZEBRA_NETWORK__NETWORK == "Testnet"
@@ -122,7 +128,7 @@ zinder_image_digest="sha256:$(printf '%064d' 1)"
 release_compose="$temporary_directory/zinder-personal-compose.yaml"
 "${personal_compose_env[@]}" "$repository_root/scripts/render-personal-compose.sh" \
   "$zinder_image_digest" > "$release_compose"
-"${personal_compose_env[@]}" ZINDER_IMAGE=zinder:local \
+"${personal_compose_env[@]}" DEPLOY_IMAGE=zinder:local \
   docker compose --env-file /dev/null -f "$release_compose" config --format json \
   | jq -e --arg digest "$zinder_image_digest" '
     .services.zinder.image == ("ghcr.io/zcashfoundation/zinder@" + $digest)
@@ -352,6 +358,38 @@ jq -e '
 ' --slurpfile released "$released_compose" --slurpfile source "$resolved_compose" \
   -n >/dev/null \
   || fail "DEPLOY_VERSION does not select ghcr.io/zcashfoundation/zinder:v9.8.7 while keeping its source build"
+
+default_build_compose="$temporary_directory/default-build-compose.json"
+env -u DEPLOY_X86_64_CPU_BASELINE -u DEPLOY_PASTA_ASM \
+  DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+  docker compose \
+    --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
+    -f "$repository_root/deploy/docker-compose.yml" \
+    config --format json > "$default_build_compose"
+jq -e '
+  .services as $services
+  | ["zinder-index", "zinder-serve"]
+  | all(. as $service
+    | $services[$service].build.args.ZINDER_X86_64_CPU_BASELINE == "x86-64-v3")
+' "$default_build_compose" >/dev/null \
+  || fail "Compose does not default ZINDER_X86_64_CPU_BASELINE to x86-64-v3"
+
+baseline_compose="$temporary_directory/baseline-compose.json"
+DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_X86_64_CPU_BASELINE=x86-64 \
+DEPLOY_PASTA_ASM=0 \
+docker compose \
+  --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  config --format json > "$baseline_compose"
+jq -e '
+  .services as $services
+  | ["zinder-index", "zinder-serve"]
+  | all(. as $service
+    | $services[$service].build.args.ZINDER_X86_64_CPU_BASELINE == "x86-64"
+    and $services[$service].build.args.ZINDER_PASTA_ASM == "0")
+' "$baseline_compose" >/dev/null \
+  || fail "DEPLOY_X86_64_CPU_BASELINE=x86-64 DEPLOY_PASTA_ASM=0 did not override build args"
 
 invalid_compose="$temporary_directory/invalid-compose.json"
 jq '.services["zinder-history-publisher"] = .services["zinder-serve"]' \
@@ -837,6 +875,44 @@ expect_rejected_because \
   'release admission rejected: the release image packager must' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --image-packager "$unchecked_healthcheck_packager"
+
+no_darkside_packager="$temporary_directory/no-darkside-packager.sh"
+mutate_image_packager "$no_darkside_packager" \
+  sed 's/dev darkside --help/help/g'
+expect_rejected_because \
+  "an image packager without a dev darkside help smoke" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$no_darkside_packager"
+
+no_profile_validate_packager="$temporary_directory/no-profile-validate-packager.sh"
+# shellcheck disable=SC2016
+mutate_image_packager "$no_profile_validate_packager" \
+  sed '/--env-file "\$profile_env"/s/config validate$/config validate --help/'
+expect_rejected_because \
+  "an image packager without deployment-profile config validate smoke" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$no_profile_validate_packager"
+
+no_unknown_key_packager="$temporary_directory/no-unknown-key-packager.sh"
+mutate_image_packager "$no_unknown_key_packager" \
+  sed 's/ZINDER_UNKNOWN__SMOKE_KEY=1/ZINDER_NOOP=1/g'
+expect_rejected_because \
+  "an image packager without unknown-key fail-closed smoke" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$no_unknown_key_packager"
+
+unchecked_unknown_key_status_packager="$temporary_directory/unchecked-unknown-key-status-packager.sh"
+# shellcheck disable=SC2016
+mutate_image_packager "$unchecked_unknown_key_status_packager" \
+  sed '/\[\[ "\$unknown_key_status" -eq 1 \]\]/d'
+expect_rejected_because \
+  "an image packager that does not require exit code 1 for unknown config keys" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$unchecked_unknown_key_status_packager"
 
 wall_clock_created_packager="$temporary_directory/wall-clock-created-packager.sh"
 # shellcheck disable=SC2016
@@ -1436,6 +1512,40 @@ sed '/docker run --rm "\${image_name}:\${PR_TAG}" --help/d' \
 expect_rejected \
   "a pull-request image workflow without runtime help smokes" \
   --build-images-workflow "$helpless_build_workflow"
+
+no_darkside_build_workflow="$temporary_directory/no-darkside-build-images.yml"
+sed 's/dev darkside --help/help/g' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$no_darkside_build_workflow"
+expect_rejected \
+  "a pull-request image workflow without dev darkside help smoke" \
+  --build-images-workflow "$no_darkside_build_workflow"
+
+no_profile_validate_build_workflow="$temporary_directory/no-profile-validate-build-images.yml"
+# shellcheck disable=SC2016
+sed '/--env-file "\$profile_env"/s/config validate$/config validate --help/' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$no_profile_validate_build_workflow"
+expect_rejected \
+  "a pull-request image workflow without deployment-profile config validate smoke" \
+  --build-images-workflow "$no_profile_validate_build_workflow"
+
+no_unknown_key_build_workflow="$temporary_directory/no-unknown-key-build-images.yml"
+sed 's/ZINDER_UNKNOWN__SMOKE_KEY=1/ZINDER_NOOP=1/g' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$no_unknown_key_build_workflow"
+expect_rejected \
+  "a pull-request image workflow without unknown-key fail-closed smoke" \
+  --build-images-workflow "$no_unknown_key_build_workflow"
+
+unchecked_unknown_key_status_build_workflow="$temporary_directory/unchecked-unknown-key-status-build-images.yml"
+# shellcheck disable=SC2016
+sed '/\[\[ "\$unknown_key_status" -ne 1 \]\]/d' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$unchecked_unknown_key_status_build_workflow"
+expect_rejected \
+  "a pull-request image workflow that does not require exit code 1 for unknown config keys" \
+  --build-images-workflow "$unchecked_unknown_key_status_build_workflow"
 
 arm64less_build_workflow="$temporary_directory/arm64less-build-images.yml"
 sed '/^[[:space:]]*-[[:space:]]*name: arm64$/,/^[[:space:]]*runner: ubuntu-24.04-arm$/d' \

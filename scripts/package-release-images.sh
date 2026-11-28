@@ -264,6 +264,32 @@ while IFS= read -r image_name; do
       echo >&2 "${image_name} ${binary_name} healthcheck against a closed port exited ${healthcheck_status}, expected 1"
       exit 1
     }
+    if [[ "$binary_name" == zinder ]]; then
+      docker run --rm --platform "$platform" --user 10001:10001 \
+        --entrypoint "$binary_name" "$smoke_image" dev darkside --help >/dev/null
+      mapfile -t profile_envs < <(
+        find "${repository_root}/deploy/profiles" -mindepth 2 -maxdepth 2 \
+          -name zinder.env -type f | LC_ALL=C sort
+      )
+      [[ "${#profile_envs[@]}" -gt 0 ]] || {
+        echo >&2 "${image_name}: no deploy/profiles/*/zinder.env profiles found"
+        exit 1
+      }
+      for profile_env in "${profile_envs[@]}"; do
+        docker run --rm --platform "$platform" --user 10001:10001 \
+          --env-file "$profile_env" --entrypoint "$binary_name" "$smoke_image" config validate
+      done
+      unknown_key_status=0
+      docker run --rm --platform "$platform" --user 10001:10001 \
+        --env-file "${repository_root}/deploy/profiles/mainnet/zinder.env" \
+        --env ZINDER_UNKNOWN__SMOKE_KEY=1 \
+        --entrypoint "$binary_name" "$smoke_image" config validate \
+        >/dev/null 2>&1 || unknown_key_status=$?
+      [[ "$unknown_key_status" -eq 1 ]] || {
+        echo >&2 "${image_name} ${binary_name} config validate with ZINDER_UNKNOWN__SMOKE_KEY exited ${unknown_key_status}, expected 1"
+        exit 1
+      }
+    fi
   done
   rm -f -- "$smoke_filesystem"
   echo "${image_name} (${platform_arch}): ${carried_binaries[*]} match the archive and run as UID 10001"
