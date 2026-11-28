@@ -150,6 +150,111 @@ fn compact_block_round_trips_through_prost() -> eyre::Result<()> {
 }
 
 #[test]
+fn mixed_pool_projection_keeps_consensus_indexes_and_full_tree_sizes() -> eyre::Result<()> {
+    use zinder_core::{
+        CompactBlockArtifact, CompactChainMetadata, CompactPool, CompactTransaction,
+    };
+    use zinder_proto::wire::{
+        compact_block_from_message, compact_block_message, compact_block_message_for_pools,
+    };
+
+    let mixed = all_pool_scan_fields();
+    let sapling = CompactTransactionData {
+        sapling_spends: mixed.sapling_spends.clone(),
+        sapling_outputs: mixed.sapling_outputs.clone(),
+        ..CompactTransactionData::default()
+    };
+    let orchard = CompactTransactionData {
+        orchard_actions: mixed.orchard_actions.clone(),
+        ..CompactTransactionData::default()
+    };
+    let ironwood = CompactTransactionData {
+        ironwood_actions: mixed.ironwood_actions.clone(),
+        ..CompactTransactionData::default()
+    };
+    let transparent = CompactTransactionData {
+        transparent_inputs: mixed.transparent_inputs.clone(),
+        transparent_outputs: mixed.transparent_outputs.clone(),
+        ..CompactTransactionData::default()
+    };
+    let transactions = [(2, mixed), (5, orchard.clone()), (9, sapling.clone())]
+        .into_iter()
+        .map(|(index, scan)| CompactTransaction {
+            index: u64::from(index),
+            transaction_id: TransactionId::from_bytes([index; 32]),
+            data: scan,
+        })
+        .collect();
+    let trees = CompactChainMetadata {
+        sapling_commitment_tree_size: 8,
+        orchard_commitment_tree_size: 13,
+        ironwood_commitment_tree_size: 21,
+    };
+    let block = CompactBlockArtifact::new(
+        BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([6; 32])),
+        BlockHash::from_bytes([7; 32]),
+        123,
+        transactions,
+        trees,
+    )?;
+
+    for (pool, indexes, scan) in [
+        (CompactPool::Sapling, &[2, 9][..], sapling),
+        (CompactPool::Orchard, &[2, 5][..], orchard),
+        (CompactPool::Ironwood, &[2][..], ironwood),
+        (CompactPool::Transparent, &[2][..], transparent),
+    ] {
+        let projected =
+            compact_block_from_message(compact_block_message_for_pools(&block, &[pool]))?;
+        assert_eq!(projected.chain_metadata(), trees);
+        let expected = indexes
+            .iter()
+            .map(|&index| CompactTransaction {
+                index: u64::from(index),
+                transaction_id: TransactionId::from_bytes([index; 32]),
+                data: scan.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(projected.transactions(), expected);
+    }
+    assert_eq!(
+        compact_block_message_for_pools(&block, &[]),
+        compact_block_message(&block)
+    );
+    assert_eq!(
+        compact_block_from_message(compact_block_message(&block))?,
+        block
+    );
+    Ok(())
+}
+
+#[test]
+fn projected_nullifier_decoder_rejects_non_increasing_transaction_indexes() {
+    use zinder_proto::compat::lightwalletd::{CompactBlock, CompactSaplingSpend, CompactTx};
+
+    for indexes in [[4, 4], [4, 3]] {
+        let block = CompactBlock {
+            hash: vec![1; 32],
+            prev_hash: vec![2; 32],
+            vtx: indexes
+                .into_iter()
+                .map(|index| CompactTx {
+                    index,
+                    txid: vec![3; 32],
+                    spends: vec![CompactSaplingSpend { nf: vec![4; 32] }],
+                    ..CompactTx::default()
+                })
+                .collect(),
+            ..CompactBlock::default()
+        };
+        assert_eq!(
+            zinder_proto::wire::decode_projected_block_nullifiers(&block.encode_to_vec()),
+            Err(WalletWireDecodeError::InvalidCompactTransactionOrder)
+        );
+    }
+}
+
+#[test]
 fn compact_block_decoder_rejects_non_increasing_transaction_indexes() {
     let data = wallet::CompactTransactionData::default();
     let block = wallet::CompactBlock {
@@ -214,10 +319,8 @@ fn chain_epoch_decoder_rejects_distinct_hashes_at_same_height() -> eyre::Result<
     Ok(())
 }
 
-#[test]
-fn mempool_entry_round_trips_shared_all_pool_scan_data() -> eyre::Result<()> {
-    let transaction_id = TransactionId::from_bytes([0x44; 32]);
-    let scan_data = CompactTransactionData {
+fn all_pool_scan_fields() -> CompactTransactionData {
+    CompactTransactionData {
         fee_zat: None,
         sapling_spends: vec![CompactSaplingSpend {
             nullifier: [0x45; 32],
@@ -247,12 +350,17 @@ fn mempool_entry_round_trips_shared_all_pool_scan_data() -> eyre::Result<()> {
             value_zat: 2_000,
             script_pub_key: vec![0x52, 0x53],
         }],
-    };
+    }
+}
+
+#[test]
+fn mempool_entry_round_trips_shared_all_pool_scan_data() -> eyre::Result<()> {
+    let transaction_id = TransactionId::from_bytes([0x44; 32]);
     let entry = MempoolEntry::new(
         transaction_id,
         None,
         RawTransactionBytes::new(vec![0x01, 0x02]),
-        scan_data,
+        all_pool_scan_fields(),
         MempoolObservation {
             first_seen_unix_millis: UnixTimestampMillis::new(1_774_670_000_000),
             first_seen_chain_epoch: zinder_proto::wire::chain_epoch_from_message(
@@ -1873,5 +1981,74 @@ fn transaction_absence_survives_status_detail_bytes() -> eyre::Result<()> {
 
     assert_eq!(received.code(), tonic::Code::NotFound);
     assert_eq!(TransactionAbsence::from_status(&received)?, Some(absence));
+    Ok(())
+}
+
+#[test]
+fn compact_scan_and_transparent_batches_round_trip_through_prost() -> eyre::Result<()> {
+    let pools = [
+        zinder_core::CompactPool::Sapling,
+        zinder_core::CompactPool::Ironwood,
+    ]
+    .map(|pool| zinder_proto::wire::compact_pool_message(pool) as i32)
+    .to_vec();
+    let request = wallet::CompactBlocksInRangeRequest {
+        start_height: 42,
+        end_height: 40,
+        at_epoch_id: Some(7),
+        pool_types: pools.clone(),
+    };
+    assert_eq!(round_trip(&request)?, request);
+    let request = wallet::CompactNullifiersInRangeRequest {
+        start_height: 42,
+        end_height: 40,
+        at_epoch_id: Some(7),
+        pool_types: pools,
+    };
+    assert_eq!(round_trip(&request)?, request);
+    let block = zinder_core::CompactBlockNullifiers {
+        height: BlockHeight::new(42),
+        block_hash: BlockHash::from_bytes([1; 32]),
+        previous_block_hash: BlockHash::from_bytes([2; 32]),
+        time: 123,
+        transactions: vec![zinder_core::CompactTransactionNullifiers {
+            index: 1,
+            transaction_id: TransactionId::from_bytes([3; 32]),
+            sapling_nullifiers: vec![[4; 32]],
+            orchard_nullifiers: Vec::new(),
+            ironwood_nullifiers: vec![[5; 32]],
+        }],
+    };
+    let message = zinder_proto::wire::compact_block_nullifiers_message(&block);
+    assert_eq!(
+        zinder_proto::wire::compact_block_nullifiers_from_message(round_trip(&message)?)?,
+        block,
+    );
+    let fee =
+        zinder_core::StandardFee::new(5_000, 1).ok_or_else(|| eyre!("invalid fixture fee"))?;
+    let message = zinder_proto::wire::standard_fee_message(fee);
+    assert_eq!(
+        zinder_proto::wire::standard_fee_from_message(round_trip(&message)?),
+        Some(fee)
+    );
+
+    let addresses = [[6; 32], [7; 32]]
+        .map(|script_hash| wallet::AddressLookup {
+            selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                script_hash.to_vec(),
+            )),
+        })
+        .to_vec();
+    let request = wallet::TransparentAddressBalancesRequest {
+        addresses: addresses.clone(),
+        at_epoch_id: Some(7),
+    };
+    assert_eq!(round_trip(&request)?, request);
+    let request = wallet::TransparentAddressesUnspentOutputsRequest {
+        addresses,
+        at_epoch_id: Some(7),
+        start_height: 40,
+    };
+    assert_eq!(round_trip(&request)?, request);
     Ok(())
 }

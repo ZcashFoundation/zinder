@@ -1,16 +1,19 @@
 //! Client-owned wallet capability vocabulary.
 
 use zinder_proto::capabilities::{
+    WALLET_ADDRESS_TRANSPARENT_BALANCES_V1, WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1,
     WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
     WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1, WALLET_EVENTS_MEMPOOL_V2,
     WALLET_READ_BLOCK_ID_BY_SELECTOR_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
     WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2, WALLET_READ_COMPACT_BLOCK_RANGE_V2,
+    WALLET_READ_COMPACT_BLOCK_RANGE_V3, WALLET_READ_COMPACT_NULLIFIER_RANGE_V1,
     WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
     WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1, WALLET_READ_SERVER_INFO_V2,
-    WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
-    WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
-    WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
-    WALLET_READ_VISIBLE_TIP_BLOCK_V1, WALLET_SNAPSHOT_MEMPOOL_V3,
+    WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_STANDARD_FEE_V1,
+    WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1, WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
+    WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1,
+    WALLET_READ_TREE_STATE_AT_HEIGHT_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+    WALLET_SNAPSHOT_MEMPOOL_V3,
 };
 
 /// A wallet-plane capability advertised by a Zinder endpoint.
@@ -63,6 +66,16 @@ pub enum Capability {
     FullBlockRange,
     /// Named network-upgrade activation heights and branch identifiers.
     NetworkUpgradeActivations,
+    /// Descending or pool-filtered compact block ranges.
+    CompactBlockScan,
+    /// Shielded nullifiers over a bounded block range.
+    CompactNullifierRange,
+    /// Recommended marginal fee from a verified upstream node.
+    StandardFee,
+    /// Confirmed balance across a batch of transparent addresses.
+    TransparentAddressBalances,
+    /// Unspent outputs across a batch of transparent addresses.
+    TransparentAddressesUnspentOutputs,
     /// Additive capability emitted by a newer server.
     Unknown(String),
 }
@@ -95,6 +108,13 @@ impl Capability {
             Self::FullBlock => WALLET_READ_FULL_BLOCK_AT_V1,
             Self::FullBlockRange => WALLET_READ_FULL_BLOCK_RANGE_V1,
             Self::NetworkUpgradeActivations => WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
+            Self::CompactBlockScan => WALLET_READ_COMPACT_BLOCK_RANGE_V3,
+            Self::CompactNullifierRange => WALLET_READ_COMPACT_NULLIFIER_RANGE_V1,
+            Self::StandardFee => WALLET_READ_STANDARD_FEE_V1,
+            Self::TransparentAddressBalances => WALLET_ADDRESS_TRANSPARENT_BALANCES_V1,
+            Self::TransparentAddressesUnspentOutputs => {
+                WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1
+            }
             Self::Unknown(capability) => capability,
         }
     }
@@ -124,6 +144,13 @@ impl Capability {
             WALLET_READ_FULL_BLOCK_AT_V1 => Self::FullBlock,
             WALLET_READ_FULL_BLOCK_RANGE_V1 => Self::FullBlockRange,
             WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1 => Self::NetworkUpgradeActivations,
+            WALLET_READ_COMPACT_BLOCK_RANGE_V3 => Self::CompactBlockScan,
+            WALLET_READ_COMPACT_NULLIFIER_RANGE_V1 => Self::CompactNullifierRange,
+            WALLET_READ_STANDARD_FEE_V1 => Self::StandardFee,
+            WALLET_ADDRESS_TRANSPARENT_BALANCES_V1 => Self::TransparentAddressBalances,
+            WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1 => {
+                Self::TransparentAddressesUnspentOutputs
+            }
             _ => Self::Unknown(capability),
         }
     }

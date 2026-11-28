@@ -51,9 +51,12 @@ pub use transparent_delta_kind::{
 };
 pub use wallet::{
     WalletWireDecodeError, chain_epoch_from_message, chain_epoch_message,
-    compact_block_from_message, compact_block_message, compact_transaction_data_from_message,
-    compact_transaction_data_message, decode_compact_block, encode_compact_block,
-    mempool_entry_from_message, mempool_entry_message, outpoint_from_message, outpoint_message,
+    compact_block_from_message, compact_block_message, compact_block_message_for_pools,
+    compact_block_nullifiers_from_message, compact_block_nullifiers_message,
+    compact_pool_from_message, compact_pool_message, compact_transaction_data_from_message,
+    compact_transaction_data_message, decode_compact_block, decode_projected_block_nullifiers,
+    encode_compact_block, mempool_entry_from_message, mempool_entry_message, outpoint_from_message,
+    outpoint_message, standard_fee_from_message, standard_fee_message,
     transparent_outpoint_spend_status_entry_from_message,
     transparent_outpoint_spend_status_entry_message,
 };

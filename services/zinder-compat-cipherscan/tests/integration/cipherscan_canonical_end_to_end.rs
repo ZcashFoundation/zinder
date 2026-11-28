@@ -106,6 +106,40 @@ impl TestWalletQuery {
 
 #[tonic::async_trait]
 impl WalletQuery for TestWalletQuery {
+    type CompactNullifiersInRangeStream =
+        <InnerWalletAdapter as WalletQuery>::CompactNullifiersInRangeStream;
+    type TransparentAddressesUnspentOutputsStream = Self::TransparentAddressUnspentOutputsStream;
+
+    async fn compact_nullifiers_in_range(
+        &self,
+        request: Request<wallet::CompactNullifiersInRangeRequest>,
+    ) -> std::result::Result<Response<Self::CompactNullifiersInRangeStream>, Status> {
+        self.inner.compact_nullifiers_in_range(request).await
+    }
+
+    async fn standard_fee(
+        &self,
+        request: Request<wallet::StandardFeeRequest>,
+    ) -> std::result::Result<Response<wallet::StandardFeeResponse>, Status> {
+        self.inner.standard_fee(request).await
+    }
+
+    async fn transparent_address_balances(
+        &self,
+        request: Request<wallet::TransparentAddressBalancesRequest>,
+    ) -> std::result::Result<Response<wallet::TransparentAddressBalancesResponse>, Status> {
+        self.inner.transparent_address_balances(request).await
+    }
+
+    async fn transparent_addresses_unspent_outputs(
+        &self,
+        request: Request<wallet::TransparentAddressesUnspentOutputsRequest>,
+    ) -> std::result::Result<Response<Self::TransparentAddressesUnspentOutputsStream>, Status> {
+        self.inner
+            .transparent_addresses_unspent_outputs(request)
+            .await
+    }
+
     type CompactBlocksInRangeStream =
         <InnerWalletAdapter as WalletQuery>::CompactBlocksInRangeStream;
     type FullBlocksInRangeStream = <InnerWalletAdapter as WalletQuery>::FullBlocksInRangeStream;

@@ -657,6 +657,7 @@ async fn serving_pair_compact_range_outside_retained_history_is_artifact_unavail
                 start_height,
                 end_height,
                 at_epoch_id: None,
+                pool_types: Vec::new(),
             }),
         )
         .await
@@ -702,6 +703,58 @@ fn fixture_block_identities(chain: &ChainFixture) -> Vec<(BlockHeight, BlockHash
         .collect()
 }
 
+#[tokio::test]
+async fn native_v2_compact_range_refuses_pool_selection_before_admission() -> eyre::Result<()> {
+    use tokio_stream::StreamExt as _;
+    use zinder_proto::v1::wallet::{
+        compact_blocks_in_range_chunk::Body, wallet_query_server::WalletQuery as WalletQueryService,
+    };
+
+    let (query, _store, _ingest) = crate::common::native_serving_query_over(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(1),
+    )
+    .await?;
+    let adapter = zinder_query::WalletQueryGrpcAdapter::new(
+        query,
+        zinder_query::WalletEndpointMetadata::default(),
+    )
+    .with_max_concurrent_compact_block_streams(NonZeroU32::MIN);
+    let request = |pool_types| {
+        tonic::Request::new(wallet::CompactBlocksInRangeRequest {
+            start_height: 1,
+            end_height: 1,
+            at_epoch_id: None,
+            pool_types,
+        })
+    };
+    let mut stream = WalletQueryService::compact_blocks_in_range(&adapter, request(Vec::new()))
+        .await?
+        .into_inner();
+    let refusal = WalletQueryService::compact_blocks_in_range(
+        &adapter,
+        request(vec![wallet::CompactPool::Sapling as i32]),
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("v2 accepted a pool selection"))?;
+    assert_eq!(refusal.code(), tonic::Code::Unimplemented);
+
+    assert!(matches!(
+        stream
+            .next()
+            .await
+            .transpose()?
+            .and_then(|chunk| chunk.body),
+        Some(Body::Header(_))
+    ));
+    assert!(matches!(
+        stream.next().await.transpose()?.and_then(|chunk| chunk.body),
+        Some(Body::Item(block)) if block.height == 1
+    ));
+    assert!(stream.next().await.is_none());
+    Ok(())
+}
+
 /// An adapter refuses a `CompactBlocksInRange` stream past its limit.
 ///
 /// The refusal is `RESOURCE_EXHAUSTED` with the typed
@@ -735,6 +788,7 @@ async fn native_compact_block_streams_are_refused_past_the_stream_limit() -> eyr
             start_height: 1,
             end_height: 3,
             at_epoch_id: None,
+            pool_types: Vec::new(),
         })
     };
 

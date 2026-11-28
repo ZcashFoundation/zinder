@@ -658,6 +658,7 @@ impl ChainIndex for RemoteChainIndex {
                     start_height: block_range.start.value(),
                     end_height: block_range.end.value(),
                     at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                    pool_types: Vec::new(),
                 },
                 async |mut client, request| client.compact_blocks_in_range(request).await,
             )

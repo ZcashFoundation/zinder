@@ -375,7 +375,16 @@ message CompactTransparentOutput {
   bytes script_pub_key = 2;
 }
 
-// Inclusive compact block range request.
+// Pool whose scan fields a compact block stream includes.
+enum CompactPool {
+  COMPACT_POOL_UNSPECIFIED = 0;
+  COMPACT_POOL_SAPLING = 1;
+  COMPACT_POOL_ORCHARD = 2;
+  COMPACT_POOL_IRONWOOD = 3;
+  COMPACT_POOL_TRANSPARENT = 4;
+}
+
+// Inclusive compact block range in the direction of the requested endpoints.
 message CompactBlocksInRangeRequest {
   // First requested block height.
   uint32 start_height = 1;
@@ -386,6 +395,10 @@ message CompactBlocksInRangeRequest {
   // Optional chain-epoch id that must be used to answer the request. When
   // absent, the server uses the visible epoch at request time.
   optional uint64 at_epoch_id = 3;
+
+  // Pools to include. Empty includes every pool. Ascending requests without
+  // this field work on endpoints that advertise only the v2 capability.
+  repeated CompactPool pool_types = 4;
 }
 
 // Single compact block request.
@@ -574,7 +587,7 @@ message TransactionStatusResponse {
 // One message in the [`CompactBlocksInRange`] server stream.
 //
 // The server sends exactly one `header` message first, then one `item`
-// message per block in ascending height order, from `start_height` through
+// message per block in requested height order, from `start_height` through
 // `end_height`. The header carries the single chain epoch that answers the
 // whole range; items carry no per-block epoch. A consumer reads the epoch once
 // and binds every later block to it.
@@ -587,6 +600,67 @@ message CompactBlocksInRangeChunk {
     // Compact block at the next requested height. Sent after the header.
     CompactBlock item = 2;
   }
+}
+
+// Inclusive range of shielded nullifier blocks in endpoint order.
+message CompactNullifiersInRangeRequest {
+  // First requested block height.
+  uint32 start_height = 1;
+  // Last requested block height.
+  uint32 end_height = 2;
+  // Optional chain epoch pin.
+  optional uint64 at_epoch_id = 3;
+  // Shielded pools to include. Empty includes every shielded pool.
+  repeated CompactPool pool_types = 4;
+}
+
+// Shielded nullifiers from one transaction in consensus order.
+message CompactTransactionNullifiers {
+  // Zero-based transaction position in consensus block order.
+  uint64 index = 1;
+  // Transaction identifier in Zcash protocol byte order.
+  bytes transaction_id = 2;
+  // Sapling spend nullifiers, each exactly 32 consensus bytes.
+  repeated bytes sapling_nullifiers = 3;
+  // Orchard action nullifiers, each exactly 32 consensus bytes.
+  repeated bytes orchard_nullifiers = 4;
+  // Ironwood action nullifiers, each exactly 32 consensus bytes.
+  repeated bytes ironwood_nullifiers = 5;
+}
+
+// Block identity and shielded nullifiers without note payloads.
+message CompactBlockNullifiers {
+  // Height of the source block.
+  uint32 height = 1;
+  // Canonical block hash in RPC byte order.
+  string block_hash = 2;
+  // Canonical parent block hash in RPC byte order.
+  string previous_block_hash = 3;
+  // Block time as Unix seconds.
+  uint32 time = 4;
+  // Transactions with nullifiers in the selected pools, in block order.
+  repeated CompactTransactionNullifiers transactions = 5;
+}
+
+// One leading chain view followed by one nullifier block per height.
+message CompactNullifiersInRangeChunk {
+  oneof body {
+    // Chain view pinned for the entire stream.
+    ChainView header = 1;
+    // Nullifiers for the next block in requested height order.
+    CompactBlockNullifiers block = 2;
+  }
+}
+
+// Request the upstream node's recommended marginal fee.
+message StandardFeeRequest {}
+
+// The upstream node's recommended fee per logical action.
+message StandardFeeResponse {
+  // Recommended fee per logical action, in zatoshis.
+  uint64 fee_zat = 1;
+  // Node fee estimator version. Zero identifies the static estimate.
+  uint32 estimator_version = 2;
 }
 
 // Tree-state request for one exact block height.
@@ -1255,6 +1329,34 @@ message TransparentAddressUnspentOutputsRequest {
   optional uint64 at_epoch_id = 3;
 }
 
+// Request the confirmed total balance across a set of transparent addresses.
+message TransparentAddressBalancesRequest {
+  // Between 1 and 256 selectors. Duplicate addresses count once.
+  repeated AddressLookup addresses = 1;
+  // Optional chain epoch pin.
+  optional uint64 at_epoch_id = 2;
+}
+
+// Confirmed balance across the requested addresses at one chain epoch.
+message TransparentAddressBalancesResponse {
+  // Chain view used for every address.
+  ChainView chain_view = 1;
+  // Confirmed unspent balance in zatoshis.
+  uint64 confirmed_zat = 2;
+  // Number of distinct addresses included in the total.
+  uint32 address_count = 3;
+}
+
+// Request the complete unspent output set across transparent addresses.
+message TransparentAddressesUnspentOutputsRequest {
+  // Between 1 and 256 selectors. Duplicate addresses count once.
+  repeated AddressLookup addresses = 1;
+  // Minimum mined height to include. Zero includes all retained heights.
+  uint32 start_height = 2;
+  // Optional chain epoch pin.
+  optional uint64 at_epoch_id = 3;
+}
+
 // One unspent transparent output streamed by
 // [`TransparentAddressUnspentOutputs`].
 message TransparentUnspentOutput {
@@ -1491,6 +1593,13 @@ service WalletQuery {
   // `ChainView` header, then one compact block per height.
   rpc CompactBlocksInRange(CompactBlocksInRangeRequest) returns (stream CompactBlocksInRangeChunk);
 
+  // Stream shielded nullifiers for an inclusive height range.
+  rpc CompactNullifiersInRange(CompactNullifiersInRangeRequest)
+      returns (stream CompactNullifiersInRangeChunk);
+
+  // Return the verified upstream node's recommended marginal fee.
+  rpc StandardFee(StandardFeeRequest) returns (StandardFeeResponse);
+
   // Return one full serialized block at a given height. Served from the
   // stored block blob, present only when the writer deployment retains
   // block blobs (`storage.raw_blob_policy = "all"`); otherwise NOT_FOUND.
@@ -1547,6 +1656,14 @@ service WalletQuery {
   // address at a single pinned chain epoch. The stream is always complete:
   // no cursor, no entry cap.
   rpc TransparentAddressUnspentOutputs(TransparentAddressUnspentOutputsRequest)
+      returns (stream TransparentUnspentOutputsChunk);
+
+  // Return the confirmed unspent balance across the requested addresses.
+  rpc TransparentAddressBalances(TransparentAddressBalancesRequest)
+      returns (TransparentAddressBalancesResponse);
+
+  // Stream complete unspent output sets across the requested addresses.
+  rpc TransparentAddressesUnspentOutputs(TransparentAddressesUnspentOutputsRequest)
       returns (stream TransparentUnspentOutputsChunk);
 
   // Stream the transparent-address tx-history index for an inclusive

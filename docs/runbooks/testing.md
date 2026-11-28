@@ -1189,6 +1189,11 @@ wallet.read.block_id_by_selector_v1
 wallet.read.block_header_by_selector_v1
 wallet.read.compact_block_at_v2
 wallet.read.compact_block_range_v2
+wallet.read.compact_block_range_v3
+wallet.read.compact_nullifier_range_v1
+wallet.read.standard_fee_v1
+wallet.address.transparent_balances_v1
+wallet.address.transparent_batch_unspent_outputs_v1
 wallet.read.compact_block_ironwood_v2
 wallet.read.full_block_at_v1
 wallet.read.full_block_range_v1

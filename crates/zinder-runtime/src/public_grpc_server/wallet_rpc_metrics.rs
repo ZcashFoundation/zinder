@@ -80,6 +80,8 @@ impl WalletRpcMetricsLayer {
                 ("BlockHeaderBySelector", Unary),
                 ("CompactBlock", Unary),
                 ("CompactBlocksInRange", CompactRangeWithHeader),
+                ("CompactNullifiersInRange", CompactRangeWithHeader),
+                ("StandardFee", Unary),
                 ("FullBlock", Unary),
                 ("FullBlocksInRange", BlockRange),
                 ("Transaction", Unary),
@@ -91,6 +93,8 @@ impl WalletRpcMetricsLayer {
                 ("MempoolSnapshot", Unary),
                 ("MempoolEvents", Stream),
                 ("TransparentAddressUnspentOutputs", Stream),
+                ("TransparentAddressBalances", Unary),
+                ("TransparentAddressesUnspentOutputs", Stream),
                 ("TransparentAddressTxIdsInRange", Stream),
                 ("TransparentOutpointSpendStatus", Unary),
                 ("ChainValuePoolsAtTip", Unary),
@@ -153,6 +157,10 @@ impl WalletRpcMetricsLayer {
                 "BlockHeaderBySelector" => Some(("BlockHeaderBySelector", Unary)),
                 "CompactBlock" => Some(("CompactBlock", Unary)),
                 "CompactBlocksInRange" => Some(("CompactBlocksInRange", CompactRangeWithHeader)),
+                "CompactNullifiersInRange" => {
+                    Some(("CompactNullifiersInRange", CompactRangeWithHeader))
+                }
+                "StandardFee" => Some(("StandardFee", Unary)),
                 "FullBlock" => Some(("FullBlock", Unary)),
                 "FullBlocksInRange" => Some(("FullBlocksInRange", BlockRange)),
                 "Transaction" => Some(("Transaction", Unary)),
@@ -165,6 +173,10 @@ impl WalletRpcMetricsLayer {
                 "MempoolEvents" => Some(("MempoolEvents", Stream)),
                 "TransparentAddressUnspentOutputs" => {
                     Some(("TransparentAddressUnspentOutputs", Stream))
+                }
+                "TransparentAddressBalances" => Some(("TransparentAddressBalances", Unary)),
+                "TransparentAddressesUnspentOutputs" => {
+                    Some(("TransparentAddressesUnspentOutputs", Stream))
                 }
                 "TransparentAddressTxIdsInRange" => {
                     Some(("TransparentAddressTxIdsInRange", Stream))
@@ -743,6 +755,10 @@ mod tests {
                 .collect();
             assert_eq!(described, measured);
             assert_eq!(described.len(), surface.methods().len());
+            for &(method, shape) in surface.methods() {
+                let path = format!("/{}/{method}", surface.service_name());
+                assert_eq!(surface.method(&path), Some((method, shape)));
+            }
         }
         Ok(())
     }
