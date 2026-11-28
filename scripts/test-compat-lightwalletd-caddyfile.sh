@@ -13,11 +13,11 @@ docker run --rm --network none --user "$(id -u):$(id -g)" \
   --volume "$repository_root/deploy/compat-lightwalletd.Caddyfile:/etc/caddy/Caddyfile:ro" \
   --volume "$fixture/tls:/tls:ro" \
   --env XDG_DATA_HOME=/tmp \
-  --env ZINDER_COMPAT_PUBLIC_FQDN=localhost \
-  --env ZINDER_COMPAT_TLS_CERT_FILE=/tls/server.pem \
-  --env ZINDER_COMPAT_TLS_KEY_FILE=/tls/server-key.pem \
-  --env ZINDER_COMPAT_HOST_PORT=9067 \
-  --env ZINDER_COMPAT_OPS_HOST_PORT=9108 \
+  --env DEPLOY_COMPAT_PUBLIC_FQDN=localhost \
+  --env DEPLOY_COMPAT_TLS_CERT_FILE=/tls/server.pem \
+  --env DEPLOY_COMPAT_TLS_KEY_FILE=/tls/server-key.pem \
+  --env DEPLOY_COMPAT_HOST_PORT=9067 \
+  --env DEPLOY_SERVE_OPS_HOST_PORT=9108 \
   "$caddy_image" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile --validate \
   > "$fixture/adapted.json"
 

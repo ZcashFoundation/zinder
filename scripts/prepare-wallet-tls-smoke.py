@@ -19,13 +19,13 @@ subprocess.run([str(root / 'scripts/generate-live-indexer-tls.sh'), str(output)]
 # Keep the production route and readiness behavior; isolate only its listeners.
 config = (root / 'deploy/compat-lightwalletd.Caddyfile').read_text()
 config = config.replace('auto_https off', 'auto_https off\n\tadmin off')
-config = config.replace('https://{$ZINDER_COMPAT_PUBLIC_FQDN}:443 {',
+config = config.replace('https://{$DEPLOY_COMPAT_PUBLIC_FQDN}:443 {',
                         f'https://localhost:{args.port} {{\n\tbind 127.0.0.1')
 for name, value in {
-    'ZINDER_COMPAT_TLS_CERT_FILE': output / 'server.pem',
-    'ZINDER_COMPAT_TLS_KEY_FILE': output / 'server-key.pem',
-    'ZINDER_COMPAT_HOST_PORT': args.grpc_port,
-    'ZINDER_COMPAT_OPS_HOST_PORT': args.ops_port,
+    'DEPLOY_COMPAT_TLS_CERT_FILE': output / 'server.pem',
+    'DEPLOY_COMPAT_TLS_KEY_FILE': output / 'server-key.pem',
+    'DEPLOY_COMPAT_HOST_PORT': args.grpc_port,
+    'DEPLOY_SERVE_OPS_HOST_PORT': args.ops_port,
 }.items():
     replacement = json.dumps(str(value)) if isinstance(value, Path) else str(value)
     config = config.replace('{$' + name + '}', replacement)

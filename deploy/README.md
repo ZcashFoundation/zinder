@@ -30,12 +30,11 @@ Use the baseline archive for Linux CPUs without AVX2 or ADX.
 
 ## Docker Compose
 
-1. Create the required host control tokens in `${ZINDER_CONTROL_SECRETS_DIR:-/etc/zinder/control-secrets}` (`ingest.token` and `checkpoint.token`).
-2. Start the stack with the env file for your network and upstream node:
+1. Create the required host control tokens in `${DEPLOY_CONTROL_SECRETS_DIR:-/etc/zinder/control-secrets}` (`ingest.token` and `checkpoint.token`).
+2. Start the stack with the `deploy.env` file for your network and upstream node (which selects its matching `zinder.env` runtime file via `DEPLOY_ZINDER_ENV`):
 
 ```bash
-ZINDER_PRESET=wallet \
-  docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
+docker compose --env-file deploy/profiles/mainnet/deploy.env -f deploy/docker-compose.yml up -d
 ```
 
 Optional profiles:
@@ -50,11 +49,11 @@ The [Tor overlay](docker-compose.tor.yml) adds a Tor v3 sidecar on the shared Zi
 
 ## Kubernetes
 
-[kubernetes/statefulset.yaml](kubernetes/statefulset.yaml) runs `zinder serve --preset wallet` in a single non-root `StatefulSet` (`UID 10001`, `fsGroup: 10001`, read-only root filesystem, ReadWriteOnce PVC at `/var/lib/zinder`, `startupProbe` and `livenessProbe` on `/healthz`, `readinessProbe` on `/readyz`).
+[kubernetes/statefulset.yaml](kubernetes/statefulset.yaml) includes a `zinder-config` `ConfigMap` (`ZINDER_DEPLOYMENT__PROFILE=wallet`) and runs `zinder serve` in a single non-root `StatefulSet` (`UID 10001`, `fsGroup: 10001`, read-only root filesystem, ReadWriteOnce PVC at `/var/lib/zinder`, `startupProbe` and `livenessProbe` on `/healthz`, `readinessProbe` on `/readyz`).
 
 ## Systemd
 
-[systemd/zinder.service](systemd/zinder.service) wraps the Compose topology cleanly on Linux hosts using `/etc/zinder/env`. Optionally add `COMPOSE_PROFILES=observability` to `/etc/zinder/env` to include Prometheus and Grafana.
+[systemd/zinder.service](systemd/zinder.service) wraps the Compose topology cleanly on Linux hosts using `/etc/zinder/deploy.env` (pointing `DEPLOY_ZINDER_ENV` at `/etc/zinder/zinder.env`, plus optional writer-only `/etc/zinder/index.env`). Optionally add `COMPOSE_PROFILES=observability` to `/etc/zinder/deploy.env` to include Prometheus and Grafana.
 
 ## TLS reverse proxy
 

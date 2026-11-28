@@ -8,7 +8,7 @@ Each supported deployment runs against persistent storage on one host (`rocksdb`
 
 ## Step 1: Choose a preset
 
-Select the preset (`--preset <light-wallet|wallet|explorer>` on `zinder serve` / `zinder index`, or `ZINDER_PRESET` in Compose / `ZINDER_DEPLOYMENT__PROFILE` in env) that matches what your clients read. All presets build complete canonical history from genesis unless configured with a checkpoint override.
+Select the deployment profile (`ZINDER_DEPLOYMENT__PROFILE=light-wallet|wallet|explorer` in `zinder.env`, or `--preset <light-wallet|wallet|explorer>` on direct CLI invocations) that matches what your clients read. All presets build complete canonical history from genesis unless configured with a checkpoint override.
 
 | Preset (`deployment.profile`) | Roles run | Mainnet disk | First sync (8 writer cores) | Transaction bodies & transparent reads |
 | --- | --- | --- | --- | --- |
@@ -48,15 +48,15 @@ You need an archive Zebra or Zakura node on the same network. Ingest reads every
 
 ### Private or standard Mainnet VM
 
-- **CPU:** 8+ vCPUs (Broadwell+/Zen+ `x86-64` supporting `x86-64-v3` + `ADX`, or `AArch64`). The AMD64 image uses the optimized archive. Choose the baseline GNU/Linux archive if your CPU lacks the optimized build’s features. Optimized wallet accumulators can use AVX-512F/VL when available. Hosts with fewer than 8 logical CPUs take longer to sync; see [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
+- **CPU:** 8+ vCPUs (Broadwell+/Zen+ `x86-64` supporting `x86-64-v3` + `ADX`, or `AArch64`). The AMD64 image uses the optimized archive; choose the baseline GNU/Linux archive if your CPU lacks the optimized build's features (pass `DEPLOY_PASTA_ASM=0` only when building Compose images from source for pre-Broadwell/Haswell `x86-64` hosts without `ADX`). Optimized wallet accumulators can use AVX-512F/VL when available. Hosts with fewer than 8 logical CPUs take longer to sync; see [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
 - **RAM:** 32 GiB RAM. Give `zinder-index` enough memory for canonical + wallet construction (`14g`–`24g` on Mainnet), keep `4g`+ on `zinder-serve` for private endpoints (raise for high-concurrency range reads), and give single-volume containers (`zinder serve`) at least 8–16 GB.
 - **Disk:** Fast local SSD/NVMe formatted **`ext4 -O verity`** (when protecting canonical settled segments with optional Linux fs-verity). Reserve **240+ GB free** for `wallet` (pre-v2 Schema `v1` steady-state was ~102 GB canonical + wallet at Mainnet height 3,593,347 and growing, plus ~130 GB temporary sort spill headroom during initial wallet construction). Enabling `--full-blocks` (`storage.full_blocks = true`, `raw_blob_policy = "all"`) stores a single Zstd-compressed copy of full consensus blocks plus 40-byte transaction slice descriptors (`ZSBLKB01` + `live_tail_raw_block`), so budget additional free NVMe capacity beyond the ~250+ GiB raw chain data and wallet sort spill headroom.
 
 ### Public high-concurrency Mainnet endpoint
 
-- **CPU:** 8–16+ vCPUs (Broadwell+/Zen+ `x86-64` with `BMI2 + ADX`, or `AArch64`). Release images and optimized binary archives enable `pasta_curves/asm` (`ZINDER_PASTA_ASM=1`; pass `--features pasta_curves/asm` when compiling directly with Cargo), saving ~6.7–8.2% on Orchard Merkle hashing and canonical construction benchmarks while failing closed at startup if `ADX` is missing.
-- **RAM:** **64+ GiB RAM** and size `zinder-serve`'s cgroup memory limit above **32 GiB** (`ZINDER_SERVE_MEMORY_LIMIT`). Under cgroup v2, the OS page cache for canonical `ZSHRNG02` settled segments counts against the container reading those segments; keeping headroom above the active settled-segment working set prevents page-cache thrashing and `wait_timeout` refusals under concurrent range syncs.
-- **Node feed:** Set `ZINDER_NODE__INDEXER_GRPC_ADDR` and `ZINDER_INGEST__SOURCE=zebra-indexer-grpc` (in your Compose env file or exported environment) to stream mempool events and fetch blocks as binary protobufs instead of polling the full mempool over JSON-RPC on every block.
+- **CPU:** 8–16+ vCPUs (Broadwell+/Zen+ `x86-64` with `BMI2 + ADX`, or `AArch64`). Release images and optimized binary archives enable `pasta_curves/asm` (pass `--features pasta_curves/asm` when compiling directly with Cargo; `DEPLOY_PASTA_ASM=0` disables it in source Compose builds), saving ~6.7–8.2% on Orchard Merkle hashing and canonical construction benchmarks while failing closed at startup if `ADX` is missing.
+- **RAM:** **64+ GiB RAM** and size `zinder-serve`'s cgroup memory limit above **32 GiB** (`DEPLOY_SERVE_MEMORY_LIMIT`). Under cgroup v2, the OS page cache for canonical `ZSHRNG02` settled segments counts against the container reading those segments; keeping headroom above the active settled-segment working set prevents page-cache thrashing and `wait_timeout` refusals under concurrent range syncs.
+- **Node feed:** Set `ZINDER_NODE__INDEXER_GRPC_ADDR` in `zinder.env` (and `ZINDER_INGEST__SOURCE=zebra-indexer-grpc`, plus any `ZINDER_NODE__INDEXER_TLS__*` PEMs, in writer-only `index.env` pointed to by `DEPLOY_INDEX_ENV`) to stream mempool events and fetch blocks as binary protobufs instead of polling the full mempool over JSON-RPC on every block.
 - **Edge proxy:** Put a TLS proxy with per-client connection, request, and stream limits in front of the listeners ([Exposing over TLS](exposing-over-tls.md)).
 
 ### Testnet and Regtest baselines
@@ -154,7 +154,7 @@ Compose also exposes these internal/observability ports:
 
 ## Testnet Docker Compose quickstart
 
-This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](https://github.com/ZcashFoundation/z3) with zero TOML configuration files, using Docker Engine, the Compose v2 plugin, `git`, `curl`, and `grpcurl`. For Zakura, use `deploy/.env.zakura-testnet` and follow [Attach a Zakura node](deploying-on-a-vm.md#attach-a-zakura-node) for step 1.
+This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](https://github.com/ZcashFoundation/z3) with zero TOML configuration files, using Docker Engine, the Compose v2 plugin, `git`, `curl`, and `grpcurl`. For Zakura, use `deploy/profiles/zakura-testnet/deploy.env` and follow [Attach a Zakura node](deploying-on-a-vm.md#attach-a-zakura-node) for step 1.
 
 1. Start a Zebra Testnet node with Z3 and wait until it is synced (this creates the `z3-testnet` Docker network and `z3-testnet-cookie` volume):
 
@@ -178,13 +178,13 @@ This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](h
    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin /etc/zinder/control-secrets/checkpoint.token
    ```
 
-4. Pull the signed release image for your tag and start Zinder (select `--preset` via `ZINDER_PRESET=light-wallet|wallet|explorer`, defaulting to `wallet`; keep `--no-build` so Compose uses the published image; add `--profile observability` to also start Prometheus on `19095` and Grafana on `13002`):
+4. Pull the signed release image for your tag and start Zinder (select the runtime profile via `ZINDER_DEPLOYMENT__PROFILE=light-wallet|wallet|explorer` in `zinder.env`, defaulting to `wallet`; keep `--no-build` so Compose uses the published image; add `--profile observability` to also start Prometheus on `19095` and Grafana on `13002`):
 
    ```bash
-   export ZINDER_VERSION=vX.Y.Z
-   docker compose --env-file deploy/.env.testnet \
+   export DEPLOY_VERSION=vX.Y.Z
+   docker compose --env-file deploy/profiles/testnet/deploy.env \
      -f deploy/docker-compose.yml pull
-   docker compose --env-file deploy/.env.testnet \
+   docker compose --env-file deploy/profiles/testnet/deploy.env \
      -f deploy/docker-compose.yml up -d --no-build
    ```
 
@@ -212,10 +212,10 @@ This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](h
 
 ### Build from source
 
-To run an unreleased checkout, leave `ZINDER_VERSION` unset and build the images:
+To run an unreleased checkout instead of published images, leave `DEPLOY_VERSION` unset (export `DEPLOY_PASTA_ASM=0` only if building for a pre-Broadwell/Haswell `x86-64` host without `ADX`) and run:
 
 ```bash
-docker compose --env-file deploy/.env.testnet \
+docker compose --env-file deploy/profiles/testnet/deploy.env \
   -f deploy/docker-compose.yml up -d --build
 ```
 

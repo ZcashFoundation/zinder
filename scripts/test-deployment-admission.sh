@@ -132,10 +132,14 @@ if "$repository_root/scripts/render-personal-compose.sh" latest >/dev/null 2>&1;
   fail "personal Compose release accepted an image tag"
 fi
 
-deployment_env_names=(mainnet testnet regtest zakura-mainnet zakura-testnet)
+deployment_profile_names=(mainnet testnet regtest zakura-mainnet zakura-testnet)
 
-env_file_value() {
-  sed -n "s/^$2=//p" "$repository_root/deploy/.env.$1"
+profile_deploy_value() {
+  sed -n "s/^$2=//p" "$repository_root/deploy/profiles/$1/deploy.env"
+}
+
+profile_zinder_value() {
+  sed -n "s/^$2=//p" "$repository_root/deploy/profiles/$1/zinder.env"
 }
 
 if grep -Eiq 'JSON_RPC_ADDR:?-|INDEXER_GRPC_ADDR:?-[^}]|//(zebra|zakura)\b|z3-|:1?8232\b|:8230\b|:8155\b' \
@@ -143,18 +147,40 @@ if grep -Eiq 'JSON_RPC_ADDR:?-|INDEXER_GRPC_ADDR:?-[^}]|//(zebra|zakura)\b|z3-|:
   fail "the deployment Compose topology defaults to a hardcoded node"
 fi
 
-for deployment_env in "${deployment_env_names[@]}"; do
-  grep -Fqx 'ZINDER_NODE__INDEXER_GRPC_ADDR=' \
-    "$repository_root/deploy/.env.$deployment_env" \
-    || fail "the $deployment_env env file enables streaming mempool by default"
+for profile_name in "${deployment_profile_names[@]}"; do
+  deploy_file="$repository_root/deploy/profiles/$profile_name/deploy.env"
+  zinder_file="$repository_root/deploy/profiles/$profile_name/zinder.env"
+  [[ -r "$deploy_file" && -r "$zinder_file" ]] \
+    || fail "missing deploy/profiles/$profile_name/{deploy.env,zinder.env}"
+  if grep -Ev '^[[:space:]]*(#.*)?$' "$deploy_file" | grep -qvE '^DEPLOY_[A-Z0-9_]+=.+$'; then
+    fail "$deploy_file must contain only non-empty DEPLOY_* variables"
+  fi
+  if grep -Ev '^[[:space:]]*(#.*)?$' "$zinder_file" | grep -qvE '^ZINDER_[A-Z0-9_]+=.+$'; then
+    fail "$zinder_file must contain only non-empty ZINDER_* variables"
+  fi
 done
+
+[[ "$(profile_zinder_value regtest ZINDER_NODE__AUTH__METHOD)" == "none" ]] \
+  || fail "regtest zinder.env must set ZINDER_NODE__AUTH__METHOD=none"
+if grep -Eq '^ZINDER_NODE__AUTH__PATH=' "$repository_root/deploy/profiles/regtest/zinder.env"; then
+  fail "regtest zinder.env must omit ZINDER_NODE__AUTH__PATH"
+fi
+
 for zakura_network in mainnet testnet; do
-  for shared_name in ZINDER_DEPLOY_NETWORK ZINDER_NETWORK__NAME \
-    ZINDER_INDEX_OPS_HOST_PORT ZINDER_SERVE_OPS_HOST_PORT ZINDER_COMPAT_OPS_HOST_PORT \
-    ZINDER_QUERY_HOST_PORT ZINDER_COMPAT_HOST_PORT ZINDER_EXPLORER_HOST_PORT; do
-    [[ "$(env_file_value "zakura-$zakura_network" "$shared_name")" \
-      == "$(env_file_value "$zakura_network" "$shared_name")" ]] \
-      || fail "the zakura-$zakura_network env file does not share $shared_name with the $zakura_network deployment"
+  for shared_name in DEPLOY_NETWORK \
+    DEPLOY_INDEX_OPS_HOST_PORT DEPLOY_SERVE_OPS_HOST_PORT \
+    DEPLOY_QUERY_HOST_PORT DEPLOY_COMPAT_HOST_PORT \
+    DEPLOY_EXPLORER_HOST_PORT DEPLOY_CIPHERSCAN_HOST_PORT \
+    DEPLOY_PROMETHEUS_HOST_PORT DEPLOY_GRAFANA_HOST_PORT \
+    DEPLOY_INDEX_MEMORY_LIMIT DEPLOY_SERVE_MEMORY_LIMIT; do
+    [[ "$(profile_deploy_value "zakura-$zakura_network" "$shared_name")" \
+      == "$(profile_deploy_value "$zakura_network" "$shared_name")" ]] \
+      || fail "the zakura-$zakura_network deploy.env does not share $shared_name with the $zakura_network deployment"
+  done
+  for shared_runtime in ZINDER_DEPLOYMENT__PROFILE ZINDER_NETWORK__NAME; do
+    [[ "$(profile_zinder_value "zakura-$zakura_network" "$shared_runtime")" \
+      == "$(profile_zinder_value "$zakura_network" "$shared_runtime")" ]] \
+      || fail "the zakura-$zakura_network zinder.env does not share $shared_runtime with the $zakura_network deployment"
   done
 done
 
@@ -163,9 +189,10 @@ control_secrets="$temporary_directory/control-secrets"
 mkdir -p "$control_secrets"
 printf 'test-ingest-token\n' > "$control_secrets/ingest.token"
 printf 'test-checkpoint-token\n' > "$control_secrets/checkpoint.token"
-ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_GRAFANA_ADMIN_PASSWORD="test-grafana-password" \
 docker compose \
-  --env-file "$repository_root/deploy/.env.testnet" \
+  --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
   -f "$repository_root/deploy/docker-compose.yml" \
   --profile observability \
   config --format json > "$resolved_compose"
@@ -173,79 +200,129 @@ bash "$validator" --compose-contract "$resolved_compose"
 
 jq -e '
   .services as $services
-  | $services["zinder-index"].command == ["index", "--preset", "wallet"]
-  and $services["zinder-serve"].command == ["serve", "--readers-only", "--preset", "wallet"]
+  | $services["zinder-index"].command == ["index"]
+  and $services["zinder-serve"].command == ["serve", "--readers-only"]
   and $services["zinder-index"].environment.ZINDER_DEPLOYMENT__PROFILE == "wallet"
   and $services["zinder-serve"].environment.ZINDER_DEPLOYMENT__PROFILE == "wallet"
-  and $services["zinder-index"].environment.ZINDER_INGEST__SOURCE == "zebra-json-rpc"
-  and $services["zinder-serve"].environment.ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS == "false"
-  and $services["zinder-serve"].environment.ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS == "false"
-  and $services["zinder-serve"].environment.ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS == "false"
+  and $services["zinder-grafana"].environment.GF_SECURITY_ADMIN_PASSWORD == "test-grafana-password"
+  and (($services["zinder-index"].environment // {}) | has("ZINDER_NODE__INDEXER_GRPC_ADDR") | not)
+  and (($services["zinder-serve"].environment // {}) | has("ZINDER_NODE__INDEXER_GRPC_ADDR") | not)
+  and (($services["zinder-index"].environment // {}) | keys | all((startswith("DEPLOY_") | not) and . != "ZINDER_PRESET"))
+  and (($services["zinder-serve"].environment // {}) | keys | all((startswith("DEPLOY_") | not) and . != "ZINDER_PRESET"))
   and ($services | has("zinder-history-publisher") | not)
   and (($services["zinder-serve"].environment // {})
     | keys | all(startswith("ZINDER_COMPAT__SHIELDED_HISTORY__") | not))
 ' "$resolved_compose" >/dev/null \
-  || fail "the default Compose topology does not select the wallet preset, zebra-json-rpc source, default proxy untrust, and canonical serving without history-publisher"
+  || fail "the default Compose topology does not resolve pure runtime env_file isolation and canonical serving"
+
+custom_zinder_env="$temporary_directory/custom-zinder.env"
+cat > "$custom_zinder_env" <<'EOF'
+ZINDER_DEPLOYMENT__PROFILE=explorer
+ZINDER_NETWORK__NAME=zcash-testnet
+ZINDER_NODE__JSON_RPC_ADDR=http://zakura:18232
+ZINDER_NODE__AUTH__METHOD=cookie
+ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie
+ZINDER_COMPAT__BROWSER_ORIGINS=https://wallet.example
+ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=true
+ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true
+ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=true
+EOF
+custom_index_env="$temporary_directory/custom-index.env"
+cat > "$custom_index_env" <<'EOF'
+ZINDER_INGEST__SOURCE=zebra-indexer-grpc
+ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura:8230
+ZINDER_NODE__INDEXER_TLS__SERVER_NAME=zakura.internal
+ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM=CA-PEM
+ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM=CLIENT-CERT-PEM
+ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM=CLIENT-KEY-PEM
+EOF
 
 explorer_preset_compose="$temporary_directory/explorer-preset-compose.json"
-ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
-ZINDER_PRESET=explorer \
-ZINDER_INGEST__SOURCE=zebra-indexer-grpc \
+DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_ZINDER_ENV="$custom_zinder_env" \
+DEPLOY_INDEX_ENV="$custom_index_env" \
 docker compose \
-  --env-file "$repository_root/deploy/.env.testnet" \
+  --env-file "$repository_root/deploy/profiles/zakura-testnet/deploy.env" \
   -f "$repository_root/deploy/docker-compose.yml" \
   config --format json > "$explorer_preset_compose"
 bash "$validator" --compose-contract "$explorer_preset_compose"
 jq -e '
   .services as $services
-  | $services["zinder-index"].command == ["index", "--preset", "explorer"]
-  and $services["zinder-serve"].command == ["serve", "--readers-only", "--preset", "explorer"]
+  | $services["zinder-index"].command == ["index"]
+  and $services["zinder-serve"].command == ["serve", "--readers-only"]
   and $services["zinder-index"].environment.ZINDER_DEPLOYMENT__PROFILE == "explorer"
   and $services["zinder-serve"].environment.ZINDER_DEPLOYMENT__PROFILE == "explorer"
+  and $services["zinder-index"].environment.ZINDER_COMPAT__BROWSER_ORIGINS == "https://wallet.example"
+  and $services["zinder-serve"].environment.ZINDER_COMPAT__BROWSER_ORIGINS == "https://wallet.example"
+  and $services["zinder-serve"].environment.ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS == "true"
+  and $services["zinder-serve"].environment.ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS == "true"
+  and $services["zinder-serve"].environment.ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS == "true"
   and $services["zinder-index"].environment.ZINDER_INGEST__SOURCE == "zebra-indexer-grpc"
+  and $services["zinder-index"].environment.ZINDER_NODE__INDEXER_GRPC_ADDR == "https://zakura:8230"
+  and $services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__SERVER_NAME == "zakura.internal"
+  and $services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM == "CA-PEM"
+  and $services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM == "CLIENT-CERT-PEM"
+  and $services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM == "CLIENT-KEY-PEM"
+  and (($services["zinder-serve"].environment // {}) | has("ZINDER_INGEST__SOURCE") | not)
+  and (($services["zinder-serve"].environment // {}) | has("ZINDER_NODE__INDEXER_GRPC_ADDR") | not)
+  and (($services["zinder-serve"].environment // {}) | keys | all(startswith("ZINDER_NODE__INDEXER_TLS__") | not))
 ' "$explorer_preset_compose" >/dev/null \
-  || fail "the Compose topology does not forward ZINDER_PRESET=explorer or ZINDER_INGEST__SOURCE overrides"
+  || fail "Compose env_file did not forward arbitrary ZINDER_* overrides or isolate writer-only DEPLOY_INDEX_ENV secrets"
 
+light_wallet_zinder_env="$temporary_directory/light-wallet-zinder.env"
+sed 's/^ZINDER_DEPLOYMENT__PROFILE=wallet$/ZINDER_DEPLOYMENT__PROFILE=light-wallet/' \
+  "$repository_root/deploy/profiles/testnet/zinder.env" > "$light_wallet_zinder_env"
 light_wallet_preset_compose="$temporary_directory/light-wallet-preset-compose.json"
-ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
-ZINDER_DEPLOYMENT__PROFILE=light-wallet \
+DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_ZINDER_ENV="$light_wallet_zinder_env" \
 docker compose \
-  --env-file "$repository_root/deploy/.env.testnet" \
+  --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
   -f "$repository_root/deploy/docker-compose.yml" \
   config --format json > "$light_wallet_preset_compose"
 bash "$validator" --compose-contract "$light_wallet_preset_compose"
 jq -e '
   .services as $services
-  | $services["zinder-index"].command == ["index", "--preset", "light-wallet"]
-  and $services["zinder-serve"].command == ["serve", "--readers-only", "--preset", "light-wallet"]
+  | $services["zinder-index"].command == ["index"]
+  and $services["zinder-serve"].command == ["serve", "--readers-only"]
   and $services["zinder-index"].environment.ZINDER_DEPLOYMENT__PROFILE == "light-wallet"
   and $services["zinder-serve"].environment.ZINDER_DEPLOYMENT__PROFILE == "light-wallet"
 ' "$light_wallet_preset_compose" >/dev/null \
   || fail "the Compose topology does not propagate ZINDER_DEPLOYMENT__PROFILE=light-wallet"
 
-trusted_proxy_compose="$temporary_directory/trusted-proxy-compose.json"
-ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
-ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=true \
-ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true \
-ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=true \
+tor_compose="$temporary_directory/tor-compose.json"
+DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_ZINDER_ENV="$custom_zinder_env" \
 docker compose \
-  --env-file "$repository_root/deploy/.env.testnet" \
+  --env-file "$repository_root/deploy/profiles/mainnet/deploy.env" \
   -f "$repository_root/deploy/docker-compose.yml" \
-  config --format json > "$trusted_proxy_compose"
+  -f "$repository_root/deploy/docker-compose.tor.yml" \
+  --profile tor \
+  config --format json > "$tor_compose"
 jq -e '
-  [
-    .services["zinder-serve"].environment.ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS,
-    .services["zinder-serve"].environment.ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS,
-    .services["zinder-serve"].environment.ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS
-  ] == ["true", "true", "true"]
-' "$trusted_proxy_compose" >/dev/null \
-  || fail "the Compose topology does not forward trust_proxy_client_address overrides to zinder-serve"
+  .services as $services
+  | ($services | has("zinder-tor"))
+  and (($services["zinder-index"].ports // []) | length == 0)
+  and $services["zinder-index"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "false"
+  and $services["zinder-index"].environment.ZINDER_OPS__LISTEN_ADDR == "127.0.0.1:9105"
+  and $services["zinder-serve"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "false"
+  and $services["zinder-serve"].environment.ZINDER_OPS__LISTEN_ADDR == "127.0.0.1:9108"
+  and $services["zinder-serve"].environment.ZINDER_COMPAT__LISTEN_ADDR == "127.0.0.1:9067"
+  and $services["zinder-serve"].environment.ZINDER_QUERY__LISTEN_ADDR == "127.0.0.1:9102"
+  and $services["zinder-serve"].environment.ZINDER_EXPLORER__LISTEN_ADDR == "127.0.0.1:9068"
+  and $services["zinder-serve"].environment.ZINDER_CIPHERSCAN__LISTEN_ADDR == "127.0.0.1:9070"
+  and $services["zinder-serve"].environment.ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS == "false"
+  and $services["zinder-serve"].environment.ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS == "false"
+  and $services["zinder-serve"].environment.ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS == "false"
+  and $services["zinder-serve"].environment.ZINDER_COMPAT__PROXY_PROTOCOL_TRUSTED_CIDRS == "none"
+  and $services["zinder-serve"].environment.ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS == "none"
+' "$tor_compose" >/dev/null \
+  || fail "the Compose Tor overlay does not reset ports, bind loopback, untrust proxies, and disable PROXY protocol"
 
 released_compose="$temporary_directory/released-compose.json"
-ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
-ZINDER_VERSION=v9.8.7 \
+DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_VERSION=v9.8.7 \
 docker compose \
-  --env-file "$repository_root/deploy/.env.testnet" \
+  --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
   -f "$repository_root/deploy/docker-compose.yml" \
   config --format json > "$released_compose"
 jq -e '
@@ -256,7 +333,7 @@ jq -e '
     and $source[0].services[$service].image == "ghcr.io/zcashfoundation/zinder:local")
 ' --slurpfile released "$released_compose" --slurpfile source "$resolved_compose" \
   -n >/dev/null \
-  || fail "ZINDER_VERSION does not select ghcr.io/zcashfoundation/zinder:v9.8.7 while keeping its source build"
+  || fail "DEPLOY_VERSION does not select ghcr.io/zcashfoundation/zinder:v9.8.7 while keeping its source build"
 
 invalid_compose="$temporary_directory/invalid-compose.json"
 jq '.services["zinder-history-publisher"] = .services["zinder-serve"]' \
@@ -295,65 +372,85 @@ jq '.services["zinder-index"].ulimits.nofile = {"soft":1024,"hard":524288}' \
   "$resolved_compose" > "$invalid_compose"
 expect_rejected "zinder-index using the exhausted Mainnet soft limit" --compose-contract "$invalid_compose"
 
-for deployment_env in "${deployment_env_names[@]}"; do
-  resolved_env_compose="$temporary_directory/resolved-$deployment_env-compose.json"
-  ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+for profile_name in "${deployment_profile_names[@]}"; do
+  resolved_env_compose="$temporary_directory/resolved-$profile_name-compose.json"
+  DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
   docker compose \
-    --env-file "$repository_root/deploy/.env.$deployment_env" \
+    --env-file "$repository_root/deploy/profiles/$profile_name/deploy.env" \
     -f "$repository_root/deploy/docker-compose.yml" \
     --profile observability \
     config --format json > "$resolved_env_compose"
   bash "$validator" --compose-contract "$resolved_env_compose"
   jq -e \
-    --arg deploy_network "$(env_file_value "$deployment_env" ZINDER_DEPLOY_NETWORK)" \
-    --arg source_network "$(env_file_value "$deployment_env" ZINDER_SOURCE_NETWORK_NAME)" \
-    --arg cookie_volume "$(env_file_value "$deployment_env" ZINDER_SOURCE_COOKIE_VOLUME_NAME)" \
-    --arg json_rpc_addr "$(env_file_value "$deployment_env" ZINDER_NODE__JSON_RPC_ADDR)" '
-    .name == "zinder-\($deploy_network)"
+    --arg deploy_network "$(profile_deploy_value "$profile_name" DEPLOY_NETWORK)" \
+    --arg source_network "$(profile_deploy_value "$profile_name" DEPLOY_NODE_NETWORK)" \
+    --arg cookie_volume "$(profile_deploy_value "$profile_name" DEPLOY_NODE_COOKIE_VOLUME)" \
+    --arg json_rpc_addr "$(profile_zinder_value "$profile_name" ZINDER_NODE__JSON_RPC_ADDR)" \
+    --arg network_name "$(profile_zinder_value "$profile_name" ZINDER_NETWORK__NAME)" '
+    .services as $services
+    | .name == "zinder-\($deploy_network)"
     and .networks.node.external == true
     and .networks.node.name == $source_network
     and .volumes["node-cookie"].external == true
     and .volumes["node-cookie"].name == $cookie_volume
     and .volumes.data.name == "zinder-\($deploy_network)-data"
-    and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_GRPC_ADDR == ""
-    and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__SERVER_NAME == ""
-    and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM == ""
-    and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM == ""
-    and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM == ""
+    and (($services["zinder-index"].environment // {}) | has("ZINDER_NODE__INDEXER_GRPC_ADDR") | not)
+    and (($services["zinder-index"].environment // {}) | keys | all(startswith("ZINDER_NODE__INDEXER_TLS__") | not))
+    and (($services["zinder-index"].environment // {}) | keys | all((startswith("DEPLOY_") | not) and . != "ZINDER_PRESET"))
+    and (($services["zinder-serve"].environment // {}) | keys | all((startswith("DEPLOY_") | not) and . != "ZINDER_PRESET"))
     and $json_rpc_addr != ""
-    and (.services["zinder-index"].environment.ZINDER_NODE__JSON_RPC_ADDR == $json_rpc_addr)
-    and (.services["zinder-serve"].environment.ZINDER_NODE__JSON_RPC_ADDR == $json_rpc_addr)
-    and (.services["zinder-index"].ulimits.nofile == {"soft":65536,"hard":65536})
-    and (.services["zinder-serve"].ulimits.nofile == {"soft":65536,"hard":65536})
+    and ($services["zinder-index"].environment.ZINDER_NODE__JSON_RPC_ADDR == $json_rpc_addr)
+    and ($services["zinder-serve"].environment.ZINDER_NODE__JSON_RPC_ADDR == $json_rpc_addr)
+    and ($services["zinder-index"].environment.ZINDER_NETWORK__NAME == $network_name)
+    and ($services["zinder-serve"].environment.ZINDER_NETWORK__NAME == $network_name)
+    and ($services["zinder-index"].ulimits.nofile == {"soft":65536,"hard":65536})
+    and ($services["zinder-serve"].ulimits.nofile == {"soft":65536,"hard":65536})
   ' "$resolved_env_compose" >/dev/null \
-    || fail "the $deployment_env env file does not resolve to its expected network, cookie volume, endpoints, and ulimits"
+    || fail "the $profile_name profile does not resolve to its expected network, cookie volume, endpoints, and ulimits"
 done
 
-missing_node_env="$temporary_directory/missing-node.env"
-grep -v '^ZINDER_NODE__JSON_RPC_ADDR=' "$repository_root/deploy/.env.testnet" > "$missing_node_env"
-if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
-  --env-file "$missing_node_env" \
+missing_zinder_env="$temporary_directory/missing-zinder-env.deploy.env"
+grep -v '^DEPLOY_ZINDER_ENV=' "$repository_root/deploy/profiles/testnet/deploy.env" > "$missing_zinder_env"
+if DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+  --env-file "$missing_zinder_env" \
   -f "$repository_root/deploy/docker-compose.yml" \
   config -q >/dev/null 2>&1; then
-  fail "the deployment Compose topology resolved without a node JSON-RPC address"
+  fail "the deployment Compose topology resolved without DEPLOY_ZINDER_ENV"
+fi
+missing_zinder_env_target="$temporary_directory/missing-zinder-env-target.deploy.env"
+sed 's|^DEPLOY_ZINDER_ENV=.*|DEPLOY_ZINDER_ENV=./profiles/does-not-exist/zinder.env|' \
+  "$repository_root/deploy/profiles/testnet/deploy.env" > "$missing_zinder_env_target"
+if DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+  --env-file "$missing_zinder_env_target" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  config -q >/dev/null 2>&1; then
+  fail "the deployment Compose topology resolved with a missing DEPLOY_ZINDER_ENV file"
 fi
 missing_deploy_network_env="$temporary_directory/missing-deploy-network.env"
-grep -v '^ZINDER_DEPLOY_NETWORK=' "$repository_root/deploy/.env.testnet" > "$missing_deploy_network_env"
-if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+grep -v '^DEPLOY_NETWORK=' "$repository_root/deploy/profiles/testnet/deploy.env" > "$missing_deploy_network_env"
+if DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
   --env-file "$missing_deploy_network_env" \
   -f "$repository_root/deploy/docker-compose.yml" \
   config -q >/dev/null 2>&1; then
-  fail "docker-compose.yml resolved without ZINDER_DEPLOY_NETWORK"
+  fail "docker-compose.yml resolved without DEPLOY_NETWORK"
+fi
+missing_node_network_env="$temporary_directory/missing-node-network.env"
+grep -v '^DEPLOY_NODE_NETWORK=' "$repository_root/deploy/profiles/testnet/deploy.env" > "$missing_node_network_env"
+if DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+  --env-file "$missing_node_network_env" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  config -q >/dev/null 2>&1; then
+  fail "docker-compose.yml resolved without DEPLOY_NODE_NETWORK"
 fi
 
 # systemd unit must keep active syncs intact on restart and avoid unintended builds.
 systemd_unit="$repository_root/deploy/systemd/zinder.service"
-grep -Fqx 'ExecStart=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml up --no-build' \
+grep -Fqx 'ExecStart=/usr/bin/docker compose --env-file /etc/zinder/deploy.env -f docker-compose.yml up --no-build' \
   "$systemd_unit" \
-  || fail "deploy/systemd/zinder.service ExecStart must pass --no-build"
-grep -Fqx 'ExecStop=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml down' \
+  || fail "deploy/systemd/zinder.service ExecStart must use /etc/zinder/deploy.env and --no-build"
+grep -Fqx 'ExecStop=/usr/bin/docker compose --env-file /etc/zinder/deploy.env -f docker-compose.yml down' \
   "$systemd_unit" \
-  || fail "deploy/systemd/zinder.service must preserve ExecStop down"
+  || fail "deploy/systemd/zinder.service must preserve ExecStop down with /etc/zinder/deploy.env"
 if grep -Ev '^[[:space:]]*#' "$systemd_unit" | grep -Eq 'ExecStartPre|--remove-orphans'; then
   fail "deploy/systemd/zinder.service must not run destructive ExecStartPre down --remove-orphans"
 fi
@@ -495,42 +592,55 @@ expect_rejected \
   "a Compose contract relying on an image-baked public-bind opt-in" \
   --compose-contract "$implicit_security_compose"
 
-# Verify inline indexer TLS passthrough reaches only zinder-index when set in env.
-resolved_inline_tls_compose="$temporary_directory/resolved-inline-tls-compose.json"
-ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
-ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura:8230 \
-ZINDER_NODE__INDEXER_TLS__SERVER_NAME=zakura.internal \
-ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM="CA-PEM" \
-ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM="CLIENT-CERT-PEM" \
-ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM="CLIENT-KEY-PEM" \
-docker compose \
-  --env-file "$repository_root/deploy/.env.zakura-mainnet" \
-  -f "$repository_root/deploy/docker-compose.yml" \
-  config --format json > "$resolved_inline_tls_compose"
-bash "$validator" --compose-contract "$resolved_inline_tls_compose"
-jq -e '
-  .services["zinder-index"].environment as $env
-  | $env.ZINDER_NODE__INDEXER_GRPC_ADDR == "https://zakura:8230"
-  and $env.ZINDER_NODE__INDEXER_TLS__SERVER_NAME == "zakura.internal"
-  and $env.ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM == "CA-PEM"
-  and $env.ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM == "CLIENT-CERT-PEM"
-  and $env.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM == "CLIENT-KEY-PEM"
-' "$resolved_inline_tls_compose" >/dev/null \
-  || fail "Compose did not forward inline ZINDER_NODE__INDEXER_TLS__* credentials to zinder-index"
-
-missing_tls_env_compose="$temporary_directory/missing-tls-env-compose.json"
-jq 'del(.services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM)' \
-  "$resolved_compose" > "$missing_tls_env_compose"
+# Reject DEPLOY_* / ZINDER_PRESET leakage, mismatched profiles, hardcoded --preset, or writer secrets on zinder-serve.
+leaked_deploy_env_compose="$temporary_directory/leaked-deploy-env-compose.json"
+jq '.services["zinder-serve"].environment.DEPLOY_NETWORK = "testnet"' \
+  "$resolved_compose" > "$leaked_deploy_env_compose"
 expect_rejected \
-  "a Compose contract dropping inline indexer TLS passthrough" \
-  --compose-contract "$missing_tls_env_compose"
+  "a Compose contract leaking DEPLOY_* orchestration variables into container environment" \
+  --compose-contract "$leaked_deploy_env_compose"
+
+legacy_preset_env_compose="$temporary_directory/legacy-preset-env-compose.json"
+jq '.services["zinder-index"].environment.ZINDER_PRESET = "wallet"' \
+  "$resolved_compose" > "$legacy_preset_env_compose"
+expect_rejected \
+  "a Compose contract setting retired ZINDER_PRESET in container environment" \
+  --compose-contract "$legacy_preset_env_compose"
+
+mismatched_profile_compose="$temporary_directory/mismatched-profile-compose.json"
+jq '.services["zinder-serve"].environment.ZINDER_DEPLOYMENT__PROFILE = "explorer"' \
+  "$resolved_compose" > "$mismatched_profile_compose"
+expect_rejected \
+  "a Compose contract with mismatched zinder-index and zinder-serve ZINDER_DEPLOYMENT__PROFILE" \
+  --compose-contract "$mismatched_profile_compose"
+
+hardcoded_preset_cmd_compose="$temporary_directory/hardcoded-preset-cmd-compose.json"
+jq '.services["zinder-serve"].command = ["serve", "--readers-only", "--preset", "wallet"]' \
+  "$resolved_compose" > "$hardcoded_preset_cmd_compose"
+expect_rejected \
+  "a Compose contract hardcoding --preset on zinder-serve command" \
+  --compose-contract "$hardcoded_preset_cmd_compose"
 
 leaked_tls_env_compose="$temporary_directory/leaked-tls-env-compose.json"
-jq '.services["zinder-serve"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM = ""' \
+jq '.services["zinder-serve"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM = "CLIENT-KEY-PEM"' \
   "$resolved_compose" > "$leaked_tls_env_compose"
 expect_rejected \
   "a Compose contract forwarding indexer TLS keys to zinder-serve" \
   --compose-contract "$leaked_tls_env_compose"
+
+leaked_fallback_tls_compose="$temporary_directory/leaked-fallback-tls-compose.json"
+jq '.services["zinder-serve"].environment.ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PEM = "CLIENT-KEY-PEM"' \
+  "$resolved_compose" > "$leaked_fallback_tls_compose"
+expect_rejected \
+  "a Compose contract forwarding fallback indexer TLS keys to zinder-serve" \
+  --compose-contract "$leaked_fallback_tls_compose"
+
+leaked_ingest_source_compose="$temporary_directory/leaked-ingest-source-compose.json"
+jq '.services["zinder-serve"].environment.ZINDER_INGEST__SOURCE = "zebra-indexer-grpc"' \
+  "$resolved_compose" > "$leaked_ingest_source_compose"
+expect_rejected \
+  "a Compose contract forwarding ZINDER_INGEST__SOURCE to zinder-serve" \
+  --compose-contract "$leaked_ingest_source_compose"
 
 missing_cipherscan_port_compose="$temporary_directory/missing-cipherscan-port-compose.json"
 jq '.services["zinder-index"].ports |= map(select(.target != 9070))' \
@@ -1349,5 +1459,21 @@ sed 's/runAsUser: 10001/runAsUser: 0/' \
 expect_rejected \
   "a Kubernetes StatefulSet manifest running as root" \
   --kubernetes-manifest "$root_kube_manifest"
+
+preset_kube_manifest="$temporary_directory/preset-statefulset.yaml"
+awk '{ print; if ($0 ~ /^            - serve$/) { print "            - --preset"; print "            - wallet" } }' \
+  "$repository_root/deploy/kubernetes/statefulset.yaml" \
+  > "$preset_kube_manifest"
+expect_rejected \
+  "a Kubernetes StatefulSet manifest hardcoding --preset" \
+  --kubernetes-manifest "$preset_kube_manifest"
+
+configmapless_kube_manifest="$temporary_directory/configmapless-statefulset.yaml"
+sed 's/kind: ConfigMap/kind: RemovedConfigMap/' \
+  "$repository_root/deploy/kubernetes/statefulset.yaml" \
+  > "$configmapless_kube_manifest"
+expect_rejected \
+  "a Kubernetes manifest missing the zinder-config ConfigMap" \
+  --kubernetes-manifest "$configmapless_kube_manifest"
 
 echo "deployment admission tests passed"

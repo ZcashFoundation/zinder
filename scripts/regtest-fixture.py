@@ -367,11 +367,22 @@ def provision(args, directory):
         token.chmod(0o644)
     (directory / 'zebra.toml').write_bytes(config.read_bytes())
     (directory / 'zebra.toml').chmod(0o644)
-    env = dict(os.environ, ZINDER_DEPLOY_NETWORK='regtest', ZINDER_NETWORK__NAME='zcash-regtest',
-               ZINDER_SOURCE_NETWORK_NAME=args.project + '-node',
-               ZINDER_SOURCE_COOKIE_VOLUME_NAME=args.project + '-cookie',
-               ZINDER_CONTROL_SECRETS_DIR=str(directory / 'tokens'),
-               ZINDER_NODE__JSON_RPC_ADDR='http://node:39232')
+    zinder_env_lines = [
+        'ZINDER_NETWORK__NAME=zcash-regtest',
+        'ZINDER_NODE__JSON_RPC_ADDR=http://node:39232',
+        'ZINDER_NODE__AUTH__METHOD=none',
+    ]
+    if args.raw_blob_policy == 'all':
+        zinder_env_lines.insert(0, 'ZINDER_DEPLOYMENT__PROFILE=wallet')
+    (directory / 'zinder.env').write_text('\n'.join(zinder_env_lines) + '\n')
+    (directory / 'zinder.env').chmod(0o644)
+    env = dict(os.environ,
+               DEPLOY_NETWORK='regtest',
+               DEPLOY_NODE_NETWORK=args.project + '-node',
+               DEPLOY_NODE_COOKIE_VOLUME=args.project + '-cookie',
+               DEPLOY_CONTROL_SECRETS_DIR=str(directory / 'tokens'),
+               DEPLOY_ZINDER_ENV=str(directory / 'zinder.env'))
+    env.pop('DEPLOY_INDEX_ENV', None)
     model = json.loads(run('docker', 'compose', '-f', str(ROOT / 'deploy/docker-compose.yml'),
                            'config', '--format', 'json', env=env))
     owner = secrets.token_hex(16)
@@ -398,6 +409,7 @@ def provision(args, directory):
     for name in SERVICES:
         service = model['services']['zinder-' + name]
         service.pop('build', None)
+        service.pop('env_file', None)
         service.update(image=zinder_image, pull_policy='never', restart='no')
         service['environment'].update(TOKIO_WORKER_THREADS='2', RAYON_NUM_THREADS='2',
                                       ZINDER_NODE__AUTH__METHOD='none')
