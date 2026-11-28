@@ -36,9 +36,17 @@ Gateway implementation and deployment qualification are pending.
    calls with a bounded, time-windowed HPKE `enc` strike register. Validate
    the encapsulated request time and reject repeated `enc` values or
    expired requests before forwarding. Keep the register ephemeral and
-   refuse broadcast when replay protection cannot be enforced. Strip
-   client IPs and identifying headers before forwarding, and exclude them
-   from gateway logs. The independent relay owns per-client rate limits.
+   refuse broadcast when replay protection cannot be enforced.
+
+   After a gateway restart or any loss of the strike register, disable
+   forwarding `SendTransaction` and `BroadcastTransaction` under every
+   retained HPKE key that could have accepted requests before the loss.
+   Keep broadcast forwarding disabled under those keys until every
+   previously acceptable request has expired. The holdoff covers the full
+   replay window and all allowed clock skew.
+
+   Strip client IPs and identifying headers before forwarding, and exclude
+   them from gateway logs. The independent relay owns per-client rate limits.
 
 ## Evidence
 
@@ -60,6 +68,14 @@ Gateway implementation and deployment qualification are pending.
   sees the client address and the gateway sees the request. Reopen if
   independent-relay tests expose a client identifier or allow a replay
   to trigger a second broadcast.
+- Decision 4, recovery after replay-state loss: Judgment. Retained HPKE
+  keys can still decrypt pre-restart requests after the strike register
+  clears. Qualification requires a gateway restart/replay test that retains
+  an affected key and replays a previously forwarded broadcast while its
+  timestamp is still valid. Verify that forwarding stays blocked through
+  the latest allowed expiry, including clock skew. After the holdoff, a
+  fresh broadcast must forward and the expired replay must still be refused.
+  Reopen Decision 4 if the test permits duplicate broadcast forwarding.
 
 ## Consequences
 
