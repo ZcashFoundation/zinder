@@ -3,7 +3,10 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    fmt, io,
+    fmt,
+    fs::File,
+    io,
+    num::NonZeroU64,
     path::Path,
     sync::Arc,
 };
@@ -12,6 +15,7 @@ use parking_lot::{Condvar, Mutex};
 use zinder_core::{BlockHeight, BlockId};
 
 use crate::{
+    StoreRole, container_memory_budget_bytes,
     settled_raw_block_segment::{
         RawBlockSegmentIdentity, SettledRawBlockSegmentError, SettledRawBlockSegmentOpenOptions,
         SettledRawBlockSegmentReader,
@@ -33,6 +37,7 @@ use super::{
         SEGMENTS_DIR_NAME, SettledSegmentIndexEntry, SettledSegmentKind, SettledSegmentModules,
         format_segment_filename,
     },
+    page_cache::SettledSegmentPageCache,
 };
 
 /// Default shared bounded-LRU segment reader capacity (`1,024` segments).
@@ -306,6 +311,7 @@ pub(crate) struct SettledSegmentReaderCache {
     root_dir: VerifiedDir,
     max_open_segments: usize,
     require_fs_verity: bool,
+    page_cache: SettledSegmentPageCache,
     inner: Mutex<LruReaderState>,
     #[cfg(test)]
     test_hooks: CacheTestHooks,
@@ -382,6 +388,7 @@ impl SettledSegmentReaderCache {
             root_dir,
             max_open_segments,
             require_fs_verity,
+            page_cache: SettledSegmentPageCache::default(),
             inner: Mutex::new(LruReaderState::new(max_open_segments)),
             #[cfg(test)]
             test_hooks: CacheTestHooks::default(),
@@ -389,6 +396,7 @@ impl SettledSegmentReaderCache {
     }
 
     /// Creates a shared reader cache with [`DEFAULT_SETTLED_SEGMENT_READER_CACHE_CAPACITY`] (`1,024`).
+    #[cfg(test)]
     pub(crate) fn with_default_capacity(
         store_root: impl AsRef<Path>,
         require_fs_verity: bool,
@@ -398,6 +406,40 @@ impl SettledSegmentReaderCache {
             DEFAULT_SETTLED_SEGMENT_READER_CACHE_CAPACITY,
             require_fs_verity,
         )?))
+    }
+
+    pub(in crate::canonical_store) fn with_admitted_corpus(
+        store_root: &Path,
+        entries: &[SettledSegmentIndexEntry],
+    ) -> Result<Arc<Self>, SettledSegmentsError> {
+        Self::with_corpus_budget(
+            store_root,
+            entries,
+            container_memory_budget_bytes().and_then(NonZeroU64::new),
+        )
+    }
+
+    pub(super) fn with_corpus_budget(
+        store_root: &Path,
+        entries: &[SettledSegmentIndexEntry],
+        memory_budget: Option<NonZeroU64>,
+    ) -> Result<Arc<Self>, SettledSegmentsError> {
+        let mut cache = Self::new(
+            store_root,
+            DEFAULT_SETTLED_SEGMENT_READER_CACHE_CAPACITY,
+            false,
+        )?;
+        cache.page_cache =
+            SettledSegmentPageCache::measure(&cache.root_dir, entries, memory_budget)?;
+        Ok(Arc::new(cache))
+    }
+
+    pub(in crate::canonical_store) fn record_corpus_admission(&self, role: StoreRole) {
+        self.page_cache.record_admission(role);
+    }
+
+    pub(super) fn advise_file(&self, file: &File) {
+        self.page_cache.advise_file(file);
     }
 
     /// Returns the configured maximum number of open segments held in the cache.
@@ -720,7 +762,7 @@ impl SettledSegmentReaderCache {
                 hook(kind);
             }
         }
-        let loaded = open_single_module(&self.root_dir, entry, kind, self.require_fs_verity)
+        let loaded = open_single_module(self, entry, kind)
             .map_err(|err| CachedOpenFailure::from_error(&err));
         let final_result = self.commit_leader_outcome(key, expected_pin, inflight, loaded);
 
@@ -817,17 +859,18 @@ fn insert_module_into_slot(
 }
 
 fn open_single_module(
-    root_dir: &VerifiedDir,
+    cache: &SettledSegmentReaderCache,
     entry: &SettledSegmentIndexEntry,
     kind: SettledSegmentKind,
-    require_fs_verity: bool,
 ) -> Result<LoadedModuleReader, SettledSegmentsError> {
-    let segments_dir = root_dir.open_child_dir_existing(SEGMENTS_DIR_NAME)?;
+    let segments_dir = cache.root_dir.open_child_dir_existing(SEGMENTS_DIR_NAME)?;
+    let require_fs_verity = cache.require_fs_verity;
     let start = entry.start_height;
     let end = entry.end_block.height;
     let file = segments_dir
         .open_child_dir_existing(kind.subdir_name())?
         .open_regular_file_nofollow(&format_segment_filename(kind, start, end)?)?;
+    cache.advise_file(&file);
 
     match kind {
         SettledSegmentKind::Shielded => Ok(LoadedModuleReader::Shielded(Arc::new(

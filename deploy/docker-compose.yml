@@ -121,6 +121,7 @@ services:
 
   zinder-serve:
     <<: *zinder-image
+    # Include headroom for buffered settled-segment reads. See docs/runbooks/deploying.md.
     mem_limit: ${ZINDER_SERVE_MEMORY_LIMIT:-8g}
     ulimits:
       nofile:

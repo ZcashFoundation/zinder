@@ -1,7 +1,7 @@
 //! T0 unit tests for canonical settled segments layout, manifests, live-tail
 //! records, aligned sealing, `.staging/` recovery, pinned snapshots, and LRU cache.
 
-use std::{fs, io, path::Path, sync::Arc};
+use std::{fs, io, num::NonZeroU64, path::Path, sync::Arc};
 
 use sha2::{Digest as _, Sha256};
 use tempfile::{NamedTempFile, TempDir};
@@ -2655,6 +2655,113 @@ fn seal_multi_test_strides(
         entries.extend(sealer.push_block(build_block_input(height, modules.raw_bodies))?);
     }
     Ok(entries)
+}
+
+#[test]
+fn settled_corpus_admission_reports_exact_bytes_and_warns_only_below_budget() -> TestResult {
+    let dir = TempDir::new()?;
+    let entries = seal_multi_test_strides(
+        dir.path(),
+        2,
+        4,
+        SettledSegmentModules {
+            supplement: true,
+            raw_bodies: true,
+        },
+    )?;
+    let mut corpus_bytes = 0;
+    for entry in &entries {
+        let paths = SettledSegmentFilePaths::for_entry(dir.path(), entry)?;
+        for path in [Some(paths.shielded), paths.supplement, paths.raw_block]
+            .into_iter()
+            .flatten()
+        {
+            corpus_bytes += fs::metadata(path)?.len();
+        }
+    }
+    let orphan = SettledSegmentFilePaths::for_entry(dir.path(), &entries[0])?
+        .shielded
+        .with_file_name("unpublished-segment");
+    fs::write(orphan, b"excluded from corpus")?;
+    for (budget, exposed_budget, ratio, constrained) in [
+        (NonZeroU64::new(1), "1".to_owned(), corpus_bytes, true),
+        (
+            NonZeroU64::new(corpus_bytes),
+            corpus_bytes.to_string(),
+            1,
+            false,
+        ),
+        (None, "inf".to_owned(), 0, false),
+    ] {
+        let capture = zinder_testkit::LogCapture::install_for_target("zinder::store");
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let cache = SettledSegmentReaderCache::with_corpus_budget(dir.path(), &entries, budget)?;
+        cache.record_corpus_admission(crate::StoreRole::CanonicalSecondary);
+        let corpus = corpus_bytes.to_string();
+        assert_eq!(
+            capture.any(|event| {
+                event.level == tracing::Level::WARN
+                    && event.field("event") == Some("settled_segment_corpus_exceeds_memory_budget")
+                    && event.field("store_role") == Some("canonical_secondary")
+                    && event.field("corpus_bytes") == Some(corpus.as_str())
+                    && event.field("memory_budget_bytes") == Some("1")
+            }),
+            constrained
+        );
+        assert_eq!(capture.events().len(), usize::from(constrained));
+        let metrics = recorder.handle().render();
+        for (metric, sample) in [
+            ("corpus_bytes", corpus),
+            ("memory_budget_bytes", exposed_budget),
+            ("corpus_to_budget_ratio", ratio.to_string()),
+        ] {
+            let expected = format!(
+                "zinder_store_settled_segment_{metric}{{store_role=\"canonical_secondary\"}} {sample}"
+            );
+            assert!(
+                metrics
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case(&expected)),
+                "missing {expected} in {metrics}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn constrained_and_unbounded_readers_serve_concurrent_settled_ranges() -> TestResult {
+    let dir = TempDir::new()?;
+    let entry = seal_test_stride(
+        dir.path(),
+        1..=4,
+        4,
+        SettledSegmentModules {
+            supplement: false,
+            raw_bodies: false,
+        },
+        None,
+    )?;
+    let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(4));
+    let entries = std::slice::from_ref(&entry);
+    let baseline = SettledSegmentReaderCache::with_corpus_budget(dir.path(), entries, None)?
+        .get_or_open_shielded(&entry)?
+        .read_default_range(range, HeightOrder::Ascending)?;
+    for budget in [NonZeroU64::new(1), None] {
+        let cache = SettledSegmentReaderCache::with_corpus_budget(dir.path(), entries, budget)?;
+        assert_singleflight_module(8, || {
+            let reader = cache.get_or_open_shielded(&entry)?;
+            let blocks = reader.read_default_range(range, HeightOrder::Ascending)?;
+            assert_eq!(blocks.len(), baseline.len());
+            for (block, expected) in blocks.iter().zip(&baseline) {
+                assert_eq!(block.payload(), expected.payload());
+            }
+            Ok(reader)
+        })?;
+        assert_eq!(cache.open_count(SettledSegmentKind::Shielded), 1);
+    }
+    Ok(())
 }
 
 #[test]

@@ -647,6 +647,7 @@ struct ShieldedEntryContext<'a> {
     first_shielded: &'a AuthenticatedShieldedBoundary,
     last_shielded: Option<&'a AuthenticatedShieldedBoundary>,
     require_fs_verity: bool,
+    cache: Option<&'a SettledSegmentReaderCache>,
 }
 
 fn verify_single_entry_files(
@@ -660,6 +661,9 @@ fn verify_single_entry_files(
     let end = entry.end_block.height;
     let shielded_name = format_segment_filename(SettledSegmentKind::Shielded, start, end)?;
     let shielded_file = dirs.shielded.open_regular_file_nofollow(&shielded_name)?;
+    if let Some(cache) = cache {
+        cache.advise_file(&shielded_file);
+    }
     let shielded_reader = SettledShieldedSegmentReader::open_file(
         shielded_file,
         &entry.shielded_identity,
@@ -688,6 +692,7 @@ fn verify_single_entry_files(
         first_shielded: &first_shielded,
         last_shielded: last_shielded.as_ref(),
         require_fs_verity,
+        cache,
     };
     let sup_reader = if let (Some(sup_dir), Some(sup_id)) =
         (dirs.supplement.as_ref(), entry.supplement_identity.as_ref())
@@ -832,6 +837,9 @@ fn verify_supplement_linkage(
         ctx.entry.end_block.height,
     )?;
     let sup_file = sup_dir.open_regular_file_nofollow(&filename)?;
+    if let Some(cache) = ctx.cache {
+        cache.advise_file(&sup_file);
+    }
     let reader = SettledSupplementSegmentReader::open_file(
         sup_file,
         sup_id,
@@ -884,6 +892,9 @@ fn verify_raw_block_linkage(
         ctx.entry.end_block.height,
     )?;
     let raw_file = raw_dir.open_regular_file_nofollow(&filename)?;
+    if let Some(cache) = ctx.cache {
+        cache.advise_file(&raw_file);
+    }
     let raw_reader = SettledRawBlockSegmentReader::open_file(
         raw_file,
         raw_id,

@@ -6,6 +6,7 @@
 mod block_hash_index;
 mod canonical_store;
 pub use canonical_store::edge_snapshot;
+mod cgroup_memory;
 mod chain_event;
 mod event_stream;
 mod format;
@@ -64,6 +65,9 @@ pub use canonical_store::{
     TreeStateCheckpointVerification, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
     TreeStateStride, TreeStateStrideCommit, TreeStateStrideScan, TreeStateVerificationError,
     ValidatedRocksDbCanonicalBuild,
+};
+pub use cgroup_memory::{
+    CgroupMemorySnapshot, container_memory_budget_bytes, container_memory_snapshot,
 };
 pub use chain_event::{
     ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest,

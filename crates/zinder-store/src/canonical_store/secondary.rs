@@ -127,7 +127,7 @@ impl RocksDbCanonicalSecondary {
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resources: impl Into<RocksDbOpenResources>,
     ) -> Result<Self, CanonicalStoreError> {
-        Self::open_ready_with_expectation(
+        let secondary = Self::open_ready_with_expectation(
             primary_path.as_ref(),
             secondary_path.as_ref(),
             &CanonicalStoreAdmissionExpectation::from_activations(
@@ -137,7 +137,11 @@ impl RocksDbCanonicalSecondary {
             ),
             resources.into(),
             canonical_column_family_descriptors,
-        )
+        )?;
+        secondary
+            .segment_cache
+            .record_corpus_admission(StoreRole::CanonicalSecondary);
+        Ok(secondary)
     }
 
     /// Opens a secondary with explicit minimum retained data and history.
@@ -156,7 +160,7 @@ impl RocksDbCanonicalSecondary {
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resources: impl Into<RocksDbOpenResources>,
     ) -> Result<Self, CanonicalStoreError> {
-        Self::open_ready_with_expectation(
+        let secondary = Self::open_ready_with_expectation(
             primary_path.as_ref(),
             secondary_path.as_ref(),
             &CanonicalStoreAdmissionExpectation::adopting_writer_schedule(
@@ -166,7 +170,11 @@ impl RocksDbCanonicalSecondary {
             ),
             resources.into(),
             canonical_column_family_descriptors,
-        )
+        )?;
+        secondary
+            .segment_cache
+            .record_corpus_admission(StoreRole::CanonicalSecondary);
+        Ok(secondary)
     }
 
     #[allow(
@@ -246,7 +254,8 @@ impl RocksDbCanonicalSecondary {
                 });
             }
         }
-        let segment_cache = SettledSegmentReaderCache::with_default_capacity(&primary_path, false)?;
+        let segment_cache =
+            SettledSegmentReaderCache::with_admitted_corpus(&primary_path, &sealed_segments)?;
         let ctx = SegmentStoreContext {
             db: &bounded_open.db,
             segment_cache: Some(&segment_cache),

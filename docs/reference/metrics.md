@@ -543,7 +543,10 @@ within each process.
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `zinder_store_block_cache_capacity_bytes` | gauge | `store_role` | Block cache capacity. Excludes canonical settled-segment (`ZSHRNG02` / `ZSTSUP01` / `ZSBLKB01`) file reads, which use OS buffered I/O and rely on the Linux OS page cache. |
-| `zinder_store_block_cache_usage_bytes` | gauge | `store_role` | Block cache use. It can exceed capacity by pinned index and filter blocks. Excludes signed-history catalog page-cache residency. |
+| `zinder_store_block_cache_usage_bytes` | gauge | `store_role` | Block cache use. Pinned index and filter blocks can push use above capacity. |
+| `zinder_store_settled_segment_corpus_bytes` | gauge | `store_role` | Sum of the logical file lengths of admitted shielded, supplement, and raw-block segments at canonical open. |
+| `zinder_store_settled_segment_memory_budget_bytes` | gauge | `store_role` | Tightest finite cgroup v2 memory budget detected at canonical open. `+Inf` means no finite limit was detected. |
+| `zinder_store_settled_segment_corpus_to_budget_ratio` | gauge | `store_role` | Corpus bytes divided by the budget, or zero when no finite limit was detected. |
 | `zinder_store_block_cache_pinned_usage_bytes` | gauge | `store_role` | Pinned block cache use. |
 | `zinder_store_block_cache_entries` | gauge | `store_role`, `entry_role` | Serving readers only. Number of cached entries by RocksDB role, such as `DataBlock`, `IndexBlock`, or `FilterBlock`. |
 | `zinder_store_block_cache_entry_bytes` | gauge | `store_role`, `entry_role` | Serving readers only. Approximate cache charge by entry role. RocksDB rounds each role's charge before export. |
@@ -557,15 +560,14 @@ within each process.
 | `zinder_store_rocksdb_property` | gauge | `store_role`, `cf`, `property` | RocksDB properties, such as pending compaction bytes and per-family live SST size (`rocksdb.live-sst-files-size`). |
 | `zinder_store_rocksdb_ticker` | gauge | `store_role`, `ticker` | RocksDB statistics tickers, when statistics are on. |
 
-> **Diagnosing canonical settled-segment cgroup v2 page-cache thrashing:**
-> Canonical settled-segment reads (`ZSHRNG02`, `ZSTSUP01`, `ZSBLKB01`) use OS
-> buffered I/O outside RocksDB, so `zinder_store_block_cache_*` and
-> `rocksdb.block.cache.miss` stay at zero even when the reader repeatedly
-> re-reads settled segments from disk. Under Linux cgroup v2, OS page cache for
-> those files is charged to the reader's `MemoryMax` (systemd) or `mem_limit`
-> (Docker). If `zinder_compat_block_range_stream_refusals_total{reason="wait_timeout"}`
-> rises alongside disk read saturation under concurrent range syncs, raise the
-> reader's cgroup memory limit to hold the settled shielded segment working set.
+The settled-segment gauges report the most recent successful canonical open
+for each `store_role`. A ratio above 1 emits
+`settled_segment_corpus_exceeds_memory_budget` at WARN with `store_role`,
+`corpus_bytes`, and `memory_budget_bytes`. On Linux the store requests disabled
+speculative readahead on the segment handles for that open. The ratio compares
+file sizes with the full budget. Use cgroup memory and disk I/O metrics to
+observe actual cache residency and reclaim. For serving limits and workload
+sizing, see [Size your host](../runbooks/deploying.md#step-3-size-your-host).
 
 Ingest samples the canonical primary after bulk loads, while following the
 tip, and after checkpoint densification commits. The projector samples the

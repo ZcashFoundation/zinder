@@ -1339,7 +1339,7 @@ pub(in crate::canonical_store) fn verify_cold_segments_and_manifest(
             ),
         });
     }
-    let segment_cache = SettledSegmentReaderCache::with_default_capacity(store_root, false)?;
+    let segment_cache = SettledSegmentReaderCache::with_admitted_corpus(store_root, &entries)?;
     verify_pinned_segments_into_cache(store_root, &entries, false, &segment_cache)?;
     Ok((entries, segment_cache))
 }

@@ -27,7 +27,7 @@ This image runs as non-root UID/GID `10001:10001` on `gcr.io/distroless/cc-debia
 
 ## Configure the container
 
-Attach one persistent volume at `/var/lib/zinder`, sized per [Size your host](deploying.md#what-you-need), with at least 8 GB of RAM.
+Attach one persistent volume at `/var/lib/zinder`, sized per [Size your host](deploying.md#step-3-size-your-host), with at least 8 GB of RAM. The platform memory limit also covers the page cache charged for settled-segment reads. Allow headroom for the other roles sharing the container.
 
 ### Required variables
 

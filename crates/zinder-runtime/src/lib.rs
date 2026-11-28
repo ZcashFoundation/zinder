@@ -112,8 +112,7 @@ pub use logging::{
     install_tracing_subscriber, trace_ingest_control, trace_node_rpc,
 };
 pub use memory_budget::{
-    CgroupMemorySnapshot, canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
-    container_memory_budget_bytes, container_memory_snapshot,
+    canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
     wallet_build_outpoint_sort_memory_bytes, wallet_build_outpoint_sort_memory_bytes_for,
     wallet_build_reorg_undo_memory_bytes, wallet_build_reorg_undo_memory_bytes_for,
     wallet_build_secondary_sort_memory_bytes_per_sorter,
@@ -182,6 +181,9 @@ pub use transport::{
     DEFAULT_ZINDER_GRPC_CONNECT_TIMEOUT, InvalidZinderGrpcEndpoint, LazyZinderGrpcChannel,
     connect_zinder_grpc, connect_zinder_grpc_at_startup, connect_zinder_grpc_with_timeout,
     validate_zinder_grpc_endpoint,
+};
+pub use zinder_store::{
+    CgroupMemorySnapshot, container_memory_budget_bytes, container_memory_snapshot,
 };
 
 use tokio::task::JoinHandle;

@@ -158,7 +158,12 @@ impl RocksDbTreeStateVerifier {
             resource_budget.into(),
             canonical_verification_column_family_descriptors,
         )
-        .map(|secondary| Self { secondary })
+        .map(|secondary| {
+            secondary
+                .segment_cache
+                .record_corpus_admission(StoreRole::TreeStateVerificationSecondary);
+            Self { secondary }
+        })
     }
 
     /// Publishes this verifier's resource gauges independently of replay and serving readers.
