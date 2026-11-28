@@ -48,10 +48,7 @@ use super::{
     snapshot::verify_pinned_segments_into_cache,
 };
 
-/// Bundle of shared readers for compact-block and canonical-replay paths.
-///
-/// Deliberately omits `ZSBLKB01` raw-block readers so compact-block and replay
-/// reads never open raw-block files.
+/// Shared shielded and optional supplement readers for compact-block reconstruction.
 #[derive(Clone)]
 pub(in crate::canonical_store) struct SegmentReplayReaders {
     /// Authenticated `ZSHRNG02` shielded segment reader.
@@ -390,7 +387,7 @@ pub(in crate::canonical_store) const fn segment_modules_for_stored_set(
 }
 
 /// Reads and decodes one canonical [`BlockHeaderArtifact`] without polluting the block cache.
-pub(in crate::canonical_store) fn read_block_header_from_db(
+fn read_block_header_from_db(
     db: &DB,
     height: BlockHeight,
 ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError> {
@@ -425,7 +422,7 @@ pub(in crate::canonical_store) fn open_shielded_segment_reader(
     opened.map_err(map_settled_segments_read_error)
 }
 
-/// Opens ONLY `ZSTSUP01` when `entry.modules.supplement` is enabled, never opening `ZSBLKB01`.
+/// Opens only `ZSTSUP01` when `entry.modules.supplement` is enabled.
 pub(in crate::canonical_store) fn open_supplement_segment_reader(
     ctx: SegmentStoreContext<'_>,
     entry: &SettledSegmentIndexEntry,
@@ -578,35 +575,24 @@ fn open_raw_block_reader(
     Ok(temp_cache.get_or_open_raw_block(entry)?)
 }
 
-fn segment_supplement_reader(
-    readers: &SegmentReplayReaders,
-    height: BlockHeight,
-) -> Result<&SettledSupplementSegmentReader, CanonicalStoreError> {
-    readers
-        .supplement
-        .as_deref()
-        .ok_or_else(|| CanonicalStoreError::SettledSegment {
-            reason: format!(
-                "settled supplement reader missing for block {}",
-                height.value()
-            ),
-        })
+/// Opens the authenticated supplement required for canonical replay.
+pub(in crate::canonical_store) fn open_replay_supplement_reader(
+    ctx: SegmentStoreContext<'_>,
+    entry: &SettledSegmentIndexEntry,
+) -> Result<Arc<SettledSupplementSegmentReader>, CanonicalStoreError> {
+    open_supplement_segment_reader(ctx, entry)?.ok_or_else(|| CanonicalStoreError::SettledSegment {
+        reason: format!(
+            "settled supplement reader missing for segment at height {}",
+            entry.start_height.value()
+        ),
+    })
 }
 
 fn reconstruct_replay_from_parts(
-    db: &DB,
-    height: BlockHeight,
-    shielded_payload: &[u8],
+    header: BlockHeaderArtifact,
     sup_record: &BlockSupplementRecord,
 ) -> Result<ValidatedCanonicalBlockReplay, CanonicalStoreError> {
-    let header = read_block_header_from_db(db, height)?.ok_or_else(|| {
-        CanonicalStoreError::block_replay_sequence(format!(
-            "block header at settled height {} is absent",
-            height.value()
-        ))
-    })?;
-    let compact = reconstruct_compact_block_artifact(shielded_payload, sup_record)
-        .map_err(SettledSegmentsError::Supplement)?;
+    let height = header.height;
     let facts = reconstruct_canonical_block_facts(header, sup_record).map_err(|err| {
         CanonicalStoreError::SettledSegment {
             reason: format!(
@@ -615,17 +601,6 @@ fn reconstruct_replay_from_parts(
             ),
         }
     })?;
-    if compact.height() != facts.block_header.height
-        || compact.block_hash() != facts.block_header.block_hash
-        || compact.previous_block_hash() != facts.block_header.parent_hash
-    {
-        return Err(CanonicalStoreError::SettledSegment {
-            reason: format!(
-                "reconstructed compact identity disagrees with block_header at height {}",
-                height.value()
-            ),
-        });
-    }
     Ok(ValidatedCanonicalBlockReplay::from_authenticated_facts(
         facts,
         CanonicalBlockReplayFormatVersion::CURRENT,
@@ -633,75 +608,113 @@ fn reconstruct_replay_from_parts(
     ))
 }
 
-/// Reconstructs and authenticates a [`ValidatedCanonicalBlockReplay`] at `height`
-/// from `block_header`, `ZSHRNG02`, and `ZSTSUP01`.
+/// Reconstructs and authenticates replay at `height` from `block_header` and `ZSTSUP01`.
 pub(in crate::canonical_store) fn reconstruct_replay_from_segment(
     db: &DB,
-    readers: &SegmentReplayReaders,
+    supplement: &SettledSupplementSegmentReader,
     height: BlockHeight,
 ) -> Result<ValidatedCanonicalBlockReplay, CanonicalStoreError> {
-    let sup_reader = segment_supplement_reader(readers, height)?;
-    let encoded_blocks = readers
-        .shielded
-        .read_default_range_for_reconstruction(
-            BlockHeightRange::inclusive(height, height),
-            HeightOrder::Ascending,
-        )
-        .map_err(SettledSegmentsError::Shielded)?;
-    let [encoded_block] =
-        <[_; 1]>::try_from(encoded_blocks).map_err(|_| CanonicalStoreError::SettledSegment {
+    let header = read_block_header_from_db(db, height)?.ok_or_else(|| {
+        CanonicalStoreError::block_replay_sequence(format!(
+            "block header at settled height {} is absent",
+            height.value()
+        ))
+    })?;
+    let mut records = supplement
+        .read_range_for_headers(std::slice::from_ref(&header))
+        .map_err(SettledSegmentsError::Supplement)?;
+    let record = records
+        .pop()
+        .ok_or_else(|| CanonicalStoreError::SettledSegment {
             reason: format!(
-                "shielded segment returned unexpected block count at height {}",
+                "settled supplement record missing at height {}",
                 height.value()
             ),
         })?;
-    let sup_record = sup_reader
-        .read_block(height)
-        .map_err(SettledSegmentsError::Supplement)?;
-    reconstruct_replay_from_parts(db, height, &encoded_block.payload(), &sup_record)
+    reconstruct_replay_from_parts(header, &record)
 }
 
-/// Batch-reconstructs connected [`ValidatedCanonicalBlockReplay`] rows across `range`
-/// within one settled segment using a single chunk pass.
+/// Batch-reconstructs replay within one settled segment using a single header
+/// iterator and a single supplement chunk pass.
 pub(in crate::canonical_store) fn reconstruct_replay_range_from_segment(
     db: &DB,
-    readers: &SegmentReplayReaders,
+    supplement: &SettledSupplementSegmentReader,
     range: BlockHeightRange,
 ) -> Result<Vec<(BlockHeight, ValidatedCanonicalBlockReplay)>, CanonicalStoreError> {
     if range.start > range.end {
         return Ok(Vec::new());
     }
-    let sup_reader = segment_supplement_reader(readers, range.start)?;
-    let encoded_blocks = readers
-        .shielded
-        .read_default_range_for_reconstruction(range, HeightOrder::Ascending)
-        .map_err(SettledSegmentsError::Shielded)?;
-    let sup_records = sup_reader
-        .read_range(range.start, range.end)
+    let headers = read_replay_headers(db, range)?;
+    let records = supplement
+        .read_range_for_headers(&headers)
         .map_err(SettledSegmentsError::Supplement)?;
-    let expected =
-        usize::try_from(u64::from(range.end.value()) - u64::from(range.start.value()) + 1)
-            .map_err(|_| {
-                CanonicalStoreError::block_replay_sequence("replay range exceeds usize")
-            })?;
-    if encoded_blocks.len() != expected || sup_records.len() != expected {
+    if records.len() != headers.len() {
         return Err(CanonicalStoreError::SettledSegment {
             reason: format!(
-                "settled segment returned unexpected batch count for {}..={}",
+                "settled supplement returned unexpected batch count for {}..={}",
                 range.start.value(),
                 range.end.value()
             ),
         });
     }
-    let mut out = Vec::with_capacity(expected);
-    for ((height, encoded_block), sup_record) in
-        range.into_iter().zip(encoded_blocks).zip(sup_records)
-    {
-        let replay =
-            reconstruct_replay_from_parts(db, height, &encoded_block.payload(), &sup_record)?;
-        out.push((height, replay));
+    headers
+        .into_iter()
+        .zip(records)
+        .map(|(header, record)| {
+            let height = header.height;
+            Ok((height, reconstruct_replay_from_parts(header, &record)?))
+        })
+        .collect()
+}
+
+fn read_replay_headers(
+    db: &DB,
+    range: BlockHeightRange,
+) -> Result<Vec<BlockHeaderArtifact>, CanonicalStoreError> {
+    let family = db
+        .cf_handle(BLOCK_HEADER_COLUMN_FAMILY)
+        .ok_or_else(|| CanonicalStoreError::publication("block_header column family is absent"))?;
+    let mut rows = db.raw_iterator_cf_opt(&family, uncached_read_options());
+    rows.seek(encode_height_key_ascending(range.start));
+    let scan_error = |source| CanonicalStoreError::RocksDbOperation {
+        operation: "block header replay scan",
+        source,
+    };
+    let mut headers = Vec::with_capacity(range.into_iter().len());
+    for height in range {
+        let Some((key, encoded)) = rows.item() else {
+            rows.status().map_err(scan_error)?;
+            return Err(CanonicalStoreError::block_replay_sequence(format!(
+                "block header at settled height {} is absent",
+                height.value()
+            )));
+        };
+        if key != encode_height_key_ascending(height) {
+            return Err(CanonicalStoreError::block_replay_sequence(format!(
+                "block header scan expected settled height {}, found key {key:02x?}",
+                height.value()
+            )));
+        }
+        headers.push(decode_block_header_record(height, encoded)?);
+        rows.next();
     }
-    Ok(out)
+    // The next batch seeks to its start, so check for keys that seek would skip.
+    match rows.item() {
+        None => rows.status().map_err(scan_error)?,
+        Some((key, _))
+            if range
+                .end
+                .next()
+                .is_none_or(|height| key < encode_height_key_ascending(height).as_slice()) =>
+        {
+            return Err(CanonicalStoreError::block_replay_sequence(format!(
+                "block header scan found unexpected key {key:02x?} after settled height {}",
+                range.end.value()
+            )));
+        }
+        Some(_) => {}
+    }
+    Ok(headers)
 }
 
 /// Converts already-fetched `live_tail_block` bytes at `height` into a [`PersistedReplayStep`]
@@ -752,8 +765,8 @@ pub(in crate::canonical_store) fn read_replay_step_split(
     height: BlockHeight,
 ) -> Result<PersistedReplayStep, CanonicalStoreError> {
     if let Some(entry) = resolve_settled_segment_for_height(ctx.db, ctx.sealed_segments, height)? {
-        let readers = open_replay_segment_readers(ctx.db, ctx.segment_cache, &entry)?;
-        let replay = reconstruct_replay_from_segment(ctx.db, &readers, height)?;
+        let supplement = open_replay_supplement_reader(ctx, &entry)?;
+        let replay = reconstruct_replay_from_segment(ctx.db, &supplement, height)?;
         return replay_step_from_validated(replay);
     }
     if let Some(encoded) =
@@ -1489,17 +1502,22 @@ mod tests {
     use tempfile::TempDir;
     use zinder_core::{
         BlockHash, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion,
-        CanonicalHistoryBounds, CanonicalTransactionFacts, CompactTransparentOutput,
+        CanonicalHistoryBounds, CanonicalTransactionFacts, ChainEpochId, CompactTransparentOutput,
         ConsensusBranchId, LockTime, PrivacyShape, TransactionComponentCounts, TransactionId,
         TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
         TransactionVersion, TransparentAddressScriptHash, TransparentOutputFact,
-        encode_canonical_block_replay,
+        decode_canonical_block_replay, encode_canonical_block_replay,
     };
 
     use super::super::super::{
+        CanonicalStoreReadyEvidence,
         block_load::encode_block_header,
-        settled_segments::sealer::{
-            SettledSegmentBlockInput, SettledSegmentSealer, SettledSegmentSealerConfig,
+        block_replay::{
+            CanonicalReplayRangeScan, CanonicalReplayScan, validate_persisted_block_replays,
+        },
+        settled_segments::{
+            layout::SettledSegmentFilePaths,
+            sealer::{SettledSegmentBlockInput, SettledSegmentSealer, SettledSegmentSealerConfig},
         },
     };
     use super::*;
@@ -1695,6 +1713,247 @@ mod tests {
     }
 
     type SealedSeedFixture = (SettledSegmentIndexEntry, Vec<Vec<u8>>, Vec<Vec<Vec<u8>>>);
+
+    fn seed_settled_replay(
+        db: &DB,
+        stride: u32,
+        segment_count: u32,
+    ) -> Result<Vec<ValidatedCanonicalBlockReplay>, Box<dyn std::error::Error>> {
+        let header_cf = db
+            .cf_handle(BLOCK_HEADER_COLUMN_FAMILY)
+            .ok_or("header cf missing")?;
+        let index_cf = db
+            .cf_handle(SETTLED_SEGMENT_INDEX_COLUMN_FAMILY)
+            .ok_or("index cf missing")?;
+        let modules = SettledSegmentModules {
+            supplement: true,
+            raw_bodies: false,
+        };
+        let config = SettledSegmentSealerConfig::new(Network::ZcashRegtest, 1, modules)
+            .with_segment_blocks(stride);
+        let mut sealer = SettledSegmentSealer::new(db.path(), config, None)?;
+        let mut expected = Vec::new();
+        for height in 1..=stride * segment_count {
+            let (block, _) = bridge_block_fixture(height, 2)?;
+            let header = &block.facts.block_header;
+            db.put_cf(
+                &header_cf,
+                encode_height_key_ascending(header.height),
+                encode_block_header(header),
+            )?;
+            expected.push(decode_canonical_block_replay(
+                block.replay_envelope.as_bytes(),
+            )?);
+            let entries = sealer.push_block(SettledSegmentBlockInput {
+                compact_block: block.compact_block,
+                native_bytes: 512,
+                canonical_facts: block.facts,
+                raw_block: None,
+            })?;
+            for entry in entries {
+                db.put_cf(
+                    &index_cf,
+                    encode_height_key_ascending(entry.start_height),
+                    entry.encode_v1()?,
+                )?;
+            }
+        }
+        Ok(expected)
+    }
+
+    #[test]
+    fn settled_replay_matches_full_facts_across_partial_segments_without_shielded_files()
+    -> TestResult {
+        let dir = TempDir::new()?;
+        let db = open_bridge_test_db(dir.path())?;
+        let expected = seed_settled_replay(&db, 272, 2)?;
+        let entries = read_all_settled_segment_entries(&db)?;
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            std::fs::remove_file(SettledSegmentFilePaths::for_entry(dir.path(), entry)?.shielded)?;
+        }
+        let cache = SettledSegmentReaderCache::new(dir.path(), 4, false)?;
+        let ctx = SegmentStoreContext {
+            db: &db,
+            segment_cache: Some(&cache),
+            sealed_segments: Some(&entries),
+        };
+        let checkpoint = entries[1].end_sequence_checkpoint;
+        let first = &expected[0].facts().block_header;
+        let ready = CanonicalStoreReadyEvidence {
+            schema_version: crate::CANONICAL_STORE_SCHEMA_VERSION,
+            first_retained_block: BlockId::new(first.height, first.block_hash),
+            visible_tip: checkpoint.through(),
+            visible_epoch: ChainEpochId::new(1),
+            visible_event_sequence: 1,
+            visible_block_count: checkpoint.retained_block_count(),
+            block_digest_version: CanonicalBlockFactsDigestVersion::CURRENT,
+            replay_format_version: CanonicalBlockReplayFormatVersion::CURRENT,
+            sequence_digest_version: checkpoint.sequence_digest().version(),
+            visible_sequence_digest: checkpoint.sequence_digest().as_bytes(),
+            visible_logical_replay_bytes: checkpoint.logical_replay_bytes(),
+            sequence_checkpoint: checkpoint,
+            construction_manifest_version: crate::CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
+            construction_manifest_sha256: [0; 32],
+        };
+        let full = CanonicalReplayScan::new(ctx, &ready)?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(full, expected);
+        let range = BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(274));
+        let partial =
+            CanonicalReplayRangeScan::new(ctx, &ready, range)?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(partial, expected[1..274]);
+        assert_eq!(
+            read_replay_step_split(ctx, range.end)?.replay,
+            expected[273]
+        );
+        let persisted = validate_persisted_block_replays(ctx)?;
+        assert_eq!(persisted.sequence_digest, checkpoint.sequence_digest());
+
+        let family = db
+            .cf_handle(BLOCK_HEADER_COLUMN_FAMILY)
+            .ok_or("header cf missing")?;
+        let mut malformed_key = encode_height_key_ascending(entries[0].end_block.height).to_vec();
+        malformed_key.push(0);
+        db.put_cf(&family, malformed_key, [0xff])?;
+        assert!(matches!(
+            CanonicalReplayRangeScan::new(ctx, &ready, range)?.collect::<Result<Vec<_>, _>>(),
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn settled_replay_rejects_a_header_key_after_maximum_height() -> TestResult {
+        let dir = TempDir::new()?;
+        let db = open_bridge_test_db(dir.path())?;
+        let family = db
+            .cf_handle(BLOCK_HEADER_COLUMN_FAMILY)
+            .ok_or("header cf missing")?;
+        let (mut block, _) = bridge_block_fixture(1, 1)?;
+        let height = BlockHeight::new(u32::MAX);
+        block.facts.block_header.height = height;
+        let key = encode_height_key_ascending(height);
+        db.put_cf(&family, key, encode_block_header(&block.facts.block_header))?;
+        let range = BlockHeightRange::inclusive(height, height);
+        assert_eq!(read_replay_headers(&db, range)?, [block.facts.block_header]);
+
+        let mut malformed_key = key.to_vec();
+        malformed_key.push(0);
+        db.put_cf(&family, malformed_key, [0xff])?;
+        assert!(matches!(
+            read_replay_headers(&db, range),
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn settled_replay_rejects_missing_and_corrupt_header_rows() -> TestResult {
+        let dir = TempDir::new()?;
+        let db = open_bridge_test_db(dir.path())?;
+        let expected = seed_settled_replay(&db, 3, 1)?;
+        let entries = read_all_settled_segment_entries(&db)?;
+        let ctx = SegmentStoreContext {
+            db: &db,
+            segment_cache: None,
+            sealed_segments: Some(&entries),
+        };
+        let supplement = open_replay_supplement_reader(ctx, &entries[0])?;
+        let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3));
+        let family = db
+            .cf_handle(BLOCK_HEADER_COLUMN_FAMILY)
+            .ok_or("header cf missing")?;
+        for replay in &expected {
+            let header = &replay.facts().block_header;
+            let key = encode_height_key_ascending(header.height);
+            db.delete_cf(&family, key)?;
+            assert!(matches!(
+                reconstruct_replay_range_from_segment(&db, &supplement, range),
+                Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+            ));
+            db.put_cf(&family, key, [0xff])?;
+            let error = reconstruct_replay_range_from_segment(&db, &supplement, range)
+                .err()
+                .ok_or("malformed header accepted")?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("block header is not the exact version-1 value")
+            );
+            db.put_cf(&family, key, encode_block_header(header))?;
+        }
+
+        let header = &expected[1].facts().block_header;
+        let key = encode_height_key_ascending(header.height);
+        let mut malformed_key = key.to_vec();
+        malformed_key.push(0);
+        db.put_cf(&family, &malformed_key, encode_block_header(header))?;
+        assert!(matches!(
+            reconstruct_replay_range_from_segment(&db, &supplement, range),
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+        ));
+        db.delete_cf(&family, malformed_key)?;
+
+        let mut wrong_hash = header.clone();
+        wrong_hash.block_hash = BlockHash::from_bytes([0xff; 32]);
+        let mut wrong_parent = header.clone();
+        wrong_parent.parent_hash = BlockHash::from_bytes([0xff; 32]);
+        let mut wrong_time = header.clone();
+        wrong_time.block_time += 1;
+        for wrong_header in [wrong_hash, wrong_parent, wrong_time] {
+            db.put_cf(&family, key, encode_block_header(&wrong_header))?;
+            let error = reconstruct_replay_range_from_segment(&db, &supplement, range)
+                .err()
+                .ok_or("mismatched header accepted")?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("disagrees with ZSTSUP01 envelope")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn settled_replay_requires_authentic_supplement_chunks() -> TestResult {
+        let dir = TempDir::new()?;
+        let db = open_bridge_test_db(dir.path())?;
+        seed_settled_replay(&db, 3, 1)?;
+        let entries = read_all_settled_segment_entries(&db)?;
+        let ctx = SegmentStoreContext {
+            db: &db,
+            segment_cache: None,
+            sealed_segments: Some(&entries),
+        };
+        let entry = &entries[0];
+        let height = entry.start_height;
+        let reader = open_replay_supplement_reader(ctx, entry)?;
+        let plan = reader.index().plan_block_range(height, height)?;
+        let chunk = plan.chunks().first().ok_or("missing supplement chunk")?;
+        let chunk_offset = usize::try_from(chunk.compressed_range().offset)?;
+        drop(reader);
+
+        let path = SettledSegmentFilePaths::for_entry(dir.path(), entry)?
+            .supplement
+            .ok_or("missing supplement path")?;
+        let mut bytes = std::fs::read(&path)?;
+        std::fs::remove_file(&path)?;
+        assert!(matches!(
+            read_replay_step_split(ctx, height),
+            Err(CanonicalStoreError::SettledSegment { .. })
+        ));
+        bytes[chunk_offset] ^= 0xff;
+        std::fs::write(path, bytes)?;
+        let error = read_replay_step_split(ctx, height)
+            .err()
+            .ok_or("corrupt supplement accepted")?;
+        assert!(
+            error
+                .to_string()
+                .contains("supplement chunk 0 SHA-256 digest mismatch")
+        );
+        Ok(())
+    }
 
     fn seed_segment_and_live_tail_db(
         dir: &Path,
