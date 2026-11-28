@@ -27,6 +27,7 @@ fn generate(repository_root: &Path, output_dir: &Path) -> Result<(), Box<dyn Err
     std::fs::create_dir_all(output_dir)?;
     let proto_root = repository_root.join("crates/zinder-proto/proto");
     let compat_root = proto_root.join("compat/lightwalletd");
+    let darkside_root = proto_root.join("compat/darkside");
     let zebra_root = proto_root.join("external/zebra");
     let native_files = [
         proto_root.join("zinder/v1/wallet/wallet.proto"),
@@ -48,6 +49,15 @@ fn generate(repository_root: &Path, output_dir: &Path) -> Result<(), Box<dyn Err
         .build_client(true)
         .file_descriptor_set_path(output_dir.join("lightwalletd_compat_descriptor.bin"))
         .compile_protos(&compat_files, std::slice::from_ref(&compat_root))?;
+    tonic_prost_build::configure()
+        .out_dir(output_dir)
+        .build_server(true)
+        .build_client(true)
+        .file_descriptor_set_path(output_dir.join("darkside_descriptor.bin"))
+        .compile_protos(
+            &[darkside_root.join("darkside.proto")],
+            &[compat_root.clone(), darkside_root],
+        )?;
     encoded_block_range::enable(&output_dir.join("cash.z.wallet.sdk.rpc.rs"))?;
     tonic_prost_build::configure()
         .out_dir(output_dir)

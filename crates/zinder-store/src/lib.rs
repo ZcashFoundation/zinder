@@ -48,7 +48,7 @@ pub use canonical_store::{
     CanonicalStoreBuildPlanError, CanonicalStoreBuildState, CanonicalStoreError,
     CanonicalStoreReadyEvidence, CanonicalStoreRequirements, CanonicalStoredData,
     CanonicalStoredSet, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
-    DEFAULT_CANONICAL_EVENT_RETENTION_MAX_DELETED_EVENTS,
+    ConstructionTreeStateCheckpointPolicy, DEFAULT_CANONICAL_EVENT_RETENTION_MAX_DELETED_EVENTS,
     DEFAULT_CANONICAL_EVENT_RETENTION_MAX_INSPECTED_EVENTS, DEFAULT_REORG_WINDOW_BLOCKS,
     DEFAULT_SETTLED_SEGMENT_BLOCKS, DensifiedTreeStateStride, DisplacedBlockCursor,
     DisplacedBlockPage, DisplacedBlockSummaryPage, DisplacedFinalRootPage,

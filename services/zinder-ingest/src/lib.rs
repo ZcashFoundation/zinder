@@ -28,7 +28,7 @@ mod writer;
 pub use artifact_builder::{
     BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
     PositionedCanonicalBlock, PreparedCanonicalBlock, RawBlobPolicy, RetainedRawBlobs,
-    position_canonical_block, prepare_canonical_block,
+    compact_transaction_data, position_canonical_block, prepare_canonical_block,
 };
 pub use canonical_block_context::{
     CanonicalBlockContextReader, PrevoutCache, require_genesis_complete_history,

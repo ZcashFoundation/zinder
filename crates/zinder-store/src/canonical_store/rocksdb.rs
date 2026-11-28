@@ -19,12 +19,12 @@ use crate::{
 
 use super::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildState,
-    CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalSubtreeRootLoadCoverage,
+    CanonicalStoreError, CanonicalStoreReadyEvidence, ConstructionTreeStateCheckpointPolicy,
     activation_schedule::CanonicalActivationSchedule,
     block_replay::CanonicalReplayScan,
     construction_manifest::{
-        copy_construction_manifest, read_construction_manifest_binding,
-        validate_ready_construction_manifest,
+        ConstructionManifestDetails, copy_construction_manifest,
+        read_construction_manifest_binding, validate_ready_construction_manifest,
     },
     control::{
         ActivationScheduleBinding, ControlRevisions, DecodedStoreControl, decode_store_control,
@@ -272,6 +272,7 @@ pub struct RocksDbCanonicalStore {
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
+    construction_tree_state_checkpoint_policy: Option<ConstructionTreeStateCheckpointPolicy>,
     pub(super) stored_set: super::CanonicalStoredSet,
     /// Serializes retained-event, projection-lease, and mempool-log lifecycle changes.
     ///
@@ -307,19 +308,21 @@ impl RocksDbCanonicalStore {
         build_plan: super::CanonicalStoreBuildPlan,
         cursor_auth_key: [u8; 32],
         ready_evidence: &CanonicalStoreReadyEvidence,
-        subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
+        manifest_details: ConstructionManifestDetails,
         activation_schedule: CanonicalActivationSchedule,
         replay_tail: AuthenticatedReplayTail,
         sealed_segments: Vec<SettledSegmentIndexEntry>,
         segment_cache: Arc<SettledSegmentReaderCache>,
     ) -> Self {
-        let stored_set = build_plan.admitted_stored_set(subtree_root_coverage);
+        let stored_set = build_plan.admitted_stored_set(manifest_details.subtree_root_coverage);
         segment_cache.record_corpus_admission(StoreRole::CanonicalPrimary);
         Self {
             bounded_open,
             build_plan,
             cursor_auth_key,
             ready_evidence: *ready_evidence,
+            construction_tree_state_checkpoint_policy: manifest_details
+                .tree_state_checkpoint_policy,
             stored_set,
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
@@ -610,10 +613,10 @@ impl RocksDbCanonicalStore {
     ) -> Result<Self, CanonicalStoreError> {
         validate_resource_budget(resource_budget)?;
         let store_path = canonical_store_path(path)?;
-        let (admitted_database_identity, admitted_control, admitted_subtree_root_coverage) =
+        let (admitted_database_identity, admitted_control, admitted_manifest_details) =
             admit_existing_store(&store_path, expectation, resource_budget)?;
-        let (CanonicalStoreBuildState::Ready(_), Some(subtree_root_coverage)) =
-            (admitted_control.build_state, admitted_subtree_root_coverage)
+        let (CanonicalStoreBuildState::Ready(_), Some(manifest_details)) =
+            (admitted_control.build_state, admitted_manifest_details)
         else {
             return Err(CanonicalStoreError::StoreNotReady { path: store_path });
         };
@@ -641,7 +644,7 @@ impl RocksDbCanonicalStore {
             read_admitted_schedule(&bounded_open.db, &store_path, &opened_control)?;
         let reorg_policy = opened_control.effective_reorg_policy();
         let build_plan = opened_control.build_plan;
-        let stored_set = build_plan.admitted_stored_set(subtree_root_coverage);
+        let stored_set = build_plan.admitted_stored_set(manifest_details.subtree_root_coverage);
         let (sealed_segments, segment_cache) = match mode {
             PrimarySegmentOpenMode::HealPrimary => cleanup_primary_segments_and_build_cache(
                 &store_path,
@@ -670,6 +673,8 @@ impl RocksDbCanonicalStore {
             build_plan,
             cursor_auth_key: opened_control.cursor_auth_key,
             ready_evidence: opened_ready_evidence,
+            construction_tree_state_checkpoint_policy: manifest_details
+                .tree_state_checkpoint_policy,
             stored_set,
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
@@ -827,10 +832,10 @@ impl RocksDbCanonicalStore {
             StoredDataAdmission::Exact(retention),
             reorg_policy,
         );
-        let (database_identity, control, subtree_root_coverage) =
+        let (database_identity, control, manifest_details) =
             admit_open_store(target, &opened.db, &expectation)?;
-        let (CanonicalStoreBuildState::Ready(ready_evidence), Some(subtree_root_coverage)) =
-            (control.build_state, subtree_root_coverage)
+        let (CanonicalStoreBuildState::Ready(ready_evidence), Some(manifest_details)) =
+            (control.build_state, manifest_details)
         else {
             return Err(CanonicalStoreError::StoreNotReady {
                 path: target.to_path_buf(),
@@ -838,7 +843,7 @@ impl RocksDbCanonicalStore {
         };
         let stored_set = control
             .build_plan
-            .admitted_stored_set(subtree_root_coverage);
+            .admitted_stored_set(manifest_details.subtree_root_coverage);
         let (sealed_segments, segment_cache) =
             verify_cold_segments_and_manifest(target, &opened.db, control.network, stored_set)?;
         let ctx = SegmentStoreContext {
@@ -1033,6 +1038,16 @@ impl RocksDbCanonicalStore {
     #[must_use]
     pub const fn ready_evidence(&self) -> CanonicalStoreReadyEvidence {
         self.ready_evidence
+    }
+
+    /// Returns the policy recorded in the authenticated construction manifest.
+    ///
+    /// A legacy manifest without this record returns `None`.
+    #[must_use]
+    pub const fn construction_tree_state_checkpoint_policy(
+        &self,
+    ) -> Option<ConstructionTreeStateCheckpointPolicy> {
+        self.construction_tree_state_checkpoint_policy
     }
 
     /// Returns the authenticated replay prefix through the settled tip.
@@ -1338,7 +1353,7 @@ pub(super) fn admit_existing_store(
     (
         Vec<u8>,
         DecodedStoreControl,
-        Option<CanonicalSubtreeRootLoadCoverage>,
+        Option<ConstructionManifestDetails>,
     ),
     CanonicalStoreError,
 > {
@@ -1367,12 +1382,12 @@ fn admit_open_store(
     (
         Vec<u8>,
         DecodedStoreControl,
-        Option<CanonicalSubtreeRootLoadCoverage>,
+        Option<ConstructionManifestDetails>,
     ),
     CanonicalStoreError,
 > {
     let control = validate_open_store_control(db, path, expectation)?;
-    let subtree_root_coverage = match control.build_state {
+    let manifest_details = match control.build_state {
         CanonicalStoreBuildState::Ready(ready) => Some(validate_ready_construction_manifest(
             path,
             &ready,
@@ -1384,7 +1399,7 @@ fn admit_open_store(
     let database_identity = db.get_db_identity().map_err(|source| {
         CanonicalStoreError::admission(path, format!("database identity read failed: {source}"))
     })?;
-    Ok((database_identity, control, subtree_root_coverage))
+    Ok((database_identity, control, manifest_details))
 }
 
 fn validate_stored_data(

@@ -19,7 +19,7 @@ use crate::{
 use super::{
     CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalRetainedEvent,
     CanonicalSequenceCheckpoint, CanonicalStoreBuildState, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreRequirements,
+    CanonicalStoreReadyEvidence, CanonicalStoreRequirements, ConstructionTreeStateCheckpointPolicy,
     activation_schedule::CanonicalActivationSchedule,
     block_replay::{
         CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at_with_cache,
@@ -85,6 +85,7 @@ pub struct RocksDbCanonicalSecondary {
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     history_predecessor_digest: [u8; 32],
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
+    construction_tree_state_checkpoint_policy: Option<ConstructionTreeStateCheckpointPolicy>,
     pub(super) stored_set: super::CanonicalStoredSet,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
@@ -230,14 +231,14 @@ impl RocksDbCanonicalSecondary {
         let CanonicalStoreBuildState::Ready(ready_evidence) = opened_control.build_state else {
             return Err(CanonicalStoreError::StoreNotReady { path: primary_path });
         };
-        let subtree_root_coverage = validate_ready_construction_manifest(
+        let manifest_details = validate_ready_construction_manifest(
             &primary_path,
             &ready_evidence,
             &opened_control.build_plan,
         )?;
         let stored_set = opened_control
             .build_plan
-            .admitted_stored_set(subtree_root_coverage);
+            .admitted_stored_set(manifest_details.subtree_root_coverage);
         expectation.validate_reader_requirements(&primary_path, stored_set)?;
         let reorg_policy = opened_control.effective_reorg_policy();
         let sealed_segments = store_access::read_all_settled_segment_entries(&bounded_open.db)?;
@@ -285,6 +286,8 @@ impl RocksDbCanonicalSecondary {
             history_predecessor_digest: opened_control.build_plan.history_predecessor_digest(),
             build_plan: opened_control.build_plan,
             ready_evidence,
+            construction_tree_state_checkpoint_policy: manifest_details
+                .tree_state_checkpoint_policy,
             stored_set,
             cursor_auth_key: opened_control.cursor_auth_key,
             activation_schedule,
@@ -684,6 +687,16 @@ impl RocksDbCanonicalSecondary {
     #[must_use]
     pub const fn ready_evidence(&self) -> CanonicalStoreReadyEvidence {
         self.ready_evidence
+    }
+
+    /// Returns the policy recorded in the authenticated construction manifest.
+    ///
+    /// A legacy manifest without this record returns `None`.
+    #[must_use]
+    pub const fn construction_tree_state_checkpoint_policy(
+        &self,
+    ) -> Option<ConstructionTreeStateCheckpointPolicy> {
+        self.construction_tree_state_checkpoint_policy
     }
 
     /// Returns the authenticated settled sequence checkpoint.
