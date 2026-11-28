@@ -128,11 +128,28 @@ jobs:
           scripts/generate-api-artifacts.sh v0.0.0-ci
           scripts/check-api-artifact.sh dist/zinder-api-docs-v0.0.0-ci.tar.gz
 
-      - name: Check native protobuf compatibility against the pull request base
-        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'allow-proto-breaking')
+      - name: Check protobuf compatibility against the pull request base
+        if: >-
+          ${{
+          !cancelled() && steps.archive.outcome == 'success' &&
+          github.event_name == 'pull_request' &&
+          !contains(github.event.pull_request.labels.*.name, 'allow-proto-breaking')
+          }}
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: buf breaking --against ".git#ref=${BASE_SHA}"
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d)"
+          trap 'rm -rf "$scratch"' EXIT
+          mkdir -p "$scratch/base"
+          git archive "$BASE_SHA" -- crates/zinder-proto/proto \
+            | tar -xf - --strip-components=2 -C "$scratch/base"
+          cp crates/zinder-proto/buf.release.yaml "$scratch/base/buf.yaml"
+          buf build "$scratch/base" --as-file-descriptor-set \
+            --output "$scratch/base.contract.descriptor.bin"
+          buf breaking dist/zinder.contract.descriptor.bin \
+            --against "$scratch/base.contract.descriptor.bin" \
+            --config crates/zinder-proto/buf.release.yaml
 
       - name: Check protobuf compatibility against the published release
         if: >-
