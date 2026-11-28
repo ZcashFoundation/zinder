@@ -916,6 +916,7 @@ pub fn not_ready_status(cause: &ReadinessCause) -> Status {
         ReadinessCause::SchemaMismatch
             | ReadinessCause::CanonicalStoreDamaged { .. }
             | ReadinessCause::NodeCapabilityMissing { .. }
+            | ReadinessCause::WalletTransitionLimitExceeded { .. }
     ) {
         crate::RetryPushback::DoNotRetry
     } else {
@@ -1899,7 +1900,17 @@ mod tests {
 
         let refusal = not_ready_status(&report.cause);
         assert_eq!(refusal.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            refusal.metadata().get("grpc-retry-pushback-ms"),
+            Some(&tonic::metadata::MetadataValue::from_static("-1"))
+        );
         let refusal_details = refusal.get_error_details();
+        assert_eq!(
+            refusal_details
+                .error_info()
+                .map(|error_info| error_info.reason.as_str()),
+            Some(ErrorReason::ServiceNotReady.as_str_name())
+        );
         assert_eq!(
             refusal_details
                 .error_info()

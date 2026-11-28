@@ -38,7 +38,7 @@ carries a `BroadcastRejectionReason` verdict instead, as
 
 ## Retry pushback
 
-Zinder sends `grpc-retry-pushback-ms` as trailing metadata, including on trailers-only responses, when it refuses a call for admission, overload, or readiness. Wallet listener range admission uses a fixed delay of 250 milliseconds, and `SERVED_TIP_MISMATCH` uses 1,000 milliseconds. Other retryable refusals with pushback use a delay selected from 500 to 1,500 milliseconds. A value of `-1` stops automatic retries on the current call, for example when a schema mismatch requires operator action.
+Zinder sends `grpc-retry-pushback-ms` as trailing metadata, including on trailers-only responses, when it refuses a call for admission, overload, or readiness. Wallet listener range admission uses a fixed delay of 250 milliseconds, and `SERVED_TIP_MISMATCH` uses 1,000 milliseconds. Other retryable refusals with pushback use a delay selected from 500 to 1,500 milliseconds. A value of `-1` stops automatic retries on the current call. Examples include a schema mismatch and a [projector parked at its wallet transition limit](readiness.md#projector).
 
 Apply the delay to calls that your retry policy permits you to retry. A pushback delay alone does not make transaction submission safe to retry. See the [gRPC retry specification](https://github.com/grpc/proposal/blob/master/A6-client-retries.md).
 

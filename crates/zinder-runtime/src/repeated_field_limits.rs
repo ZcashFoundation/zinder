@@ -703,7 +703,7 @@ fn read_varint(message: &mut &[u8]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, io::Write as _};
 
     use http_body_util::BodyExt as _;
 
@@ -732,6 +732,95 @@ mod tests {
                 .as_ref()
                 .map(Status::code),
             Some(tonic::Code::ResourceExhausted)
+        );
+        Ok(())
+    }
+
+    const SMALL_ZSTD_REQUEST: &[u8] = &[0x0a, 1, b'a'];
+
+    fn small_zstd_frame(window_log: u32) -> eyre::Result<Vec<u8>> {
+        use zstd::zstd_safe::{FrameHeaderStatus, get_frame_content_size, get_frame_header};
+
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1)?;
+        encoder.window_log(window_log)?;
+        encoder.include_contentsize(false)?;
+        encoder.write_all(SMALL_ZSTD_REQUEST)?;
+        // Flush before finishing so the frame keeps the streaming window.
+        encoder.flush()?;
+        let compressed = encoder.finish()?;
+        assert!(matches!(get_frame_content_size(&compressed), Ok(None)));
+        assert!(matches!(
+            get_frame_header(&compressed),
+            Ok(FrameHeaderStatus::Complete(header)) if header.windowSize == 1_u64 << window_log
+        ));
+        assert_eq!(
+            zstd::bulk::decompress(&compressed, SMALL_ZSTD_REQUEST.len())?,
+            SMALL_ZSTD_REQUEST
+        );
+        Ok(compressed)
+    }
+
+    fn scan_zstd_request(compressed: &[u8]) -> Result<Bytes, Status> {
+        let mut frame = grpc_frame(compressed);
+        frame[0] = 1;
+        BoundedRequestBody::new(
+            TonicBody::empty(),
+            Some(&BALANCE_LIMITS),
+            Some(RequestCompression::Zstd),
+        )
+        .scan_frame(frame.into())
+    }
+
+    fn assert_zstd_window_refused(compressed: &[u8]) -> eyre::Result<()> {
+        let refusal = scan_zstd_request(compressed).err().ok_or_else(|| {
+            eyre::eyre!("the guard accepted a zstd request with an oversized window")
+        })?;
+        assert_eq!(refusal.code(), tonic::Code::ResourceExhausted);
+        assert!(refusal.message().contains("decoder window limit"));
+        Ok(())
+    }
+
+    #[test]
+    fn zstd_rejects_an_oversized_window_on_a_small_request() -> eyre::Result<()> {
+        let compressed = small_zstd_frame(MAX_DECODING_MESSAGE_BYTES.ilog2() + 1)?;
+        assert_zstd_window_refused(&compressed)
+    }
+
+    #[test]
+    fn zstd_rejects_an_oversized_window_on_a_second_frame() -> eyre::Result<()> {
+        let window_log = MAX_DECODING_MESSAGE_BYTES.ilog2();
+        let mut compressed = small_zstd_frame(window_log)?;
+        compressed.extend(small_zstd_frame(window_log + 1)?);
+        assert_zstd_window_refused(&compressed)
+    }
+
+    #[test]
+    fn zstd_accepts_a_window_at_the_limit() -> eyre::Result<()> {
+        let compressed = small_zstd_frame(MAX_DECODING_MESSAGE_BYTES.ilog2())?;
+        assert_eq!(
+            scan_zstd_request(&compressed)?,
+            grpc_frame(SMALL_ZSTD_REQUEST)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn zstd_rejects_legacy_frames() -> eyre::Result<()> {
+        // A v0.7 single-segment frame with one raw block and an end block.
+        let legacy = [
+            0x27, 0xb5, 0x2f, 0xfd, 0x20, 3, 0x40, 0, 3, 0x0a, 1, b'a', 0xc0, 0, 0,
+        ];
+        assert_eq!(
+            zstd::stream::decode_all(legacy.as_slice())?,
+            SMALL_ZSTD_REQUEST
+        );
+        let refusal = scan_zstd_request(&legacy)
+            .err()
+            .ok_or_else(|| eyre::eyre!("the guard accepted a legacy zstd frame"))?;
+        assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            refusal.message(),
+            "invalid or unsupported compressed gRPC message"
         );
         Ok(())
     }
