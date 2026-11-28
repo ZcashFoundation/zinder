@@ -13,11 +13,11 @@ use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
     ClientAddressSource, ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection,
-    DeploymentToml, GrpcProxyProtocol, IngestControlReaderToml, IngestControlSection,
-    NetworkSection, NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsServerError, OpsToml,
-    ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, RocksDbResourceBudgetSection,
-    RocksDbResourceBudgetToml, RuntimeService, SecuritySection, SecurityToml,
-    derive_canonical_path, derive_canonical_secondary_path, derive_wallet_path,
+    DeploymentToml, GrpcProxyProtocol, GrpcRangeAdmission, IngestControlReaderToml,
+    IngestControlSection, NetworkSection, NetworkToml, NodeFallbacksToml, NodeToml, OpsSection,
+    OpsServerError, OpsToml, ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader,
+    RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, RuntimeService, SecuritySection,
+    SecurityToml, derive_canonical_path, derive_canonical_secondary_path, derive_wallet_path,
     derive_wallet_secondary_path, guard_optional_serving_bind, guard_serving_bind,
     parse_socket_addr, require_field, resolve_allow_public_bind,
     resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
@@ -66,6 +66,8 @@ pub struct QueryConfig {
     pub client_address_source: ClientAddressSource,
     /// Trusted TCP proxy peers for a listener requiring PROXY protocol.
     pub proxy_protocol: GrpcProxyProtocol,
+    /// Client quotas and overload policy for block-range RPCs.
+    pub range_admission: GrpcRangeAdmission,
     /// Canonical reorg-window identity enforced on admitted stores.
     pub canonical_reorg_policy: CanonicalReorgPolicy,
     /// Maximum bounded attempts to converge the serving read pair.
@@ -251,6 +253,7 @@ struct QuerySection {
     forwarded_transaction_cache_bytes: Option<u64>,
     trust_proxy_client_address: Option<bool>,
     proxy_protocol_trusted_cidrs: Option<String>,
+    range_admission: GrpcRangeAdmission,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -394,6 +397,7 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         allow_public_bind,
         client_address_source,
         proxy_protocol,
+        range_admission: config.query.range_admission,
         canonical_reorg_policy,
         pair_convergence_attempts,
         tree_state_replay_wait,
@@ -576,6 +580,7 @@ impl QueryConfigToml {
                     .client_address_source
                     .trust_proxy_client_address(),
                 proxy_protocol_trusted_cidrs: config.proxy_protocol.redacted_cidrs(),
+                range_admission: config.range_admission,
             },
             node: config.node.as_ref().map(NodeToml::from_node_target),
             node_fallbacks: NodeFallbacksToml::from_node_targets(&config.node_fallbacks),
@@ -597,6 +602,7 @@ struct QueryToml {
     trust_proxy_client_address: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     proxy_protocol_trusted_cidrs: Option<&'static str>,
+    range_admission: GrpcRangeAdmission,
 }
 
 #[derive(Serialize)]

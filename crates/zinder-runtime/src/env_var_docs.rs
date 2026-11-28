@@ -1275,6 +1275,30 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Comma-separated CIDRs for trusted TCP proxies. Requires a PROXY v1 or v2 preface on every connection. Disabled when omitted.",
     },
     EnvVarDoc {
+        name: "ZINDER_QUERY__RANGE_ADMISSION__MAX_STREAMS_PER_CLIENT",
+        toml_path: "query.range_admission.max_streams_per_client",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum concurrent block-range calls per client, including calls waiting to start. Must be greater than zero. Defaults to 4.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_QUERY__RANGE_ADMISSION__CLIENT_KEY",
+        toml_path: "query.range_admission.client_key",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Quota key for block-range calls. Use `connection` for IP and port, or `subnet` to group IPv4 /32 and IPv6 /64. Defaults to `connection`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_QUERY__RANGE_ADMISSION__MAX_SCHEDULING_DELAY_MS",
+        toml_path: "query.range_admission.max_scheduling_delay_ms",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Scheduling delay in milliseconds that triggers refusal of new block-range calls. Must be greater than zero. Disabled when omitted.",
+    },
+    EnvVarDoc {
         name: "ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS",
         toml_path: "query.trust_proxy_client_address",
         used_by: &["zinder-query"],
@@ -1475,6 +1499,30 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: true,
         description: "Comma-separated CIDRs for trusted TCP proxies. Requires a PROXY v1 or v2 preface on every connection. Disabled when omitted.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__RANGE_ADMISSION__MAX_STREAMS_PER_CLIENT",
+        toml_path: "compat.range_admission.max_streams_per_client",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum concurrent block-range calls per client, including calls waiting to start. Must be greater than zero. Defaults to 4.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__RANGE_ADMISSION__CLIENT_KEY",
+        toml_path: "compat.range_admission.client_key",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Quota key for block-range calls. Use `connection` for IP and port, or `subnet` to group IPv4 /32 and IPv6 /64. Defaults to `connection`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__RANGE_ADMISSION__MAX_SCHEDULING_DELAY_MS",
+        toml_path: "compat.range_admission.max_scheduling_delay_ms",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Scheduling delay in milliseconds that triggers refusal of new block-range calls. Must be greater than zero. Disabled when omitted.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS",
@@ -2399,6 +2447,9 @@ mod tests {
                 "ZINDER_QUERY__FORWARDED_READ_WAITERS_PER_SLOT",
                 "ZINDER_QUERY__FORWARDED_TRANSACTION_CACHE_BYTES",
                 "ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS",
+                "ZINDER_QUERY__RANGE_ADMISSION__MAX_STREAMS_PER_CLIENT",
+                "ZINDER_QUERY__RANGE_ADMISSION__CLIENT_KEY",
+                "ZINDER_QUERY__RANGE_ADMISSION__MAX_SCHEDULING_DELAY_MS",
                 "ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS",
             ]
         );
@@ -2428,6 +2479,9 @@ mod tests {
                 "ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS",
                 "ZINDER_COMPAT__PING_VERY_INSECURE",
                 "ZINDER_COMPAT__PROXY_PROTOCOL_TRUSTED_CIDRS",
+                "ZINDER_COMPAT__RANGE_ADMISSION__MAX_STREAMS_PER_CLIENT",
+                "ZINDER_COMPAT__RANGE_ADMISSION__CLIENT_KEY",
+                "ZINDER_COMPAT__RANGE_ADMISSION__MAX_SCHEDULING_DELAY_MS",
                 "ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS",
             ]
         );

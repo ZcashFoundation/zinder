@@ -363,7 +363,12 @@ async fn serve_query(
         |server| {
             server
                 .with_proxy_protocol(query_config.proxy_protocol.clone())
-                .layer(zinder_runtime::WalletRpcMetricsLayer::WalletQuery)
+                .layer(
+                    zinder_runtime::WalletRpcMetricsLayer::WalletQuery.with_range_admission(
+                        query_config.range_admission,
+                        query_config.client_address_source,
+                    ),
+                )
         },
     )?;
 

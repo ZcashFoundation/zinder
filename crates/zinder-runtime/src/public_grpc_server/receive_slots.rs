@@ -56,7 +56,7 @@ struct HeldSlot {
 /// its full address, so distinct connections from one host stay separate
 /// clients. A bare IP a trusted proxy names, such as GCP GXLB's
 /// `{client_ip_address}`, has no port and so keys the whole address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ClientFairnessKey {
     /// A full connection address, from a direct socket or an `ip:port`
     /// proxy header. Preserved per ADR-0007 Decision 10, which keeps clients

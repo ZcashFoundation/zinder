@@ -54,6 +54,7 @@ mod call_termination;
 mod grpc_timeout;
 mod message_boundaries;
 mod proxy_protocol;
+mod range_admission;
 mod receive_slots;
 mod release_gate;
 mod send_stall;
@@ -100,6 +101,7 @@ pub use self::call_termination::{
 };
 pub use self::grpc_timeout::GrpcDeadline;
 pub use self::proxy_protocol::GrpcProxyProtocol;
+pub use self::range_admission::{GrpcRangeAdmission, RangeClientKey};
 use self::send_stall::ResponseCancellation;
 pub use self::send_stall::{GrpcSendStall, GrpcSendStallLayer};
 pub use self::serving::{PublicGrpcRouter, PublicGrpcServer};

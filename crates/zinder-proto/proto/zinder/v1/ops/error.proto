@@ -170,4 +170,9 @@ enum ErrorReason {
   // tip than the reader's served tip, or consecutive pages disagreed at that
   // tip. The node is up; retry after the `grpc-retry-pushback-ms` delay.
   SERVED_TIP_MISMATCH = 59;
+
+  // UNAVAILABLE family.
+  // The wallet listener refused a native block-range stream at admission.
+  // Retry on the existing connection after the grpc-retry-pushback-ms delay.
+  BLOCK_RANGE_ADMISSION_REFUSED = 60;
 }

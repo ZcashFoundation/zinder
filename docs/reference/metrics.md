@@ -356,6 +356,7 @@ reflection, and unknown method paths are outside this denominator.
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `zinder_wallet_rpc_requests_total` | counter | `surface`, `method`, `grpc_code`, `error_class` | Completed RPCs, including refusals and terminal stream errors. |
+| `zinder_grpc_block_range_admission_refusals_total` | counter | `surface`, `reason` | New block-range calls refused on `lightwalletd` or `wallet_query`. Reasons are `client_quota`, `client_capacity` when the client table is full, and `scheduling_delay` when adaptive shedding is active. |
 | `zinder_wallet_rpc_readiness_refusals_total` | counter | `surface`, `method` | Requests refused by the readiness interceptor. Each recognized method starts at zero. A refusal also contributes one terminal RPC outcome. |
 | `zinder_wallet_rpc_duration_seconds` | histogram | same as completed RPCs | Seconds from listener arrival through completion or cancellation. |
 | `zinder_wallet_rpc_in_flight` | gauge | `surface`, `method` | Calls from arrival until their final outcome. |

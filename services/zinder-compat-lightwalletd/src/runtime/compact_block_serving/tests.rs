@@ -1,5 +1,7 @@
 //! Tests for `compact_block_serving`.
 
+mod range_admission;
+
 use std::{sync::Arc, time::Duration};
 
 use compact_tx_streamer_server::CompactTxStreamer;

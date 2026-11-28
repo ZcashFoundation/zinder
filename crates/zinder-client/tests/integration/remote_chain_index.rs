@@ -3,6 +3,8 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
+mod range_admission;
+
 use std::{
     convert::Infallible,
     marker::PhantomData,

@@ -148,6 +148,8 @@ they can format a deadline response for the client.
 On a listener reserved for an allowlisted TCP proxy, pass the resolved
 `GrpcProxyProtocol` to `PublicGrpcServer::with_proxy_protocol` and use
 `ClientAddressSource::Connection` to identify the forwarded client.
+On wallet routes, attach `WalletRpcMetricsLayer::with_range_admission` with
+the resolved `GrpcRangeAdmission` policy and the listener's address source.
 
 - Public operations accept and return domain types, not RocksDB handles,
   column families, or untyped byte maps.
