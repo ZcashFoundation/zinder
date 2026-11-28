@@ -85,6 +85,9 @@ pub(crate) struct RocksDbRawBlobRetentionComparisonArgs {
     /// Tree-state checkpoint coverage persisted during canonical construction.
     #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Commitment threshold for commitment-budget coverage. Defaults to the ingest threshold.
+    #[arg(long)]
+    tree_state_commitment_budget: Option<NonZeroU32>,
     /// Write the JSON report to this fresh path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -131,6 +134,7 @@ struct EffectiveLimits {
     supported_reorg_depth: u32,
     source_segment_delay_millis: u64,
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    tree_state_commitment_budget: Option<NonZeroU32>,
     derived_for_cpu_limit_cores: u32,
     derived_for_memory_limit_bytes: u64,
     pipeline: PipelineLimitSummary,
@@ -282,6 +286,7 @@ struct ValidatedComparisonArgs {
     source_segment_delay: Duration,
     source_segment_delay_millis: u64,
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    tree_state_commitment_budget: Option<NonZeroU32>,
     report: Option<PathBuf>,
 }
 
@@ -357,6 +362,7 @@ async fn run_retention_arm(
         supported_reorg_depth: validated.supported_reorg_depth,
         source_segment_delay: validated.source_segment_delay,
         tree_state_checkpoint_coverage: validated.tree_state_checkpoint_coverage,
+        tree_state_commitment_budget: validated.tree_state_commitment_budget,
     })
     .await?;
     let authenticated_replay_lifecycle_seconds = replay_started.elapsed().as_secs_f64();
@@ -386,10 +392,7 @@ async fn run_retention_arm(
         replay_plan_digest_sha256: outcome.replay_plan_digest_sha256.clone(),
         canonical_store_path: canonical_store_path.to_string_lossy().into_owned(),
         secondary_root_path: secondary_root_path.to_string_lossy().into_owned(),
-        effective_limits: EffectiveLimits::from_validated(
-            validated,
-            outcome.tree_state_checkpoint_coverage,
-        ),
+        effective_limits: EffectiveLimits::from_validated(validated, &outcome),
         logical_replay_identity: LogicalReplayIdentity::from_outcome(&outcome),
         storage_layout_evidence: StorageLayoutEvidence::from_outcome(&outcome),
         raw_blob_counts: RawBlobCounts::from_outcome(&outcome),
@@ -424,6 +427,11 @@ impl RocksDbRawBlobRetentionComparisonArgs {
             source_segment_delay: Duration::from_millis(self.source_segment_delay_millis),
             source_segment_delay_millis: self.source_segment_delay_millis,
             tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
+            tree_state_commitment_budget: TreeStateCheckpointCoverage::from_selection(
+                self.tree_state_checkpoint_coverage
+                    .resolve(self.tree_state_commitment_budget)?,
+            )?
+            .1,
             report: paths.report,
         })
     }
@@ -545,13 +553,14 @@ impl RocksDbRawBlobRetentionComparisonArgs {
 impl EffectiveLimits {
     fn from_validated(
         validated: &ValidatedComparisonArgs,
-        tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+        outcome: &CanonicalFixtureRocksDbReplayOutcome,
     ) -> Self {
         Self {
             request_timeout_seconds: validated.request_timeout_seconds,
             supported_reorg_depth: validated.supported_reorg_depth,
             source_segment_delay_millis: validated.source_segment_delay_millis,
-            tree_state_checkpoint_coverage,
+            tree_state_checkpoint_coverage: outcome.tree_state_checkpoint_coverage,
+            tree_state_commitment_budget: outcome.tree_state_commitment_budget,
             derived_for_cpu_limit_cores: CANONICAL_FIXTURE_REPLAY_PROFILE_CPU_CORES,
             derived_for_memory_limit_bytes: CANONICAL_FIXTURE_REPLAY_PROFILE_MEMORY_BYTES,
             pipeline: PipelineLimitSummary::from(validated.pipeline_limits),
@@ -1079,6 +1088,7 @@ mod tests {
             supported_reorg_depth: 2,
             source_segment_delay_millis: 0,
             tree_state_checkpoint_coverage: super::TreeStateCheckpointCoverage::CadenceAndTip,
+            tree_state_commitment_budget: None,
             derived_for_cpu_limit_cores: 4,
             derived_for_memory_limit_bytes: 1_048_576,
             pipeline: super::PipelineLimitSummary {

@@ -1,11 +1,13 @@
 //! Machine-readable benchmark report and its assembly from scraped metrics.
 
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, num::NonZeroU32};
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use zinder_core::CanonicalBlockReplayFormatVersion;
-use zinder_store::{RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE};
+use zinder_store::{
+    RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
+};
 
 use crate::{
     canonical_replay_storage::postgres::PostgresServerSettings,
@@ -359,6 +361,8 @@ pub enum TreeStateCheckpointCoverage {
     /// `TREE_STATE_CHECKPOINT_STRIDE` blocks, and at the build tip.
     #[default]
     CadenceAndTip,
+    /// Persist extra checkpoints when the shared commitment budget is reached.
+    CommitmentBudget,
 }
 
 impl TreeStateCheckpointCoverage {
@@ -368,6 +372,7 @@ impl TreeStateCheckpointCoverage {
         match self {
             Self::EveryBlock => "every-block",
             Self::CadenceAndTip => "cadence-and-tip",
+            Self::CommitmentBudget => "commitment-budget",
         }
     }
 
@@ -387,11 +392,66 @@ impl TreeStateCheckpointCoverage {
         }
     }
 
+    /// Resolves benchmark coverage to the production construction policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a budget is supplied for sparse or every-block coverage.
+    pub fn resolve(
+        self,
+        budget: Option<NonZeroU32>,
+    ) -> Result<Option<TreeStateCheckpointSelection>, BenchError> {
+        match (self, budget) {
+            (Self::CadenceAndTip, None) => Ok(None),
+            (Self::EveryBlock, None) => Ok(Some(TreeStateCheckpointSelection::EveryBlock)),
+            (Self::CommitmentBudget, budget) => Ok(Some(
+                TreeStateCheckpointSelection::CommitmentBudget(budget.unwrap_or_else(|| {
+                    NonZeroU32::new(zinder_ingest::DEFAULT_TREE_STATE_COMMITMENT_BUDGET)
+                        .unwrap_or(NonZeroU32::MIN)
+                })),
+            )),
+            (Self::CadenceAndTip | Self::EveryBlock, Some(_)) => Err(BenchError::invalid_argument(
+                "--tree-state-commitment-budget requires --tree-state-checkpoint-coverage commitment-budget",
+            )),
+        }
+    }
+
+    /// Returns the reported coverage and budget from the actual builder policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a construction policy this benchmark cannot report.
+    pub fn from_selection(
+        selection: Option<TreeStateCheckpointSelection>,
+    ) -> Result<(Self, Option<NonZeroU32>), BenchError> {
+        match selection {
+            None => Ok((Self::CadenceAndTip, None)),
+            Some(TreeStateCheckpointSelection::EveryBlock) => Ok((Self::EveryBlock, None)),
+            Some(TreeStateCheckpointSelection::CommitmentBudget(budget)) => {
+                Ok((Self::CommitmentBudget, Some(budget)))
+            }
+            Some(unsupported) => Err(BenchError::report_format(format!(
+                "unsupported construction checkpoint policy: {unsupported:?}",
+            ))),
+        }
+    }
+
+    pub(crate) fn checkpoint_count_matches(self, first: u32, tip: u32, count: u64) -> bool {
+        if self == Self::CommitmentBudget {
+            return Self::CadenceAndTip
+                .expected_checkpoint_count(first, tip)
+                .zip(Self::EveryBlock.expected_checkpoint_count(first, tip))
+                .is_some_and(|(min, max)| (min..=max).contains(&count));
+        }
+        self.expected_checkpoint_count(first, tip) == Some(count)
+    }
+
     /// Returns the exact persisted tree-state checkpoint count, including the
     /// predecessor checkpoint at `first_height - 1`, for contiguous loaded
     /// heights `first_height..=tip_height`.
     ///
-    /// Returns `None` when `first_height == 0` or `tip_height < first_height`.
+    /// Returns `None` for invalid ranges or commitment-budget coverage, whose
+    /// count depends on the loaded blocks.
     #[must_use]
     pub fn expected_checkpoint_count(self, first_height: u32, tip_height: u32) -> Option<u64> {
         if first_height == 0 || tip_height < first_height {
@@ -410,6 +470,7 @@ impl TreeStateCheckpointCoverage {
                 let tip_checkpoint = u64::from(!tip_height.is_multiple_of(stride));
                 Some(1 + cadence_checkpoints + tip_checkpoint)
             }
+            Self::CommitmentBudget => None,
         }
     }
 }
@@ -858,6 +919,8 @@ pub struct RocksDbCanonicalFixtureReplayResourceLimits {
     pub source_segment_delay_millis: u64,
     /// Tree-state checkpoint coverage persisted during canonical construction.
     pub tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Resolved commitment count threshold, when selected.
+    pub tree_state_commitment_budget: Option<NonZeroU32>,
     /// Canonical embedded-store writer and cold-reopen budget.
     pub canonical_rocksdb: RocksDbResourceBudgetSummary,
 }
@@ -891,6 +954,10 @@ pub struct RocksDbCanonicalFixtureSourceLoadSummary {
     pub block_blob_count: u64,
     /// Typed commitment-tree checkpoints, including the predecessor.
     pub tree_state_checkpoint_count: u64,
+    /// Checkpoint key and value bytes submitted to the SST writer.
+    pub tree_state_checkpoint_logical_bytes: u64,
+    /// Physical bytes in the staged checkpoint SSTs.
+    pub tree_state_checkpoint_sst_bytes: u64,
     /// Source-authenticated completed subtree roots.
     pub subtree_root_count: u64,
     /// Logical semantic replay bytes across settled segments and live-tail blocks.
@@ -974,6 +1041,10 @@ pub struct RocksDbCanonicalFixtureReplayMeasurements {
     pub publication_proof_provenance: &'static str,
     /// Complete measured lifecycle seconds.
     pub total_seconds: f64,
+    /// Fresh builder open through READY publication.
+    pub ready_seconds: f64,
+    /// Independent primary reopen and append-anchor authentication.
+    pub reopen_seconds: f64,
     /// Block/SST/count evidence from the real canonical loader.
     pub source_load: RocksDbCanonicalFixtureSourceLoadSummary,
     /// READY and independent cold-reopen evidence.
@@ -1011,6 +1082,10 @@ pub struct RocksDbCanonicalFixtureReplayReport {
     pub publication_proof_provenance: String,
     /// Complete measured lifecycle seconds.
     pub total_seconds: f64,
+    /// Fresh builder open through READY publication.
+    pub ready_seconds: f64,
+    /// Independent primary reopen and append-anchor authentication.
+    pub reopen_seconds: f64,
     /// End-to-end loaded blocks per second.
     pub blocks_per_second: f64,
     /// Block/SST/count evidence from the real canonical loader.
@@ -1113,6 +1188,8 @@ pub struct StorageLifecycleResourceLimits {
     pub canonical_rocksdb: RocksDbResourceBudgetSummary,
     /// Tree-state checkpoint coverage persisted during canonical construction.
     pub tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Resolved commitment count threshold, when selected.
+    pub tree_state_commitment_budget: Option<NonZeroU32>,
     /// Publication path measured before canonical READY.
     pub canonical_publication_mode: CanonicalPublicationMode,
     /// Wallet embedded-store resource budget.
@@ -2707,6 +2784,10 @@ impl RocksDbCanonicalFixtureReplayReport {
     /// Validates authenticated checkpointed fixture replay without claiming live-source certification.
     pub fn validate_evidence(&self) -> Result<(), BenchError> {
         validate_canonical_fixture_report_identity_and_resources(self)?;
+        validate_resolved_checkpoint_budget(
+            self.resource_limits.tree_state_checkpoint_coverage,
+            self.resource_limits.tree_state_commitment_budget,
+        )?;
         validate_canonical_fixture_source_load(
             &self.fixture,
             &self.source_load,
@@ -2814,6 +2895,18 @@ fn validate_canonical_fixture_report_identity_and_resources(
     Ok(())
 }
 
+fn validate_resolved_checkpoint_budget(
+    coverage: TreeStateCheckpointCoverage,
+    budget: Option<NonZeroU32>,
+) -> Result<(), BenchError> {
+    if (coverage == TreeStateCheckpointCoverage::CommitmentBudget) != budget.is_some() {
+        return Err(BenchError::report_format(
+            "tree-state checkpoint coverage and resolved commitment budget disagree",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_canonical_fixture_source_load(
     fixture: &FixtureSummary,
     load: &RocksDbCanonicalFixtureSourceLoadSummary,
@@ -2836,8 +2929,6 @@ fn validate_canonical_fixture_source_load(
             "canonical fixture replay load range, tip, count, or digest differs from the fixture",
         ));
     }
-    let expected_checkpoint_count = tree_state_checkpoint_coverage
-        .expected_checkpoint_count(load.first_block.height, load.tip.height);
     if load.block_count == 0
         || load.block_header_count != load.block_count
         || load.block_hash_index_count != load.block_count
@@ -2855,7 +2946,11 @@ fn validate_canonical_fixture_source_load(
         || load.transaction_blob_count != 0
         || load.block_blob_count != 0
         || load.live_tail_raw_block_logical_bytes != 0
-        || Some(load.tree_state_checkpoint_count) != expected_checkpoint_count
+        || !tree_state_checkpoint_coverage.checkpoint_count_matches(
+            load.first_block.height,
+            load.tip.height,
+            load.tree_state_checkpoint_count,
+        )
         || load.logical_bytes == 0
         || load.sst_file_bytes == 0
         || load.sst_file_count == 0
@@ -2973,13 +3068,10 @@ impl RocksDbStorageLifecycleReport {
                 "trusted-fresh publication must report zero cold certification time",
             ));
         }
-        let expected_checkpoint_count = self
-            .resource_limits
-            .tree_state_checkpoint_coverage
-            .expected_checkpoint_count(
-                canonical.first_retained_block.height,
-                canonical.visible_tip.height,
-            );
+        validate_resolved_checkpoint_budget(
+            self.resource_limits.tree_state_checkpoint_coverage,
+            self.resource_limits.tree_state_commitment_budget,
+        )?;
         if canonical.first_retained_block.height != 1
             || canonical.visible_epoch_id != 1
             || canonical.visible_event_sequence != 1
@@ -2988,7 +3080,14 @@ impl RocksDbStorageLifecycleReport {
             || canonical.sequence_digest.sequence_digest_version != 1
             || canonical.block_count == 0
             || canonical.block_count != canonical.sequence_digest.block_count
-            || Some(canonical.tree_state_checkpoint_count) != expected_checkpoint_count
+            || !self
+                .resource_limits
+                .tree_state_checkpoint_coverage
+                .checkpoint_count_matches(
+                    canonical.first_retained_block.height,
+                    canonical.visible_tip.height,
+                    canonical.tree_state_checkpoint_count,
+                )
             || !canonical.source_tip_checkpoint_authenticated
             || !canonical.cold_reopen_evidence_match
         {
@@ -3151,6 +3250,8 @@ pub fn build_rocksdb_canonical_fixture_replay_report(
         resource_limits: measurements.resource_limits,
         publication_proof_provenance: measurements.publication_proof_provenance.to_owned(),
         total_seconds: measurements.total_seconds,
+        ready_seconds: measurements.ready_seconds,
+        reopen_seconds: measurements.reopen_seconds,
         blocks_per_second,
         source_load: measurements.source_load,
         canonical_ready: measurements.canonical_ready,
@@ -3783,6 +3884,29 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
     }
 
     #[test]
+    fn commitment_budget_resolves_default_and_explicit_thresholds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::TreeStateCheckpointCoverage::{CadenceAndTip, CommitmentBudget, EveryBlock};
+        use std::num::NonZeroU32;
+
+        let (_, default) =
+            super::TreeStateCheckpointCoverage::from_selection(CommitmentBudget.resolve(None)?)?;
+        assert_eq!(default.map(NonZeroU32::get), Some(1_024));
+        let custom = Some(NonZeroU32::MIN);
+        assert_eq!(
+            super::TreeStateCheckpointCoverage::from_selection(CommitmentBudget.resolve(custom)?)?,
+            (CommitmentBudget, custom)
+        );
+        assert!(CadenceAndTip.resolve(custom).is_err());
+        assert!(EveryBlock.resolve(custom).is_err());
+        assert_eq!(CommitmentBudget.expected_checkpoint_count(603, 606), None);
+        assert!(CommitmentBudget.checkpoint_count_matches(603, 606, 3));
+        assert!(!CommitmentBudget.checkpoint_count_matches(603, 606, 1));
+        assert!(!CommitmentBudget.checkpoint_count_matches(603, 606, 6));
+        Ok(())
+    }
+
+    #[test]
     fn rocksdb_canonical_fixture_report_validates_declared_coverage_and_rejects_mismatch()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut sparse_measurements = rocksdb_canonical_fixture_measurements();
@@ -4311,12 +4435,15 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                 supported_reorg_depth: 5,
                 source_segment_delay_millis: 0,
                 tree_state_checkpoint_coverage: super::TreeStateCheckpointCoverage::EveryBlock,
+                tree_state_commitment_budget: None,
                 canonical_rocksdb: RocksDbResourceBudgetSummary::from(
                     zinder_store::RocksDbResourceBudget::canonical_writer_defaults(),
                 ),
             },
             publication_proof_provenance: "trusted-fresh-writer",
             total_seconds: 10.0,
+            ready_seconds: 0.5,
+            reopen_seconds: 0.25,
             source_load: RocksDbCanonicalFixtureSourceLoadSummary {
                 first_block: first_block.clone(),
                 first_parent_hash_hex: "parent-hash".to_owned(),
@@ -4331,6 +4458,8 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                 transaction_blob_count: 0,
                 block_blob_count: 0,
                 tree_state_checkpoint_count: 11,
+                tree_state_checkpoint_logical_bytes: 64,
+                tree_state_checkpoint_sst_bytes: 128,
                 subtree_root_count: 0,
                 logical_replay_bytes: 5_000,
                 settled_segment_index_logical_bytes: 0,
@@ -4511,6 +4640,7 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
                 block_prepare_memory_watermark_bytes: 160 * 1024 * 1024,
                 canonical_rocksdb: budget,
                 tree_state_checkpoint_coverage,
+                tree_state_commitment_budget: None,
                 canonical_publication_mode: super::CanonicalPublicationMode::ColdCertified,
                 wallet_rocksdb: budget,
                 supported_reorg_depth: 100,

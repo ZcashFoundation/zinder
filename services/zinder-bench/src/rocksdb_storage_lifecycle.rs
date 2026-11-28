@@ -144,6 +144,9 @@ pub(crate) struct RocksDbStorageLifecycleArgs {
     /// Tree-state checkpoint coverage persisted during canonical construction.
     #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Commitment threshold for commitment-budget coverage. Defaults to the ingest threshold.
+    #[arg(long)]
+    tree_state_commitment_budget: Option<NonZeroU32>,
     /// Canonical publication checks to include before READY.
     #[arg(long, value_enum, default_value = "trusted-fresh")]
     canonical_publication_mode: CanonicalPublicationMode,
@@ -167,6 +170,7 @@ struct ValidatedLifecycleArgs {
     pipeline_limits: CanonicalPipelineLimits,
     supported_reorg_depth: u32,
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    tree_state_commitment_budget: Option<NonZeroU32>,
     canonical_publication_mode: CanonicalPublicationMode,
     canonical_storage_ready_thresholds: Option<AcceptanceThresholds>,
     wallet_storage_ready_thresholds: Option<AcceptanceThresholds>,
@@ -254,11 +258,11 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         build_plan,
         canonical_resource_budget,
     )?;
-    let builder = if validated
+    let selection = validated
         .tree_state_checkpoint_coverage
-        .stores_every_block()
-    {
-        builder.with_every_block_tree_state_checkpoints()?
+        .resolve(validated.tree_state_commitment_budget)?;
+    let builder = if let Some(selection) = selection {
+        builder.with_tree_state_checkpoint_selection(selection)?
     } else {
         builder
     };
@@ -280,11 +284,10 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let source_tip_after_canonical_load = source.tip_id().await?;
     let canonical_block_evidence = canonical_load.block_evidence;
     let canonical_subtree_evidence = canonical_load.subtree_root_evidence;
-    let actual_tree_state_checkpoint_coverage = TreeStateCheckpointCoverage::from_every_block(
-        canonical_load
-            .builder
-            .stores_every_block_tree_state_checkpoints(),
-    );
+    let (actual_tree_state_checkpoint_coverage, tree_state_commitment_budget) =
+        TreeStateCheckpointCoverage::from_selection(
+            canonical_load.builder.tree_state_checkpoint_selection(),
+        )?;
     let source_tip_checkpoint_authenticated =
         canonical_load.builder.is_source_tip_checkpoint_confirmed();
 
@@ -449,6 +452,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
                 .get(),
             canonical_rocksdb: RocksDbResourceBudgetSummary::from(canonical_resource_budget),
             tree_state_checkpoint_coverage: actual_tree_state_checkpoint_coverage,
+            tree_state_commitment_budget,
             canonical_publication_mode: validated.canonical_publication_mode,
             wallet_rocksdb: RocksDbResourceBudgetSummary::from(wallet_resource_budget),
             supported_reorg_depth: validated.supported_reorg_depth,
@@ -556,6 +560,11 @@ impl RocksDbStorageLifecycleArgs {
             pipeline_limits,
             supported_reorg_depth: self.supported_reorg_depth,
             tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
+            tree_state_commitment_budget: TreeStateCheckpointCoverage::from_selection(
+                self.tree_state_checkpoint_coverage
+                    .resolve(self.tree_state_commitment_budget)?,
+            )?
+            .1,
             canonical_publication_mode: self.canonical_publication_mode,
             canonical_storage_ready_thresholds: acceptance_thresholds(
                 self.canonical_storage_ready_target_seconds,

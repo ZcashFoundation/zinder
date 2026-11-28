@@ -367,6 +367,7 @@ fn canonical_fixture_rocksdb_replay_config(
         supported_reorg_depth: 1,
         source_segment_delay: Duration::ZERO,
         tree_state_checkpoint_coverage: TreeStateCheckpointCoverage::EveryBlock,
+        tree_state_commitment_budget: None,
     }
 }
 
@@ -2154,5 +2155,56 @@ fn fixture_v1_rejects_uppercase_sequence_digest_hex() -> Result<()> {
         ));
     };
     assert!(error.to_string().contains("lowercase hexadecimal"));
+    Ok(())
+}
+
+#[test]
+fn checkpoint_policy_comparison_measures_off_cadence_checkpoints() -> Result<()> {
+    let fixture = zinder_testkit::manifest_dir!().join("fixtures/checkpoint-policy");
+    let scratch = tempdir()?;
+    let output = Command::new(zinder_testkit::bin_exe!("zinder-bench"))
+        .env("TOKIO_WORKER_THREADS", "2")
+        .arg("rocksdb-checkpoint-policy-comparison")
+        .arg("--fixture")
+        .arg(fixture)
+        .arg("--scratch-directory")
+        .arg(scratch.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "comparison failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["byte_equivalent"], true);
+    assert_eq!(
+        report["sampled_heights"],
+        serde_json::json!([603, 604, 605, 606])
+    );
+    let arms = report["arms"]
+        .as_array()
+        .ok_or_else(|| eyre!("comparison arms missing"))?;
+    assert_eq!(arms.len(), 4);
+    assert_eq!(arms[0]["coverage"], "cadence-and-tip");
+    assert_eq!(arms[1]["commitment_budget"], 1);
+    assert_eq!(arms[2]["commitment_budget"], 3);
+    assert_eq!(arms[3]["coverage"], "every-block");
+    for (arm, (rows, misses, max_blocks, max_commitments)) in
+        arms.iter()
+            .zip([(2, 3, 3, 2), (3, 2, 2, 0), (2, 3, 3, 2), (5, 0, 0, 0)])
+    {
+        assert_eq!(arm["checkpoint_rows"], rows);
+        assert_eq!(arm["miss_samples"], misses);
+        assert_eq!(arm["max_replayed_blocks"], max_blocks);
+        assert_eq!(arm["max_replayed_commitments"], max_commitments);
+        assert_eq!(arm["miss_latency_seconds"].is_null(), misses == 0);
+        for bytes in ["checkpoint_logical_bytes", "checkpoint_sst_bytes"] {
+            assert!(arm[bytes].as_u64().is_some_and(|count| count > 0));
+        }
+        for phase in ["ready_seconds", "reopen_seconds"] {
+            assert!(arm[phase].as_f64().is_some_and(|seconds| seconds > 0.0));
+        }
+    }
+    assert_eq!(std::fs::read_dir(scratch.path())?.count(), 0);
     Ok(())
 }
