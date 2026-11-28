@@ -17,7 +17,7 @@ Every first-party crate and service shares one product version, the root
 | Binary archives | One archive per [release platform](../adrs/0022-release-artifacts.md#decision) with the unified `bin/zinder` executable, plus an SPDX 2.3 SBOM for each |
 | Personal-node Compose | `zinder-personal-compose.yaml` |
 | Rust SDK | `zinder-core`, `zinder-proto`, and `zinder-client` on crates.io |
-| API artifacts | `zinder.v1.descriptor.bin` and a `zinder-api-docs` archive with the native `.proto` sources and OpenAPI documents |
+| API artifacts | `zinder.v1.descriptor.bin` and a [standalone protobuf contract archive](../reference/integration-surfaces.md#generate-bindings-from-a-pinned-release) with native and vendored schemas, descriptors, and OpenAPI documents |
 | GitHub Release | All of the above files, `SHA256SUMS`, and its signature `SHA256SUMS.sigstore.json` |
 
 The tag must be `v` followed by the workspace version. A prerelease adds a

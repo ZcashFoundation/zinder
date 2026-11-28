@@ -412,6 +412,17 @@ impl BlockMethods {
         }
     }
 
+    pub(crate) async fn unary_block<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        method: &'static str,
+        block_id: &lightwalletd::BlockId,
+        shape: CompactBlockShape,
+    ) -> Result<UnaryCompactBlock, Status> {
+        self.await_block_tip(reads, method, block_id).await?;
+        compact_block(reads, block_id, shape).await
+    }
+
     /// Runs [`Self::await_tip`] for a block-range request at the highest
     /// height it names, in either order.
     ///
@@ -708,13 +719,69 @@ async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     }))
 }
 
-/// Answers `GetBlock` or `GetBlockNullifiers` with the stored block `block_id`
-/// names, shaped by `shape`, read at one captured view.
-pub(crate) async fn compact_block<Reads: CompactBlockReads>(
+pub(crate) enum UnaryCompactBlock {
+    Encoded(EncodedBlock),
+    Message(lightwalletd::CompactBlock),
+}
+
+impl UnaryCompactBlock {
+    pub(crate) fn into_message(self) -> Result<lightwalletd::CompactBlock, Status> {
+        match self {
+            Self::Encoded(encoded) => lightwalletd::CompactBlock::decode(encoded.payload())
+                .map_err(|error| compact_block_decode_status(&error)),
+            Self::Message(message) => Ok(message),
+        }
+    }
+
+    pub(crate) fn into_encoded(self) -> Result<EncodedBlock, Status> {
+        match self {
+            Self::Encoded(encoded) => Ok(encoded),
+            Self::Message(message) => {
+                EncodedBlock::encode(&message).map_err(|error| Status::internal(error.to_string()))
+            }
+        }
+    }
+
+    fn check_hash(&self, requested_hash: &[u8]) -> Result<(), Status> {
+        if requested_hash.is_empty() {
+            return Ok(());
+        }
+        let matches = match self {
+            Self::Encoded(encoded) => {
+                CompactBlockHash::decode(encoded.payload())
+                    .map_err(|error| compact_block_decode_status(&error))?
+                    .hash
+                    == requested_hash
+            }
+            Self::Message(message) => message.hash == requested_hash,
+        };
+        if !matches {
+            return Err(Status::not_found(
+                "requested block hash does not match indexed block",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(prost::Message)]
+struct CompactBlockHash {
+    #[prost(bytes = "bytes", tag = "3")]
+    hash: prost::bytes::Bytes,
+}
+
+fn compact_block_decode_status(error: &prost::DecodeError) -> Status {
+    Status::data_loss(format!(
+        "failed to decode encoded compact block protobuf: {error}"
+    ))
+}
+
+/// Reads one block at a captured view and keeps its existing representation.
+async fn compact_block<Reads: CompactBlockReads>(
     reads: &Reads,
     block_id: &lightwalletd::BlockId,
     shape: CompactBlockShape,
-) -> Result<lightwalletd::CompactBlock, Status> {
+) -> Result<UnaryCompactBlock, Status> {
     let block = requested_block(block_id, decode_internal_block_hash)?;
     let view = reads.capture_view().await?;
     if let RequestedBlock::Height(height) = block {
@@ -725,20 +792,12 @@ pub(crate) async fn compact_block<Reads: CompactBlockReads>(
             .read_encoded_compact_block(&view, block, selection)
             .await?
     {
-        lightwalletd::CompactBlock::decode(encoded.payload()).map_err(|error| {
-            Status::data_loss(format!(
-                "failed to decode encoded compact block protobuf: {error}"
-            ))
-        })?
+        UnaryCompactBlock::Encoded(encoded)
     } else {
         let compact_block = reads.read_compact_block(&view, block).await?;
-        shape.message(compact_block)?
+        UnaryCompactBlock::Message(shape.message(compact_block)?)
     };
-    if !block_id.hash.is_empty() && block_id.hash != compact_block.hash {
-        return Err(Status::not_found(
-            "requested block hash does not match indexed block",
-        ));
-    }
+    compact_block.check_hash(&block_id.hash)?;
     Ok(compact_block)
 }
 

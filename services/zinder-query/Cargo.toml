@@ -52,6 +52,7 @@ workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 eyre.workspace = true
+http-body-util.workspace = true
 metrics-exporter-prometheus.workspace = true
 prost.workspace = true
 reqwest.workspace = true

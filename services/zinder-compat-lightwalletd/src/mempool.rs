@@ -8,7 +8,8 @@ mod exclusions;
 mod ingest_control;
 mod surface;
 
-pub(crate) use exclusions::MempoolExclusions;
+pub(crate) use exclusions::MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST;
+pub use exclusions::{MempoolExclusions, MempoolExclusionsError};
 pub use ingest_control::{
     IngestControlMempoolSurface, WatchTipChangeWatcher, spawn_ingest_control_tip_change_publisher,
 };

@@ -227,6 +227,7 @@ crates use their own types and convert at the service adapter.
 | Private control APIs | `zinder_proto::v1::ingest` | `CanonicalControl`, `ProjectorControl`, `IngestControl` | `zinder-ingest`, `zinder-projector` |
 | Shared operations messages | `zinder_proto::v1::ops` | `ServerInfo`, `ErrorReason`, readiness messages | Embedded in the surfaces above |
 | Lightwalletd compatibility | `zinder_proto::compat::lightwalletd` | `CompactTxStreamer` | `zinder-compat-lightwalletd` |
+| Darkside test control | `zinder_proto::compat::lightwalletd` | `DarksideStreamer` | Standalone test servers |
 | Zebra indexer client | `zinder_proto::external::zebra_indexer_rpc` | `Indexer` (client only) | Called by `zinder-source` |
 
 - `WalletQuery` is the native contract for wallets and applications.
@@ -246,6 +247,12 @@ crates use their own types and convert at the service adapter.
   schemas through native gRPC reflection v1 and v1alpha.
   [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md)
   covers method behavior.
+- Darkside control bindings share the wallet protobuf package so clients can
+  reuse its messages. The independent pin in
+  [Darkside provenance](../../crates/zinder-proto/proto/compat/darkside/UPSTREAM.md)
+  tracks `zcash/lightwalletd`. `zinder_proto::DARKSIDE_FILE_DESCRIPTOR_SET`
+  includes the control schema and its wallet message imports for test-server
+  reflection.
 - Upstream node protocols belong to
   [Node source boundary](node-source-boundary.md), and storage encodings to
   [Storage backend](storage-backend.md).
@@ -268,12 +275,12 @@ crates never expose generated types in their public APIs.
 - A new `ErrorReason` gets a new scalar value, a policy entry, a client
   variant, and a round-trip test. Renaming, removing, or repurposing a reason
   is a breaking change.
-- Vendored lightwalletd and external Zebra schemas change only with an
-  explicit update to their pinned source and provenance record.
+- Vendored wallet, Darkside, and Zebra schemas change only with an explicit
+  update to their pinned source and provenance record.
 
 ## Wire conventions
 
-The generated lightwalletd server accepts optional `EncodedBlockRange` and `EncodedBlockRangeNullifiers` implementations for `GetBlockRange` and `GetBlockRangeNullifiers`. Each single-message stream element is an `EncodedBlock` (one complete `CompactBlock` protobuf message in gRPC's length-prefixed form), and uncompressed range producers may also emit pre-batched `EncodedBlockFrame` chunks assembled by `EncodedBlockBatcher`. Tonic decodes the request and applies the message size limits. When the server may compress responses, tonic also compresses and frames each `EncodedBlock`. Otherwise a message of 32 KiB or more leaves the generated server as its own buffer, without tonic's encode-buffer copy, and shorter messages are batched into 8 KiB opening and 32 KiB subsequent frames (either during the chunk read via `EncodedBlockBatcher` or in the response body). Both uncompressed bodies keep at most 512 KiB, and at most twice the chunk, alive behind each data chunk, copying a message whose allocation is larger, sparser, or unknown into 64 KiB pieces, and mark the response with `BoundedChunkRetention`. Only `zinder-proto` can create that marker. The public listener's send-stall bound hands slices of a marked response to HTTP/2 instead of copies. A producer declares a message's allocation with `EncodedBlock::from_length_prefixed_in`. Existing server implementations and generated clients use their ordinary typed interfaces.
+The generated lightwalletd server accepts optional `EncodedBlockRange` and `EncodedBlockRangeNullifiers` implementations for `GetBlockRange` and `GetBlockRangeNullifiers`. Each single-message stream element is an `EncodedBlock` (one complete `CompactBlock` protobuf message in gRPC's length-prefixed form), and uncompressed range producers may also emit pre-batched `EncodedBlockFrame` chunks assembled by `EncodedBlockBatcher`. The public request guard bounds decompression and scans repeated fields before tonic decodes the protobuf. When the client negotiates compression, tonic compresses and frames each `EncodedBlock`. On the identity path, a message of 32 KiB or more leaves the generated server as its own buffer, without tonic's encode-buffer copy, and shorter messages are batched into 8 KiB opening and 32 KiB subsequent frames (either during the chunk read via `EncodedBlockBatcher` or in the response body). Both uncompressed bodies keep at most 512 KiB, and at most twice the chunk, alive behind each data chunk, copying a message whose allocation is larger, sparser, or unknown into 64 KiB pieces, and mark the response with `BoundedChunkRetention`. Only `zinder-proto` can create that marker. The public listener's send-stall bound hands slices of a marked response to HTTP/2 instead of copies. A producer declares a message's allocation with `EncodedBlock::from_length_prefixed_in`. Existing server implementations and generated clients use their ordinary typed interfaces.
 
 These rules apply at every protocol boundary.
 [ADR-0002](../adrs/0002-serialization-and-byte-order.md) records why.

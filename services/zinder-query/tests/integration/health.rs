@@ -67,10 +67,17 @@ async fn native_listener_health_follows_readyz_through_readiness_and_shutdown() 
     let refused = wallet_client
         .visible_tip_block(wallet::VisibleTipBlockRequest { at_epoch_id: None })
         .await;
-    assert_eq!(
-        refused.err().map(|status| status.code()),
-        Some(Code::Unavailable)
-    );
+    let refusal = refused
+        .err()
+        .ok_or_else(|| eyre::eyre!("not-ready listener accepted a call"))?;
+    assert_eq!(refusal.code(), Code::Unavailable);
+    let delay = refusal
+        .metadata()
+        .get("grpc-retry-pushback-ms")
+        .ok_or_else(|| eyre::eyre!("missing retry pushback"))?
+        .to_str()?
+        .parse::<i32>()?;
+    assert!((500..=1500).contains(&delay));
     let reflected = probe.reflected_services().await?;
     assert!(
         reflected.iter().any(|name| name == WALLET_SERVICE)

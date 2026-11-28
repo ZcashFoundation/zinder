@@ -16,11 +16,11 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, sleep_until};
 use tokio_util::task::AbortOnDropHandle;
-use tonic::{Status, body::Body, metadata::MetadataValue};
+use tonic::{Status, body::Body};
 use zinder_proto::{status_for_reason, v1::ops::ErrorReason};
 
 use super::{
-    ClientAddressSource, WalletRpcMetricsLayer, proxy_named_client,
+    ClientAddressSource, RetryPushback, WalletRpcMetricsLayer, proxy_named_client,
     receive_slots::ClientFairnessKey, remote_address,
 };
 
@@ -85,16 +85,13 @@ impl Refusal {
             Self::ClientCapacity => "block-range client tracking limit reached",
             Self::SchedulingDelay => "runtime overloaded; retry the block range",
         };
-        let mut status = match surface {
+        let status = match surface {
             WalletRpcMetricsLayer::WalletQuery => {
                 status_for_reason(ErrorReason::BlockRangeAdmissionRefused, message)
             }
             WalletRpcMetricsLayer::Lightwalletd => Status::unavailable(message),
         };
-        status
-            .metadata_mut()
-            .insert("grpc-retry-pushback-ms", MetadataValue::from_static("250"));
-        status
+        RetryPushback::After(Duration::from_millis(250)).apply(status)
     }
 }
 

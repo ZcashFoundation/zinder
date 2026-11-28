@@ -47,6 +47,7 @@ composefs-ioctls = "0.10.0"
 config = { version = "0.15.27", default-features = false, features = ["toml"] }
 const-hex = "1.19.3"
 eyre = "0.6.14"
+flate2 = "1.1.11"
 fs-verity = "0.2.0"
 fastrand = "2.5.0"
 futures-core = "0.3.34"
@@ -112,7 +113,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
 tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }
 toml = "1.2.1"
-tonic = { version = "0.14.9", features = ["tls-ring", "tls-native-roots"] }
+tonic = { version = "0.14.9", features = ["tls-ring", "tls-native-roots", "gzip", "zstd"] }
 tonic-health = "0.14.9"
 tonic-prost = "0.14.9"
 tonic-prost-build = "0.14.9"

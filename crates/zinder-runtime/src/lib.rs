@@ -140,7 +140,7 @@ pub use public_grpc_server::{
     GrpcReceiveLimit, GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStall, GrpcSendStallLayer,
     HTTP2_MAX_LOCAL_ERROR_RESETS, MAX_CONCURRENT_STREAMS_PER_CONNECTION,
     PROXY_CLIENT_ADDRESS_HEADER, PublicGrpcLayers, PublicGrpcRouter, PublicGrpcServer,
-    RangeClientKey, WalletRpcMetrics, WalletRpcMetricsLayer, public_grpc_reflection,
+    RangeClientKey, RetryPushback, WalletRpcMetrics, WalletRpcMetricsLayer, public_grpc_reflection,
     public_grpc_server, public_grpc_server_with,
 };
 pub use readiness::{
@@ -190,17 +190,16 @@ use tokio_util::sync::CancellationToken;
 /// Upper bound on the size of an incoming gRPC request message, applied to
 /// every serving Zinder gRPC server via `max_decoding_message_size`.
 ///
-/// tonic holds a request message in memory while it decodes it, so this
-/// bound times [`DEFAULT_GRPC_RECEIVE_SLOTS`] bounds the request bytes a
-/// public server decodes at once.
+/// The same cap applies to the decompressed payload and zstd window on
+/// public application services.
 ///
 /// The largest legitimate request is a broadcast transaction of
 /// [`zinder_core::MAX_RAW_TRANSACTION_BYTES`] (2,000,000 bytes), which
 /// encodes to at most 2,000,015 bytes as a lightwalletd `RawTransaction` and
 /// fits under 2 MiB with room to spare. A larger transaction that still fits
-/// is rejected by the broadcast guard with its typed error; one beyond this
-/// bound fails in the transport with `OUT_OF_RANGE`, before tonic buffers
-/// it.
+/// is rejected by the broadcast guard with its typed error. The transport
+/// rejects an oversized frame with `OUT_OF_RANGE` and an oversized
+/// decompressed payload with `RESOURCE_EXHAUSTED`.
 ///
 /// Setting it explicitly also keeps a future tonic default from silently
 /// widening the limit.

@@ -16,6 +16,7 @@ axum.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true
+flate2.workspace = true
 futures-util.workspace = true
 http.workspace = true
 http-body.workspace = true
@@ -56,6 +57,7 @@ zinder-core.workspace = true
 zinder-proto.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true
+zstd = "0.14.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["param"] }

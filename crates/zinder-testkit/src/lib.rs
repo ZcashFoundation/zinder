@@ -47,6 +47,7 @@ pub mod canonical_writer_fixture;
 pub mod chain_fixture;
 pub mod commitment_tree_fixtures;
 pub mod env_var_contract;
+pub mod grpc_web;
 pub mod ingest_control_fixture;
 pub mod json_rpc_test_server;
 pub mod live;

@@ -18,7 +18,7 @@ use prost::Message as _;
 use thiserror::Error;
 use tokio_stream as stream;
 use tokio_stream::StreamExt as _;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, codec::CompressionEncoding};
 use tonic_types::{ErrorDetails, StatusExt as _};
 use zinder_core::wire::WireDecodeError;
 use zinder_core::{
@@ -43,7 +43,7 @@ use zinder_query::{
     TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
     address_lookup_to_script_hash, status_from_query_error,
 };
-use zinder_runtime::RepeatedFieldGuard;
+use zinder_runtime::{RepeatedFieldGuard, RetryPushback};
 use zinder_source::{NodeCapability, SourceError};
 use zinder_source::{parse_transparent_address, transparent_address_matches_network};
 use zinder_store::{
@@ -52,9 +52,8 @@ use zinder_store::{
 };
 
 use crate::block_methods::{
-    self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
-    CompactBlockReads, EncodedChunkReadOutcome, RequestedBlock, TipCapture, requested_block,
-    view_reaches,
+    BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView, CompactBlockReads,
+    EncodedChunkReadOutcome, RequestedBlock, TipCapture, requested_block, view_reaches,
 };
 use crate::compact_block_messages::CompactBlockShape;
 use crate::mempool::{
@@ -95,8 +94,6 @@ const ADDRESS_UTXO_STREAM_CHANNEL_CAPACITY: usize = 64;
 const ADDRESS_UTXO_FIRST_PAGE_BUDGET: usize = 8 * 1_024;
 /// Fewest outputs the first page of one address's UTXO stream reads.
 const ADDRESS_UTXO_MIN_FIRST_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.saturating_add(15);
-/// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
-pub(crate) const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 20_000;
 /// Most distinct transactions one `GetMempoolStream` sends between tip changes.
 ///
 /// The stream remembers each id it sent so it can skip repeats, and that set
@@ -317,9 +314,14 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     {
         RepeatedFieldGuard::new(
             compact_tx_streamer_server::CompactTxStreamerServer::new(self)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .send_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Zstd)
                 .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES),
             COMPACT_TX_STREAMER_FIELD_LIMITS,
         )
+        .with_request_compression()
     }
 }
 
@@ -419,7 +421,8 @@ impl<QueryApi: Sync> LightwalletdGrpcAdapter<QueryApi> {
         request: Request<lightwalletd::GetMempoolTxRequest>,
     ) -> Result<Response<GrpcStream<lightwalletd::CompactTx>>, Status> {
         let request = request.into_inner();
-        validate_excluded_txid_suffixes(&request.exclude_txid_suffixes)?;
+        let exclusions = MempoolExclusions::from_suffixes(request.exclude_txid_suffixes)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let shape = CompactBlockShape::for_mempool(&request.pool_types)?;
         let mempool_surface = self
             .mempool_surface
@@ -430,21 +433,16 @@ impl<QueryApi: Sync> LightwalletdGrpcAdapter<QueryApi> {
             .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
             .await
             .map_err(status_from_mempool_surface_error)?;
-        if request.exclude_txid_suffixes.is_empty() {
+        if exclusions.is_empty() {
             return Ok(Response::new(stream_mempool_compact_transactions(
                 mempool_surface,
                 first_page,
                 shape,
             )));
         }
-        buffered_mempool_transactions(
-            mempool_surface,
-            first_page,
-            shape,
-            request.exclude_txid_suffixes,
-        )
-        .await
-        .map(Response::new)
+        buffered_mempool_transactions(mempool_surface, first_page, shape, exclusions)
+            .await
+            .map(Response::new)
     }
 
     async fn mempool_stream(
@@ -1103,10 +1101,52 @@ where
 }
 
 #[tonic::async_trait]
+impl<QueryApi> lightwalletd::EncodedUnaryBlocks for LightwalletdGrpcAdapter<QueryApi>
+where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    async fn get_encoded_block(
+        &self,
+        request: Request<lightwalletd::BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status> {
+        self.block_methods
+            .unary_block(
+                &self.query_api,
+                "get_block",
+                request.get_ref(),
+                CompactBlockShape::FULL_BLOCK,
+            )
+            .await?
+            .into_encoded()
+            .map(Response::new)
+    }
+
+    async fn get_encoded_block_nullifiers(
+        &self,
+        request: Request<lightwalletd::BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status> {
+        self.block_methods
+            .unary_block(
+                &self.query_api,
+                "get_block_nullifiers",
+                request.get_ref(),
+                CompactBlockShape::BLOCK_NULLIFIERS,
+            )
+            .await?
+            .into_encoded()
+            .map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
 impl<QueryApi> compact_tx_streamer_server::CompactTxStreamer for LightwalletdGrpcAdapter<QueryApi>
 where
     QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
+    fn encoded_unary_blocks(&self) -> Option<&dyn lightwalletd::EncodedUnaryBlocks> {
+        Some(self)
+    }
+
     fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
         Some(self)
     }
@@ -1131,12 +1171,15 @@ where
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        let block_id = request.into_inner();
         self.block_methods
-            .await_block_tip(&self.query_api, "get_block", &block_id)
-            .await?;
-        block_methods::compact_block(&self.query_api, &block_id, CompactBlockShape::FULL_BLOCK)
-            .await
+            .unary_block(
+                &self.query_api,
+                "get_block",
+                request.get_ref(),
+                CompactBlockShape::FULL_BLOCK,
+            )
+            .await?
+            .into_message()
             .map(Response::new)
     }
 
@@ -1144,17 +1187,16 @@ where
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        let block_id = request.into_inner();
         self.block_methods
-            .await_block_tip(&self.query_api, "get_block_nullifiers", &block_id)
-            .await?;
-        block_methods::compact_block(
-            &self.query_api,
-            &block_id,
-            CompactBlockShape::BLOCK_NULLIFIERS,
-        )
-        .await
-        .map(Response::new)
+            .unary_block(
+                &self.query_api,
+                "get_block_nullifiers",
+                request.get_ref(),
+                CompactBlockShape::BLOCK_NULLIFIERS,
+            )
+            .await?
+            .into_message()
+            .map(Response::new)
     }
 
     type GetBlockRangeStream = GrpcStream<lightwalletd::CompactBlock>;
@@ -2050,7 +2092,11 @@ impl ResponseSource for AddressUtxoMerge {
     }
 }
 
-fn address_utxo_height_limit_exceeded(height: u64, count: usize) -> Status {
+/// Builds the wallet RPC error for a first matching height that exceeds `maxEntries`.
+///
+/// The error details include the height and full output count so clients can size a retry.
+#[must_use]
+pub fn address_utxo_height_limit_exceeded(height: u64, count: usize) -> Status {
     let mut details = ErrorDetails::new();
     details.set_error_info(
         "MAX_ENTRIES_EXCEEDED_AT_HEIGHT",
@@ -2302,7 +2348,8 @@ fn standard_fee_response(
 /// reason.
 fn tree_state_status(error: &QueryError) -> Status {
     if matches!(error, QueryError::TreeStateReplayLimitReached { .. }) {
-        return Status::unavailable(format!("{error}; retry shortly"));
+        return RetryPushback::Backoff
+            .apply(Status::unavailable(format!("{error}; retry shortly")));
     }
     status_from_query_error(error)
 }
@@ -2315,7 +2362,7 @@ fn tree_state_status(error: &QueryError) -> Status {
 /// `RESOURCE_EXHAUSTED` with its typed reason.
 fn forwarded_read_status(error: &QueryError) -> Status {
     if matches!(error, QueryError::ForwardedReadLimitReached { .. }) {
-        return Status::unavailable(error.to_string());
+        return RetryPushback::Backoff.apply(Status::unavailable(error.to_string()));
     }
     status_from_query_error(error)
 }
@@ -2327,7 +2374,8 @@ fn forwarded_read_status(error: &QueryError) -> Status {
 /// permanent precondition failure.
 fn subtree_roots_status(error: &QueryError) -> Status {
     if matches!(error, QueryError::ChainEpochPinUnavailable { .. }) {
-        return Status::unavailable(format!("{error}; retry shortly"));
+        return RetryPushback::Backoff
+            .apply(Status::unavailable(format!("{error}; retry shortly")));
     }
     status_from_query_error(error)
 }
@@ -2642,10 +2690,12 @@ where
             if this.seen.len() >= this.max_distinct {
                 this.upstream = None;
                 this.seen = HashSet::new();
-                return std::task::Poll::Ready(Some(Err(Status::unavailable(format!(
-                    "stream sent {} distinct transactions without a tip change; reconnect",
-                    this.max_distinct
-                )))));
+                return std::task::Poll::Ready(Some(Err(RetryPushback::Backoff.apply(
+                    Status::unavailable(format!(
+                        "stream sent {} distinct transactions without a tip change; reconnect",
+                        this.max_distinct
+                    )),
+                ))));
             }
             this.seen.insert(streamed_key);
             return std::task::Poll::Ready(Some(Ok(streamed)));
@@ -2677,10 +2727,9 @@ async fn buffered_mempool_transactions(
     mempool_surface: SharedMempoolSurface,
     first_page: MempoolSnapshotPage,
     shape: CompactBlockShape,
-    exclude_txid_suffixes: Vec<Vec<u8>>,
+    mut exclusions: MempoolExclusions,
 ) -> Result<GrpcStream<lightwalletd::CompactTx>, Status> {
     let mut entries = mempool_snapshot_entries(mempool_surface, first_page);
-    let mut exclusions = MempoolExclusions::new(exclude_txid_suffixes);
     let mut compact_messages = Vec::new();
     while let Some(entry_outcome) = entries.next().await {
         let entry = entry_outcome?;
@@ -2839,7 +2888,9 @@ fn mempool_snapshot_entries(
 
 fn status_from_mempool_surface_error(error: MempoolSurfaceError) -> Status {
     match error {
-        MempoolSurfaceError::Unavailable { reason } => Status::unavailable(reason),
+        MempoolSurfaceError::Unavailable { reason } => {
+            RetryPushback::Backoff.apply(Status::unavailable(reason))
+        }
         MempoolSurfaceError::UnsupportedEncoding { reason } => zinder_proto::status_for_reason(
             zinder_proto::v1::ops::ErrorReason::UnsupportedWalletEncoding,
             reason,
@@ -2847,23 +2898,6 @@ fn status_from_mempool_surface_error(error: MempoolSurfaceError) -> Status {
         MempoolSurfaceError::CursorInvalid => Status::invalid_argument("mempool cursor is invalid"),
         MempoolSurfaceError::CursorExpired => Status::failed_precondition("mempool cursor expired"),
     }
-}
-
-fn validate_excluded_txid_suffixes(exclude_suffixes: &[Vec<u8>]) -> Result<(), Status> {
-    if exclude_suffixes.len() > MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST {
-        return Err(Status::invalid_argument(format!(
-            "exclude_txid_suffixes contains {} entries; at most {MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST} are allowed",
-            exclude_suffixes.len(),
-        )));
-    }
-    for (index, suffix) in exclude_suffixes.iter().enumerate() {
-        if suffix.len() > 32 {
-            return Err(Status::invalid_argument(format!(
-                "exclude txid {index} is larger than 32 bytes",
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[allow(

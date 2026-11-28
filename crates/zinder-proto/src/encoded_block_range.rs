@@ -15,11 +15,54 @@ use tonic::{
     body::Body,
     codec::{Codec, EnabledCompressionEncodings, EncodeBuf, Encoder},
     codegen::{BoxStream, StdError, http, tokio_stream},
-    server::{Grpc, ServerStreamingService},
+    server::{Grpc, ServerStreamingService, UnaryService},
 };
 use tonic_prost::ProstDecoder;
 
-use crate::compat::lightwalletd::{BlockRange, CompactBlock};
+use crate::compat::lightwalletd::{BlockId, BlockRange, CompactBlock};
+
+/// Serves unary lightwalletd block calls from canonical encoded protobuf messages.
+///
+/// Opt in through [`CompactTxStreamer::encoded_unary_blocks`]. Implementations
+/// must return the same protobuf payload and statuses as their typed methods.
+///
+/// [`CompactTxStreamer::encoded_unary_blocks`]: crate::compat::lightwalletd::compact_tx_streamer_server::CompactTxStreamer::encoded_unary_blocks
+#[tonic::async_trait]
+pub trait EncodedUnaryBlocks: Send + Sync {
+    /// Returns the requested block with all pools.
+    async fn get_encoded_block(
+        &self,
+        request: Request<BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status>;
+
+    /// Returns the requested block with shielded nullifiers only.
+    async fn get_encoded_block_nullifiers(
+        &self,
+        request: Request<BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status>;
+}
+
+pub(crate) enum UnaryBlockMethod {
+    Full,
+    Nullifiers,
+}
+
+pub(crate) struct EncodedUnaryBlock<'a>(
+    pub(crate) &'a dyn EncodedUnaryBlocks,
+    pub(crate) UnaryBlockMethod,
+);
+
+impl<'a> UnaryService<BlockId> for EncodedUnaryBlock<'a> {
+    type Response = EncodedBlock;
+    type Future = Pin<Box<dyn Future<Output = Result<Response<EncodedBlock>, Status>> + Send + 'a>>;
+
+    fn call(&mut self, request: Request<BlockId>) -> Self::Future {
+        match self.1 {
+            UnaryBlockMethod::Full => self.0.get_encoded_block(request),
+            UnaryBlockMethod::Nullifiers => self.0.get_encoded_block_nullifiers(request),
+        }
+    }
+}
 
 /// A stream of complete lightwalletd `CompactBlock` messages, each already
 /// framed for gRPC.
@@ -311,6 +354,23 @@ impl Codec for EncodedBlockCodec {
     }
 }
 
+pub(crate) struct EncodedUnaryBlockCodec;
+
+impl Codec for EncodedUnaryBlockCodec {
+    type Encode = EncodedBlock;
+    type Decode = BlockId;
+    type Encoder = EncodedBlockCodec;
+    type Decoder = ProstDecoder<BlockId>;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        EncodedBlockCodec
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        ProstDecoder::default()
+    }
+}
+
 impl Encoder for EncodedBlockCodec {
     type Item = EncodedBlock;
     type Error = Status;
@@ -327,8 +387,8 @@ impl Encoder for EncodedBlockCodec {
 
 /// Handles one `GetBlockRange` call for the generated server.
 ///
-/// tonic decodes the request and builds the response head. Unless the server
-/// may compress responses, the messages are then sent by [`EncodedBlockBody`]
+/// tonic decodes the request and builds the response head. Unless the client
+/// negotiates compression, the messages are then sent by [`EncodedBlockBody`]
 /// instead of tonic's encoder, which would copy each one into its buffer.
 pub(crate) async fn server_streaming<B>(
     grpc: &mut Grpc<EncodedBlockCodec>,
@@ -341,7 +401,7 @@ where
     B: http_body::Body + Send + 'static,
     B::Error: Into<StdError> + Send,
 {
-    if !send_compression.is_empty() {
+    if negotiates_compression(request.headers(), send_compression) {
         return grpc.server_streaming(service, request).await;
     }
     let mut taken = None;
@@ -370,7 +430,7 @@ where
     B: http_body::Body + Send + 'static,
     B::Error: Into<StdError> + Send,
 {
-    if !send_compression.is_empty() {
+    if negotiates_compression(request.headers(), send_compression) {
         return grpc.server_streaming(service, request).await;
     }
     let mut taken = None;
@@ -384,6 +444,29 @@ where
         )
         .await;
     finish_encoded_body(response, taken, max_message_size)
+}
+
+// Keep the fast-path check aligned with tonic's grpc-accept-encoding parser.
+fn negotiates_compression(
+    headers: &http::HeaderMap,
+    mut enabled: EnabledCompressionEncodings,
+) -> bool {
+    let Some(accepts) = headers
+        .get("grpc-accept-encoding")
+        .and_then(|header| header.to_str().ok())
+    else {
+        return false;
+    };
+    while let Some(encoding) = enabled.pop() {
+        let encoding = encoding.to_string();
+        if accepts
+            .split(',')
+            .any(|accepted| accepted.trim() == encoding)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Marks a response that keeps bounded allocations behind its data chunks and

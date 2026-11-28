@@ -13,7 +13,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use tokio::sync::watch;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, codec::CompressionEncoding};
 use zinder_core::{ChainEpoch, CompactBlockArtifact, NetworkUpgradeActivations};
 use zinder_proto::compat::lightwalletd::{self, EncodedBlock, compact_tx_streamer_server};
 use zinder_query::{
@@ -24,8 +24,8 @@ use zinder_runtime::RepeatedFieldGuard;
 use zinder_store::{ArtifactFamily, CompactBlockSpliceSelection, EncodedCompactBlockRangeRequest};
 
 use crate::block_methods::{
-    self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
-    CompactBlockReads, EncodedChunkReadOutcome, RequestedBlock, view_reaches,
+    BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView, CompactBlockReads,
+    EncodedChunkReadOutcome, RequestedBlock, view_reaches,
 };
 use crate::compact_block_messages::CompactBlockShape;
 use crate::grpc::GrpcStream;
@@ -486,9 +486,14 @@ impl CompactBlocksGrpcAdapter {
     ) -> RepeatedFieldGuard<compact_tx_streamer_server::CompactTxStreamerServer<Self>> {
         RepeatedFieldGuard::new(
             compact_tx_streamer_server::CompactTxStreamerServer::new(self)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .send_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Zstd)
                 .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES),
             COMPACT_TX_STREAMER_FIELD_LIMITS,
         )
+        .with_request_compression()
     }
 }
 
@@ -534,7 +539,37 @@ impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
 }
 
 #[tonic::async_trait]
+impl lightwalletd::EncodedUnaryBlocks for CompactBlocksGrpcAdapter {
+    async fn get_encoded_block(
+        &self,
+        request: Request<lightwalletd::BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status> {
+        self.block_methods
+            .unary_block(
+                &self.slot,
+                "get_block",
+                request.get_ref(),
+                CompactBlockShape::FULL_BLOCK,
+            )
+            .await?
+            .into_encoded()
+            .map(Response::new)
+    }
+
+    async fn get_encoded_block_nullifiers(
+        &self,
+        _request: Request<lightwalletd::BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status> {
+        Err(unsupported("GetBlockNullifiers"))
+    }
+}
+
+#[tonic::async_trait]
 impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter {
+    fn encoded_unary_blocks(&self) -> Option<&dyn lightwalletd::EncodedUnaryBlocks> {
+        Some(self)
+    }
+
     fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
         Some(self)
     }
@@ -572,12 +607,15 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter 
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        let block_id = request.into_inner();
         self.block_methods
-            .await_block_tip(&self.slot, "get_block", &block_id)
-            .await?;
-        block_methods::compact_block(&self.slot, &block_id, CompactBlockShape::FULL_BLOCK)
-            .await
+            .unary_block(
+                &self.slot,
+                "get_block",
+                request.get_ref(),
+                CompactBlockShape::FULL_BLOCK,
+            )
+            .await?
+            .into_message()
             .map(Response::new)
     }
 

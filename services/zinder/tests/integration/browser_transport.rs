@@ -1,4 +1,4 @@
-use std::{future::Future, net::SocketAddr, path::Path, time::Duration};
+use std::{future::Future, io::Read as _, net::SocketAddr, path::Path, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use eyre::{OptionExt as _, Result, bail, ensure};
@@ -31,13 +31,11 @@ use zinder_runtime::{Readiness, expected_writer_fence};
 use zinder_store::{RocksDbCanonicalStore, RocksDbResourceBudget};
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, IngestControlFixtureService,
-    sample_regtest_upgrade_activations,
+    grpc_web::encode_grpc_web_frame, sample_regtest_upgrade_activations,
 };
 use zinder_wallet_rocksdb::{RocksDbWalletBuildOptions, build_wallet_from_canonical};
 
-use super::stateless_topology_conformance::{
-    build_fixture_chain, encode_grpc_web_frame, prepare_materialized_views,
-};
+use super::stateless_topology_conformance::{build_fixture_chain, prepare_materialized_views};
 
 const ALLOWED_ORIGIN: &str = "https://wallet.example";
 const DENIED_ORIGIN: &str = "https://elsewhere.example";
@@ -204,6 +202,10 @@ async fn read_web_messages<M: Message + Default>(
         response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
         ALLOWED_ORIGIN
     );
+    let gzip = response
+        .headers()
+        .get("grpc-encoding")
+        .is_some_and(|encoding| encoding == "gzip");
     let body = response.bytes().await?;
     let mut decoded = Vec::new();
     let mut wire = if encoding == TEXT {
@@ -215,6 +217,7 @@ async fn read_web_messages<M: Message + Default>(
         &body
     };
     let mut messages = Vec::new();
+    let mut saw_compressed_message = false;
     while let Some((head, remaining)) = wire.split_at_checked(5) {
         let length = usize::try_from(u32::from_be_bytes(head[1..].try_into()?))?;
         let (payload, tail) = remaining
@@ -222,8 +225,15 @@ async fn read_web_messages<M: Message + Default>(
             .ok_or_eyre("truncated gRPC-Web frame")?;
         match head[0] {
             0 => messages.push(M::decode(payload)?),
+            1 if gzip => {
+                let mut message = Vec::new();
+                flate2::read::GzDecoder::new(payload).read_to_end(&mut message)?;
+                messages.push(M::decode(message.as_slice())?);
+                saw_compressed_message = true;
+            }
             0x80 => {
                 assert_eq!(tail, b"");
+                assert!(!gzip || saw_compressed_message);
                 assert!(
                     std::str::from_utf8(payload)?
                         .lines()
@@ -236,6 +246,36 @@ async fn read_web_messages<M: Message + Default>(
         wire = tail;
     }
     bail!("response has no terminal gRPC status frame")
+}
+
+async fn assert_wallet_browser_compression(listener: &NativeListener) -> Result<()> {
+    let http = Client::builder()
+        .http1_only()
+        .timeout(WAIT)
+        .default_headers(header::HeaderMap::from_iter([(
+            header::HeaderName::from_static("grpc-accept-encoding"),
+            header::HeaderValue::from_static("gzip, zstd"),
+        )]))
+        .build()?;
+    let response = listener
+        .post(
+            &http,
+            BINARY,
+            ALLOWED_ORIGIN,
+            ("ServerInfo", wallet::ServerInfoRequest {}),
+        )
+        .await?;
+    assert!(
+        response.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS]
+            .to_str()?
+            .split(',')
+            .any(|name| name.trim() == "grpc-encoding")
+    );
+    assert_eq!(response.headers()["grpc-encoding"], "gzip");
+    let messages = read_web_messages::<wallet::ServerInfoResponse>(response, BINARY).await?;
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].info.is_some());
+    Ok(())
 }
 
 async fn wallet_browser_calls(listener: &NativeListener, http: &Client) -> Result<()> {
@@ -472,6 +512,7 @@ async fn wallet_query_serves_browser_unary_and_streaming_when_configured() -> Re
         native.server_info(wallet::ServerInfoRequest {}).await?;
         if browser_enabled {
             wallet_browser_calls(&listener, &http).await?;
+            assert_wallet_browser_compression(&listener).await?;
         } else {
             assert_native_only(&listener, &http).await?;
         }

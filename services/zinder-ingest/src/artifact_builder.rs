@@ -872,7 +872,7 @@ fn compact_transactions(
 }
 
 /// Builds Zinder-native wallet scan data from a parsed Zebra transaction.
-pub(crate) fn compact_transaction_data(
+pub fn compact_transaction_data(
     transaction: &ZebraTransaction,
 ) -> Result<CompactTransactionData, CanonicalBlockConstructionError> {
     Ok(CompactTransactionData {

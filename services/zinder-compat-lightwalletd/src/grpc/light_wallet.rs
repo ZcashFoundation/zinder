@@ -29,7 +29,7 @@ use zinder_core::{
     },
 };
 use zinder_proto::{
-    compat::lightwalletd::{self, compact_tx_streamer_server},
+    compat::lightwalletd::{self, EncodedBlock, compact_tx_streamer_server},
     status_for_reason,
     v1::ops::ErrorReason,
 };
@@ -41,6 +41,7 @@ use zinder_query::{
     VerifiedNodeTarget, parse_receivable_transparent_address, read_on_blocking_thread,
     status_from_query_error,
 };
+use zinder_runtime::RetryPushback;
 use zinder_source::{
     SourceError, SourceTransparentUnspentOutput, SourceTransparentUtxoPage,
     TransactionBroadcaster as _, TransparentAddressLookup, TransparentAddressRowLimit,
@@ -58,7 +59,7 @@ use super::{
     tree_state_status, u32_to_usize, wire_decode_error_to_status,
 };
 use crate::CanonicalReaderSlot;
-use crate::block_methods::{self, RequestedBlock, requested_block};
+use crate::block_methods::{RequestedBlock, requested_block};
 use crate::compact_block_messages::CompactBlockShape;
 use crate::tip_wait::{TipWait, TipWaitProgress};
 
@@ -531,7 +532,7 @@ impl NodeReads<'_> {
 /// wallet retries every admission limit the same way. `RESOURCE_EXHAUSTED`
 /// stays reserved for deterministic size and row caps.
 fn forwarded_read_refused(refused: ForwardedReadRefused) -> Status {
-    Status::unavailable(refused.to_string())
+    RetryPushback::Backoff.apply(Status::unavailable(refused.to_string()))
 }
 
 #[allow(
@@ -540,7 +541,9 @@ fn forwarded_read_refused(refused: ForwardedReadRefused) -> Status {
 )]
 fn forwarded_query_status(error: QueryError) -> Status {
     match error {
-        QueryError::ForwardedReadLimitReached { .. } => Status::unavailable(error.to_string()),
+        QueryError::ForwardedReadLimitReached { .. } => {
+            RetryPushback::Backoff.apply(Status::unavailable(error.to_string()))
+        }
         QueryError::Node(error) => node_status(error),
         error => status_from_query_error(&error),
     }
@@ -1023,10 +1026,6 @@ fn history_changed() -> Status {
     )
 }
 
-/// Retry pushback hint in milliseconds attached to `SERVED_TIP_MISMATCH`
-/// refusals as `grpc-retry-pushback-ms` metadata.
-const SERVED_TIP_MISMATCH_RETRY_PUSHBACK_MS: u64 = 1_000;
-const GRPC_RETRY_PUSHBACK_MS_HEADER: &str = "grpc-retry-pushback-ms";
 const TIP_MISMATCH_MESSAGE: &str =
     "node answered at another tip than the served tip; retry shortly";
 const PAGES_DISAGREED_MESSAGE: &str = "node UTXO pages at the served tip disagree; retry shortly";
@@ -1054,12 +1053,8 @@ impl UtxoAttemptError {
 /// view (or whose pages disagreed) with `SERVED_TIP_MISMATCH` and retry
 /// pushback guidance.
 fn served_tip_mismatch(message: &str) -> Status {
-    let mut status = status_for_reason(ErrorReason::ServedTipMismatch, message);
-    status.metadata_mut().insert(
-        GRPC_RETRY_PUSHBACK_MS_HEADER,
-        tonic::metadata::MetadataValue::from(SERVED_TIP_MISMATCH_RETRY_PUSHBACK_MS),
-    );
-    status
+    RetryPushback::After(Duration::from_secs(1))
+        .apply(status_for_reason(ErrorReason::ServedTipMismatch, message))
 }
 
 #[allow(
@@ -1191,9 +1186,48 @@ impl lightwalletd::EncodedBlockRangeNullifiers for LightwalletdGrpcAdapter<NodeB
 }
 
 #[tonic::async_trait]
+impl lightwalletd::EncodedUnaryBlocks for LightwalletdGrpcAdapter<NodeBackedLightWallet> {
+    async fn get_encoded_block(
+        &self,
+        request: Request<lightwalletd::BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status> {
+        self.block_methods
+            .unary_block(
+                &self.query_api.slot,
+                "get_block",
+                request.get_ref(),
+                CompactBlockShape::FULL_BLOCK,
+            )
+            .await?
+            .into_encoded()
+            .map(Response::new)
+    }
+
+    async fn get_encoded_block_nullifiers(
+        &self,
+        request: Request<lightwalletd::BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status> {
+        self.block_methods
+            .unary_block(
+                &self.query_api.slot,
+                "get_block_nullifiers",
+                request.get_ref(),
+                CompactBlockShape::BLOCK_NULLIFIERS,
+            )
+            .await?
+            .into_encoded()
+            .map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
 impl compact_tx_streamer_server::CompactTxStreamer
     for LightwalletdGrpcAdapter<NodeBackedLightWallet>
 {
+    fn encoded_unary_blocks(&self) -> Option<&dyn lightwalletd::EncodedUnaryBlocks> {
+        Some(self)
+    }
+
     fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
         Some(self)
     }
@@ -1218,34 +1252,32 @@ impl compact_tx_streamer_server::CompactTxStreamer
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        let block_id = request.into_inner();
         self.block_methods
-            .await_block_tip(&self.query_api.slot, "get_block", &block_id)
-            .await?;
-        block_methods::compact_block(
-            &self.query_api.slot,
-            &block_id,
-            CompactBlockShape::FULL_BLOCK,
-        )
-        .await
-        .map(Response::new)
+            .unary_block(
+                &self.query_api.slot,
+                "get_block",
+                request.get_ref(),
+                CompactBlockShape::FULL_BLOCK,
+            )
+            .await?
+            .into_message()
+            .map(Response::new)
     }
 
     async fn get_block_nullifiers(
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        let block_id = request.into_inner();
         self.block_methods
-            .await_block_tip(&self.query_api.slot, "get_block_nullifiers", &block_id)
-            .await?;
-        block_methods::compact_block(
-            &self.query_api.slot,
-            &block_id,
-            CompactBlockShape::BLOCK_NULLIFIERS,
-        )
-        .await
-        .map(Response::new)
+            .unary_block(
+                &self.query_api.slot,
+                "get_block_nullifiers",
+                request.get_ref(),
+                CompactBlockShape::BLOCK_NULLIFIERS,
+            )
+            .await?
+            .into_message()
+            .map(Response::new)
     }
 
     type GetBlockRangeStream = GrpcStream<lightwalletd::CompactBlock>;
@@ -1736,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rate_limited_node_is_unavailable_with_its_own_reason() {
+    fn a_rate_limited_node_is_unavailable_with_its_own_reason() -> eyre::Result<()> {
         let status = node_status(SourceError::NodeRateLimited {
             operation: "getaddressutxos",
         });
@@ -1747,5 +1779,13 @@ mod tests {
                 .map(|error_info| error_info.reason),
             Some("NODE_RATE_LIMITED".to_owned())
         );
+        let delay_ms = status
+            .metadata()
+            .get("grpc-retry-pushback-ms")
+            .ok_or_else(|| eyre::eyre!("missing retry pushback"))?
+            .to_str()?
+            .parse::<i32>()?;
+        assert!((500..=1500).contains(&delay_ms));
+        Ok(())
     }
 }

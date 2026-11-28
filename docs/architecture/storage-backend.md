@@ -156,6 +156,13 @@ presplit deterministically):
 singleflight deduplication. Opening `ZSHRNG02` never touches `ZSTSUP01` or
 `ZSBLKB01`, and opening `ZSTSUP01` never touches `ZSBLKB01`.
 
+Supplement readers reuse a Zstd decompressor on each reader thread. They share
+an LRU that retains up to 4 MiB of decompressed chunk payloads across the
+process. Each reader verifies the compressed chunk from its own source before
+caching it. Reads continue to authenticate row-index bytes and verify the
+requested row payload. Explicit full-payload verification reads the source
+directly.
+
 During cold store admission (`verify_pinned_segments_into_cache`), storage
 admission checks `kernel_verified()` on each pinned `ZSHRNG02`, `ZSTSUP01`, and
 `ZSBLKB01` segment reader. `O(index)` describes opening and index
@@ -197,7 +204,9 @@ unsealed heights `> sealed_tip`):
     Each query runtime caches up to `256` settled answers scoped to the epoch,
     sequence digest, and retained history.
   - A byte-bounded read fetches one row first, then adapts subsequent batch sizes
-    from `1` to `16` within the remaining byte budget.
+    from `1` to `16` within the remaining byte budget. For settled segments with
+    a supplement, it charges the native length recorded in the index. For
+    shielded-only segments, it measures the reconstructed block.
 
 Reads verify block height linkage across every decoded row and fail on missing
 rows inside retained history as store damage. Compact-block payload range reads
@@ -519,6 +528,12 @@ build plan as the control record and carry evidence for the full family
 inventory, including zero-row checks on post-publication families (`chain_epoch`,
 `chain_event`, `mempool_event`, `displaced_block_facts`) and on
 `live_tail_raw_block` when `raw_blob_policy = "none"`.
+
+The v2 manifest records the construction `tree_state_checkpoint_policy` as
+`cadence-and-tip`, `every-block`, or `commitment-budget` with its resolved
+budget. READY authenticates the original manifest file bytes. Older v2
+manifests without this field open with an unknown policy. Background
+densification can add checkpoint rows without rewriting the manifest.
 
 `CanonicalStoredSet` derives retained block data and its history floor from
 the build plan. Readers specify minimum data and a starting height with

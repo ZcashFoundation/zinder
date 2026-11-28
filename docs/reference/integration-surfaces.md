@@ -26,6 +26,73 @@ Zinder serves two wallet protocols on separate endpoints. A client speaks one of
 
 All four client ports (`9067`, `9068`, `9070`, `9102`) are published on host loopback by `deploy/docker-compose.yml` (`zinder-serve` listens on `[::]:9070` with `ZINDER_CIPHERSCAN__LISTEN_ADDR` and `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`; select `--preset explorer` / `ZINDER_PRESET=explorer` to start Explorer and Cipherscan compat alongside wallet serving). Your operator may publish different ports.
 
+#### Generate bindings from a pinned release
+
+Pin a Zinder tag whose `zinder-api-docs-<tag>.tar.gz` contains a root
+`buf.yaml`. Record the tag and your generator versions in your build. Download
+the archive and its signed checksum manifest in an empty directory. Replace
+`vX.Y.Z` with your chosen tag. These commands use GitHub CLI, Cosign, and
+`sha256sum`.
+
+```bash
+tag=vX.Y.Z
+archive="zinder-api-docs-${tag}.tar.gz"
+gh release download "$tag" --repo ZcashFoundation/zinder \
+  --pattern "$archive" \
+  --pattern SHA256SUMS \
+  --pattern SHA256SUMS.sigstore.json
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity "https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/${tag}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS &&
+  awk -v asset="$archive" '$2 == asset' SHA256SUMS | sha256sum --check --strict
+```
+
+After verification succeeds, extract the archive and run Buf from its root.
+The included generation template uses the `protoc` on your `PATH` to generate
+Python message bindings for all schemas. Zinder CI uses Buf 1.75.0 and
+protoc 36.2.
+
+```bash
+mkdir contract
+tar -xzf "$archive" -C contract
+cd contract
+buf build
+buf generate
+```
+
+For example, install `grpcio-tools` at your project's pinned version in a
+Python environment. Generate the `WalletQuery` client and its messages from
+the extracted archive.
+
+```bash
+mkdir -p gen/grpc-python
+python -m grpc_tools.protoc -I proto \
+  --python_out=gen/grpc-python --grpc_python_out=gen/grpc-python \
+  proto/zinder/v1/ops/server_info.proto proto/zinder/v1/wallet/wallet.proto
+```
+
+For other languages, pin the Protobuf and gRPC plugins in your own template
+and pass it to `buf generate --template`. Use `--path proto/zinder` to limit
+generation to native Zinder. With `protoc`, use `-I proto` for native Zinder,
+`-I proto/compat/lightwalletd` for lightwalletd, and
+`-I proto/external/zebra` for Zebra. Keep the vendored notices alongside any
+schemas you redistribute.
+
+The archive includes `zinder.contract.descriptor.bin` for all three schema
+families and `zinder.v1.descriptor.bin` for native-only tooling. For an upgrade,
+verify and extract the new tag into a separate directory. From the new
+directory, compare the full descriptors.
+
+```bash
+buf breaking zinder.contract.descriptor.bin \
+  --against ../old-contract/zinder.contract.descriptor.bin --config buf.yaml
+```
+
+Regenerate with your pinned tools, review the generated changes and release
+notes, and test against the server versions you support. Check `ServerInfo`
+capabilities before using newly added native behavior.
+
 ### Choose a network
 
 Each endpoint serves one Zcash network, and the two networks are separate chains with separate funds.
@@ -64,7 +131,9 @@ On the Foundation's Mainnet endpoints, wallets behind one public IPv4 address sh
 
 On `zinder-query`, a method whose capability is absent fails with `FAILED_PRECONDITION` and `ENDPOINT_CAPABILITY_UNAVAILABLE`. On `zinder-explorer`, a method whose backing store or `WalletQuery` endpoint is not configured fails with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED`. The `node` field describes the node that broadcasts transactions and can change while the server runs, so read it from a fresh `ServerInfo` instead of caching it.
 
-**Errors.** Most native failures carry a `google.rpc.ErrorInfo` with `domain = "zinder.dev"` and a stable reason string. Branch on the reason, not the message. Some rejections carry only a gRPC status code. Listener overload returns `UNAVAILABLE`; retry it with backoff. Malformed request fields, such as a missing block selector or an oversized repeated field, return `INVALID_ARGUMENT`. Handle a status without `ErrorInfo` by its code. [Error vocabulary](error-vocabulary.md) gives each reason's status code and retry rule.
+**Message compression.** Native gRPC clients of `CompactTxStreamer`, `WalletQuery`, and `ExplorerQuery` can send `gzip` or `zstd` requests and advertise supported response encodings in `grpc-accept-encoding`. With an omitted header or only `identity`, responses are uncompressed. Each compressed request must fit the [request message limits](configuration.md#public-grpc-listeners).
+
+**Errors.** Most native failures carry a `google.rpc.ErrorInfo` with `domain = "zinder.dev"` and a stable reason string. Branch on the reason, not the message. Some rejections carry only a gRPC status code. Listener overload returns `UNAVAILABLE` with [retry pushback metadata](error-vocabulary.md#retry-pushback). Malformed request fields, such as a missing block selector or an oversized repeated field, return `INVALID_ARGUMENT`. Handle a status without `ErrorInfo` by its code. [Error vocabulary](error-vocabulary.md) gives each reason's status code and retry rule.
 
 **Consistent reads.** Native responses carry the chain epoch they read. Pin related reads to one epoch with `at_epoch_id`, and restart the workflow when a pin fails with `CHAIN_EPOCH_PIN_UNAVAILABLE`. [Wallet data plane](../architecture/wallet-data-plane.md) explains the rules.
 
@@ -101,6 +170,10 @@ Use binary or text gRPC-Web for unary RPCs. For server streams such as
 WalletQuery's `CompactBlocksInRange` and `ChainEvents` or ExplorerQuery's
 `RecentTransactions`, choose an encoding your client supports for streaming.
 Read through the terminal gRPC status before treating a stream as complete.
+
+If your gRPC-Web client supports message compression, it can advertise
+`gzip` or `zstd` in `grpc-accept-encoding`. Read the exposed
+`grpc-encoding` response header to identify the selected codec.
 
 On settled `ChainEvents` streams, browsers can read the
 `zinder-chain-event-family` response header. If ExplorerQuery requires a

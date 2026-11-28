@@ -902,21 +902,32 @@ pub fn not_ready_status(cause: &ReadinessCause) -> Status {
             || format!("its {configured}-block reorg window"),
             |covered| format!("the {covered} blocks its {configured}-block reorg window covered"),
         );
-        return status_with_reason_and_metadata(
+        return crate::RetryPushback::DoNotRetry.apply(status_with_reason_and_metadata(
             ErrorReason::ReorgWindowExceeded,
             format!(
                 "the canonical writer is parked: a {depth}-block replacement exceeds {coverage}, and an operator must reconcile the canonical store"
             ),
             ErrorDetails::new(),
             metadata,
-        );
+        ));
     }
-    status_with_reason_and_metadata(
+    let pushback = if matches!(
+        cause,
+        ReadinessCause::SchemaMismatch
+            | ReadinessCause::CanonicalStoreDamaged { .. }
+            | ReadinessCause::NodeCapabilityMissing { .. }
+            | ReadinessCause::WalletTransitionLimitExceeded { .. }
+    ) {
+        crate::RetryPushback::DoNotRetry
+    } else {
+        crate::RetryPushback::Backoff
+    };
+    pushback.apply(status_with_reason_and_metadata(
         ErrorReason::ServiceNotReady,
         format!("service is not ready to accept new traffic: {readiness_cause}"),
         ErrorDetails::new(),
         metadata,
-    )
+    ))
 }
 
 /// Mutable readiness state owned by the service's runtime task.
@@ -1529,6 +1540,10 @@ mod tests {
             .err()
             .ok_or("schema mismatch readiness must reject new traffic")?;
         assert_eq!(blocked.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            blocked.metadata().get("grpc-retry-pushback-ms"),
+            Some(&tonic::metadata::MetadataValue::from_static("-1"))
+        );
 
         readiness.set(ReadinessState::reorg_window_exceeded(
             1_001,
@@ -1885,7 +1900,17 @@ mod tests {
 
         let refusal = not_ready_status(&report.cause);
         assert_eq!(refusal.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            refusal.metadata().get("grpc-retry-pushback-ms"),
+            Some(&tonic::metadata::MetadataValue::from_static("-1"))
+        );
         let refusal_details = refusal.get_error_details();
+        assert_eq!(
+            refusal_details
+                .error_info()
+                .map(|error_info| error_info.reason.as_str()),
+            Some(ErrorReason::ServiceNotReady.as_str_name())
+        );
         assert_eq!(
             refusal_details
                 .error_info()

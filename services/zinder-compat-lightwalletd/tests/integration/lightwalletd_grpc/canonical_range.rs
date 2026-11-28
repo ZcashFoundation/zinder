@@ -8,12 +8,15 @@ use super::{
     block_range_request, damage_compact_block_row, drain_slowly, fixture_block,
 };
 use eyre::eyre;
+use http_body_util::BodyExt as _;
 use prost::Message;
 use std::{num::NonZeroU32, path::Path, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{
     Code,
+    body::Body,
+    codegen::{Bytes, Service as _, http},
     transport::{Channel, Server, server::Router},
 };
 use zinder_compat_lightwalletd::{
@@ -781,6 +784,71 @@ fn dense_history() -> eyre::Result<ChainFixture> {
             .with_compact_block_artifact(compact);
     }
     Ok(chain)
+}
+
+#[tokio::test]
+async fn dense_canonical_range_negotiates_compression_and_preserves_the_identity_body()
+-> eyre::Result<()> {
+    let chain = dense_history()?;
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(20)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let reader = ReaderFixture::new(writer.into_serving_store_fixture()?)?;
+    let mut server = LightwalletdGrpcAdapter::new(reader.query).into_server();
+
+    let message = block_range_request(2, 4).encode_to_vec();
+    let mut frame = vec![0];
+    frame.extend_from_slice(&u32::try_from(message.len())?.to_be_bytes());
+    frame.extend(message);
+    let frame = Bytes::from(frame);
+    let mut identity_bytes: Option<Bytes> = None;
+    for accepted in [None, Some("identity"), Some("gzip"), Some("zstd")] {
+        let mut request =
+            http::Request::post("/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange")
+                .header("content-type", "application/grpc");
+        if let Some(encoding) = accepted {
+            request = request.header("grpc-accept-encoding", encoding);
+        }
+        let response = server
+            .call(request.body(Body::new(http_body_util::Full::new(frame.clone())))?)
+            .await?;
+        let compressed = matches!(accepted, Some("gzip" | "zstd"));
+        assert_eq!(
+            response
+                .headers()
+                .get("grpc-encoding")
+                .map(http::HeaderValue::to_str)
+                .transpose()?,
+            accepted.filter(|_| compressed),
+        );
+        assert_eq!(
+            response
+                .extensions()
+                .get::<lightwalletd::BoundedChunkRetention>()
+                .is_some(),
+            !compressed,
+        );
+        let body = response.into_body().collect().await?;
+        assert_eq!(
+            body.trailers()
+                .and_then(|trailers| trailers.get("grpc-status")),
+            Some(&http::HeaderValue::from_static("0"))
+        );
+        let bytes = body.to_bytes();
+        assert_eq!(bytes.first().copied(), Some(u8::from(compressed)));
+        if let Some(identity) = &identity_bytes {
+            if compressed {
+                assert!(bytes.len() < identity.len() / 2);
+            } else {
+                assert_eq!(&bytes, identity);
+            }
+        } else {
+            assert!(bytes.len() > 128 * 1024);
+            identity_bytes = Some(bytes);
+        }
+    }
+    Ok(())
 }
 
 async fn paced_clients(
