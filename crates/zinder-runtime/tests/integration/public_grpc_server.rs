@@ -213,6 +213,18 @@ fn list_services() -> ServerReflectionRequest {
 async fn requests_past_the_receive_slots_are_refused_until_one_returns() -> Result<()> {
     let server = serve(1, Duration::from_secs(30)).await?;
     let stalled = hold_the_request_slot(&server).await?;
+    let refusal = check(&server.channel)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("request exceeded receive slots without refusal"))?;
+    assert_eq!(refusal.code(), Code::Unavailable);
+    let delay = refusal
+        .metadata()
+        .get("grpc-retry-pushback-ms")
+        .ok_or_else(|| eyre!("missing retry pushback"))?
+        .to_str()?
+        .parse::<i32>()?;
+    assert!((500..=1500).contains(&delay));
 
     stalled.abort();
     let channel = server.channel.clone();

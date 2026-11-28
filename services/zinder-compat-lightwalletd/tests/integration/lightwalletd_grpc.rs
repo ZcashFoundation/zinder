@@ -2467,10 +2467,17 @@ async fn a_disconnected_client_returns_its_block_range_stream_slot() -> eyre::Re
     let refused = other_wallet
         .get_block_range(block_range_request(1, 10))
         .await;
-    assert_eq!(
-        refused.err().map(|status| status.code()),
-        Some(Code::Unavailable)
-    );
+    let refusal = refused
+        .err()
+        .ok_or_else(|| eyre!("block range admission did not refuse"))?;
+    assert_eq!(refusal.code(), Code::Unavailable);
+    let delay = refusal
+        .metadata()
+        .get("grpc-retry-pushback-ms")
+        .ok_or_else(|| eyre!("missing retry pushback"))?
+        .to_str()?
+        .parse::<i32>()?;
+    assert!((500..=1500).contains(&delay));
 
     drop(wide);
     drop(syncing_wallet);
@@ -2642,6 +2649,88 @@ where
             .await
     });
     Ok((format!("http://{server_addr}"), shutdown_tx, server_handle))
+}
+
+#[tokio::test]
+async fn compressed_wallet_requests_preserve_the_decode_and_repeated_field_limits()
+-> eyre::Result<()> {
+    use tonic::codec::CompressionEncoding;
+
+    let store_fixture = acceptance_store_fixture()?;
+    let (endpoint, shutdown, task) =
+        spawn_compat_server(acceptance_adapter(&store_fixture)).await?;
+    let client = CompactTxStreamerClient::connect(endpoint).await?;
+    let mut identity = client.clone();
+    let requested_block = lightwalletd::BlockId {
+        height: 1,
+        hash: Vec::new(),
+    };
+    let expected = identity
+        .get_block(requested_block.clone())
+        .await?
+        .into_inner();
+    let expected_blocks = collect_grpc_stream(
+        identity
+            .get_block_range(block_range_request(1, 1))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    for encoding in [CompressionEncoding::Gzip, CompressionEncoding::Zstd] {
+        let mut compressed = client
+            .clone()
+            .send_compressed(encoding)
+            .accept_compressed(encoding);
+        let block = compressed.get_block(requested_block.clone()).await?;
+        assert_eq!(
+            block
+                .metadata()
+                .get("grpc-encoding")
+                .and_then(|header| header.to_str().ok()),
+            Some(encoding.to_string().as_str())
+        );
+        assert_eq!(block.into_inner(), expected);
+        let blocks = compressed
+            .get_block_range(block_range_request(1, 1))
+            .await?;
+        assert_eq!(
+            collect_grpc_stream(blocks.into_inner()).await?,
+            expected_blocks
+        );
+
+        let refusal = compressed
+            .send_transaction(lightwalletd::RawTransaction {
+                data: vec![0; zinder_runtime::MAX_DECODING_MESSAGE_BYTES + 1],
+                height: 0,
+            })
+            .await
+            .err()
+            .ok_or_else(|| eyre!("oversized compressed transaction was accepted"))?;
+        assert_eq!(refusal.code(), Code::ResourceExhausted);
+        assert!(refusal.message().contains("size limit"), "{refusal}");
+
+        let refusal = compressed
+            .get_taddress_balance(lightwalletd::AddressList {
+                addresses: vec![String::new(); 1024],
+            })
+            .await
+            .err()
+            .ok_or_else(|| eyre!("oversized repeated field was accepted"))?;
+        assert_eq!(refusal.code(), Code::InvalidArgument);
+        assert!(
+            refusal
+                .message()
+                .contains("request field addresses carries"),
+            "{refusal}"
+        );
+    }
+    drop(identity);
+    drop(client);
+    shutdown
+        .send(())
+        .map_err(|()| eyre!("compat server stopped"))?;
+    task.await??;
+    Ok(())
 }
 
 async fn collect_grpc_stream(

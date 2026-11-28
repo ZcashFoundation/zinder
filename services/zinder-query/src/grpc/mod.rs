@@ -11,6 +11,8 @@ use tonic::Status;
 use tonic_types::{ErrorDetails, FieldViolation, PreconditionViolation};
 use zinder_proto::wire::canonical_history_unavailable_status;
 use zinder_proto::{BoundaryError, status_with_reason};
+use zinder_runtime::RetryPushback;
+use zinder_source::SourceError;
 use zinder_store::status_from_store_error;
 
 use crate::QueryError;
@@ -57,11 +59,23 @@ pub fn status_from_query_error(error: &QueryError) -> Status {
             precondition_failure_details(error),
         );
     }
-    status_with_reason(
+    let status = status_with_reason(
         error.error_reason(),
         error.to_string(),
         typed_detail_for(error),
-    )
+    );
+    if matches!(
+        error,
+        QueryError::BroadcastBudgetExhausted { .. }
+            | QueryError::CompactBlockStreamLimitReached { .. }
+            | QueryError::ForwardedReadLimitReached { .. }
+            | QueryError::Node(SourceError::NodeRateLimited { .. })
+            | QueryError::TreeStateReplayLimitReached { .. }
+    ) {
+        RetryPushback::Backoff.apply(status)
+    } else {
+        status
+    }
 }
 
 #[allow(

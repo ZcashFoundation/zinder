@@ -24,6 +24,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_core::BlockHeight;
+use zinder_runtime::RetryPushback;
 
 use crate::block_methods::CompactBlockReads;
 
@@ -55,9 +56,10 @@ const WAITERS_GAUGE: &str = "zinder_compat_tip_waiters";
 pub(crate) enum TipWaitProgress {
     /// The visible tip is now at or above the requested height.
     Reached,
-    /// The wait was disabled, skipped, expired, cancelled, full, or left the
-    /// window.
+    /// The wait was disabled, skipped, expired, cancelled, or left the window.
     NotReached,
+    /// Every tip-wait place was already taken.
+    WaitersFull,
 }
 
 /// How long, and how far past the visible tip, a height-selected block read
@@ -69,7 +71,7 @@ pub(crate) enum TipWaitProgress {
 /// publication moves the tip down out of the window, when the wait expires,
 /// at shutdown, or when its client leaves. Then the method answers as it
 /// would have without the wait, against the tip current at that moment.
-///
+/// A read that finds every waiter place taken is refused with `UNAVAILABLE`.
 /// Clones share one set of waiter places.
 #[derive(Clone, Debug)]
 pub struct TipWait {
@@ -150,9 +152,15 @@ impl TipWait {
         method: &'static str,
         requested: BlockHeight,
     ) -> Result<(), Status> {
-        self.await_height_until(reads, method, requested, None)
-            .await
-            .map(|_| ())
+        match self
+            .await_height_until(reads, method, requested, None)
+            .await?
+        {
+            TipWaitProgress::Reached | TipWaitProgress::NotReached => Ok(()),
+            TipWaitProgress::WaitersFull => Err(RetryPushback::Backoff.apply(Status::unavailable(
+                "too many requests waiting for the served tip",
+            ))),
+        }
     }
 
     /// Waits until `reads` publishes a visible tip at or above `requested`,
@@ -201,7 +209,7 @@ impl TipWait {
         };
         let Ok(place) = Arc::clone(&self.waiters).try_acquire_owned() else {
             record_waiters_full(method, blocks_ahead);
-            return Ok(TipWaitProgress::NotReached);
+            return Ok(TipWaitProgress::WaitersFull);
         };
         let waiter = Waiter::start(place, method, blocks_ahead);
         let outcome = self

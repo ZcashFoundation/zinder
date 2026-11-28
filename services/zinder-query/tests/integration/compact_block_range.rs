@@ -703,6 +703,258 @@ fn fixture_block_identities(chain: &ChainFixture) -> Vec<(BlockHeight, BlockHash
         .collect()
 }
 
+fn dense_compact_block_chain() -> eyre::Result<ChainFixture> {
+    use zinder_core::{
+        CompactSaplingSpend, CompactTransaction, CompactTransactionData, TransactionId,
+    };
+
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::None)
+        .extend_blocks(2);
+    let height = BlockHeight::new(2);
+    let block = chain
+        .block_at(height)
+        .ok_or_else(|| eyre!("missing dense block"))?;
+    let txid = TransactionId::from_bytes([2; 32]);
+    let mut rows = zinder_testkit::FixtureTransactionRows::from_raw_transaction(
+        txid,
+        height,
+        block.hash,
+        0,
+        [2],
+    );
+    rows.facts.public_facts.counts.sapling_spend_count = 2048;
+    let compact = CompactBlockArtifact::new(
+        BlockId::new(height, block.hash),
+        block.parent_hash,
+        block.block_time_seconds,
+        vec![CompactTransaction {
+            index: 0,
+            transaction_id: txid,
+            data: CompactTransactionData {
+                sapling_spends: vec![CompactSaplingSpend { nullifier: [2; 32] }; 2048],
+                ..Default::default()
+            },
+        }],
+        CompactChainMetadata {
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        },
+    )?;
+    Ok(chain
+        .with_transaction_rows(rows)
+        .with_compact_block_artifact(compact))
+}
+
+#[tokio::test]
+async fn native_dense_range_compression_reduces_wire_bytes() -> eyre::Result<()> {
+    use http_body_util::{BodyExt as _, Full};
+    use tonic::{
+        body::Body,
+        codegen::{Bytes, Service as _, http},
+    };
+
+    let (query, _store, _ingest) =
+        crate::common::native_serving_query_over(&dense_compact_block_chain()?).await?;
+    let mut server = zinder_query::WalletQueryGrpcAdapter::new(
+        query,
+        zinder_query::WalletEndpointMetadata::default(),
+    )
+    .into_server();
+    let message = wallet::CompactBlocksInRangeRequest {
+        start_height: 2,
+        end_height: 2,
+        at_epoch_id: None,
+        pool_types: Vec::new(),
+    }
+    .encode_to_vec();
+    let mut frame = vec![0];
+    frame.extend_from_slice(&u32::try_from(message.len())?.to_be_bytes());
+    frame.extend(message);
+    let frame = Bytes::from(frame);
+    let mut identity_bytes = None;
+    for accepted in [None, Some("identity"), Some("gzip"), Some("zstd")] {
+        let mut request = http::Request::post("/zinder.v1.wallet.WalletQuery/CompactBlocksInRange")
+            .header("content-type", "application/grpc");
+        if let Some(encoding) = accepted {
+            request = request.header("grpc-accept-encoding", encoding);
+        }
+        let response = server
+            .call(request.body(Body::new(Full::new(frame.clone())))?)
+            .await?;
+        let compressed = matches!(accepted, Some("gzip" | "zstd"));
+        assert_eq!(
+            response
+                .headers()
+                .get("grpc-encoding")
+                .map(http::HeaderValue::to_str)
+                .transpose()?,
+            accepted.filter(|_| compressed),
+        );
+        let body = response.into_body().collect().await?;
+        assert_eq!(
+            body.trailers()
+                .and_then(|trailers| trailers.get("grpc-status")),
+            Some(&http::HeaderValue::from_static("0")),
+        );
+        let bytes = body.to_bytes();
+        assert_eq!(bytes.first().copied(), Some(u8::from(compressed)));
+        if let Some(identity) = identity_bytes {
+            if compressed {
+                assert!(bytes.len() < identity / 2);
+            } else {
+                assert_eq!(bytes.len(), identity);
+            }
+        } else {
+            assert!(bytes.len() > 64 * 1024);
+            identity_bytes = Some(bytes.len());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_wallet_clients_round_trip_compressed_calls_with_bounded_decoding()
+-> eyre::Result<()> {
+    use futures_util::TryStreamExt as _;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Code, codec::CompressionEncoding, transport::Server};
+    use wallet::wallet_query_client::WalletQueryClient;
+
+    let (query, _store, _ingest) =
+        crate::common::native_serving_query_over(&dense_compact_block_chain()?).await?;
+    let server = zinder_query::WalletQueryGrpcAdapter::new(
+        query,
+        zinder_query::WalletEndpointMetadata::default(),
+    )
+    .into_server();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(
+        Server::builder()
+            .add_service(server)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                shutdown.clone().cancelled_owned(),
+            ),
+    );
+    let mut identity = WalletQueryClient::connect(format!("http://{address}")).await?;
+    let block_request = wallet::CompactBlockRequest {
+        height: 2,
+        at_epoch_id: None,
+    };
+    let range_request = wallet::CompactBlocksInRangeRequest {
+        start_height: 2,
+        end_height: 1,
+        at_epoch_id: None,
+        pool_types: vec![wallet::CompactPool::Sapling.into()],
+    };
+    let expected_block = identity.compact_block(block_request).await?.into_inner();
+    let expected_range = identity
+        .compact_blocks_in_range(range_request.clone())
+        .await?
+        .into_inner()
+        .try_collect::<Vec<_>>()
+        .await?;
+    assert_eq!(compact_range_heights(&expected_range), [2, 1]);
+    for encoding in [CompressionEncoding::Gzip, CompressionEncoding::Zstd] {
+        let mut client = identity
+            .clone()
+            .accept_compressed(encoding)
+            .send_compressed(encoding);
+        let block = client.compact_block(block_request).await?;
+        assert_eq!(
+            block
+                .metadata()
+                .get("grpc-encoding")
+                .and_then(|header| header.to_str().ok()),
+            Some(encoding.to_string().as_str())
+        );
+        assert_eq!(block.into_inner(), expected_block);
+        let range = client
+            .compact_blocks_in_range(range_request.clone())
+            .await?
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(range, expected_range);
+        let refusal = client
+            .broadcast_transaction(wallet::BroadcastTransactionRequest {
+                raw_transaction: vec![0; zinder_runtime::MAX_DECODING_MESSAGE_BYTES + 1],
+            })
+            .await
+            .err()
+            .ok_or_else(|| eyre!("oversized compressed transaction was accepted"))?;
+        assert_eq!(refusal.code(), Code::ResourceExhausted);
+        assert!(refusal.message().contains("size limit"), "{refusal}");
+    }
+    assert_nullifier_range_compression(&mut identity).await?;
+    drop(identity);
+    shutdown.cancel();
+    task.await??;
+    Ok(())
+}
+
+fn compact_range_heights(chunks: &[wallet::CompactBlocksInRangeChunk]) -> Vec<u32> {
+    use wallet::compact_blocks_in_range_chunk::Body;
+
+    chunks
+        .iter()
+        .filter_map(|chunk| match chunk.body.as_ref()? {
+            Body::Header(_) => None,
+            Body::Item(block) => Some(block.height),
+        })
+        .collect()
+}
+
+async fn assert_nullifier_range_compression(
+    identity: &mut wallet::wallet_query_client::WalletQueryClient<tonic::transport::Channel>,
+) -> eyre::Result<()> {
+    use futures_util::TryStreamExt as _;
+    use tonic::codec::CompressionEncoding;
+    use wallet::compact_nullifiers_in_range_chunk::Body;
+
+    let request = wallet::CompactNullifiersInRangeRequest {
+        start_height: 2,
+        end_height: 1,
+        at_epoch_id: None,
+        pool_types: vec![wallet::CompactPool::Sapling.into()],
+    };
+    let expected_range = identity
+        .compact_nullifiers_in_range(request.clone())
+        .await?
+        .into_inner()
+        .try_collect::<Vec<_>>()
+        .await?;
+    let blocks = expected_range
+        .iter()
+        .filter_map(|chunk| match chunk.body.as_ref()? {
+            Body::Header(_) => None,
+            Body::Block(block) => Some(block),
+        });
+    assert_eq!(blocks.map(|block| block.height).collect::<Vec<_>>(), [2, 1]);
+    for encoding in [CompressionEncoding::Gzip, CompressionEncoding::Zstd] {
+        let response = identity
+            .clone()
+            .send_compressed(encoding)
+            .accept_compressed(encoding)
+            .compact_nullifiers_in_range(request.clone())
+            .await?;
+        assert_eq!(
+            response
+                .metadata()
+                .get("grpc-encoding")
+                .and_then(|header| header.to_str().ok()),
+            Some(encoding.to_string().as_str()),
+        );
+        let range = response.into_inner().try_collect::<Vec<_>>().await?;
+        assert_eq!(range, expected_range);
+    }
+    Ok(())
+}
+
 /// An adapter refuses a `CompactBlocksInRange` stream past its limit.
 ///
 /// The refusal is `RESOURCE_EXHAUSTED` with the typed
@@ -746,6 +998,13 @@ async fn native_compact_block_streams_are_refused_past_the_stream_limit() -> eyr
         .err()
         .ok_or_else(|| eyre::eyre!("the second stream was not refused"))?;
     assert_eq!(refusal.code(), tonic::Code::ResourceExhausted);
+    let delay = refusal
+        .metadata()
+        .get("grpc-retry-pushback-ms")
+        .ok_or_else(|| eyre!("missing retry pushback"))?
+        .to_str()?
+        .parse::<i32>()?;
+    assert!((500..=1500).contains(&delay));
     let error_info = tonic_types::StatusExt::get_details_error_info(&refusal)
         .ok_or_else(|| eyre::eyre!("the refusal carries no google.rpc.ErrorInfo"))?;
     assert_eq!(error_info.domain, "zinder.dev");

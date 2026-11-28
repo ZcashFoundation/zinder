@@ -32,7 +32,7 @@ use zinder_proto::{
 };
 use zinder_runtime::{
     BearerToken, BearerTokenServerInterceptor, ComposedReadiness, IngestPhase, ReadinessCause,
-    ReadinessInput, ReadinessReport, UpstreamNotReadyDetail,
+    ReadinessInput, ReadinessReport, RetryPushback, UpstreamNotReadyDetail,
 };
 use zinder_source::{NodeCapability, NodeSource, SourceError};
 use zinder_store::{
@@ -621,10 +621,10 @@ fn chain_value_pools_response(
 fn status_from_source_error(error: &SourceError) -> Status {
     match error {
         SourceError::NodeUnavailable { reason } => Status::unavailable(reason.clone()),
-        SourceError::NodeRateLimited { .. } => zinder_proto::status_for_reason(
-            zinder_proto::v1::ops::ErrorReason::NodeRateLimited,
+        SourceError::NodeRateLimited { .. } => RetryPushback::Backoff.apply(status_for_reason(
+            ops::ErrorReason::NodeRateLimited,
             error.to_string(),
-        ),
+        )),
         SourceError::NodeCapabilityMissing { capability } => {
             Status::failed_precondition(format!("upstream node is missing {capability}"))
         }
@@ -1313,8 +1313,7 @@ mod tests {
     }
 
     /// A node that refuses the value-pool read with HTTP 429 reaches the
-    /// client as retryable `UNAVAILABLE` with `NODE_RATE_LIMITED`, not as
-    /// `INTERNAL`.
+    /// client as `UNAVAILABLE` with `NODE_RATE_LIMITED` and retry pushback.
     #[tokio::test(flavor = "multi_thread")]
     async fn rate_limited_value_pool_read_is_unavailable_with_its_reason()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1349,6 +1348,13 @@ mod tests {
                 .map(|error_info| error_info.reason),
             Some("NODE_RATE_LIMITED".to_owned())
         );
+        let delay_ms = status
+            .metadata()
+            .get("grpc-retry-pushback-ms")
+            .ok_or("missing retry pushback")?
+            .to_str()?
+            .parse::<i32>()?;
+        assert!((500..=1500).contains(&delay_ms));
         fixture.shutdown().await
     }
 

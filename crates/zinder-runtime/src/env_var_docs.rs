@@ -1525,7 +1525,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Most lightwalletd reads that may wait for the tip at once. A read that finds every waiting place taken runs or refuses at once without waiting. Applies to every serving mode. Must be at least 1. Defaults to 256.",
+        description: "Most lightwalletd reads that may wait for the tip at once. A read that finds every waiting place taken is refused at once with `UNAVAILABLE`. Applies to every serving mode. Must be at least 1. Defaults to 256.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__PING_VERY_INSECURE",

@@ -53,6 +53,7 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
 };
 use zinder_query::DEFAULT_MAX_COMPACT_BLOCK_RANGE;
+use zinder_runtime::RetryPushback;
 use zinder_store::HeightOrder;
 
 /// Stored compact-block bytes one block-range chunk keeps at most.
@@ -436,11 +437,11 @@ impl BlockRangeStreamLimit {
     /// `UNAVAILABLE`, which wallets retry, rather than `RESOURCE_EXHAUSTED`,
     /// as lightwalletd returns for its own block-range limit.
     fn refusal(&self) -> Status {
-        Status::unavailable(format!(
+        RetryPushback::Backoff.apply(Status::unavailable(format!(
             "this server already serves its limit of {} concurrent block-range streams; retry \
              shortly",
             self.max_streams
-        ))
+        )))
     }
 }
 

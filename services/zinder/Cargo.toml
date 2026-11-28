@@ -48,6 +48,7 @@ path = "src/main.rs"
 [dev-dependencies]
 base64.workspace = true
 eyre.workspace = true
+flate2.workspace = true
 prost.workspace = true
 reqwest = { workspace = true, features = ["http2"] }
 tempfile.workspace = true

@@ -327,8 +327,8 @@ impl Encoder for EncodedBlockCodec {
 
 /// Handles one `GetBlockRange` call for the generated server.
 ///
-/// tonic decodes the request and builds the response head. Unless the server
-/// may compress responses, the messages are then sent by [`EncodedBlockBody`]
+/// tonic decodes the request and builds the response head. Unless the client
+/// negotiates compression, the messages are then sent by [`EncodedBlockBody`]
 /// instead of tonic's encoder, which would copy each one into its buffer.
 pub(crate) async fn server_streaming<B>(
     grpc: &mut Grpc<EncodedBlockCodec>,
@@ -341,7 +341,7 @@ where
     B: http_body::Body + Send + 'static,
     B::Error: Into<StdError> + Send,
 {
-    if !send_compression.is_empty() {
+    if negotiates_compression(request.headers(), send_compression) {
         return grpc.server_streaming(service, request).await;
     }
     let mut taken = None;
@@ -370,7 +370,7 @@ where
     B: http_body::Body + Send + 'static,
     B::Error: Into<StdError> + Send,
 {
-    if !send_compression.is_empty() {
+    if negotiates_compression(request.headers(), send_compression) {
         return grpc.server_streaming(service, request).await;
     }
     let mut taken = None;
@@ -384,6 +384,29 @@ where
         )
         .await;
     finish_encoded_body(response, taken, max_message_size)
+}
+
+// Keep the fast-path check aligned with tonic's grpc-accept-encoding parser.
+fn negotiates_compression(
+    headers: &http::HeaderMap,
+    mut enabled: EnabledCompressionEncodings,
+) -> bool {
+    let Some(accepts) = headers
+        .get("grpc-accept-encoding")
+        .and_then(|header| header.to_str().ok())
+    else {
+        return false;
+    };
+    while let Some(encoding) = enabled.pop() {
+        let encoding = encoding.to_string();
+        if accepts
+            .split(',')
+            .any(|accepted| accepted.trim() == encoding)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Marks a response that keeps bounded allocations behind its data chunks and

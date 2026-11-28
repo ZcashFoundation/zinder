@@ -64,7 +64,9 @@ On the Foundation's Mainnet endpoints, wallets behind one public IPv4 address sh
 
 On `zinder-query`, a method whose capability is absent fails with `FAILED_PRECONDITION` and `ENDPOINT_CAPABILITY_UNAVAILABLE`. On `zinder-explorer`, a method whose backing store or `WalletQuery` endpoint is not configured fails with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED`. The `node` field describes the node that broadcasts transactions and can change while the server runs, so read it from a fresh `ServerInfo` instead of caching it.
 
-**Errors.** Most native failures carry a `google.rpc.ErrorInfo` with `domain = "zinder.dev"` and a stable reason string. Branch on the reason, not the message. Some rejections carry only a gRPC status code. Listener overload returns `UNAVAILABLE`; retry it with backoff. Malformed request fields, such as a missing block selector or an oversized repeated field, return `INVALID_ARGUMENT`. Handle a status without `ErrorInfo` by its code. [Error vocabulary](error-vocabulary.md) gives each reason's status code and retry rule.
+**Message compression.** Native gRPC clients of `CompactTxStreamer`, `WalletQuery`, and `ExplorerQuery` can send `gzip` or `zstd` requests and advertise supported response encodings in `grpc-accept-encoding`. With an omitted header or only `identity`, responses are uncompressed. Each compressed request must fit the [request message limits](configuration.md#public-grpc-listeners).
+
+**Errors.** Most native failures carry a `google.rpc.ErrorInfo` with `domain = "zinder.dev"` and a stable reason string. Branch on the reason, not the message. Some rejections carry only a gRPC status code. Listener overload returns `UNAVAILABLE` with [retry pushback metadata](error-vocabulary.md#retry-pushback). Malformed request fields, such as a missing block selector or an oversized repeated field, return `INVALID_ARGUMENT`. Handle a status without `ErrorInfo` by its code. [Error vocabulary](error-vocabulary.md) gives each reason's status code and retry rule.
 
 **Consistent reads.** Native responses carry the chain epoch they read. Pin related reads to one epoch with `at_epoch_id`, and restart the workflow when a pin fails with `CHAIN_EPOCH_PIN_UNAVAILABLE`. [Wallet data plane](../architecture/wallet-data-plane.md) explains the rules.
 
@@ -101,6 +103,10 @@ Use binary or text gRPC-Web for unary RPCs. For server streams such as
 WalletQuery's `CompactBlocksInRange` and `ChainEvents` or ExplorerQuery's
 `RecentTransactions`, choose an encoding your client supports for streaming.
 Read through the terminal gRPC status before treating a stream as complete.
+
+If your gRPC-Web client supports message compression, it can advertise
+`gzip` or `zstd` in `grpc-accept-encoding`. Read the exposed
+`grpc-encoding` response header to identify the selected codec.
 
 On settled `ChainEvents` streams, browsers can read the
 `zinder-chain-event-family` response header. If ExplorerQuery requires a

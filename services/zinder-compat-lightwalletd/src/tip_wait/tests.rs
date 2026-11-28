@@ -372,14 +372,24 @@ async fn a_tip_regression_out_of_the_window_ends_the_wait_at_once() -> Result<()
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_full_waiter_cap_lets_the_next_request_return_at_once() -> Result<()> {
+async fn a_full_waiter_cap_refuses_the_next_request_at_once() -> Result<()> {
     let reads = FakeReads::at_tip(9);
     let wait = tip_wait(2, 1)?;
     let parked = spawn_wait(&wait, &reads, 10);
     settle().await;
 
-    let elapsed = spawn_wait(&wait, &reads, 10).await??;
-    assert_eq!(elapsed, Duration::ZERO);
+    let refused = spawn_wait(&wait, &reads, 10)
+        .await?
+        .err()
+        .ok_or_else(|| eyre!("a full waiter cap should refuse the request"))?;
+    assert_eq!(refused.code(), tonic::Code::Unavailable);
+    let delay = refused
+        .metadata()
+        .get("grpc-retry-pushback-ms")
+        .ok_or_else(|| eyre!("missing retry pushback"))?
+        .to_str()?
+        .parse::<i32>()?;
+    assert!((500..=1500).contains(&delay));
     assert!(!parked.is_finished(), "the first waiter keeps its place");
 
     reads.publish_tip(10);
@@ -547,7 +557,7 @@ async fn waits_record_outcome_duration_and_waiter_metrics() -> Result<()> {
         "one parked waiter: {gauge_while_waiting}"
     );
     // waiters_full, while the single place is taken
-    spawn_wait(&wait, &reads, 10).await??;
+    assert!(spawn_wait(&wait, &reads, 10).await?.is_err());
     reads.publish_tip(10);
     served.await??;
 

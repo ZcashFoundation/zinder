@@ -4,7 +4,7 @@ use std::{num::NonZeroU32, pin::Pin, time::Instant};
 
 use tokio_stream::{self as stream, Stream, StreamExt as _, wrappers::ReceiverStream};
 use tokio_util::sync::CancellationToken;
-use tonic::{Code, Request, Response, Status};
+use tonic::{Code, Request, Response, Status, codec::CompressionEncoding};
 use tonic_types::ErrorDetails;
 use zinder_core::wire::{
     decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex, decode_zinder_native_chain_name,
@@ -253,9 +253,14 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
     {
         RepeatedFieldGuard::new(
             wallet_query_server::WalletQueryServer::new(self)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .send_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Zstd)
                 .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES),
             super::WALLET_QUERY_FIELD_LIMITS,
         )
+        .with_request_compression()
     }
 
     fn decode_address_batch(

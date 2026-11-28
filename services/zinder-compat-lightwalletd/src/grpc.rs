@@ -18,7 +18,7 @@ use prost::Message as _;
 use thiserror::Error;
 use tokio_stream as stream;
 use tokio_stream::StreamExt as _;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, codec::CompressionEncoding};
 use tonic_types::{ErrorDetails, StatusExt as _};
 use zinder_core::wire::WireDecodeError;
 use zinder_core::{
@@ -43,7 +43,7 @@ use zinder_query::{
     TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
     address_lookup_to_script_hash, status_from_query_error,
 };
-use zinder_runtime::RepeatedFieldGuard;
+use zinder_runtime::{RepeatedFieldGuard, RetryPushback};
 use zinder_source::{NodeCapability, SourceError};
 use zinder_source::{parse_transparent_address, transparent_address_matches_network};
 use zinder_store::{
@@ -317,9 +317,14 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     {
         RepeatedFieldGuard::new(
             compact_tx_streamer_server::CompactTxStreamerServer::new(self)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .send_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Zstd)
                 .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES),
             COMPACT_TX_STREAMER_FIELD_LIMITS,
         )
+        .with_request_compression()
     }
 }
 
@@ -2302,7 +2307,8 @@ fn standard_fee_response(
 /// reason.
 fn tree_state_status(error: &QueryError) -> Status {
     if matches!(error, QueryError::TreeStateReplayLimitReached { .. }) {
-        return Status::unavailable(format!("{error}; retry shortly"));
+        return RetryPushback::Backoff
+            .apply(Status::unavailable(format!("{error}; retry shortly")));
     }
     status_from_query_error(error)
 }
@@ -2315,7 +2321,7 @@ fn tree_state_status(error: &QueryError) -> Status {
 /// `RESOURCE_EXHAUSTED` with its typed reason.
 fn forwarded_read_status(error: &QueryError) -> Status {
     if matches!(error, QueryError::ForwardedReadLimitReached { .. }) {
-        return Status::unavailable(error.to_string());
+        return RetryPushback::Backoff.apply(Status::unavailable(error.to_string()));
     }
     status_from_query_error(error)
 }
@@ -2327,7 +2333,8 @@ fn forwarded_read_status(error: &QueryError) -> Status {
 /// permanent precondition failure.
 fn subtree_roots_status(error: &QueryError) -> Status {
     if matches!(error, QueryError::ChainEpochPinUnavailable { .. }) {
-        return Status::unavailable(format!("{error}; retry shortly"));
+        return RetryPushback::Backoff
+            .apply(Status::unavailable(format!("{error}; retry shortly")));
     }
     status_from_query_error(error)
 }
@@ -2642,10 +2649,12 @@ where
             if this.seen.len() >= this.max_distinct {
                 this.upstream = None;
                 this.seen = HashSet::new();
-                return std::task::Poll::Ready(Some(Err(Status::unavailable(format!(
-                    "stream sent {} distinct transactions without a tip change; reconnect",
-                    this.max_distinct
-                )))));
+                return std::task::Poll::Ready(Some(Err(RetryPushback::Backoff.apply(
+                    Status::unavailable(format!(
+                        "stream sent {} distinct transactions without a tip change; reconnect",
+                        this.max_distinct
+                    )),
+                ))));
             }
             this.seen.insert(streamed_key);
             return std::task::Poll::Ready(Some(Ok(streamed)));
@@ -2839,7 +2848,9 @@ fn mempool_snapshot_entries(
 
 fn status_from_mempool_surface_error(error: MempoolSurfaceError) -> Status {
     match error {
-        MempoolSurfaceError::Unavailable { reason } => Status::unavailable(reason),
+        MempoolSurfaceError::Unavailable { reason } => {
+            RetryPushback::Backoff.apply(Status::unavailable(reason))
+        }
         MempoolSurfaceError::UnsupportedEncoding { reason } => zinder_proto::status_for_reason(
             zinder_proto::v1::ops::ErrorReason::UnsupportedWalletEncoding,
             reason,

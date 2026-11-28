@@ -261,7 +261,7 @@ Every `ZINDER_*` variable a binary accepts is listed below, with its TOML field.
 | `ZINDER_COMPAT__STALE_TIP_LIMIT_MS` | zinder-compat-lightwalletd | Optional | `compat.stale_tip_limit_ms` | Milliseconds the served tip may age, counted from its block time or from when the process first served it, whichever is earlier, while the writer cannot vouch for it because its node is unreachable, behind the network, or ahead of the writer, before lightwalletd `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE`, so wallets stop building transactions on a stale tip. A tip the node still reports is never refused. 0 disables it; otherwise at least 300000. Defaults to 1500000 (25 minutes). |
 | `ZINDER_COMPAT__TIP_WAIT_MS` | zinder-compat-lightwalletd | Optional | `compat.tip_wait_ms` | Milliseconds a height-selected lightwalletd block read, or a light-wallet forwarded UTXO or balance read whose node answered ahead of the served tip, waits for a height just past the visible tip before continuing or failing. Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`, `GetBlockRangeNullifiers`, the encoded block range methods, `GetTreeState` by height (wallet and light-wallet serving), and forwarded `GetAddressUtxos`, `GetAddressUtxosStream`, `GetTaddressBalance`, and `GetTaddressBalanceStream` (light-wallet serving). Applies to every serving mode. The worst delay before a block-range response's headers is this wait plus the existing 10-second block-range admission wait. A value of 0 disables the wait. A nonzero value must be at least twice `storage.secondary_catchup_interval_ms`. There is no upper bound. Defaults to 3000, which is provisional pending cross-region skew measurement. |
 | `ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS` | zinder-compat-lightwalletd | Optional | `compat.tip_wait_max_blocks` | Furthest past the visible tip, in blocks, that a read may name or observe and still wait for the tip. A read naming or observing a height further ahead runs or refuses at once. Applies to every serving mode. Must be at least 1, with no upper bound. Defaults to 2. |
-| `ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS` | zinder-compat-lightwalletd | Optional | `compat.tip_wait_max_waiters` | Most lightwalletd reads that may wait for the tip at once. A read that finds every waiting place taken runs or refuses at once without waiting. Applies to every serving mode. Must be at least 1. Defaults to 256. |
+| `ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS` | zinder-compat-lightwalletd | Optional | `compat.tip_wait_max_waiters` | Most lightwalletd reads that may wait for the tip at once. A read that finds every waiting place taken is refused at once with `UNAVAILABLE`. Applies to every serving mode. Must be at least 1. Defaults to 256. |
 | `ZINDER_COMPAT__PING_VERY_INSECURE` | zinder-compat-lightwalletd | Optional | `compat.ping_very_insecure` | Answers the lightwalletd `Ping` load-testing RPC, as `lightwalletd --ping-very-insecure` does. Each call holds a server task for as long as the client asks, so enable it only on a server you are load testing. Defaults to false, which refuses `Ping` with `FAILED_PRECONDITION`. |
 | `ZINDER_COMPAT__PROXY_PROTOCOL_TRUSTED_CIDRS` | zinder-compat-lightwalletd | Optional | `compat.proxy_protocol_trusted_cidrs` | Comma-separated CIDRs for trusted TCP proxies. Requires a PROXY v1 or v2 preface on every connection. Disabled when omitted. (sensitive; redacted) |
 | `ZINDER_COMPAT__RANGE_ADMISSION__MAX_STREAMS_PER_CLIENT` | zinder-compat-lightwalletd | Optional | `compat.range_admission.max_streams_per_client` | Maximum concurrent block-range calls per client, including calls waiting to start. Must be greater than zero. Defaults to 4. |
@@ -356,6 +356,8 @@ request with an unlisted `Origin` receives HTTP 403. Use `*` alone to allow
 every origin on a listener without Explorer bearer authentication. When you
 configure an inline or file-backed Explorer bearer token, list specific
 origins to enable gRPC-Web. ExplorerQuery checks the token on each RPC.
+See [Browser clients for the native APIs](integration-surfaces.md#browser-clients-for-the-native-apis)
+for the response headers used by browser clients.
 
 ## Listener and request limits
 
@@ -367,7 +369,9 @@ These limits are compiled in. No setting changes them unless the entry names one
 
 | Limit | Value | Client sees |
 | --- | --- | --- |
-| Request message size, including gRPC reflection | 2 MiB | `OUT_OF_RANGE` |
+| Request frame payload size, including gRPC reflection | 2 MiB | `OUT_OF_RANGE` |
+| Decompressed gRPC request message size | 2 MiB | `RESOURCE_EXHAUSTED` |
+| Zstd request decoder window | 2 MiB | `RESOURCE_EXHAUSTED` |
 | Concurrent streams on one HTTP/2 connection | 200 | Queued stream or a new connection, depending on the client |
 | Unary and server-streaming requests still arriving, per process | 32 | `UNAVAILABLE` |
 | Client-streaming and bidirectional calls open, per process | 32 | `UNAVAILABLE` |
@@ -397,7 +401,7 @@ A piece that has window still waits while the connection cannot write out the da
 
 A client that reads again receives the data that reached it before the reset, then the reset. grpc-go, grpc-java, and tonic built with its `server` feature report the reset as `CANCELLED`. gRPC Swift on SwiftNIO reports `UNAVAILABLE`, and other clients, or a proxy in front of Zinder, may report it differently.
 
-While a response is open, the transport holds less than about 1,216 KiB of its payload, or 1,280 KiB and 8 bytes for a gRPC-Web text response: the 1 MiB HTTP/2 send buffer, the piece queued past it, the piece waiting for window, and the next piece. These are estimates of transport payload. The listener also keeps the response chunk it is splitting into pieces until it hands out that chunk's last piece; for `GetBlockRange` that chunk is one encoded block, or a batch of smaller ones. A gRPC-Web response's trailers add a frame of their own. One connection holds at most 200 responses, about 237.5 MiB of transport payload, or 250 MiB in gRPC-Web text mode. A `GetBlockRange` response on the lightwalletd listener hands HTTP/2 slices of its stored blocks instead of copies, so a stalled range stream can keep up to about 3,456 KiB of block allocations alive, and one connection about 675 MiB ([lightwalletd compatibility](lightwalletd-compatibility.md)). That data is held only until the stream's reset.
+While a response is open, the transport holds less than about 1,216 KiB of its payload, or 1,280 KiB and 8 bytes for a gRPC-Web text response: the 1 MiB HTTP/2 send buffer, the piece queued past it, the piece waiting for window, and the next piece. These are estimates of transport payload. The listener also keeps the response chunk it is splitting into pieces until it hands out that chunk's last piece; for `GetBlockRange` that chunk is one encoded block, or a batch of smaller ones. A gRPC-Web response's trailers add a frame of their own. One connection holds at most 200 responses, about 237.5 MiB of transport payload, or 250 MiB in gRPC-Web text mode. An identity-encoded `GetBlockRange` response on the lightwalletd listener hands HTTP/2 slices of its stored blocks instead of copies, so a stalled range stream can keep up to about 3,456 KiB of block allocations alive, and one connection about 675 MiB ([lightwalletd compatibility](lightwalletd-compatibility.md)). That data is held only until the stream's reset.
 
 The server ends a response, or waits for its producer, only once HTTP/2 has encoded every byte sent so far. It sends the last byte as a frame of its own, which HTTP/2 encodes only after everything queued ahead of it on the stream. A response that has ended therefore waits for nothing but the client's socket. A client that lowers its stream window with an HTTP/2 `SETTINGS` frame before that point leaves the rest waiting for window again, and the stream is reset if that still keeps the rest from being encoded when its piece has waited 60 seconds. Zinder sets no process-wide bound on the data responses hold, because a client can open many connections. Limit connections per client at your proxy.
 
@@ -405,7 +409,7 @@ Once a write to a connection blocks, the connection must write 16 KiB, or finish
 
 ### Wallet block-range admission
 
-`compat.range_admission` covers `GetBlockRange` and `GetBlockRangeNullifiers` together. `query.range_admission` covers `CompactBlocksInRange` and `FullBlocksInRange` together. The listener admits up to four concurrent calls per client by default, counting calls waiting to start and calls streaming a response. Keep the per-client cap below the shared stream limit to reserve capacity for other wallets. Each listener tracks up to 4,096 clients with open calls and removes entries as soon as their last call ends.
+`compat.range_admission` covers `GetBlockRange` and `GetBlockRangeNullifiers` together. `query.range_admission` covers `CompactBlocksInRange`, `CompactNullifiersInRange`, and `FullBlocksInRange` together. The listener admits up to four concurrent calls per client by default, counting calls waiting to start and calls streaming a response. Keep the per-client cap below the shared stream limit to reserve capacity for other wallets. Each listener tracks up to 4,096 clients with open calls and removes entries as soon as their last call ends.
 
 The default `connection` key groups calls by source IP and port, so wallets behind the same Tor exit can use separate connections. A trusted HTTP proxy supplying only a bare IP groups all calls from that address. Select `subnet` to share a quota across ports and connections by IPv4 address or IPv6 /64. Apply connection limits at your edge when using connection keys.
 
@@ -413,7 +417,7 @@ To shed new ranges during runtime saturation, set `max_scheduling_delay_ms` on e
 
 ### Request list bounds
 
-The server counts the elements of every repeated request field before it decodes the request. Without that bound, one 2 MiB request could decode into tens of MiB of empty elements. The count covers every frame of the request and the lists inside nested messages, and allocates nothing.
+The server counts the elements of every repeated request field before it decodes the request. Without that bound, one 2 MiB request could decode into tens of MiB of empty elements. The count covers every frame of the request and nested lists. The guard scans compressed messages after bounded decompression and before allocating repeated protobuf values.
 
 A request over a bound fails with `INVALID_ARGUMENT` and the message `<Method> request field <field> carries <count> elements; at most <bound> are accepted`. `INVALID_ARGUMENT` fits because the same request can never succeed.
 
