@@ -1029,7 +1029,7 @@ fn visit_compact_block_batches(
 pub(super) fn bounded_batch_len(remaining_bytes: usize, largest_row_bytes: usize) -> usize {
     remaining_bytes
         .checked_div(largest_row_bytes)
-        .unwrap_or_else(|| remaining_bytes.min(16))
+        .unwrap_or(16)
         .clamp(1, BOUNDED_COMPACT_BLOCK_BATCH_SIZE)
 }
 
@@ -1863,13 +1863,13 @@ mod tests {
 
     #[test]
     fn a_bounded_batch_fits_the_budget_left_at_the_largest_row_read() {
-        // Before row sizes are known, the initial batch fetches up to 16 rows.
-        assert_eq!(
-            bounded_batch_len(2 * 1024 * 1024, 0),
-            16.min(BOUNDED_COMPACT_BLOCK_BATCH_SIZE)
-        );
-        assert_eq!(bounded_batch_len(3, 0), 3);
-        assert_eq!(bounded_batch_len(0, 0), 1);
+        // Before row sizes are known, the initial batch uses a fixed row count.
+        for remaining_bytes in [0, 3, 2 * 1024 * 1024] {
+            assert_eq!(
+                bounded_batch_len(remaining_bytes, 0),
+                16.min(BOUNDED_COMPACT_BLOCK_BATCH_SIZE)
+            );
+        }
         // Small rows fill the largest batch.
         assert_eq!(
             bounded_batch_len(2 * 1024 * 1024, 1_000),

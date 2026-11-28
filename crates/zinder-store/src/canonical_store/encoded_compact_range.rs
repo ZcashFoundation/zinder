@@ -578,7 +578,7 @@ fn read_live_tail_span(
             .zip(&cached)
             .filter_map(|(&height, hit)| hit.is_none().then_some(height))
             .collect::<Vec<_>>();
-        let probing = acc.largest_live_row_bytes == 0 && misses.len() > 1;
+        let multiple_misses = misses.len() > 1;
         let mut rows = if misses.is_empty() {
             Vec::new()
         } else {
@@ -599,7 +599,7 @@ fn read_live_tail_span(
                 // A missing SST for a speculative key can fail the whole
                 // MultiGet. Retry each height only when its row is needed.
                 let row = match rows.next().transpose() {
-                    Err(error) if probing && error.is_missing_table_file() => {
+                    Err(error) if multiple_misses && error.is_missing_table_file() => {
                         fetch_live_tail_batch_pinned(ctx.db, &[height], &verified_read_options())?
                             .into_iter()
                             .next()

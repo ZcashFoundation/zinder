@@ -284,24 +284,97 @@ fn a_bounded_read_its_first_block_fills_fetches_only_that_block()
                 "a {order:?} read with a {max_bytes}-byte budget must fetch one row"
             );
         }
-        assert_encoded_prefix_on_stale_secondary(&store, secondary, *order, *first)?;
+        assert_encoded_prefix_on_stale_secondary(
+            &store,
+            secondary,
+            *order,
+            BlockHeightRange::inclusive(*first, *first),
+            split_heights(),
+        )?;
     }
     Ok(())
+}
+
+#[test]
+fn a_bounded_encoded_read_keeps_an_exact_fit_row_in_its_second_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    use prost::encoding::{WireType, encode_key, encode_varint};
+
+    const PADDING_BYTES: u64 = 8 * 1024;
+
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let first = BlockHeight::new(1);
+    let exact_fit = BlockHeight::new(17);
+    let missing = BlockHeight::new(18);
+    let tip = BlockHeight::new(SPLIT_HEIGHTS);
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        tip,
+        BlockHeight::new(SPLIT_HEIGHTS - REORG_WINDOW),
+    )?;
+    let db = &store.bounded_open.db;
+    let cf = db
+        .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+        .ok_or("missing live-tail family")?;
+    let key = encode_block_position(exact_fit);
+    let bytes = db.get_cf(&cf, key)?.ok_or("missing exact-fit row")?;
+    let mut record = LiveTailBlockRecord::decode_v1(&bytes)?;
+    // An unknown protobuf field enlarges the exact-fit frame without changing
+    // its facts. The smaller rows in the first batch lead to a multi-key probe.
+    let payload = &mut record.shielded_payload;
+    encode_key(127, WireType::LengthDelimited, payload);
+    encode_varint(PADDING_BYTES, payload);
+    payload.resize(payload.len() + usize::try_from(PADDING_BYTES)?, 0);
+    db.put_cf(&cf, key, record.encode_v1()?)?;
+
+    split_rows_into_bottom_level_files(db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_table_files(db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    let secondary = open_secondary(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        RawBlobRetention::All,
+    )??;
+    compact_away_rows_in(
+        db,
+        LIVE_TAIL_BLOCK_COLUMN_FAMILY,
+        BlockHeightRange::inclusive(missing, tip),
+    )?;
+    let missing_row = secondary.compact_block_at(missing);
+    assert!(
+        missing_row
+            .as_ref()
+            .is_err_and(CanonicalStoreError::is_missing_table_file),
+        "the first height after the exact-fit prefix must require a missing SST, got {missing_row:?}"
+    );
+    assert_encoded_prefix_on_stale_secondary(
+        &store,
+        &secondary,
+        HeightOrder::Ascending,
+        BlockHeightRange::inclusive(first, exact_fit),
+        BlockHeightRange::inclusive(first, tip),
+    )
 }
 
 fn assert_encoded_prefix_on_stale_secondary(
     primary: &RocksDbCanonicalStore,
     secondary: &RocksDbCanonicalSecondary,
     order: HeightOrder,
-    first: BlockHeight,
+    prefix_range: BlockHeightRange,
+    requested_range: BlockHeightRange,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use zinder_proto::compat::lightwalletd::EncodedBlock;
+
     use crate::{
         EncodedCompactBlockOutput, EncodedCompactBlockPayload, EncodedCompactBlockRangeRequest,
         ShieldedProjectionSelection,
     };
 
     let mut request = EncodedCompactBlockRangeRequest {
-        range: BlockHeightRange::inclusive(first, first),
+        range: prefix_range,
         order,
         selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
         include_transparent: false,
@@ -315,12 +388,13 @@ fn assert_encoded_prefix_on_stale_secondary(
     let EncodedCompactBlockPayload::Blocks(frames) = expected.payload else {
         return Err("expected individual frames".into());
     };
-    request.range = split_heights();
-    request.max_bytes = frames.first().ok_or("expected first frame")?.payload_len();
+    request.range = requested_range;
+    request.max_bytes = frames.iter().map(EncodedBlock::payload_len).sum();
     let prefix = secondary
         .encoded_compact_block_range_up_to(request, None)?
         .ok_or("expected encoded prefix from the stale secondary")?;
-    assert_eq!(prefix.block_count, 1);
+    assert_eq!(prefix.block_count, expected.block_count);
+    assert_eq!(prefix.covered, prefix_range);
     assert_eq!(prefix.first_link, expected.first_link);
     assert_eq!(prefix.last_link, expected.last_link);
 
