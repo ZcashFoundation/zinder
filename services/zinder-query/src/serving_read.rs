@@ -68,8 +68,8 @@ where
 /// Times `request`, including validation and any work after its storage
 /// read, and records its typed outcome under `operation`.
 ///
-/// `requested_blocks` is `Some` only for `compact_blocks_in_range`, which
-/// also samples how many blocks the request asked for.
+/// Compact-block and nullifier range reads also sample the requested block count
+/// by passing it as `requested_blocks`.
 pub(crate) async fn record<Output>(
     operation: &'static str,
     requested_blocks: Option<usize>,

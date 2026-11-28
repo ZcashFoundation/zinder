@@ -211,6 +211,44 @@ fn public_bind_requires_an_explicit_security_opt_in() -> eyre::Result<()> {
     Ok(())
 }
 
+#[test]
+fn print_config_resolves_epoch_pin_retention_within_supported_bounds() -> eyre::Result<()> {
+    let temporary = TempDir::new()?;
+    let secondary = temporary.path().join("canonical-secondary");
+    let render = |seconds: Option<&str>| {
+        const RETENTION_ENV: &str = "ZINDER_QUERY__EPOCH_PIN_RETENTION_SECONDS";
+        let mut command = query_command(&temporary, &secondary);
+        command.env_remove(RETENTION_ENV);
+        if let Some(seconds) = seconds {
+            command.env(RETENTION_ENV, seconds);
+        }
+        command.output()
+    };
+
+    for (configured, expected) in [(None, "60"), (Some("60"), "60"), (Some("300"), "300")] {
+        let output = render(configured)?;
+        assert!(
+            output.status.success(),
+            "print-config failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout)?;
+        let expected = format!("epoch_pin_retention_seconds = {expected}");
+        assert!(stdout.lines().any(|line| line == expected), "{stdout}");
+    }
+
+    for seconds in ["59", "301"] {
+        let output = render(Some(seconds))?;
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("query.epoch_pin_retention_seconds must be in 60..=300"),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
 /// The tree-state rebuild wait defaults to two seconds, follows its
 /// environment variable, and refuses a wait the client deadline cannot hold.
 #[test]

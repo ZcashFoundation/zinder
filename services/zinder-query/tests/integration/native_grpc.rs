@@ -1511,6 +1511,8 @@ async fn stalled_native_mempool_event_stream_establishment_is_bounded() -> eyre:
 
 #[tokio::test]
 async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()> {
+    use zinder_proto::capabilities::WALLET_READ_STANDARD_FEE_V1;
+
     let (read_only_adapter, _read_only_store, _read_only_ingest) = native_adapter().await?;
     let read_only_info = WalletQueryService::server_info(
         &read_only_adapter,
@@ -1526,6 +1528,16 @@ async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()>
         &read_only_info,
         WALLET_BROADCAST_TRANSACTION_V1
     ));
+    assert!(!has_capability(
+        &read_only_info,
+        WALLET_READ_STANDARD_FEE_V1
+    ));
+    assert_standard_fee_refusal(
+        &read_only_adapter,
+        Code::FailedPrecondition,
+        ops::ErrorReason::EndpointCapabilityUnavailable,
+    )
+    .await?;
 
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(
@@ -1566,7 +1578,79 @@ async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()>
         Some(wallet::NodeCapabilitiesDescriptor::default()),
         "an unverified node reports no capabilities"
     );
+    assert!(has_capability(&broadcast_info, WALLET_READ_STANDARD_FEE_V1));
+    assert_standard_fee_refusal(
+        &broadcast_adapter,
+        Code::Unavailable,
+        ops::ErrorReason::NodeUnavailable,
+    )
+    .await?;
 
+    Ok(())
+}
+
+async fn assert_standard_fee_refusal(
+    adapter: &impl WalletQueryService,
+    code: Code,
+    reason: ops::ErrorReason,
+) -> eyre::Result<()> {
+    let status =
+        WalletQueryService::standard_fee(adapter, Request::new(wallet::StandardFeeRequest {}))
+            .await
+            .err()
+            .ok_or_else(|| eyre!("expected native standard fee refusal"))?;
+    assert_eq!(status.code(), code, "{status:?}");
+    assert_native_error_reason(&status, reason)
+}
+
+fn assert_native_error_reason(status: &Status, reason: ops::ErrorReason) -> eyre::Result<()> {
+    let details = status.get_error_details();
+    let error = details
+        .error_info()
+        .ok_or_else(|| eyre!("missing ErrorInfo: {status:?}"))?;
+    assert_eq!(error.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+    assert_eq!(error.reason, reason.as_str_name());
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_balance_batch_refuses_unavailable_epoch_and_invalid_selector_counts()
+-> eyre::Result<()> {
+    let (adapter, _store, _ingest) = native_adapter().await?;
+    let address = wallet::AddressLookup {
+        selector: Some(wallet::address_lookup::Selector::ScriptHash(vec![0x51; 32])),
+    };
+    let status = WalletQueryService::transparent_address_balances(
+        &adapter,
+        Request::new(wallet::TransparentAddressBalancesRequest {
+            addresses: vec![address.clone()],
+            at_epoch_id: Some(u64::MAX),
+        }),
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("accepted unavailable epoch"))?;
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_native_error_reason(&status, ops::ErrorReason::ChainEpochPinUnavailable)?;
+
+    for addresses in [
+        Vec::new(),
+        vec![address; zinder_core::MAX_TRANSPARENT_ADDRESSES_PER_BATCH + 1],
+    ] {
+        let count = addresses.len();
+        let status = WalletQueryService::transparent_address_balances(
+            &adapter,
+            Request::new(wallet::TransparentAddressBalancesRequest {
+                addresses,
+                at_epoch_id: None,
+            }),
+        )
+        .await
+        .err()
+        .ok_or_else(|| eyre!("accepted {count} selectors"))?;
+        assert_eq!(status.code(), Code::InvalidArgument, "{count} selectors");
+        assert!(status.message().contains("selectors"), "{status:?}");
+    }
     Ok(())
 }
 
