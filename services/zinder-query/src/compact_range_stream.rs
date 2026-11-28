@@ -230,6 +230,7 @@ pub(crate) async fn read_nullifiers(
                 output: EncodedCompactBlockOutput::Blocks,
                 max_bytes: read.max_bytes,
                 enforce_wire_fee_limit: false,
+                include_transparent: false,
             },
             None,
         )
