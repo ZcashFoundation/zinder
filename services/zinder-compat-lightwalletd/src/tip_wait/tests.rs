@@ -25,7 +25,7 @@ use super::{TipWait, TipWaitProgress};
 use crate::{
     block_methods::{
         BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, CompactBlockReads,
-        RequestedBlock, compact_block,
+        RequestedBlock,
     },
     compact_block_messages::CompactBlockShape,
 };
@@ -271,7 +271,13 @@ async fn an_expired_wait_returns_after_the_cap_and_the_method_answers_out_of_ran
     let wait = tip_wait(2, 8)?;
 
     let elapsed = spawn_wait(&wait, &reads, 10).await??;
-    let status = compact_block(&reads, &height_id(10), CompactBlockShape::FULL_BLOCK)
+    let status = BlockMethods::default()
+        .unary_block(
+            &reads,
+            METHOD,
+            &height_id(10),
+            CompactBlockShape::FULL_BLOCK,
+        )
         .await
         .err()
         .ok_or_else(|| eyre!("the method must refuse a height past the tip"))?;

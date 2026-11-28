@@ -2,11 +2,11 @@ use std::{error::Error, fmt::Write, fs, path::Path};
 
 // tonic-prost-build fixes each server response to its decoded protobuf type.
 // Reuse its generated gRPC settings for the encoded representations of the
-// two range methods, GetBlockRange and GetBlockRangeNullifiers.
+// unary and streaming block methods.
 pub(super) fn enable(path: &Path) -> Result<(), Box<dyn Error>> {
     inject(path, &Method::GET_BLOCK_RANGE)?;
     inject(path, &Method::GET_BLOCK_RANGE_NULLIFIERS)?;
-    Ok(())
+    inject_unary(path)
 }
 
 /// One server-streaming range method the generated server can serve encoded.
@@ -73,13 +73,7 @@ fn inject(path: &Path, method: &Method) -> Result<(), Box<dyn Error>> {
     let (setup, after_call) = method_body
         .split_once(Method::call_line())
         .ok_or("missing generated encoded range call")?;
-    let (codec_start, codec_end) = split_unique(setup, "tonic_prost::ProstCodec::default()")?;
-    let setup_with_codec =
-        format!("{codec_start}crate::encoded_block_range::EncodedBlockCodec{codec_end}");
-    let mut encoded_setup = String::new();
-    for line in setup_with_codec.lines() {
-        writeln!(encoded_setup, "    {line}")?;
-    }
+    let encoded_setup = encoded_grpc_setup(setup, "EncodedBlockCodec")?;
     let indent = "                        ";
 
     let source = format!(
@@ -99,6 +93,47 @@ fn inject(path: &Path, method: &Method) -> Result<(), Box<dyn Error>> {
         serve = method.serve,
     );
     Ok(fs::write(path, source)?)
+}
+
+fn inject_unary(path: &Path) -> Result<(), Box<dyn Error>> {
+    let mut source = fs::read_to_string(path)?;
+    let marker =
+        "        /// Provides encoded protobuf responses for GetBlockRange when available.";
+    let (before, after) = split_unique(&source, marker)?;
+    let hook = concat!(
+        "        /// Provides encoded protobuf responses for unary block calls when available.\n",
+        "        fn encoded_unary_blocks(&self) -> Option<&dyn super::EncodedUnaryBlocks> {\n",
+        "            None\n",
+        "        }\n",
+    );
+    source = format!("{before}{hook}{marker}{after}");
+    for (method, variant) in [("GetBlock", "Full"), ("GetBlockNullifiers", "Nullifiers")] {
+        let marker = format!("                        let method = {method}Svc(inner);\n");
+        let (before, rest) = split_unique(&source, &marker)?;
+        let (setup, _) = rest
+            .split_once("                        let res = grpc.unary(method, req).await;")
+            .ok_or("missing generated unary block call")?;
+        let encoded_setup = encoded_grpc_setup(setup, "EncodedUnaryBlockCodec")?;
+        let indent = "                        ";
+        source = format!(
+            "{before}{indent}if let Some(encoded) = inner.encoded_unary_blocks() {{\n\
+             {encoded_setup}\
+             {indent}    return Ok(grpc.unary(crate::encoded_block_range::EncodedUnaryBlock(encoded, \
+             crate::encoded_block_range::UnaryBlockMethod::{variant}), req).await);\n\
+             {indent}}}\n{marker}{rest}",
+        );
+    }
+    Ok(fs::write(path, source)?)
+}
+
+fn encoded_grpc_setup(setup: &str, codec: &str) -> Result<String, Box<dyn Error>> {
+    let (before, after) = split_unique(setup, "tonic_prost::ProstCodec::default()")?;
+    let setup = format!("{before}crate::encoded_block_range::{codec}{after}");
+    let mut indented = String::new();
+    for line in setup.lines() {
+        writeln!(indented, "    {line}")?;
+    }
+    Ok(indented)
 }
 
 fn split_unique<'a>(source: &'a str, marker: &str) -> Result<(&'a str, &'a str), Box<dyn Error>> {

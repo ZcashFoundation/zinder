@@ -156,6 +156,13 @@ presplit deterministically):
 singleflight deduplication. Opening `ZSHRNG02` never touches `ZSTSUP01` or
 `ZSBLKB01`, and opening `ZSTSUP01` never touches `ZSBLKB01`.
 
+Supplement readers reuse a Zstd decompressor on each reader thread. They share
+an LRU that retains up to 4 MiB of decompressed chunk payloads across the
+process. Each reader verifies the compressed chunk from its own source before
+caching it. Reads continue to authenticate row-index bytes and verify the
+requested row payload. Explicit full-payload verification reads the source
+directly.
+
 During cold store admission (`verify_pinned_segments_into_cache`), storage
 admission checks `kernel_verified()` on each pinned `ZSHRNG02`, `ZSTSUP01`, and
 `ZSBLKB01` segment reader. `O(index)` describes opening and index
@@ -197,7 +204,9 @@ unsealed heights `> sealed_tip`):
     Each query runtime caches up to `256` settled answers scoped to the epoch,
     sequence digest, and retained history.
   - A byte-bounded read fetches one row first, then adapts subsequent batch sizes
-    from `1` to `16` within the remaining byte budget.
+    from `1` to `16` within the remaining byte budget. For settled segments with
+    a supplement, it charges the native length recorded in the index. For
+    shielded-only segments, it measures the reconstructed block.
 
 Reads verify block height linkage across every decoded row and fail on missing
 rows inside retained history as store damage. Compact-block payload range reads

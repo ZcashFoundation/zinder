@@ -1349,6 +1349,10 @@ pub mod compact_tx_streamer_server {
             &self,
             request: tonic::Request<super::BlockId>,
         ) -> std::result::Result<tonic::Response<super::CompactBlock>, tonic::Status>;
+        /// Provides encoded protobuf responses for unary block calls when available.
+        fn encoded_unary_blocks(&self) -> Option<&dyn super::EncodedUnaryBlocks> {
+            None
+        }
         /// Provides encoded protobuf responses for GetBlockRange when available.
         fn encoded_block_range(&self) -> Option<&dyn super::EncodedBlockRange> {
             None
@@ -1705,6 +1709,19 @@ pub mod compact_tx_streamer_server {
                     let max_encoding_message_size = self.max_encoding_message_size;
                     let inner = self.inner.clone();
                     let fut = async move {
+                        if let Some(encoded) = inner.encoded_unary_blocks() {
+                            let codec = crate::encoded_block_range::EncodedUnaryBlockCodec;
+                            let mut grpc = tonic::server::Grpc::new(codec)
+                                .apply_compression_config(
+                                    accept_compression_encodings,
+                                    send_compression_encodings,
+                                )
+                                .apply_max_message_size_config(
+                                    max_decoding_message_size,
+                                    max_encoding_message_size,
+                                );
+                            return Ok(grpc.unary(crate::encoded_block_range::EncodedUnaryBlock(encoded, crate::encoded_block_range::UnaryBlockMethod::Full), req).await);
+                        }
                         let method = GetBlockSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
@@ -1754,6 +1771,19 @@ pub mod compact_tx_streamer_server {
                     let max_encoding_message_size = self.max_encoding_message_size;
                     let inner = self.inner.clone();
                     let fut = async move {
+                        if let Some(encoded) = inner.encoded_unary_blocks() {
+                            let codec = crate::encoded_block_range::EncodedUnaryBlockCodec;
+                            let mut grpc = tonic::server::Grpc::new(codec)
+                                .apply_compression_config(
+                                    accept_compression_encodings,
+                                    send_compression_encodings,
+                                )
+                                .apply_max_message_size_config(
+                                    max_decoding_message_size,
+                                    max_encoding_message_size,
+                                );
+                            return Ok(grpc.unary(crate::encoded_block_range::EncodedUnaryBlock(encoded, crate::encoded_block_range::UnaryBlockMethod::Nullifiers), req).await);
+                        }
                         let method = GetBlockNullifiersSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
