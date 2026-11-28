@@ -231,7 +231,7 @@ exercises it.
 | Workflow | Runs on | What it checks |
 | --- | --- | --- |
 | `ci-pr` | Every pull request, pushes to `main`, and weekly | The Rust jobs below, `dependency hygiene` (changelog, runbook, alignment, and release-policy scripts, `cargo deny`, and `cargo machete`), and the vendored protocols. `ci gate` passes only when all of them do. Coverage and mutation run only on the weekly schedule or a manual run. |
-| `protocol-contracts` | Pull requests and `main` pushes that touch the protocol | Checked-in generated code, `proto breaking` (pull requests only), and capability coverage |
+| `protocol-contracts` | Pull requests and `main` pushes that touch the protocol | Checked-in generated code, standalone API archive verification, and capability coverage. On pull requests, Buf checks compatibility against the base commit and the latest published contract unless `allow-proto-breaking` is set. |
 | `live-tests` | Node-facing pull requests, nightly Regtest, weekly Testnet, and manual Mainnet | The T3 suite, once against Zebra and once against Zakura on Regtest |
 | `parity-compat` | Node-facing pull requests and nightly | Live parity against a reference lightwalletd and a pinned CBB light client, on both nodes, from binaries that `build parity binaries` compiles once |
 | `binary-archives` | Pull requests and `main` pushes that touch build inputs | Release binary archives for both platforms |
