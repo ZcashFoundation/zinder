@@ -37,10 +37,13 @@ Several optional fields, such as a fee that needs resolved inputs or a raw trans
    ([#678](https://github.com/ZcashFoundation/zinder/issues/678)).
 
    TLS-authenticated Zinder `WalletQuery` gRPC responses anchor the expected
-   segment digests. Wallets need no publisher signing key. Extract sans-I/O
-   `ZSHRNG02` verification from `zinder-store` into code that consumers can
-   use without linking `rust-rocksdb`. This download path is ratified and
-   pending implementation.
+   whole-segment SHA-256 digest, byte length, and `index_sha256` pin for each
+   `ZSHRNG02` segment. These are the trusted inputs for partial `Range`
+   verification under [ADR-0024](0024-verified-edge-snapshot-bootstrap.md#shared-https-settled-segment-pool).
+   Wallets need no publisher signing key. Extract sans-I/O `ZSHRNG02`
+   verification from `zinder-store` into code that consumers can use without
+   linking `rust-rocksdb`. This download path is ratified and pending
+   implementation.
 
 10. **Shifted ephemeral keys are optional, independently verified hints.**
     The future `epk-shift` contract is an explicit native `WalletQuery`
@@ -77,7 +80,7 @@ Several optional fields, such as a fee that needs resolved inputs or a raw trans
 
 - Decision 2, wide compact ranges: Judgment. [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md#evidence) decision 8 gives the invariant and reopening condition.
 - Decision 6, transaction bytes: Judgment. [ADR-0015](0015-wallet-runtime-composition.md#evidence) decision 15 gives the admission evidence and reopening condition.
-- Decision 9: Judgment. An authenticated digest from Zinder lets the wallet verify content served by a separate HTTPS origin without a publisher trust store or a storage-engine dependency. A verification requirement the TLS-bound digest cannot satisfy would reopen the trust boundary.
+- Decision 9: Judgment. Zinder authenticates the length and digest pins so the wallet can verify partial content from a separate HTTPS origin without a publisher trust store or storage-engine dependency. A partial range that cannot be safely verified with those pins would reopen the trust boundary.
 - Decision 10, wrong hints: Measured. In a four-payment fixture, one unrelated but well-formed point hid one payment in the shifted-key scan. [#389](https://github.com/ZcashFoundation/zinder/pull/389).
 - Decision 10, opt-in and rollout: Judgment. Reopen the implementation gate when a committed consumer demonstrates safe receipt recovery under malicious hints and a net end-to-end mobile win.
 - Decision 11, consensus and compatibility: External constraint. ZIP 221 specifies the consensus history tree, and the compatibility RPC follows the upstream protocol.

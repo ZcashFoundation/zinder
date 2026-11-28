@@ -98,9 +98,17 @@ content-addressed object layout on static HTTPS. Published objects are
 immutable Schema v2 settled segments (`ZSHRNG02`, `ZSTSUP01`, `ZSBLKB01`).
 Within the versioned layout, the catalog and objects have immutable
 addresses derived from their SHA-256 digests. Each segment entry binds
-its format, height interval, byte length, and digest. The catalog is a
-public distribution contract separate from the store's internal
-`segments-manifest.json`.
+its format, height interval, byte length, and whole-segment SHA-256 digest.
+For `ZSHRNG02`, this digest covers all bytes preceding the trailer and
+is recorded in the trailer itself. The signed catalog also binds each
+`ZSHRNG02` entry's `index_sha256` pin. A partial HTTPS `Range` reader
+checks the trailer against the whole-segment digest and authenticates the
+header, raw row index, and trailer against `index_sha256` before reading
+row slices. The authenticated index supplies the row digests, so a reader
+can verify those slices without fetching the entire object.
+
+The catalog is a public distribution contract separate from the store's
+internal `segments-manifest.json`.
 Track the RocksDB checkpoint and indexes separately per
 `(network, schema_version, stored_set)`. Regional seed hosts reuse the same
 pool and run their own single writer under [ADR-0004](0004-storage-and-deployment-topologies.md).
@@ -130,7 +138,7 @@ Physical checkpoint admission, readback, and validator RPC attestation still
 precede writer `READY` and publication. Each host generates a fresh
 `cursor_auth_key`. Attestation excludes P2P-only `NODE_TREE_ROOTS` under
 [ADR-0006](0006-node-source-boundary.md). Wallet HTTP range downloads share
-the object layout and use the TLS-authenticated Zinder digest trust path in
+the object layout and use the TLS-authenticated Zinder length and digest pins in
 [ADR-0014](0014-consumer-neutral-wallet-data-plane.md).
 [#697](https://github.com/ZcashFoundation/zinder/issues/697).
 
@@ -188,6 +196,11 @@ its validator. Run `zinder-ingest bootstrap-from-snapshot --source BUNDLE
 - Transfer semantics: External constraint. RFC 9110 defines conditional
   range requests, and an origin can ignore a range and return the entire
   representation. A complete-file fallback preserves compatibility.
+- Partial segment verification: Judgment. The existing `ZSHRNG02` decoder
+  checks a trusted `index_sha256` over the header, raw index, and trailer.
+  A reader cannot recompute the whole-segment digest from those ranges.
+  Reopen the catalog contract if the pins cannot authenticate a requested
+  slice without a full-object read.
 - Direct-to-stage transfer: Judgment. Staging once avoids an extra disk
   copy. Reopen if measured recovery shows the staging layout cannot verify
   and resume safely after interrupted transfers.

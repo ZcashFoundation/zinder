@@ -26,9 +26,20 @@ Fresh construction also needs more than one block per call. A round trip per blo
 
 9. **An existing READY Schema v2 store can qualify for pruned following.**
    The store must already be verified and admitted, under any composition,
-   lean or `--full-blocks`. Admission must continuously verify
-   `node.earliest_retained_height <= store.settled_tip - reorg_safety_margin`
-   and confirm the node covers the entire required recovery interval.
+   lean or `--full-blocks`. The `reorg_safety_margin` is a positive block
+   buffer of at least the store's effective reorg window
+   (`reorg_safety_margin >= store.reorg_window`). Compute the recovery floor
+   from the store's settled tip and first retained height.
+
+   ```text
+   required_recovery_floor = store.settled_tip.saturating_sub(reorg_safety_margin).max(store.first_retained_height)
+   ```
+
+   On short chains where `store.settled_tip <= reorg_safety_margin`, the
+   floor clamps to `store.first_retained_height`. Admission must
+   continuously verify `node.earliest_retained_height <= required_recovery_floor`
+   and that the node covers the closed interval
+   `[required_recovery_floor, node.tip]`.
    A pruned validator, including pruned Zakura, qualifies only after its
    prune horizon can be verified over RPC. [ADR-0007](0007-node-failure-recovery-and-transport-policy.md)
    defines the park rule. This is a ratified admission policy for
@@ -49,7 +60,7 @@ Verified snapshot bootstrap uses the configured `NodeSource` to attest the chain
 ## Evidence
 
 - Decision 3 and Decision 9, archive construction and pruned admission: External constraint. A pruned validator cannot provide a block below its retained horizon. RPC evidence of that horizon is a prerequisite for qualifying any pruned source.
-- Decision 9, the safety margin and recovery interval: Judgment. Both checks must hold because live following and recovery can read at different depths. A recovery request outside the admitted interval reopens the rule.
+- Decision 9, the safety margin and recovery interval: Judgment. A margin of at least one effective reorg window reserves history below the settled tip, limited by the store's first retained height. Checking the full interval through the node tip detects gaps a horizon check alone can miss. A recovery request outside the admitted interval reopens the rule.
 - Decision 10: Judgment. Validator RPCs preserve one admitted chain authority. A validator RPC that exposes verifiable note-commitment roots would reopen root sourcing. P2P `NODE_TREE_ROOTS` is an External constraint of the draft in [zcash/zips#1470](https://github.com/zcash/zips/pull/1470).
 - Decision 5, the light-wallet composition's node-backed reads: judgment on measured cost. [ADR-0023](0023-deployment-profiles.md) decision 4 records the measurements, and [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7 records the verification of each answer.
 
