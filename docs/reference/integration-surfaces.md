@@ -75,12 +75,18 @@ python -m grpc_tools.protoc -I proto \
 For other languages, pin the Protobuf and gRPC plugins in your own template
 and pass it to `buf generate --template`. Use `--path proto/zinder` to limit
 generation to native Zinder. With `protoc`, use `-I proto` for native Zinder,
-`-I proto/compat/lightwalletd` for lightwalletd, and
-`-I proto/external/zebra` for Zebra. Keep the vendored notices alongside any
-schemas you redistribute.
+`-I proto/compat/lightwalletd` for lightwalletd, `-I proto/compat/darkside` for
+Darkside, and `-I proto/external/zebra` for Zebra. When compiling multiple
+schema families together, list the vendored include paths before `-I proto`.
 
-The archive includes `zinder.contract.descriptor.bin` for all three schema
-families and `zinder.v1.descriptor.bin` for native-only tooling. For an upgrade,
+`darkside.proto` is a commit-pinned schema for wallet test drivers. It shares
+lightwalletd's `cash.z.wallet.sdk.rpc` package and imports its `service.proto`,
+so pass both compatibility include paths when generating Darkside bindings.
+Keep `LICENSE`, `UPSTREAM.md`, and `COMMIT` alongside any vendored schemas you
+redistribute, plus `VERSION` for lightwalletd and Zebra.
+
+The archive includes `zinder.contract.descriptor.bin` for native and vendored
+schemas and `zinder.v1.descriptor.bin` for native-only tooling. For an upgrade,
 verify and extract the new tag into a separate directory. From the new
 directory, compare the full descriptors.
 
