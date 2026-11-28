@@ -269,6 +269,24 @@ jq -e '
 ' "$explorer_preset_compose" >/dev/null \
   || fail "Compose env_file did not forward arbitrary ZINDER_* overrides or isolate writer-only DEPLOY_INDEX_ENV secrets"
 
+if DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+  DEPLOY_INDEX_ENV="$temporary_directory/missing-index.env" \
+  docker compose \
+    --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
+    -f "$repository_root/deploy/docker-compose.yml" \
+    config >/dev/null 2>&1; then
+  fail "docker compose accepted a missing explicit DEPLOY_INDEX_ENV file"
+fi
+
+if DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+  DEPLOY_INDEX_ENV="" \
+  docker compose \
+    --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
+    -f "$repository_root/deploy/docker-compose.yml" \
+    config >/dev/null 2>&1; then
+  fail "docker compose accepted an empty explicit DEPLOY_INDEX_ENV value"
+fi
+
 light_wallet_zinder_env="$temporary_directory/light-wallet-zinder.env"
 sed 's/^ZINDER_DEPLOYMENT__PROFILE=wallet$/ZINDER_DEPLOYMENT__PROFILE=light-wallet/' \
   "$repository_root/deploy/profiles/testnet/zinder.env" > "$light_wallet_zinder_env"

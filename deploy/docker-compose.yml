@@ -85,8 +85,8 @@ services:
     env_file:
       - path: ${DEPLOY_ZINDER_ENV:?set DEPLOY_ZINDER_ENV to your Zinder runtime env file}
         required: true
-      - path: ${DEPLOY_INDEX_ENV:-./index.env}
-        required: false
+      - path: ${DEPLOY_INDEX_ENV-./profiles/empty-index.env}
+        required: true
     environment:
       ZINDER_STORAGE__DATA_DIR: /var/lib/zinder
       ZINDER_INGEST_CONTROL__LISTEN_ADDR: "127.0.0.1:9100"

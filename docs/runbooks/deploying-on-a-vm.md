@@ -134,12 +134,13 @@ ZINDER_NODE_FALLBACKS__1__AUTH__PASSWORD=rpcpass
 ZINDER_NODE_FALLBACKS__1__BROADCAST_TIMEOUT_SECS=7
 ```
 
-Put writer-only `ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__*` secrets (and optionally `ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR`) in writer-only `/etc/zinder/index.env` referenced by `DEPLOY_INDEX_ENV=/etc/zinder/index.env` in `/etc/zinder/deploy.env` so `zinder-serve` never sees `INDEXER_TLS__*`. If the fallback node uses its own external Docker network or `.cookie` volume, attach that network or volume in `/etc/zinder/docker-compose.override.yml`, then recreate with `--env-file /etc/zinder/deploy.env`:
+Put writer-only `ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__*` secrets (and optionally `ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR`) in writer-only `/etc/zinder/index.env` referenced by `DEPLOY_INDEX_ENV=/etc/zinder/index.env` in `/etc/zinder/deploy.env` so `zinder-serve` never sees `INDEXER_TLS__*`. If the fallback node uses its own external Docker network or `.cookie` volume, attach that network or volume in `/etc/zinder/docker-compose.override.yml`, then recreate with both Compose files (omit `-f /etc/zinder/docker-compose.override.yml` if you do not use an override file):
 
 ```bash
 cd /opt/zinder
 docker compose --env-file /etc/zinder/deploy.env \
   -f deploy/docker-compose.yml \
+  -f /etc/zinder/docker-compose.override.yml \
   up -d --no-build
 ```
 
