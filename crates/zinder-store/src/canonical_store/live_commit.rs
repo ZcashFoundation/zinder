@@ -6,6 +6,8 @@ use zinder_core::{
     ShieldedProtocol, SubtreeRootArtifact, TransactionLocation, UnixTimestampMillis,
 };
 
+use crate::StoreRole;
+
 use super::{
     CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalSequenceCheckpoint,
     CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoredSet, RocksDbCanonicalStore,
@@ -203,6 +205,12 @@ impl RocksDbCanonicalStore {
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<(Self, CanonicalEventFence), CanonicalStoreError> {
         let prepared = PreparedLiveAppendCommit::new(&self, append, network_upgrade_activations)?;
+        let corpus_growth = (!prepared.newly_sealed_entries.is_empty())
+            .then(|| {
+                self.segment_cache
+                    .prepare_corpus_growth(&prepared.newly_sealed_entries)
+            })
+            .transpose()?;
         let mut batch = WriteBatch::default();
         prepared
             .block_rows
@@ -250,7 +258,7 @@ impl RocksDbCanonicalStore {
             )?;
         self.ready_evidence = prepared.ready_evidence;
         self.sealed_segments = candidate_sealed_segments;
-        if !prepared.newly_sealed_entries.is_empty() {
+        if let Some(growth) = corpus_growth {
             store_access::sync_segments_manifest_from_db(&self.bounded_open.db, self.network())
                 .map_err(
                     |source| CanonicalStoreError::LiveCommitCompletedButUnverified {
@@ -258,6 +266,8 @@ impl RocksDbCanonicalStore {
                         reason: source.to_string(),
                     },
                 )?;
+            self.segment_cache
+                .admit_corpus_growth(growth, StoreRole::CanonicalPrimary);
         }
         Ok((self, prepared.outcome))
     }

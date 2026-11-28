@@ -17,7 +17,9 @@ use zinder_proto::compat::lightwalletd::{EncodedBlock, EncodedBlockBatcher};
 
 use crate::{
     HeightOrder,
-    positional_source::{ByteRange, PositionalByteSource},
+    positional_source::{
+        ByteRange, DiscardScanPages, PositionalByteSource, ScanDropBehind, bounded_file_scan,
+    },
     segment_verity,
 };
 
@@ -1137,6 +1139,7 @@ impl SettledShieldedSegmentIndex {
 /// Authenticated positional reader over one settled `ZSHRNG02` shielded segment.
 pub struct SettledShieldedSegmentReader<S = File> {
     source: S,
+    discard_scan_pages: Option<DiscardScanPages<S>>,
     index: SettledShieldedSegmentIndex,
 }
 
@@ -1167,6 +1170,15 @@ impl SettledShieldedSegmentReader<File> {
         expected: &ShieldedSegmentIdentity,
         options: SettledShieldedSegmentOpenOptions,
     ) -> Result<Self, SettledShieldedSegmentError> {
+        Self::open_file_with_scan_policy(file, expected, options, false)
+    }
+
+    pub(crate) fn open_file_with_scan_policy(
+        file: File,
+        expected: &ShieldedSegmentIdentity,
+        options: SettledShieldedSegmentOpenOptions,
+        constrained: bool,
+    ) -> Result<Self, SettledShieldedSegmentError> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(io::Error::new(
@@ -1184,7 +1196,10 @@ impl SettledShieldedSegmentReader<File> {
         if options.require_fs_verity && !kernel_verified {
             return Err(SettledShieldedSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(file, expected, options, kernel_verified)
+        let discard_scan_pages = bounded_file_scan(&file, constrained);
+        let mut reader = Self::admit_with_verity(file, expected, options, kernel_verified)?;
+        reader.discard_scan_pages = discard_scan_pages;
+        Ok(reader)
     }
 }
 
@@ -1226,7 +1241,11 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
             total_len,
             kernel_verified,
         )?;
-        let reader = Self { source, index };
+        let reader = Self {
+            source,
+            discard_scan_pages: None,
+            index,
+        };
         if options.verify_full_payload {
             reader.verify_full_payload_with_raw(&header_bytes, &index_and_trailer)?;
         }
@@ -1499,6 +1518,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
                 scratch: &mut scratch,
                 sink: &mut sink,
             },
+            plan.block_count() > 1,
         )?;
         flush_packed_blocks(&mut packed_out, &mut out)?;
         Ok(out)
@@ -1538,6 +1558,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
                 scratch,
                 sink: &mut sink,
             },
+            true,
         )
     }
 
@@ -1575,6 +1596,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
                 scratch,
                 sink: &mut sink,
             },
+            true,
         )?;
         Ok(Some(bounded))
     }
@@ -1608,6 +1630,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
                 scratch,
                 sink: &mut sink,
             },
+            true,
         )?;
         flush_packed_blocks(&mut packed_out, &mut out)?;
         Ok(out)
@@ -1638,6 +1661,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
                 scratch,
                 sink: &mut sink,
             },
+            true,
         )
     }
 
@@ -1646,6 +1670,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
         plan: &ShieldedRangePlan,
         target: RangeEmitTarget<'_>,
         buffers: &mut EmitBuffers<'_, '_>,
+        scan: bool,
     ) -> Result<(), SettledShieldedSegmentError> {
         if target
             .cancel
@@ -1669,20 +1694,28 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
             ),
             _ => None,
         };
-        let emit_step = |step: &ShieldedReadStep,
-                         step_scratch: &mut ShieldedReadScratch,
-                         step_sink: &mut StepOutputSink<'_>|
+        let mut drop_behind = scan
+            .then(|| ScanDropBehind::new(&self.source, self.discard_scan_pages))
+            .flatten();
+        let mut emit_step = |step: &ShieldedReadStep,
+                             step_scratch: &mut ShieldedReadScratch,
+                             step_sink: &mut StepOutputSink<'_>|
          -> Result<(), SettledShieldedSegmentError> {
             let slab_bytes = match step.slab_byte_range() {
-                Some(byte_range) => Some(
-                    self.source
+                Some(byte_range) => {
+                    let bytes = self
+                        .source
                         .read_vec_at(byte_range.offset, byte_range.len)
                         .inspect_err(|_| {
                             for row_idx in step.row_range() {
                                 self.index.rows[row_idx].mark_invalid();
                             }
-                        })?,
-                ),
+                        })?;
+                    if let Some(scan) = &mut drop_behind {
+                        scan.consumed(byte_range);
+                    }
+                    Some(bytes)
+                }
                 None => None,
             };
             self.index.verify_and_emit_step(
@@ -1697,29 +1730,18 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
                 step_sink,
             )
         };
-        match target.order {
-            HeightOrder::Ascending => {
-                for step in plan.steps() {
-                    if target
-                        .cancel
-                        .is_some_and(|flag| flag.load(Ordering::Relaxed))
-                    {
-                        return Err(SettledShieldedSegmentError::Cancelled);
-                    }
-                    emit_step(step, buffers.scratch, buffers.sink)?;
-                }
+        let mut steps = plan.steps().iter();
+        while let Some(step) = match target.order {
+            HeightOrder::Ascending => steps.next(),
+            HeightOrder::Descending => steps.next_back(),
+        } {
+            if target
+                .cancel
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                return Err(SettledShieldedSegmentError::Cancelled);
             }
-            HeightOrder::Descending => {
-                for step in plan.steps().iter().rev() {
-                    if target
-                        .cancel
-                        .is_some_and(|flag| flag.load(Ordering::Relaxed))
-                    {
-                        return Err(SettledShieldedSegmentError::Cancelled);
-                    }
-                    emit_step(step, buffers.scratch, buffers.sink)?;
-                }
-            }
+            emit_step(step, buffers.scratch, buffers.sink)?;
         }
         Ok(())
     }

@@ -33,7 +33,8 @@ use super::{
     replay_tail::AuthenticatedReplayTail,
     rocksdb::{
         CanonicalStoreAdmissionExpectation, StoredDataAdmission,
-        canonical_column_family_descriptors, canonical_store_path, validate_open_store_control,
+        canonical_column_family_descriptors, canonical_store_path, read_admitted_schedule,
+        validate_open_store_control,
     },
     settled_segments::{
         cache::SettledSegmentReaderCache,
@@ -267,20 +268,8 @@ impl RocksDbCanonicalSecondary {
             reorg_policy,
             &ready_evidence,
         )?;
-        let activation_schedule = opened_control
-            .activation_schedule_binding
-            .map(|binding| {
-                CanonicalActivationSchedule::read_bound(
-                    &bounded_open.db,
-                    &primary_path,
-                    binding,
-                    opened_control
-                        .build_plan
-                        .network_upgrade_activations_fingerprint()
-                        .as_bytes(),
-                )
-            })
-            .transpose()?;
+        let activation_schedule =
+            read_admitted_schedule(&bounded_open.db, &primary_path, &opened_control)?;
         Ok(Self {
             bounded_open,
             primary_path,
@@ -409,6 +398,13 @@ impl RocksDbCanonicalSecondary {
     pub fn try_catch_up(
         &mut self,
     ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
+        self.try_catch_up_for_role(StoreRole::CanonicalSecondary)
+    }
+
+    pub(super) fn try_catch_up_for_role(
+        &mut self,
+        role: StoreRole,
+    ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
         let before = self.event_fence();
         self.bounded_open
             .db
@@ -450,6 +446,15 @@ impl RocksDbCanonicalSecondary {
             ));
         }
         let updated_sealed_segments = self.sync_settled_segments_on_catch_up(&ready_evidence)?;
+        let corpus_growth = updated_sealed_segments
+            .as_ref()
+            .map(|entries| {
+                self.segment_cache
+                    .prepare_corpus_growth(&entries[self.sealed_segments.len()..])
+            })
+            .transpose()?;
+        let activation_schedule =
+            read_admitted_schedule(&self.bounded_open.db, &self.primary_path, &opened_control)?;
         // Unchanged READY evidence is still explained by the tail this reader
         // already authenticated; otherwise re-derive only what changed.
         if ready_changed {
@@ -470,22 +475,11 @@ impl RocksDbCanonicalSecondary {
             )?;
         }
         self.ready_evidence = ready_evidence;
-        if let Some(entries) = updated_sealed_segments {
+        if let Some((entries, growth)) = updated_sealed_segments.zip(corpus_growth) {
+            self.segment_cache.admit_corpus_growth(growth, role);
             self.sealed_segments = entries;
         }
-        self.activation_schedule = opened_control
-            .activation_schedule_binding
-            .map(|binding| {
-                CanonicalActivationSchedule::read_bound(
-                    &self.bounded_open.db,
-                    &self.primary_path,
-                    binding,
-                    self.build_plan
-                        .network_upgrade_activations_fingerprint()
-                        .as_bytes(),
-                )
-            })
-            .transpose()?;
+        self.activation_schedule = activation_schedule;
         Ok(CanonicalSecondaryCatchupOutcome {
             before,
             after: self.event_fence(),

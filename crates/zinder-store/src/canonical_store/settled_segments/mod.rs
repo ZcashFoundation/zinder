@@ -3,7 +3,7 @@
 
 pub(crate) mod cache;
 pub(crate) mod layout;
-mod page_cache;
+pub(super) mod page_cache;
 pub(crate) mod sealer;
 pub(crate) mod snapshot;
 pub(crate) mod store_access;

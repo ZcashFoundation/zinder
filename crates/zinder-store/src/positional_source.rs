@@ -6,7 +6,7 @@
 //! buffers (`Bytes`), asynchronous database slices (`PostgreSQL` `substring`),
 //! and HTTP `Range` fetches.
 
-use std::{fs::File, io, sync::Arc};
+use std::{fs::File, io, num::NonZeroU64, sync::Arc};
 
 use bytes::Bytes;
 
@@ -38,6 +38,85 @@ impl ByteRange {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+pub(crate) type DiscardScanPages<S> = fn(&S, u64, NonZeroU64);
+
+pub(crate) fn bounded_file_scan(file: &File, constrained: bool) -> Option<DiscardScanPages<File>> {
+    if !constrained {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{Advice, fadvise};
+        if let Err(error) = fadvise(file, 0, None, Advice::Random) {
+            tracing::debug!(target: "zinder::store", %error, "could not advise settled segment readahead");
+        }
+        Some(|source, offset, len| {
+            if let Err(error) = fadvise(source, offset, Some(len), Advice::DontNeed) {
+                tracing::debug!(target: "zinder::store", %error, "could not discard settled segment scan pages");
+            }
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        None
+    }
+}
+
+/// Discards consumed payload in batches, with no shared cursor between scans.
+pub(crate) struct ScanDropBehind<'a, S> {
+    source: &'a S,
+    discard: DiscardScanPages<S>,
+    pending: Option<(u64, u64)>,
+}
+
+impl<'a, S> ScanDropBehind<'a, S> {
+    pub(crate) fn new(source: &'a S, discard: Option<DiscardScanPages<S>>) -> Option<Self> {
+        Some(Self {
+            source,
+            discard: discard?,
+            pending: None,
+        })
+    }
+
+    pub(crate) fn consumed(&mut self, range: ByteRange) {
+        const BATCH_BYTES: u64 = 1024 * 1024;
+        let Some(end) = range.end() else {
+            return;
+        };
+        if let Some((start, previous_end)) = self.pending
+            && range.offset <= previous_end
+            && end >= start
+        {
+            self.pending = Some((start.min(range.offset), previous_end.max(end)));
+        } else {
+            self.flush();
+            self.pending = Some((range.offset, end));
+        }
+        if self
+            .pending
+            .is_some_and(|(start, end)| end - start >= BATCH_BYTES)
+        {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if let Some((start, end)) = self.pending.take()
+            && let Some(len) = NonZeroU64::new(end - start)
+        {
+            // Linux retains partial boundary pages, which may contain the next frame.
+            (self.discard)(self.source, start, len);
+        }
+    }
+}
+
+impl<S> Drop for ScanDropBehind<'_, S> {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -182,14 +261,38 @@ fn read_vec_file_at(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>>
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc};
+    use std::{cell::RefCell, fs, sync::Arc};
 
     use bytes::Bytes;
     use tempfile::TempDir;
 
-    use super::{ByteRange, PositionalByteSource};
+    use super::{ByteRange, PositionalByteSource, ScanDropBehind};
 
     type TestOutcome<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    #[test]
+    fn scan_discards_only_consumed_extents_in_bounded_batches() -> TestOutcome {
+        let discarded = RefCell::new(Vec::new());
+        let mut scan = ScanDropBehind::new(
+            &discarded,
+            Some(|out, offset, len| out.borrow_mut().push((offset, len.get()))),
+        )
+        .ok_or("expected enabled scan")?;
+        for offset in [524_288, 0, 3_145_728, 3_670_016, 5_242_880] {
+            scan.consumed(ByteRange::new(offset, 524_288));
+        }
+        assert_eq!(
+            *discarded.borrow(),
+            [(0, 1_048_576), (3_145_728, 1_048_576)]
+        );
+        drop(scan);
+        assert_eq!(
+            *discarded.borrow(),
+            [(0, 1_048_576), (3_145_728, 1_048_576), (5_242_880, 524_288)]
+        );
+        assert!(ScanDropBehind::new(&discarded, None).is_none());
+        Ok(())
+    }
 
     #[test]
     fn byte_range_arithmetic_and_empty_checks() {

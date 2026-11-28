@@ -15,7 +15,9 @@ use zstd::bulk::Decompressor;
 
 use crate::{
     HeightOrder,
-    positional_source::{ByteRange, PositionalByteSource},
+    positional_source::{
+        ByteRange, DiscardScanPages, PositionalByteSource, ScanDropBehind, bounded_file_scan,
+    },
     segment_verity,
 };
 
@@ -898,6 +900,7 @@ impl SettledSupplementSegmentIndex {
 /// Authenticated positional reader for one settled `ZSTSUP01` supplement segment.
 pub struct SettledSupplementSegmentReader<S = File> {
     source: S,
+    discard_scan_pages: Option<DiscardScanPages<S>>,
     index: SettledSupplementSegmentIndex,
 }
 
@@ -928,6 +931,15 @@ impl SettledSupplementSegmentReader<File> {
         expected: &SupplementSegmentIdentity,
         options: SettledSupplementSegmentOpenOptions,
     ) -> Result<Self, SettledSupplementSegmentError> {
+        Self::open_file_with_scan_policy(file, expected, options, false)
+    }
+
+    pub(crate) fn open_file_with_scan_policy(
+        file: File,
+        expected: &SupplementSegmentIdentity,
+        options: SettledSupplementSegmentOpenOptions,
+        constrained: bool,
+    ) -> Result<Self, SettledSupplementSegmentError> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(io::Error::new(
@@ -944,7 +956,10 @@ impl SettledSupplementSegmentReader<File> {
         if options.require_fs_verity && !verity_verified {
             return Err(SettledSupplementSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(file, expected, options, verity_verified)
+        let discard_scan_pages = bounded_file_scan(&file, constrained);
+        let mut reader = Self::admit_with_verity(file, expected, options, verity_verified)?;
+        reader.discard_scan_pages = discard_scan_pages;
+        Ok(reader)
     }
 }
 
@@ -994,7 +1009,11 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
             total_len,
             kernel_verified,
         )?;
-        let reader = Self { source, index };
+        let reader = Self {
+            source,
+            discard_scan_pages: None,
+            index,
+        };
         if options.verify_full_payload {
             reader.verify_full_payload_with_raw(&header_bytes, &indexes_and_trailer)?;
         }
@@ -1271,12 +1290,18 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
             SupplementCompressionCodec::None => None,
             SupplementCompressionCodec::Zstd => Some(Decompressor::new()?),
         };
+        let mut drop_behind = (start_height != end_height)
+            .then(|| ScanDropBehind::new(&self.source, self.discard_scan_pages))
+            .flatten();
         for step in plan.chunks() {
             let chunk_range = step.compressed_range();
             let compressed = self
                 .source
                 .read_vec_at(chunk_range.offset, chunk_range.len)
                 .inspect_err(|_| self.index.chunks[step.chunk_idx()].mark_invalid())?;
+            if let Some(scan) = &mut drop_behind {
+                scan.consumed(chunk_range);
+            }
             let decoded = self.index.verify_and_decode_verified_chunk(
                 step,
                 &compressed,
@@ -1537,17 +1562,18 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
             scratch: &mut scratch,
             emit,
         };
+        let mut drop_behind = ScanDropBehind::new(&self.source, self.discard_scan_pages);
         match request.order {
             HeightOrder::Ascending => {
                 for splice_step in plan.chunks() {
-                    if !self.process_splice_step(splice_step, &mut ctx)? {
+                    if !self.process_splice_step(splice_step, &mut ctx, &mut drop_behind)? {
                         return Ok(false);
                     }
                 }
             }
             HeightOrder::Descending => {
                 for splice_step in plan.chunks().iter().rev() {
-                    if !self.process_splice_step(splice_step, &mut ctx)? {
+                    if !self.process_splice_step(splice_step, &mut ctx, &mut drop_behind)? {
                         return Ok(false);
                     }
                 }
@@ -1560,6 +1586,7 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         &self,
         splice_step: &SupplementSpliceChunkStep,
         ctx: &mut OrderedSpliceContext<'_, '_, P>,
+        drop_behind: &mut Option<ScanDropBehind<'_, S>>,
     ) -> Result<bool, SettledSupplementSegmentError> {
         if ctx.cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Ok(false);
@@ -1573,6 +1600,9 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
                     .inspect_err(|_| {
                         self.index.chunks[decode_step.chunk_idx()].mark_invalid();
                     })?;
+                if let Some(scan) = drop_behind {
+                    scan.consumed(chunk_range);
+                }
                 Some(self.index.verify_and_decode_verified_chunk(
                     decode_step,
                     &compressed,

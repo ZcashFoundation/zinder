@@ -647,7 +647,7 @@ struct ShieldedEntryContext<'a> {
     first_shielded: &'a AuthenticatedShieldedBoundary,
     last_shielded: Option<&'a AuthenticatedShieldedBoundary>,
     require_fs_verity: bool,
-    cache: Option<&'a SettledSegmentReaderCache>,
+    constrained: bool,
 }
 
 fn verify_single_entry_files(
@@ -661,16 +661,15 @@ fn verify_single_entry_files(
     let end = entry.end_block.height;
     let shielded_name = format_segment_filename(SettledSegmentKind::Shielded, start, end)?;
     let shielded_file = dirs.shielded.open_regular_file_nofollow(&shielded_name)?;
-    if let Some(cache) = cache {
-        cache.advise_file(&shielded_file);
-    }
-    let shielded_reader = SettledShieldedSegmentReader::open_file(
+    let constrained = cache.is_some_and(SettledSegmentReaderCache::constrained);
+    let shielded_reader = SettledShieldedSegmentReader::open_file_with_scan_policy(
         shielded_file,
         &entry.shielded_identity,
         SettledShieldedSegmentOpenOptions {
             require_fs_verity,
             verify_full_payload: false,
         },
+        constrained,
     )?;
     if !shielded_reader.kernel_verified() {
         shielded_reader.verify_full_payload()?;
@@ -692,7 +691,7 @@ fn verify_single_entry_files(
         first_shielded: &first_shielded,
         last_shielded: last_shielded.as_ref(),
         require_fs_verity,
-        cache,
+        constrained,
     };
     let sup_reader = if let (Some(sup_dir), Some(sup_id)) =
         (dirs.supplement.as_ref(), entry.supplement_identity.as_ref())
@@ -837,16 +836,15 @@ fn verify_supplement_linkage(
         ctx.entry.end_block.height,
     )?;
     let sup_file = sup_dir.open_regular_file_nofollow(&filename)?;
-    if let Some(cache) = ctx.cache {
-        cache.advise_file(&sup_file);
-    }
-    let reader = SettledSupplementSegmentReader::open_file(
+    let constrained = ctx.constrained;
+    let reader = SettledSupplementSegmentReader::open_file_with_scan_policy(
         sup_file,
         sup_id,
         SettledSupplementSegmentOpenOptions {
             require_fs_verity: ctx.require_fs_verity,
             verify_full_payload: false,
         },
+        constrained,
     )?;
     if !reader.kernel_verified() {
         reader.verify_full_payload()?;
@@ -892,16 +890,15 @@ fn verify_raw_block_linkage(
         ctx.entry.end_block.height,
     )?;
     let raw_file = raw_dir.open_regular_file_nofollow(&filename)?;
-    if let Some(cache) = ctx.cache {
-        cache.advise_file(&raw_file);
-    }
-    let raw_reader = SettledRawBlockSegmentReader::open_file(
+    let constrained = ctx.constrained;
+    let raw_reader = SettledRawBlockSegmentReader::open_file_with_scan_policy(
         raw_file,
         raw_id,
         SettledRawBlockSegmentOpenOptions {
             require_fs_verity: ctx.require_fs_verity,
             verify_full_payload: false,
         },
+        constrained,
     )?;
     if !raw_reader.kernel_verified() {
         raw_reader.verify_full_payload()?;

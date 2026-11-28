@@ -3,9 +3,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    fmt,
-    fs::File,
-    io,
+    fmt, io,
     num::NonZeroU64,
     path::Path,
     sync::Arc,
@@ -273,6 +271,7 @@ struct LruReaderState {
     lru_order: VecDeque<BlockHeight>,
     inflight: HashMap<InflightKey, Arc<InflightLoad>>,
     generation: u64,
+    page_cache: SettledSegmentPageCache,
 }
 
 impl LruReaderState {
@@ -282,6 +281,7 @@ impl LruReaderState {
             lru_order: VecDeque::with_capacity(capacity),
             inflight: HashMap::new(),
             generation: 0,
+            page_cache: SettledSegmentPageCache::default(),
         }
     }
 
@@ -311,7 +311,6 @@ pub(crate) struct SettledSegmentReaderCache {
     root_dir: VerifiedDir,
     max_open_segments: usize,
     require_fs_verity: bool,
-    page_cache: SettledSegmentPageCache,
     inner: Mutex<LruReaderState>,
     #[cfg(test)]
     test_hooks: CacheTestHooks,
@@ -388,7 +387,6 @@ impl SettledSegmentReaderCache {
             root_dir,
             max_open_segments,
             require_fs_verity,
-            page_cache: SettledSegmentPageCache::default(),
             inner: Mutex::new(LruReaderState::new(max_open_segments)),
             #[cfg(test)]
             test_hooks: CacheTestHooks::default(),
@@ -419,7 +417,7 @@ impl SettledSegmentReaderCache {
         )
     }
 
-    pub(super) fn with_corpus_budget(
+    pub(in crate::canonical_store) fn with_corpus_budget(
         store_root: &Path,
         entries: &[SettledSegmentIndexEntry],
         memory_budget: Option<NonZeroU64>,
@@ -429,17 +427,44 @@ impl SettledSegmentReaderCache {
             DEFAULT_SETTLED_SEGMENT_READER_CACHE_CAPACITY,
             false,
         )?;
-        cache.page_cache =
+        cache.inner.get_mut().page_cache =
             SettledSegmentPageCache::measure(&cache.root_dir, entries, memory_budget)?;
         Ok(Arc::new(cache))
     }
 
     pub(in crate::canonical_store) fn record_corpus_admission(&self, role: StoreRole) {
-        self.page_cache.record_admission(role);
+        let page_cache = self.inner.lock().page_cache;
+        page_cache.record_admission(role, true);
     }
 
-    pub(super) fn advise_file(&self, file: &File) {
-        self.page_cache.advise_file(file);
+    pub(in crate::canonical_store) fn prepare_corpus_growth(
+        &self,
+        entries: &[SettledSegmentIndexEntry],
+    ) -> Result<SettledSegmentPageCache, SettledSegmentsError> {
+        let page_cache = self.inner.lock().page_cache;
+        page_cache.with_new_entries(&self.root_dir, entries)
+    }
+
+    pub(in crate::canonical_store) fn admit_corpus_growth(
+        &self,
+        page_cache: SettledSegmentPageCache,
+        role: StoreRole,
+    ) {
+        let mut inner = self.inner.lock();
+        let changed = inner.page_cache.constrained() != page_cache.constrained();
+        inner.page_cache = page_cache;
+        if changed {
+            inner.generation = inner.generation.wrapping_add(1);
+            inner.slots.clear();
+            inner.lru_order.clear();
+            inner.inflight.clear();
+        }
+        drop(inner);
+        page_cache.record_admission(role, changed);
+    }
+
+    pub(in crate::canonical_store) fn constrained(&self) -> bool {
+        self.inner.lock().page_cache.constrained()
     }
 
     /// Returns the configured maximum number of open segments held in the cache.
@@ -870,17 +895,18 @@ fn open_single_module(
     let file = segments_dir
         .open_child_dir_existing(kind.subdir_name())?
         .open_regular_file_nofollow(&format_segment_filename(kind, start, end)?)?;
-    cache.advise_file(&file);
+    let constrained = cache.constrained();
 
     match kind {
         SettledSegmentKind::Shielded => Ok(LoadedModuleReader::Shielded(Arc::new(
-            SettledShieldedSegmentReader::open_file(
+            SettledShieldedSegmentReader::open_file_with_scan_policy(
                 file,
                 &entry.shielded_identity,
                 SettledShieldedSegmentOpenOptions {
                     require_fs_verity,
                     verify_full_payload: false,
                 },
+                constrained,
             )?,
         ))),
         SettledSegmentKind::Supplement => {
@@ -890,13 +916,14 @@ fn open_single_module(
                 )
             })?;
             Ok(LoadedModuleReader::Supplement(Arc::new(
-                SettledSupplementSegmentReader::open_file(
+                SettledSupplementSegmentReader::open_file_with_scan_policy(
                     file,
                     sup_id,
                     SettledSupplementSegmentOpenOptions {
                         require_fs_verity,
                         verify_full_payload: false,
                     },
+                    constrained,
                 )?,
             )))
         }
@@ -907,13 +934,14 @@ fn open_single_module(
                 )
             })?;
             Ok(LoadedModuleReader::RawBlock(Arc::new(
-                SettledRawBlockSegmentReader::open_file(
+                SettledRawBlockSegmentReader::open_file_with_scan_policy(
                     file,
                     raw_id,
                     SettledRawBlockSegmentOpenOptions {
                         require_fs_verity,
                         verify_full_payload: false,
                     },
+                    constrained,
                 )?,
             )))
         }

@@ -179,7 +179,8 @@ impl RocksDbTreeStateVerifier {
     pub fn try_catch_up(
         &mut self,
     ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
-        self.secondary.try_catch_up()
+        self.secondary
+            .try_catch_up_for_role(StoreRole::TreeStateVerificationSecondary)
     }
 
     /// Returns the currently admitted READY evidence.

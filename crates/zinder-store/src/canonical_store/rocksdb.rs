@@ -1520,7 +1520,7 @@ fn store_control_iteration_error(path: &Path, source: rust_rocksdb::Error) -> Ca
     CanonicalStoreError::admission(path, format!("store-control iteration failed: {source}"))
 }
 
-fn read_admitted_schedule(
+pub(super) fn read_admitted_schedule(
     db: &DB,
     path: &Path,
     control: &DecodedStoreControl,

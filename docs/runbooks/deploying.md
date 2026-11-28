@@ -63,8 +63,8 @@ The two-container Compose manifest defaults `ZINDER_SERVE_MEMORY_LIMIT` to
 `8g`. For a native systemd deployment, set the equivalent ceiling with
 `MemoryMax`. Buffered reads of settled segments can charge the Linux page
 cache to that limit even when RocksDB uses direct I/O. If the admitted corpus
-exceeds the detected budget at open, Zinder logs a warning and requests
-disabled speculative readahead on segment files.
+exceeds the budget sampled at open, Zinder logs a warning and requests
+disabled speculative readahead and drop-behind of consumed payload pages.
 
 ### Testnet and Regtest baselines
 

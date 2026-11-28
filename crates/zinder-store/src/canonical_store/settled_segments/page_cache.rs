@@ -1,6 +1,6 @@
 //! Page-cache policy for the settled corpus admitted by one canonical open.
 
-use std::{fs::File, num::NonZeroU64};
+use std::num::NonZeroU64;
 
 use crate::StoreRole;
 
@@ -12,7 +12,7 @@ use super::{
 };
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct SettledSegmentPageCache {
+pub(in crate::canonical_store) struct SettledSegmentPageCache {
     corpus_bytes: u64,
     memory_budget: Option<NonZeroU64>,
 }
@@ -29,6 +29,18 @@ impl SettledSegmentPageCache {
         })
     }
 
+    pub(super) fn with_new_entries(
+        self,
+        root: &VerifiedDir,
+        entries: &[SettledSegmentIndexEntry],
+    ) -> Result<Self, SettledSegmentsError> {
+        let added = corpus_bytes(root, entries)?;
+        Ok(Self {
+            corpus_bytes: add_bytes(self.corpus_bytes, added)?,
+            ..self
+        })
+    }
+
     fn constrained_budget(self) -> Option<NonZeroU64> {
         self.memory_budget
             .filter(|budget| budget.get() < self.corpus_bytes)
@@ -38,7 +50,7 @@ impl SettledSegmentPageCache {
         clippy::cast_precision_loss,
         reason = "Prometheus gauges use f64 samples"
     )]
-    pub(super) fn record_admission(self, role: StoreRole) {
+    pub(super) fn record_admission(self, role: StoreRole, warn_if_constrained: bool) {
         let store_role = role.as_str();
         let corpus_bytes = self.corpus_bytes;
         let budget_bytes = self
@@ -50,7 +62,7 @@ impl SettledSegmentPageCache {
             .set(budget_bytes);
         metrics::gauge!("zinder_store_settled_segment_corpus_to_budget_ratio", "store_role" => store_role)
             .set(corpus_bytes as f64 / budget_bytes);
-        if let Some(budget) = self.constrained_budget() {
+        if warn_if_constrained && let Some(budget) = self.constrained_budget() {
             tracing::warn!(
                 target: "zinder::store",
                 event = "settled_segment_corpus_exceeds_memory_budget",
@@ -62,23 +74,8 @@ impl SettledSegmentPageCache {
         }
     }
 
-    pub(super) fn advise_file(self, file: &File) {
-        #[cfg(target_os = "linux")]
-        if let Some(advice) = self.read_ahead_advice()
-            && let Err(error) = rustix::fs::fadvise(file, 0, None, advice)
-        {
-            tracing::debug!(target: "zinder::store", %error, "could not advise settled segment readahead");
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = (self, file);
-    }
-
-    #[cfg(target_os = "linux")]
-    fn read_ahead_advice(self) -> Option<rustix::fs::Advice> {
-        // Linux disables speculative readahead on this open file description.
-        // Demand reads remain buffered and share cached pages across streams.
-        self.constrained_budget()
-            .map(|_| rustix::fs::Advice::Random)
+    pub(super) fn constrained(self) -> bool {
+        self.constrained_budget().is_some()
     }
 }
 
@@ -116,29 +113,31 @@ fn corpus_bytes(
                     dir.display_path().join(filename).display()
                 )));
             };
-            total = total.checked_add(len).ok_or_else(|| {
-                SettledSegmentsError::InvalidLayout(
-                    "settled segment corpus exceeds u64 bytes".to_owned(),
-                )
-            })?;
+            total = add_bytes(total, len)?;
         }
     }
     Ok(total)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+fn add_bytes(total: u64, added: u64) -> Result<u64, SettledSegmentsError> {
+    total.checked_add(added).ok_or_else(|| {
+        SettledSegmentsError::InvalidLayout("settled segment corpus exceeds u64 bytes".to_owned())
+    })
+}
+
+#[cfg(test)]
 #[test]
-fn readahead_is_disabled_only_when_the_corpus_exceeds_a_finite_budget() {
+fn scan_cache_is_constrained_only_when_the_corpus_exceeds_a_finite_budget() {
     for (budget, expected) in [
-        (NonZeroU64::new(1023), Some(rustix::fs::Advice::Random)),
-        (NonZeroU64::new(1024), None),
-        (NonZeroU64::new(1025), None),
-        (None, None),
+        (NonZeroU64::new(1023), true),
+        (NonZeroU64::new(1024), false),
+        (NonZeroU64::new(1025), false),
+        (None, false),
     ] {
         let page_cache = SettledSegmentPageCache {
             corpus_bytes: 1024,
             memory_budget: budget,
         };
-        assert_eq!(page_cache.read_ahead_advice(), expected);
+        assert_eq!(page_cache.constrained(), expected);
     }
 }

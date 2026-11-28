@@ -2733,24 +2733,24 @@ fn settled_corpus_admission_reports_exact_bytes_and_warns_only_below_budget() ->
 #[test]
 fn constrained_and_unbounded_readers_serve_concurrent_settled_ranges() -> TestResult {
     let dir = TempDir::new()?;
-    let entry = seal_test_stride(
-        dir.path(),
-        1..=4,
-        4,
-        SettledSegmentModules {
-            supplement: false,
-            raw_bodies: false,
-        },
-        None,
-    )?;
-    let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(4));
+    let entry = seal_dense_scan_segment(dir.path())?;
+    let file =
+        std::fs::File::open(SettledSegmentFilePaths::for_entry(dir.path(), &entry)?.shielded)?;
+    let budget = NonZeroU64::new(1024 * 1024);
+    assert!(file.metadata()?.len() > 4 * 1024 * 1024);
+    let range = BlockHeightRange::inclusive(entry.start_height, entry.end_block.height);
     let entries = std::slice::from_ref(&entry);
     let baseline = SettledSegmentReaderCache::with_corpus_budget(dir.path(), entries, None)?
         .get_or_open_shielded(&entry)?
         .read_default_range(range, HeightOrder::Ascending)?;
-    for budget in [NonZeroU64::new(1), None] {
+    for budget in [budget, None] {
+        #[cfg(target_os = "linux")]
+        {
+            file.sync_all()?;
+            rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)?;
+        }
         let cache = SettledSegmentReaderCache::with_corpus_budget(dir.path(), entries, budget)?;
-        assert_singleflight_module(8, || {
+        assert_singleflight_module(4, || {
             let reader = cache.get_or_open_shielded(&entry)?;
             let blocks = reader.read_default_range(range, HeightOrder::Ascending)?;
             assert_eq!(blocks.len(), baseline.len());
@@ -2762,6 +2762,45 @@ fn constrained_and_unbounded_readers_serve_concurrent_settled_ranges() -> TestRe
         assert_eq!(cache.open_count(SettledSegmentKind::Shielded), 1);
     }
     Ok(())
+}
+
+fn seal_dense_scan_segment(
+    root: &Path,
+) -> Result<SettledSegmentIndexEntry, Box<dyn std::error::Error>> {
+    const BLOCKS: u32 = 256;
+    let config = SettledSegmentSealerConfig::new(
+        Network::ZcashRegtest,
+        TEST_SCHEMA_VERSION,
+        SettledSegmentModules {
+            supplement: false,
+            raw_bodies: false,
+        },
+    )
+    .with_segment_blocks(BLOCKS);
+    let mut sealer = SettledSegmentSealer::new(root, config, None)?;
+    let mut entries = Vec::new();
+    for height in 1..=BLOCKS {
+        let mut block = build_block_input(height, false);
+        let parts = block.compact_block.into_parts();
+        let mut transactions = parts.transactions;
+        let first_tx = &mut transactions[0].data;
+        let action = first_tx.orchard_actions[0].clone();
+        first_tx.orchard_actions.resize(128, action);
+        block.canonical_facts.transactions[0]
+            .public_facts
+            .counts
+            .orchard_action_count = 128;
+        block.compact_block = CompactBlockArtifact::new(
+            parts.block_id,
+            parts.previous_block_hash,
+            parts.time,
+            transactions,
+            parts.chain_metadata,
+        )?;
+        entries.extend(sealer.push_block(block)?);
+    }
+    let [entry] = <[_; 1]>::try_from(entries).map_err(|_| "expected one dense scan segment")?;
+    Ok(entry)
 }
 
 #[test]

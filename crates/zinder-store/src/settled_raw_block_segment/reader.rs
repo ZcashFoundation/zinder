@@ -8,7 +8,9 @@ use zinder_core::{
 };
 
 use crate::{
-    positional_source::{ByteRange, PositionalByteSource},
+    positional_source::{
+        ByteRange, DiscardScanPages, PositionalByteSource, ScanDropBehind, bounded_file_scan,
+    },
     segment_verity,
 };
 
@@ -966,6 +968,7 @@ impl SettledRawBlockSegmentIndex {
 /// by a [`PositionalByteSource`] (default [`File`]).
 pub struct SettledRawBlockSegmentReader<S = File> {
     source: S,
+    discard_scan_pages: Option<DiscardScanPages<S>>,
     index: SettledRawBlockSegmentIndex,
 }
 
@@ -996,6 +999,15 @@ impl SettledRawBlockSegmentReader<File> {
         expected: &RawBlockSegmentIdentity,
         options: SettledRawBlockSegmentOpenOptions,
     ) -> Result<Self, SettledRawBlockSegmentError> {
+        Self::open_file_with_scan_policy(file, expected, options, false)
+    }
+
+    pub(crate) fn open_file_with_scan_policy(
+        file: File,
+        expected: &RawBlockSegmentIdentity,
+        options: SettledRawBlockSegmentOpenOptions,
+        constrained: bool,
+    ) -> Result<Self, SettledRawBlockSegmentError> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(io::Error::new(
@@ -1013,7 +1025,10 @@ impl SettledRawBlockSegmentReader<File> {
         if options.require_fs_verity && !kernel_verified {
             return Err(SettledRawBlockSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(file, expected, options, kernel_verified)
+        let discard_scan_pages = bounded_file_scan(&file, constrained);
+        let mut reader = Self::admit_with_verity(file, expected, options, kernel_verified)?;
+        reader.discard_scan_pages = discard_scan_pages;
+        Ok(reader)
     }
 }
 
@@ -1064,7 +1079,11 @@ impl<S: PositionalByteSource> SettledRawBlockSegmentReader<S> {
             total_len,
             kernel_verified,
         )?;
-        let reader = Self { source, index };
+        let reader = Self {
+            source,
+            discard_scan_pages: None,
+            index,
+        };
         if options.verify_full_payload {
             reader.verify_full_payload_with_raw(&header_bytes, &index_and_trailer)?;
         }
@@ -1215,6 +1234,18 @@ impl<S: PositionalByteSource> SettledRawBlockSegmentReader<S> {
         &self,
         height: BlockHeight,
     ) -> Result<Vec<u8>, SettledRawBlockSegmentError> {
+        self.read_raw_block_for_scan(height, &mut None)
+    }
+
+    pub(crate) fn scan_drop_behind(&self) -> Option<ScanDropBehind<'_, S>> {
+        ScanDropBehind::new(&self.source, self.discard_scan_pages)
+    }
+
+    pub(crate) fn read_raw_block_for_scan(
+        &self,
+        height: BlockHeight,
+        drop_behind: &mut Option<ScanDropBehind<'_, S>>,
+    ) -> Result<Vec<u8>, SettledRawBlockSegmentError> {
         let plan = self.index.plan_block_read(height)?;
         let row = &self.index.rows[plan.row_idx];
         let raw_rows = self
@@ -1235,6 +1266,9 @@ impl<S: PositionalByteSource> SettledRawBlockSegmentReader<S> {
             .source
             .read_vec_at(plan.slab_byte_range.offset, plan.slab_byte_range.len)
             .inspect_err(|_| row.mark_invalid())?;
+        if let Some(scan) = drop_behind {
+            scan.consumed(plan.slab_byte_range);
+        }
         self.index
             .verify_and_decode_block(&plan, verified_rows, &frame)
     }
