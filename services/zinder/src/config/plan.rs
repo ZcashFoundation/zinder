@@ -472,6 +472,13 @@ fn scrub_shared_infrastructure_sections(
     if matches!(role, ServiceRole::Projector | ServiceRole::CompatCipherscan) {
         let _cleared_node = std::mem::take(&mut role_cfg.node);
         let _cleared_fallbacks = std::mem::take(&mut role_cfg.node_fallbacks);
+    } else if role != ServiceRole::Ingest {
+        role_cfg.node.indexer_grpc_addr = None;
+        let _cleared_tls = std::mem::take(&mut role_cfg.node.indexer_tls);
+        for (_, fallback) in role_cfg.node_fallbacks.iter_mut() {
+            fallback.indexer_grpc_addr = None;
+            let _cleared_fb_tls = std::mem::take(&mut fallback.indexer_tls);
+        }
     }
     if matches!(
         role,

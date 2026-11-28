@@ -222,6 +222,11 @@ impl RedactedUrl {
         if raw.trim().is_empty() {
             return Err("empty URL value is not allowed");
         }
+        if raw.contains(REDACTED_PLACEHOLDER) {
+            return Err(
+                "URL must not contain `[REDACTED]`; supply the real endpoint instead of `--print-config` output",
+            );
+        }
         Ok(Self(raw))
     }
 
@@ -384,5 +389,22 @@ impl<'de> Deserialize<'de> for RedactedCidrs {
             return Ok(Self::Disabled);
         }
         Ok(Self::Configured(SecretString::from(raw)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RedactedUrl;
+
+    #[test]
+    fn redacted_url_rejects_redacted_placeholder_and_preserves_display_constructor() {
+        assert!(RedactedUrl::new("https://prices.example/price?[REDACTED]").is_err());
+        assert!(RedactedUrl::new("https://user:[REDACTED]@prices.example/price").is_err());
+        let displayed =
+            RedactedUrl::from_redacted_display("https://prices.example/price?api_key=secret");
+        assert_eq!(
+            displayed.as_str(),
+            "https://prices.example/price?[REDACTED]"
+        );
     }
 }

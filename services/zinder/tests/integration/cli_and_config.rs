@@ -755,3 +755,176 @@ fn config_print_redacted_output_is_rejected_on_revalidate() -> eyre::Result<()> 
     assert!(stderr.contains("[REDACTED]"), "{stderr}");
     Ok(())
 }
+
+fn assert_reader_strips_indexer_tls(reader: &zinder::config::RoleLaunchSpec) -> eyre::Result<()> {
+    assert!(
+        !reader
+            .secret_env
+            .keys()
+            .any(|k| k.contains("INDEXER_TLS") || k.contains("INDEXER_GRPC_ADDR"))
+    );
+    for forbidden in [
+        "indexer_grpc_addr",
+        "indexer_tls",
+        "primary-ca",
+        "primary-cert",
+        "primary-key-secret",
+        "fb-client.crt",
+        "fb-client.key",
+    ] {
+        assert!(
+            !reader.non_secret_toml.contains(forbidden),
+            "{:?} leaked {forbidden}",
+            reader.role
+        );
+    }
+    let parsed: zinder_runtime::ZinderConfig = toml::from_str(&reader.non_secret_toml)?;
+    assert!(parsed.node.indexer_grpc_addr.is_none());
+    assert!(parsed.node.indexer_tls.is_empty());
+    for (_, fallback) in parsed.node_fallbacks.iter() {
+        assert!(fallback.indexer_grpc_addr.is_none());
+        assert!(fallback.indexer_tls.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn reader_launch_specs_strip_primary_and_fallback_indexer_tls_and_endpoint() -> eyre::Result<()> {
+    use secrecy::ExposeSecret;
+    use zinder::{
+        cli::{ConfigScopeArgs, Preset, ServiceRole},
+        config::{ConfigScope, prepare_supervision_plan_with_env},
+    };
+
+    let sandbox = TempDir::new()?;
+    let cfg_path = write_test_config(
+        sandbox.path(),
+        &format!(
+            concat!(
+                "[network]\nname = \"zcash-regtest\"\n",
+                "[storage]\ndata_dir = \"{}\"\n",
+                "[node]\njson_rpc_addr = \"http://127.0.0.1:18232\"\n",
+                "indexer_grpc_addr = \"https://primary:8230\"\n",
+                "[node.indexer_tls]\nca_cert_pem = \"primary-ca\"\n",
+                "client_cert_pem = \"primary-cert\"\nclient_key_pem = \"primary-key-secret\"\n",
+                "[node_fallbacks.1]\njson_rpc_addr = \"http://127.0.0.1:18233\"\n",
+                "indexer_grpc_addr = \"https://fb:8230\"\n",
+                "[node_fallbacks.1.indexer_tls]\n",
+                "client_cert_path = \"/etc/zinder/fb-client.crt\"\n",
+                "client_key_path = \"/etc/zinder/fb-client.key\"\n",
+            ),
+            sandbox.path().display()
+        ),
+    )?;
+    let scope = ConfigScope::serve(ConfigScopeArgs {
+        preset: Some(Preset::Explorer),
+        readers_only: false,
+        full_blocks: false,
+        data_dir: None,
+        config_path: Some(cfg_path),
+    });
+    let plan = prepare_supervision_plan_with_env(&scope, std::iter::empty::<(String, String)>())?;
+
+    let ingest = plan
+        .roles
+        .iter()
+        .find(|spec| spec.role == ServiceRole::Ingest)
+        .ok_or_else(|| eyre::eyre!("missing ingest role"))?;
+    let secret_str = |key: &str| ingest.secret_env.get(key).map(ExposeSecret::expose_secret);
+    assert_eq!(
+        secret_str("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM"),
+        Some("primary-key-secret")
+    );
+    assert_eq!(
+        secret_str("ZINDER_NODE__INDEXER_GRPC_ADDR"),
+        Some("https://primary:8230")
+    );
+    assert_eq!(
+        secret_str("ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PATH"),
+        Some("/etc/zinder/fb-client.key")
+    );
+    assert!(ingest.non_secret_toml.contains("fb-client.crt"));
+
+    for role in [
+        ServiceRole::Query,
+        ServiceRole::CompatLightwalletd,
+        ServiceRole::Explorer,
+    ] {
+        let reader = plan
+            .roles
+            .iter()
+            .find(|spec| spec.role == role)
+            .ok_or_else(|| eyre::eyre!("missing reader role {role:?}"))?;
+        assert_reader_strips_indexer_tls(reader)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn cipherscan_credentialed_price_endpoint_print_is_rejected_on_revalidate() -> eyre::Result<()> {
+    let sandbox = TempDir::new()?;
+    let cfg_path = write_test_config(
+        sandbox.path(),
+        &format!(
+            concat!(
+                "[network]\nname = \"zcash-regtest\"\n",
+                "[storage]\ndata_dir = \"{}\"\n",
+                "[node]\njson_rpc_addr = \"http://127.0.0.1:18232\"\n",
+                "[cipherscan]\ncurrent_price_endpoint = \"https://prices.example/price?api_key=secret\"\n",
+                "historical_price_endpoint_template = \"https://prices.example/history?date={{date}}&token=hist-secret\"\n",
+            ),
+            sandbox.path().display()
+        ),
+    )?;
+    let printed = zinder_command(&[
+        "config",
+        "print",
+        "--preset",
+        "explorer",
+        "--config",
+        cfg_path.to_str().ok_or_else(|| eyre::eyre!("path"))?,
+    ])
+    .output()?;
+    assert!(
+        printed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    let printed_text = String::from_utf8_lossy(&printed.stdout);
+    assert!(printed_text.contains("https://prices.example/price?[REDACTED]"));
+    assert!(printed_text.contains("https://prices.example/history?[REDACTED]"));
+    assert!(!printed_text.contains("api_key=secret"));
+    assert!(!printed_text.contains("hist-secret"));
+
+    let redacted_price_cfg = write_test_config(
+        sandbox.path(),
+        &format!(
+            concat!(
+                "[network]\nname = \"zcash-regtest\"\n",
+                "[storage]\ndata_dir = \"{}\"\n",
+                "[node]\njson_rpc_addr = \"http://127.0.0.1:18232\"\n",
+                "[cipherscan]\ncurrent_price_endpoint = \"https://prices.example/price?[REDACTED]\"\n",
+            ),
+            sandbox.path().display()
+        ),
+    )?;
+    let revalidated = zinder_command(&[
+        "config",
+        "validate",
+        "--preset",
+        "explorer",
+        "--config",
+        redacted_price_cfg
+            .to_str()
+            .ok_or_else(|| eyre::eyre!("path"))?,
+    ])
+    .output()?;
+    assert!(!revalidated.status.success());
+    let stderr = String::from_utf8_lossy(&revalidated.stderr);
+    assert!(
+        stderr.contains("cipherscan.current_price_endpoint"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("[REDACTED]"), "{stderr}");
+    Ok(())
+}

@@ -450,3 +450,49 @@ fn section_validation_attributes_failing_leaf_without_blaming_siblings() -> Resu
     );
     Ok(())
 }
+
+#[test]
+fn whitespace_only_env_string_is_rejected_while_nonblank_preserves_bytes() -> Result<()> {
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct AnyProbe {
+        typed: std::collections::BTreeMap<String, toml::Value>,
+    }
+
+    let inactive_whitespace = ConfigLoader::new()
+        .with_zinder_env_from_map([
+            (
+                "ZINDER_NETWORK__NAME".to_owned(),
+                "zcash-regtest".to_owned(),
+            ),
+            ("ZINDER_INGEST__SOURCE".to_owned(), "   ".to_owned()),
+        ])?
+        .load::<zinder_runtime::ZinderConfig>();
+    assert!(
+        matches!(
+            inactive_whitespace,
+            Err(ConfigError::InvalidEnvValue {
+                ref original_name,
+                ref key,
+                ..
+            }) if original_name == "ZINDER_INGEST__SOURCE" && key == "ingest.source"
+        ),
+        "expected whitespace-only inactive string to fail closed: {inactive_whitespace:?}"
+    );
+
+    let any_whitespace = ConfigLoader::new()
+        .with_zinder_env_from_map([("ZINDER_TYPED__ANY_FIELD".to_owned(), " \t ".to_owned())])?
+        .load::<AnyProbe>();
+    assert!(matches!(
+        any_whitespace,
+        Err(ConfigError::InvalidEnvValue {
+            ref original_name,
+            ref key,
+            ..
+        }) if original_name == "ZINDER_TYPED__ANY_FIELD" && key == "typed.any_field"
+    ));
+
+    let kept_padded = load_toy_env(("ZINDER_TYPED__SECRET", "  keep-me  "))?;
+    assert_eq!(kept_padded.typed.secret.as_deref(), Some("  keep-me  "));
+    Ok(())
+}

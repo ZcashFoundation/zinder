@@ -1450,7 +1450,7 @@ fn reject_blank_optional(
     reason: &'static str,
 ) -> Result<Option<String>, NodeConfigError> {
     match text {
-        Some(text) if text.trim().is_empty() || text.trim() == REDACTED_PLACEHOLDER => {
+        Some(text) if text.trim().is_empty() || text.contains(REDACTED_PLACEHOLDER) => {
             Err(NodeConfigError::Invalid { reason })
         }
         other => Ok(other),
@@ -1463,7 +1463,7 @@ fn resolve_optional_disabled_url(
 ) -> Result<Option<String>, NodeConfigError> {
     match text {
         None => Ok(None),
-        Some(text) if text.trim().is_empty() || text.trim() == REDACTED_PLACEHOLDER => {
+        Some(text) if text.trim().is_empty() || text.contains(REDACTED_PLACEHOLDER) => {
             Err(NodeConfigError::Invalid { reason })
         }
         Some(text) if text.trim() == DISABLED_SENTINEL => Ok(None),

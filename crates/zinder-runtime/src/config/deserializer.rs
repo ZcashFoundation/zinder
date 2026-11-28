@@ -365,7 +365,7 @@ impl<'de> NodeDeserializer<'de> {
     {
         match self.node {
             NodeRef::Node(ConfigNode::Env { origin, raw }) => {
-                if raw.is_empty() {
+                if raw.trim().is_empty() {
                     return Err(empty_env_error(origin));
                 }
                 raw.trim()
@@ -408,7 +408,7 @@ impl<'de> NodeDeserializer<'de> {
     {
         match self.node {
             NodeRef::Node(ConfigNode::Env { origin, raw }) => {
-                if raw.is_empty() {
+                if raw.trim().is_empty() {
                     return Err(empty_env_error(origin));
                 }
                 raw.trim()
@@ -442,7 +442,7 @@ impl<'de> NodeDeserializer<'de> {
     {
         match self.node {
             NodeRef::Node(ConfigNode::Env { origin, raw }) => {
-                if raw.is_empty() {
+                if raw.trim().is_empty() {
                     return Err(empty_env_error(origin));
                 }
                 visitor.visit_str(raw.as_str())
@@ -475,7 +475,7 @@ impl<'de> NodeDeserializer<'de> {
         if as_f32 {
             let trimmed = match self.node {
                 NodeRef::Node(ConfigNode::Env { origin, raw }) => {
-                    if raw.is_empty() {
+                    if raw.trim().is_empty() {
                         return Err(empty_env_error(origin));
                     }
                     raw.trim()
@@ -504,7 +504,7 @@ impl<'de> NodeDeserializer<'de> {
     fn parse_f64(&self, label: &str) -> Result<f64, DeserError> {
         match self.node {
             NodeRef::Node(ConfigNode::Env { origin, raw }) => {
-                if raw.is_empty() {
+                if raw.trim().is_empty() {
                     return Err(empty_env_error(origin));
                 }
                 raw.trim()
@@ -666,7 +666,7 @@ impl<'de> Deserializer<'de> for NodeDeserializer<'de> {
                 visitor.visit_map(&mut access)
             }
             NodeRef::Node(ConfigNode::Env { origin, raw }) => {
-                if raw.is_empty() {
+                if raw.trim().is_empty() {
                     return Err(empty_env_error(origin));
                 }
                 visitor.visit_str(raw.as_str())
@@ -689,7 +689,7 @@ impl<'de> Deserializer<'de> for NodeDeserializer<'de> {
     {
         match self.node {
             NodeRef::Node(ConfigNode::Env { origin, raw }) => {
-                if raw.is_empty() {
+                if raw.trim().is_empty() {
                     return Err(empty_env_error(origin));
                 }
                 match raw.as_str() {
@@ -776,7 +776,7 @@ impl<'de> Deserializer<'de> for NodeDeserializer<'de> {
     fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.node {
             NodeRef::Node(ConfigNode::Env { origin, raw }) => {
-                if raw.is_empty() {
+                if raw.trim().is_empty() {
                     return Err(empty_env_error(origin));
                 }
                 visitor.visit_bytes(raw.as_bytes())
@@ -893,7 +893,7 @@ impl<'de> Deserializer<'de> for NodeDeserializer<'de> {
     ) -> Result<V::Value, Self::Error> {
         match self.node {
             NodeRef::Node(ConfigNode::Env { origin, raw }) => {
-                if raw.is_empty() {
+                if raw.trim().is_empty() {
                     return Err(empty_env_error(origin));
                 }
                 visitor.visit_enum(EnumStringAccess::new(raw.as_str(), Some(origin), variants))
