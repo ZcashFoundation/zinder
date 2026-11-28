@@ -202,6 +202,13 @@ endpoint is verified; see
 [Node source boundary](../architecture/node-source-boundary.md#capabilities)
 for verification.
 
+`BlockHeaderBySelector` returns the block identity, previous block hash,
+transaction Merkle root, raw commitment bytes, block time in Unix seconds,
+compact difficulty target, nonce, and version. Hashes and the Merkle root use
+lowercase hex in RPC byte order. The header omits the Equihash solution. For
+the consensus-serialized header, decode it from a `FullBlock` response on a
+store that retains all raw block blobs.
+
 ## Explorer capabilities
 
 `zinder-explorer` computes its set from what it has open, each time it

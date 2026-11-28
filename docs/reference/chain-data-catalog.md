@@ -6,7 +6,7 @@ The "Stored in" column names where the data lives. `zinder-ingest` writes the ca
 
 | Data | Stored in | Served through | Notes |
 | --- | --- | --- | --- |
-| Block identity, headers, and best-chain hash index | Canonical and materialized views | `WalletQuery` tips and `BlockIdBySelector`; lightwalletd `GetLatestBlock`, `GetBlock`; `ExplorerQuery.BlockDetail` | `BlockHeaderBySelector` is not advertised; `ExplorerQuery.BlockDetail` requires both materialized views and `WalletQuery` |
+| Block identity, headers, and best-chain hash index | Canonical and materialized views | `WalletQuery` tips, `BlockIdBySelector`, and `BlockHeaderBySelector`; lightwalletd `GetLatestBlock`, `GetBlock`; `ExplorerQuery.BlockDetail` | See [Capabilities](capabilities.md#wallet-capabilities) for the typed header fields. `ExplorerQuery.BlockDetail` requires both materialized views and `WalletQuery`. |
 | Compact blocks | Canonical (`ZSHRNG02` + `ZSTSUP01`, `live_tail_block`) | `WalletQuery.CompactBlock`, `CompactBlocksInRange`; lightwalletd `GetBlock`, `GetBlockRange`, nullifier variants | Built at commit, never on request |
 | Full serialized blocks | Canonical (`ZSBLKB01`, `live_tail_raw_block`) | `WalletQuery.FullBlock`, `FullBlocksInRange` | Only when `storage.raw_blob_policy = "all"` (`storage.full_blocks = true`) |
 | Tree states (Sapling, Orchard, Ironwood) | Canonical | `WalletQuery.TreeStateAtHeight`, `LatestTreeStateCheckpoint`; lightwalletd `GetTreeState`, `GetLatestTreeState` | Historical checkpoints follow the [construction and backfill policy](../architecture/chain-ingestion.md#tree-state-densification); live following stores one per block; other heights rebuilt from compact blocks |
