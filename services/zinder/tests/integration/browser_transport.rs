@@ -264,6 +264,7 @@ async fn wallet_browser_calls(listener: &NativeListener, http: &Client) -> Resul
                         start_height: 1,
                         end_height: 2,
                         at_epoch_id: None,
+                        pool_types: Vec::new(),
                     },
                 ),
             )
