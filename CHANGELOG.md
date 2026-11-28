@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.29.1] - 2026-11-28
+
+**Upgrade class:** `compatible` — Reversible by redeploying the previous release against the same store and schema.
+
+### Changed
+
+- Zinder refreshes its Rust dependencies and container base images. The bundled observability stack uses Grafana 13.3.2, and the lightwalletd compatibility suite uses the Go v0.6.3 reference. ([#768](https://github.com/ZcashFoundation/zinder/pull/768))
+
+
 ## [0.29.0] - 2026-11-28
 
 **Upgrade class:** `canonical-layout` — Requires a fresh rebuild of the canonical store and dependent projections; see release entries below for layout changes and rollback steps.
