@@ -1,0 +1,36 @@
+name: darkside-macos
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/darkside-macos.yml
+      - Cargo.lock
+      - crates/zinder-proto/**
+      - crates/zinder-testkit/src/grpc_web.rs
+      - services/zinder/src/darkside/**
+      - services/zinder/src/cli.rs
+      - services/zinder/tests/integration/darkside.rs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  darkside:
+    name: Darkside SDK scenarios on macOS
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rust
+      - name: Exercise the CLI with native gRPC and gRPC-Web
+        env:
+          CARGO_BUILD_JOBS: 5
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: |
+          export LIBCLANG_PATH="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          cargo test --locked -p zinder --test acceptance integration::darkside::

@@ -7,7 +7,8 @@
 
 use zinder_runtime::{MAX_UNCAPPED_ENUM_LIST_ELEMENTS, MethodFieldLimits, RepeatedFieldLimit};
 
-use crate::grpc::{MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST, u32_to_usize};
+use crate::grpc::u32_to_usize;
+use crate::mempool::MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST;
 
 /// Addresses one `GetAddressUtxos` or `GetAddressUtxosStream` request may
 /// list. The handler caps the returned outputs, not the addresses, so this

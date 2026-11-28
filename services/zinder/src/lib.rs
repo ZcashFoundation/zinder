@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod config;
+mod darkside;
 pub mod healthcheck;
 pub mod ops;
 pub mod supervisor;
@@ -28,6 +29,10 @@ async fn dispatch_cli(cli: Cli) -> ExitCode {
         Command::Index(args) => run_index(args).await,
         Command::Snapshot(args) => run_snapshot_command(args).await,
         Command::Backup(args) => run_backup_command(args).await,
+        Command::Dev(cli::DevCommand::Darkside(args)) => match darkside::run(args).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => emit_cli_error("dev darkside", &error.to_string()),
+        },
     }
 }
 

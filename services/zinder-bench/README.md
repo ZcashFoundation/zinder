@@ -896,7 +896,11 @@ flags, explicit target CPU, and compiled target features.
 ### Inspect column-family properties
 
 `rocksdb-store-properties` reports the default family and every canonical
-data family from one admitted secondary. Each row includes total SST bytes,
+data family from one admitted secondary. The report includes
+`construction_tree_state_checkpoint_policy` from the authenticated manifest.
+The policy has a `selection` and, for `commitment-budget`, a numeric
+`commitment_budget`. A null policy means the manifest predates the record.
+Each family includes total SST bytes,
 estimated live bytes, and the file count and estimated compression ratio at
 each level from 0 to 6. A null ratio means RocksDB has no estimate. The
 parsed aggregate table properties include index, filter, and data bytes,

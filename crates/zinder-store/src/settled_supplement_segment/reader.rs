@@ -1,15 +1,21 @@
 //! Positional sans-I/O range planner and reader for `ZSTSUP01` segments.
 
 use std::{
+    cell::RefCell,
+    collections::VecDeque,
     fs::File,
     io,
     ops::Range,
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
+use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
-use zinder_core::{BlockHash, BlockHeight, CompactBlockArtifact};
+use zinder_core::{BlockHash, BlockHeaderArtifact, BlockHeight, CompactBlockArtifact};
 use zinder_proto::compat::lightwalletd::EncodedBlock;
 use zstd::bulk::Decompressor;
 
@@ -609,33 +615,23 @@ impl SettledSupplementSegmentIndex {
         compressed_chunk_bytes: &[u8],
         verified_rows: VerifiedSupplementRowIndexSlice<'_>,
     ) -> Result<Vec<BlockSupplementRecord>, SettledSupplementSegmentError> {
-        let mut decompressor = match self.codec {
-            SupplementCompressionCodec::None => None,
-            SupplementCompressionCodec::Zstd => Some(Decompressor::new()?),
-        };
-        self.verify_and_decode_verified_chunk(
-            step,
-            compressed_chunk_bytes,
-            verified_rows,
-            decompressor.as_mut(),
-        )
+        let chunk_bytes =
+            self.verify_and_decompress_chunk(step.chunk_idx, compressed_chunk_bytes)?;
+        self.decode_chunk_rows(step, &chunk_bytes, verified_rows)
     }
 
-    fn verify_and_decode_verified_chunk(
+    fn decode_chunk_rows(
         &self,
         step: &SupplementChunkReadStep,
-        compressed_chunk_bytes: &[u8],
+        chunk_bytes: &[u8],
         verified_rows: VerifiedSupplementRowIndexSlice<'_>,
-        decompressor: Option<&mut Decompressor<'static>>,
     ) -> Result<Vec<BlockSupplementRecord>, SettledSupplementSegmentError> {
         for row_idx in step.row_range() {
             self.ensure_row_not_invalid(row_idx)?;
         }
-        let chunk_bytes =
-            self.verify_and_decompress_chunk(step.chunk_idx, compressed_chunk_bytes, decompressor)?;
         let mut out = Vec::with_capacity(step.row_range.len());
         for row_idx in step.row_range() {
-            out.push(self.decode_verified_row_from_chunk(row_idx, &chunk_bytes, verified_rows)?);
+            out.push(self.decode_verified_row_from_chunk(row_idx, chunk_bytes, verified_rows)?);
         }
         Ok(out)
     }
@@ -644,7 +640,6 @@ impl SettledSupplementSegmentIndex {
         &self,
         chunk_idx: usize,
         compressed_chunk_bytes: &[u8],
-        decompressor: Option<&mut Decompressor<'static>>,
     ) -> Result<Vec<u8>, SettledSupplementSegmentError> {
         let chunk = self.chunks.get(chunk_idx).ok_or_else(|| {
             SettledSupplementSegmentError::InvalidFormat("chunk index out of bounds".to_owned())
@@ -681,13 +676,9 @@ impl SettledSupplementSegmentIndex {
         })?;
         let decoded = match self.codec {
             SupplementCompressionCodec::None => compressed_chunk_bytes.to_vec(),
-            SupplementCompressionCodec::Zstd => decompress_exact_chunk(
-                chunk_idx,
-                chunk,
-                compressed_chunk_bytes,
-                uncompressed_len,
-                decompressor,
-            )?,
+            SupplementCompressionCodec::Zstd => {
+                decompress_exact_chunk(chunk_idx, chunk, compressed_chunk_bytes, uncompressed_len)?
+            }
         };
         chunk.mark_valid();
         Ok(decoded)
@@ -895,10 +886,65 @@ impl SettledSupplementSegmentIndex {
     }
 }
 
+const CHUNK_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const CHUNK_CACHE_MAX_ENTRIES: usize = 256;
+
+thread_local! {
+    static ZSTD_DECOMPRESSOR: RefCell<Option<Decompressor<'static>>> = const { RefCell::new(None) };
+}
+
+static CHUNK_CACHE: Mutex<ChunkCache> = Mutex::new(ChunkCache {
+    entries: VecDeque::new(),
+    bytes: 0,
+});
+
+struct CachedChunk {
+    // Separate opens must authenticate their own source even if their pins match.
+    reader_id: Arc<()>,
+    chunk_idx: usize,
+    bytes: Arc<Vec<u8>>,
+}
+
+struct ChunkCache {
+    entries: VecDeque<CachedChunk>,
+    bytes: usize,
+}
+
+impl ChunkCache {
+    fn get(&mut self, reader_id: &Arc<()>, chunk_idx: usize) -> Option<Arc<Vec<u8>>> {
+        let position = self.entries.iter().rposition(|entry| {
+            Arc::ptr_eq(&entry.reader_id, reader_id) && entry.chunk_idx == chunk_idx
+        })?;
+        let entry = self.entries.remove(position)?;
+        let bytes = Arc::clone(&entry.bytes);
+        self.entries.push_back(entry);
+        Some(bytes)
+    }
+
+    fn insert(&mut self, entry: CachedChunk) {
+        if self.get(&entry.reader_id, entry.chunk_idx).is_some() {
+            return;
+        }
+        let size = entry.bytes.capacity();
+        if size <= CHUNK_CACHE_MAX_BYTES {
+            while self.bytes + size > CHUNK_CACHE_MAX_BYTES
+                || self.entries.len() == CHUNK_CACHE_MAX_ENTRIES
+            {
+                if let Some(evicted) = self.entries.pop_front() {
+                    self.bytes -= evicted.bytes.capacity();
+                }
+            }
+            self.bytes += size;
+            self.entries.push_back(entry);
+        }
+    }
+}
+
 /// Authenticated positional reader for one settled `ZSTSUP01` supplement segment.
 pub struct SettledSupplementSegmentReader<S = File> {
     source: S,
     index: SettledSupplementSegmentIndex,
+    cache_id: Arc<()>,
 }
 
 impl SettledSupplementSegmentReader<File> {
@@ -994,7 +1040,11 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
             total_len,
             kernel_verified,
         )?;
-        let reader = Self { source, index };
+        let reader = Self {
+            source,
+            index,
+            cache_id: Arc::new(()),
+        };
         if options.verify_full_payload {
             reader.verify_full_payload_with_raw(&header_bytes, &indexes_and_trailer)?;
         }
@@ -1252,6 +1302,27 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         start_height: BlockHeight,
         end_height: BlockHeight,
     ) -> Result<Vec<BlockSupplementRecord>, SettledSupplementSegmentError> {
+        self.read_range_checked(start_height, end_height, None)
+    }
+
+    /// Reads supplements whose authenticated envelopes match the given contiguous headers.
+    pub(crate) fn read_range_for_headers(
+        &self,
+        headers: &[BlockHeaderArtifact],
+    ) -> Result<Vec<BlockSupplementRecord>, SettledSupplementSegmentError> {
+        let Some(first) = headers.first() else {
+            return Ok(Vec::new());
+        };
+        let end_height = self.end_height_for_count(first.height, headers.len())?;
+        self.read_range_checked(first.height, end_height, Some(headers))
+    }
+
+    fn read_range_checked(
+        &self,
+        start_height: BlockHeight,
+        end_height: BlockHeight,
+        headers: Option<&[BlockHeaderArtifact]>,
+    ) -> Result<Vec<BlockSupplementRecord>, SettledSupplementSegmentError> {
         let plan = self.index.plan_block_range(start_height, end_height)?;
         let row_range = plan.row_index_range();
         let raw_row_index = self
@@ -1266,25 +1337,50 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
                     row_range.offset,
                     &raw_row_index,
                 ))?;
-        let mut records = Vec::with_capacity(plan.last_row() - plan.first_row() + 1);
-        let mut decompressor = match self.index.codec {
-            SupplementCompressionCodec::None => None,
-            SupplementCompressionCodec::Zstd => Some(Decompressor::new()?),
-        };
-        for step in plan.chunks() {
-            let chunk_range = step.compressed_range();
-            let compressed = self
-                .source
-                .read_vec_at(chunk_range.offset, chunk_range.len)
-                .inspect_err(|_| self.index.chunks[step.chunk_idx()].mark_invalid())?;
-            let decoded = self.index.verify_and_decode_verified_chunk(
-                step,
-                &compressed,
-                verified_rows,
-                decompressor.as_mut(),
-            )?;
-            records.extend(decoded);
+        if let Some(headers) = headers {
+            for (offset, header) in headers.iter().enumerate() {
+                let row_idx = plan.first_row() + offset;
+                let entry = verified_rows.entry(row_idx)?;
+                let envelope = expected_envelope_from_slice(
+                    &self.index.header,
+                    row_idx,
+                    &entry,
+                    verified_rows,
+                )?;
+                verify_header_identity(envelope, header)?;
+            }
         }
+        let mut records = Vec::with_capacity(plan.last_row() - plan.first_row() + 1);
+        for step in plan.chunks() {
+            records.extend(self.read_chunk_rows(step, verified_rows)?);
+        }
+        Ok(records)
+    }
+
+    fn read_chunk_rows(
+        &self,
+        step: &SupplementChunkReadStep,
+        verified_rows: VerifiedSupplementRowIndexSlice<'_>,
+    ) -> Result<Vec<BlockSupplementRecord>, SettledSupplementSegmentError> {
+        let chunk_idx = step.chunk_idx();
+        let cached = CHUNK_CACHE.lock().get(&self.cache_id, chunk_idx);
+        if let Some(bytes) = cached {
+            return self.index.decode_chunk_rows(step, &bytes, verified_rows);
+        }
+        let range = step.compressed_range();
+        let compressed = self
+            .source
+            .read_vec_at(range.offset, range.len)
+            .inspect_err(|_| self.index.chunks[chunk_idx].mark_invalid())?;
+        let bytes = self
+            .index
+            .verify_and_decompress_chunk(chunk_idx, &compressed)?;
+        let records = self.index.decode_chunk_rows(step, &bytes, verified_rows)?;
+        CHUNK_CACHE.lock().insert(CachedChunk {
+            reader_id: Arc::clone(&self.cache_id),
+            chunk_idx,
+            bytes: Arc::new(bytes),
+        });
         Ok(records)
     }
 
@@ -1345,25 +1441,8 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
                     row_range.offset,
                     &raw_row_index,
                 ))?;
-        let mut decompressor = match self.index.codec {
-            SupplementCompressionCodec::None => None,
-            SupplementCompressionCodec::Zstd => {
-                Some(Decompressor::new().map_err(SettledSupplementSegmentError::Io)?)
-            }
-        };
         for step in plan.chunks() {
-            let chunk_range = step.compressed_range();
-            let compressed = self
-                .source
-                .read_vec_at(chunk_range.offset, chunk_range.len)
-                .inspect_err(|_| self.index.chunks[step.chunk_idx()].mark_invalid())
-                .map_err(SettledSupplementSegmentError::Io)?;
-            let records = self.index.verify_and_decode_verified_chunk(
-                step,
-                &compressed,
-                verified_rows,
-                decompressor.as_mut(),
-            )?;
+            let records = self.read_chunk_rows(step, verified_rows)?;
             for (row_idx, record) in step.row_range().zip(records.iter()) {
                 let offset = u32::try_from(row_idx - plan.first_row()).map_err(|_| {
                     SettledSupplementSegmentError::InvalidFormat(
@@ -1522,10 +1601,6 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
                     &raw_row_index,
                 ))?;
         let mut scratch = SpliceScratch::default();
-        let mut decompressor = match self.index.codec {
-            SupplementCompressionCodec::None => None,
-            SupplementCompressionCodec::Zstd => Some(Decompressor::new()?),
-        };
         let mut ctx = OrderedSpliceContext {
             verified_rows,
             plan: &plan,
@@ -1533,7 +1608,6 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
             selection: request.selection,
             order: request.order,
             cancel: request.cancel,
-            decompressor: decompressor.as_mut(),
             scratch: &mut scratch,
             emit,
         };
@@ -1559,28 +1633,16 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
     fn process_splice_step<P: AsRef<[u8]>>(
         &self,
         splice_step: &SupplementSpliceChunkStep,
-        ctx: &mut OrderedSpliceContext<'_, '_, P>,
+        ctx: &mut OrderedSpliceContext<'_, P>,
     ) -> Result<bool, SettledSupplementSegmentError> {
         if ctx.cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Ok(false);
         }
         let decode_step = splice_step.decode_step();
-        let decoded_chunk = match splice_step.compressed_range() {
-            Some(chunk_range) => {
-                let compressed = self
-                    .source
-                    .read_vec_at(chunk_range.offset, chunk_range.len)
-                    .inspect_err(|_| {
-                        self.index.chunks[decode_step.chunk_idx()].mark_invalid();
-                    })?;
-                Some(self.index.verify_and_decode_verified_chunk(
-                    decode_step,
-                    &compressed,
-                    ctx.verified_rows,
-                    ctx.decompressor.as_deref_mut(),
-                )?)
-            }
-            None => None,
+        let decoded_chunk = if splice_step.compressed_range().is_some() {
+            Some(self.read_chunk_rows(decode_step, ctx.verified_rows)?)
+        } else {
+            None
         };
         splice_chunk_rows_ordered(
             &self.index.header,
@@ -1650,23 +1712,8 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
                     &raw_row_index,
                 ))?;
         let mut records = Vec::with_capacity(shielded_payloads.len());
-        let mut decompressor = match self.index.codec {
-            SupplementCompressionCodec::None => None,
-            SupplementCompressionCodec::Zstd => Some(Decompressor::new()?),
-        };
         for step in plan.chunks() {
-            let chunk_range = step.compressed_range();
-            let compressed = self
-                .source
-                .read_vec_at(chunk_range.offset, chunk_range.len)
-                .inspect_err(|_| self.index.chunks[step.chunk_idx()].mark_invalid())?;
-            let decoded = self.index.verify_and_decode_verified_chunk(
-                step,
-                &compressed,
-                verified_rows,
-                decompressor.as_mut(),
-            )?;
-            records.extend(decoded);
+            records.extend(self.read_chunk_rows(step, verified_rows)?);
         }
         let mut artifacts = Vec::with_capacity(shielded_payloads.len());
         let base_row = plan.first_row();
@@ -1731,14 +1778,13 @@ pub(crate) struct SupplementSpliceRequest<'a> {
     pub(crate) cancel: Option<&'a AtomicBool>,
 }
 
-struct OrderedSpliceContext<'a, 'd, P> {
+struct OrderedSpliceContext<'a, P> {
     verified_rows: VerifiedSupplementRowIndexSlice<'a>,
     plan: &'a SupplementSplicePlan,
     shielded_payloads: &'a [P],
     selection: CompactBlockSpliceSelection,
     order: HeightOrder,
     cancel: Option<&'a AtomicBool>,
-    decompressor: Option<&'d mut Decompressor<'static>>,
     scratch: &'a mut SpliceScratch,
     emit: &'a mut dyn FnMut(EncodedBlock) -> Result<(), SettledSupplementSegmentError>,
 }
@@ -1931,6 +1977,23 @@ fn expected_envelope_from_slice(
     })
 }
 
+fn verify_header_identity(
+    envelope: BlockEnvelopeIdentity,
+    header: &BlockHeaderArtifact,
+) -> Result<(), SettledSupplementSegmentError> {
+    if header.height != envelope.height
+        || header.block_hash != block_hash_wire_to_domain(&envelope.block_hash_wire)?
+        || header.parent_hash != block_hash_wire_to_domain(&envelope.prev_hash_wire)?
+        || header.block_time != i64::from(envelope.block_time)
+    {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(format!(
+            "block_header at height {} disagrees with ZSTSUP01 envelope",
+            header.height.value()
+        )));
+    }
+    Ok(())
+}
+
 fn verify_reconstructed_identity(
     expected: BlockEnvelopeIdentity,
     expected_height: BlockHeight,
@@ -1974,16 +2037,19 @@ fn decompress_exact_chunk(
     chunk: &IndexedChunk,
     compressed: &[u8],
     uncompressed_len: usize,
-    reusable: Option<&mut Decompressor<'static>>,
 ) -> Result<Vec<u8>, SettledSupplementSegmentError> {
     let mut decompressed = vec![0_u8; uncompressed_len];
-    let mut owned = None;
-    let decompressor = match reusable {
-        Some(borrowed) => borrowed,
-        None => owned.insert(Decompressor::new().inspect_err(|_| chunk.mark_invalid())?),
-    };
-    let written = decompressor
-        .decompress_to_buffer(compressed, &mut decompressed)
+    let written = ZSTD_DECOMPRESSOR
+        .with(|slot| {
+            let Ok(mut slot) = slot.try_borrow_mut() else {
+                return Decompressor::new()?.decompress_to_buffer(compressed, &mut decompressed);
+            };
+            let decompressor = match slot.as_mut() {
+                Some(decompressor) => decompressor,
+                None => slot.insert(Decompressor::new()?),
+            };
+            decompressor.decompress_to_buffer(compressed, &mut decompressed)
+        })
         .map_err(|err| {
             chunk.mark_invalid();
             SettledSupplementSegmentError::PayloadIntegrity(format!(
@@ -2170,4 +2236,36 @@ fn hash_source_span_into<S: PositionalByteSource>(
         remaining -= wanted as u64;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_evicts_least_recently_used_by_bytes_and_skips_oversized_chunks() {
+        let reader_id = Arc::new(());
+        let mut cache = ChunkCache {
+            entries: VecDeque::new(),
+            bytes: 0,
+        };
+        let chunk = |chunk_idx, len| CachedChunk {
+            reader_id: Arc::clone(&reader_id),
+            chunk_idx,
+            bytes: Arc::new(vec![0; len]),
+        };
+        let half = CHUNK_CACHE_MAX_BYTES / 2;
+        cache.insert(chunk(0, half));
+        cache.insert(chunk(1, half));
+        assert_eq!(cache.bytes, CHUNK_CACHE_MAX_BYTES);
+        assert!(cache.get(&reader_id, 0).is_some());
+        cache.insert(chunk(2, half / 2));
+        assert!(cache.get(&reader_id, 1).is_none());
+        assert!(cache.get(&reader_id, 0).is_some());
+        assert!(cache.get(&reader_id, 2).is_some());
+        assert_eq!(cache.bytes, half + half / 2);
+        cache.insert(chunk(3, CHUNK_CACHE_MAX_BYTES + 1));
+        assert!(cache.get(&reader_id, 3).is_none());
+        assert_eq!(cache.bytes, half + half / 2);
+    }
 }

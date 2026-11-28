@@ -22,7 +22,7 @@ use super::{
     RocksDbCanonicalBuilder, RocksDbCanonicalStore,
     block_load::{
         CanonicalBlockLoadEvidence, CanonicalTrustedFreshBlockEvidence,
-        TreeStateCheckpointCoverage, encode_block_position, read_persisted_tip_metadata,
+        ConstructionTreeStateCheckpointPolicy, encode_block_position, read_persisted_tip_metadata,
         validate_persisted_commitment_tree_families, validate_source_tip_checkpoint,
     },
     block_replay::{
@@ -126,7 +126,7 @@ struct PublicationContext {
     build_plan: super::CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
     activation_schedule: CanonicalActivationSchedule,
-    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    tree_state_checkpoint_policy: ConstructionTreeStateCheckpointPolicy,
     block_evidence: CanonicalBlockLoadEvidence,
     trusted_fresh_block_evidence: CanonicalTrustedFreshBlockEvidence,
     staged_ssts: Vec<super::block_load::CanonicalStagedSstEvidence>,
@@ -231,7 +231,7 @@ impl PublicationContext {
             network: builder.network,
             build_plan: builder.build_plan.clone(),
             cursor_auth_key: builder.cursor_auth_key,
-            tree_state_checkpoint_coverage: builder.tree_state_checkpoint_coverage,
+            tree_state_checkpoint_policy: builder.tree_state_checkpoint_policy,
             block_evidence,
             trusted_fresh_block_evidence,
             staged_ssts,
@@ -289,6 +289,7 @@ impl PublicationContext {
         let construction_manifest = CanonicalConstructionManifestDraft::new_trusted_fresh(
             CanonicalConstructionManifestInputs {
                 build_plan: self.build_plan.clone(),
+                tree_state_checkpoint_policy: self.tree_state_checkpoint_policy,
                 source_checkpoint: self.source_tip_checkpoint,
                 block_evidence: self.block_evidence,
                 subtree_evidence: self.subtree_root_evidence,
@@ -336,7 +337,7 @@ impl PublicationContext {
         let cold_validation = validate_cold_block_families(
             ctx,
             &self.build_plan,
-            self.tree_state_checkpoint_coverage,
+            self.tree_state_checkpoint_policy,
             &self.block_evidence,
         )?;
         validate_cold_evidence_matches_writer(
@@ -373,6 +374,7 @@ impl PublicationContext {
         let construction_manifest = CanonicalConstructionManifestDraft::new_cold_certified(
             CanonicalConstructionManifestInputs {
                 build_plan: self.build_plan.clone(),
+                tree_state_checkpoint_policy: self.tree_state_checkpoint_policy,
                 source_checkpoint: self.source_tip_checkpoint,
                 block_evidence: self.block_evidence,
                 subtree_evidence: self.subtree_root_evidence,
@@ -682,7 +684,7 @@ impl ValidatedRocksDbCanonicalBuild {
             ));
         }
 
-        let subtree_root_coverage = self.construction_manifest.subtree_root_coverage();
+        let manifest_details = self.construction_manifest.details();
         let unbound_ready_evidence = CanonicalStoreReadyEvidence {
             sequence_checkpoint: prepared.sequence_checkpoint,
             ..self.ready_evidence
@@ -763,7 +765,7 @@ impl ValidatedRocksDbCanonicalBuild {
             self.build_plan,
             self.cursor_auth_key,
             &ready_evidence,
-            subtree_root_coverage,
+            manifest_details,
             self.activation_schedule,
             replay_tail,
             self.sealed_segments,
@@ -1629,7 +1631,7 @@ fn validate_reopened_identity_and_control(
 fn validate_cold_block_families(
     ctx: SegmentStoreContext<'_>,
     build_plan: &super::CanonicalStoreBuildPlan,
-    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    tree_state_checkpoint_policy: ConstructionTreeStateCheckpointPolicy,
     expected: &CanonicalBlockLoadEvidence,
 ) -> Result<ColdCanonicalBlockValidation, CanonicalStoreError> {
     let retained_checkpoint_count =
@@ -1642,7 +1644,7 @@ fn validate_cold_block_families(
     validate_persisted_commitment_tree_families(
         ctx,
         build_plan,
-        tree_state_checkpoint_coverage,
+        tree_state_checkpoint_policy,
         expected,
     )?;
     if !build_plan.raw_blob_retention().full_blocks() && expected.live_tail_raw_block_count != 0 {

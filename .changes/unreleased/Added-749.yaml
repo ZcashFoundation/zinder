@@ -1,0 +1,7 @@
+kind: added
+body: Publish versioned, standalone protobuf contracts and full descriptor sets in signed release API archives so downstream consumers can pin schemas and generate clients without cloning Zinder.
+time: 2026-11-28T09:26:11.124224042Z
+custom:
+    Bump: minor
+    Upgrade: compatible
+    PR: "749"
