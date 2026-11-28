@@ -940,6 +940,24 @@ mod tests {
         frame
     }
 
+    fn compressed_grpc_frame(
+        message: &[u8],
+        compression: RequestCompression,
+    ) -> io::Result<Vec<u8>> {
+        let compressed = match compression {
+            RequestCompression::Gzip => {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(message)?;
+                encoder.finish()?
+            }
+            RequestCompression::Zstd => zstd::bulk::compress(message, 1)?,
+        };
+        let mut frame = grpc_frame(&compressed);
+        frame[0] = 1;
+        Ok(frame)
+    }
+
     fn trailers() -> http::HeaderMap {
         let mut trailers = http::HeaderMap::new();
         trailers.insert("x-trailer", http::HeaderValue::from_static("kept"));
@@ -954,7 +972,7 @@ mod tests {
     }
 
     /// Feeds `chunks` and then trailers through the guard.
-    async fn drain(chunks: &[&[u8]]) -> Drained {
+    async fn drain(chunks: &[&[u8]], compression: Option<RequestCompression>) -> Drained {
         let mut script: VecDeque<_> = chunks
             .iter()
             .map(|chunk| Ok(Frame::data(Bytes::copy_from_slice(chunk))))
@@ -963,7 +981,7 @@ mod tests {
         let mut body = BoundedRequestBody::new(
             TonicBody::new(ScriptedBody(script)),
             Some(&BALANCE_LIMITS),
-            None,
+            compression,
         );
         let mut drained = Drained {
             bytes: Vec::new(),
@@ -1007,7 +1025,7 @@ mod tests {
         encoded.extend(grpc_frame(&[key(2, 0), 1]));
         let chunks: Vec<&[u8]> = encoded.chunks(3).collect();
 
-        let drained = drain(&chunks).await;
+        let drained = drain(&chunks, None).await;
 
         assert_eq!(drained.bytes, encoded);
         assert_eq!(drained.trailers, Some(trailers()));
@@ -1024,7 +1042,7 @@ mod tests {
         let mut encoded = accepted.clone();
         encoded.extend(grpc_frame(&[key(1, 2), 0, key(1, 2), 0, key(1, 2), 0]));
 
-        let drained = drain(&[&encoded]).await;
+        let drained = drain(&[&encoded], None).await;
 
         assert_eq!(drained.bytes, accepted);
         assert_eq!(drained.trailers, None);
@@ -1032,6 +1050,63 @@ mod tests {
             drained.refusal.as_ref().map(Status::code),
             Some(tonic::Code::InvalidArgument)
         );
+    }
+
+    #[tokio::test]
+    async fn releases_fragmented_identity_and_compressed_messages_in_order() -> io::Result<()> {
+        let first = grpc_frame(&[key(1, 2), 1, b'a']);
+        let middle = [key(1, 2), 1, b'b'];
+        let last = grpc_frame(&[key(1, 2), 1, b'c']);
+        let expected = [first.as_slice(), &grpc_frame(&middle), last.as_slice()].concat();
+
+        for compression in [RequestCompression::Gzip, RequestCompression::Zstd] {
+            let encoded = [
+                first.as_slice(),
+                &compressed_grpc_frame(&middle, compression)?,
+                last.as_slice(),
+            ]
+            .concat();
+            let chunks: Vec<&[u8]> = encoded.chunks(2).collect();
+            let drained = drain(&chunks, Some(compression)).await;
+
+            assert_eq!(drained.bytes, expected);
+            assert_eq!(drained.trailers, Some(trailers()));
+            assert!(drained.refusal.is_none(), "{:?}", drained.refusal);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn releases_valid_messages_before_refusing_a_later_compressed_message() -> io::Result<()>
+    {
+        let first = grpc_frame(&[key(1, 2), 0]);
+        let second = [key(1, 2), 1, b'a'];
+        let over_limit = [key(1, 2), 0, key(1, 2), 0, key(1, 2), 0];
+        let expected = [first.as_slice(), &grpc_frame(&second)].concat();
+
+        for compression in [RequestCompression::Gzip, RequestCompression::Zstd] {
+            let encoded = [
+                first.as_slice(),
+                &compressed_grpc_frame(&second, compression)?,
+                &compressed_grpc_frame(&over_limit, compression)?,
+            ]
+            .concat();
+            let drained = drain(&[&encoded], Some(compression)).await;
+
+            assert_eq!(drained.bytes, expected);
+            assert_eq!(drained.trailers, None);
+            assert_eq!(
+                drained.refusal.as_ref().map(Status::code),
+                Some(tonic::Code::InvalidArgument)
+            );
+            assert_eq!(
+                drained.refusal.as_ref().map(Status::message),
+                Some(
+                    "GetTaddressBalance request field addresses carries 3 elements; at most 2 are accepted"
+                )
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1046,7 +1121,7 @@ mod tests {
         }
 
         for encoded in [oversized, compressed] {
-            let drained = drain(&[&encoded]).await;
+            let drained = drain(&[&encoded], None).await;
 
             assert_eq!(drained.bytes, encoded);
             assert_eq!(drained.trailers, Some(trailers()));
@@ -1063,7 +1138,7 @@ mod tests {
         let encoded = grpc_frame(&[key(1, 2), 0]);
         let truncated = encoded.get(..encoded.len() - 1).unwrap_or_default();
 
-        let drained = drain(&[truncated]).await;
+        let drained = drain(&[truncated], None).await;
 
         assert_eq!(drained.bytes, truncated);
         assert_eq!(drained.trailers, Some(trailers()));
