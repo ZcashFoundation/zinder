@@ -1587,36 +1587,45 @@ async fn recover_wallet_transition(
         return Ok(WalletTransitionOutcome::Cancelled);
     }
     let canonical = canonical.get()?;
-    tokio::select! {
+    let transition = tokio::select! {
         biased;
         () = cancel.cancelled() => return Ok(WalletTransitionOutcome::Cancelled),
         () = tokio::time::sleep_until(deadline) => return Err(secondary_recovery_timed_out(config)),
-        attestation = attest_reopened_secondary(control, canonical) => attestation?,
-    }
-
-    let page = tokio::select! {
-        biased;
-        () = cancel.cancelled() => return Ok(WalletTransitionOutcome::Cancelled),
-        page = fetch_retained_event_page_to_target(control, canonical, wallet_source, canonical.event_fence()) => {
-            page.map_err(rebuild_required_for_expired_cursor)?
-        }
+        prepared = prepare_reopened_transition(control, canonical, wallet_source, lease, config.lease_duration) => prepared?,
     };
-    let RetainedEventPageValidation::Events(events) = page else {
+    let Some(transition) = transition else {
         return Ok(WalletTransitionOutcome::Reconverge);
+    };
+    apply(canonical, &transition)
+}
+
+async fn prepare_reopened_transition(
+    control: &mut CanonicalWriterControlClient,
+    canonical: &RocksDbCanonicalSecondary,
+    wallet_source: WalletCanonicalSourceIdentity,
+    lease: TransitionLease<'_>,
+    lease_duration: Duration,
+) -> Result<Option<NextWalletTransition>, ProjectorError> {
+    attest_reopened_secondary(control, canonical).await?;
+    let page = fetch_retained_event_page_to_target(
+        control,
+        canonical,
+        wallet_source,
+        canonical.event_fence(),
+    )
+    .await
+    .map_err(rebuild_required_for_expired_cursor)?;
+    let RetainedEventPageValidation::Events(events) = page else {
+        return Ok(None);
     };
     let anchor = match lease.first_retained_event_sequence {
         Some(sequence) => bootstrap_first_retained_event_source(canonical, &events, sequence)?,
         None => wallet_source,
     };
     let transition = plan_next_wallet_transition(canonical, &events)?;
-    renew_following_retention_lease_for_transition(
-        control,
-        lease.lease,
-        anchor,
-        config.lease_duration,
-    )
-    .await?;
-    apply(canonical, &transition)
+    renew_following_retention_lease_for_transition(control, lease.lease, anchor, lease_duration)
+        .await?;
+    Ok(Some(transition))
 }
 
 fn secondary_slot_empty() -> ProjectorError {
@@ -1644,7 +1653,7 @@ impl CanonicalSecondarySlot {
 fn secondary_recovery_timed_out(config: &config::ProjectorConfig) -> ProjectorError {
     CanonicalStoreError::AdmissionRefused {
         path: config.canonical_path.clone(),
-        reason: "canonical secondary reopen or writer attestation timed out".to_owned(),
+        reason: "canonical secondary recovery timed out".to_owned(),
     }
     .into()
 }

@@ -564,12 +564,11 @@ impl RocksDbCanonicalSecondary {
         let outcome = self.catch_up_inner(recover_missing_live_tail);
         // A successful reopen already installed its own empty cache.
         if outcome.is_ok() && self.read_caches.live_tail.is_none() {
-            self.read_caches.live_tail = if previous_ready == self.ready_evidence {
-                previous_cache
-            } else {
-                None
-            }
-            .or_else(|| Some(live_tail_cache_for(&self.ready_evidence)));
+            let cache = match previous_cache {
+                Some(cache) if previous_ready == self.ready_evidence => cache,
+                _ => live_tail_cache_for(&self.ready_evidence),
+            };
+            self.read_caches.live_tail = Some(cache);
         }
         outcome
     }

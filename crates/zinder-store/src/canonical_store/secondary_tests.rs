@@ -64,6 +64,13 @@ fn missing_live_tail_replay_recovers_on_a_fresh_secondary() -> Result<(), Box<dy
 
     secondary.reopen_after_missing_live_tail(height)?;
     assert_eq!(secondary.event_fence(), store.event_fence());
+    assert!(
+        secondary
+            .live_tail_cache()
+            .ok_or("fresh reopen must enable the cache")?
+            .lookup(&[height])[0]
+            .is_none()
+    );
     let rows = secondary
         .scan_canonical_replay_range(range)?
         .collect::<Result<Vec<_>, _>>()?;
@@ -90,6 +97,7 @@ fn missing_live_tail_replay_fails_closed_when_a_reopen_cannot_admit_it()
     ));
     assert_eq!(secondary.event_fence(), fence);
     assert_eq!(store.event_fence(), fence);
+    assert!(secondary.live_tail_cache().is_none());
     Ok(())
 }
 
@@ -116,6 +124,7 @@ fn catch_up_attempts_one_reopen_when_the_new_ready_tip_row_is_missing()
     assert_eq!(attempts[0].field("visible_height"), Some("4"));
     assert_eq!(attempts[0].field("replay_tip_height"), Some("5"));
     assert_eq!(secondary.event_fence(), before);
+    assert!(secondary.live_tail_cache().is_none());
     Ok(())
 }
 
@@ -144,6 +153,13 @@ fn catch_up_recovers_the_new_ready_tip_after_one_reopen() -> Result<(), Box<dyn 
     assert_eq!(catchup.before(), before);
     assert_eq!(catchup.after(), after);
     assert_eq!(secondary.event_fence(), after);
+    assert!(
+        secondary
+            .live_tail_cache()
+            .ok_or("fresh catch-up reopen must enable the cache")?
+            .lookup(&[before.visible_tip().height])[0]
+            .is_none()
+    );
     let range = BlockHeightRange::inclusive(height, height);
     let replay = secondary
         .scan_canonical_replay_range(range)?
@@ -171,6 +187,7 @@ fn advancing_ready_with_missing_tip(
         BlockHeight::new(2),
     )?;
     let secondary = open_adopting_secondary(&store_path, root.join("secondary"))??;
+    warm_live_tail_cache(&store, &secondary, BlockHeight::new(4))?;
     let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
     let store = append_block_five(store, &activations)?;
     let key =
@@ -246,7 +263,9 @@ fn hide_admitted_live_tail_row(
         BlockHeight::new(2),
     )?;
     let mut secondary = open_adopting_secondary(&store_path, root.join("secondary"))??;
-    let key = zinder_core::wire::encode_height_key_ascending(BlockHeight::new(3));
+    let height = BlockHeight::new(3);
+    warm_live_tail_cache(&store, &secondary, height)?;
+    let key = zinder_core::wire::encode_height_key_ascending(height);
     let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     let row = store
         .bounded_open
@@ -257,9 +276,36 @@ fn hide_admitted_live_tail_row(
     // the authenticated READY fence when one replay row becomes invisible.
     store.bounded_open.db.delete_cf(&family, key)?;
     drop(family);
-    let catchup = secondary.try_catch_up()?;
+    let catchup = secondary.try_catch_up_following()?;
     assert_eq!(catchup.after(), catchup.before());
+    assert!(
+        secondary
+            .live_tail_cache()
+            .ok_or("unchanged catch-up must retain the cache")?
+            .lookup(&[height])[0]
+            .is_some()
+    );
     Ok((store, secondary, row))
+}
+
+fn warm_live_tail_cache(
+    store: &RocksDbCanonicalStore,
+    secondary: &RocksDbCanonicalSecondary,
+    height: BlockHeight,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cf = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    let key = zinder_core::wire::encode_height_key_ascending(height);
+    let row = store
+        .bounded_open
+        .db
+        .get_cf(&cf, key)?
+        .ok_or("fixture needs a live tail row to cache")?;
+    let wire = LiveTailBlockRecord::decode_shielded_wire_v1(&row, height)?;
+    let cache = secondary
+        .live_tail_cache()
+        .ok_or("the secondary must have a live-tail cache")?;
+    assert!(cache.admit(&wire, row.len())?.is_some());
+    Ok(())
 }
 
 #[test]

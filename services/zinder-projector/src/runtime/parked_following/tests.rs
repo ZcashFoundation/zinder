@@ -16,6 +16,7 @@ use std::{
 
 use parking_lot::Mutex;
 use tempfile::TempDir;
+use tokio::sync::Notify;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status};
@@ -92,6 +93,103 @@ async fn recovery_replans_an_overwritten_reconciliation_after_another_reorg() ->
 #[tokio::test]
 async fn recovery_fails_closed_if_the_replanned_transition_is_also_missing_replay() -> TestResult {
     recover_after_reorg(false, true).await
+}
+
+#[tokio::test]
+async fn recovery_times_out_while_the_event_page_is_stalled() -> TestResult {
+    interrupted_recovery_rpc(StalledRecoveryRpc::EventPage, false).await
+}
+
+#[tokio::test]
+async fn recovery_cancels_while_the_event_page_is_stalled() -> TestResult {
+    interrupted_recovery_rpc(StalledRecoveryRpc::EventPage, true).await
+}
+
+#[tokio::test]
+async fn recovery_times_out_while_the_lease_renewal_is_stalled() -> TestResult {
+    interrupted_recovery_rpc(StalledRecoveryRpc::RenewLease, false).await
+}
+
+#[tokio::test]
+async fn recovery_cancels_while_the_lease_renewal_is_stalled() -> TestResult {
+    interrupted_recovery_rpc(StalledRecoveryRpc::RenewLease, true).await
+}
+
+async fn interrupted_recovery_rpc(rpc: StalledRecoveryRpc, cancelled: bool) -> TestResult {
+    let Some(listener) = bind_loopback().await? else {
+        return Ok(());
+    };
+    let root = TempDir::new()?;
+    let ParkFixture {
+        writer,
+        secondary,
+        wallet,
+    } = ParkFixture::build(root.path())?;
+    let wallet_source = WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+    let fence = secondary.event_fence();
+    let mut slot = CanonicalSecondarySlot(Some(secondary));
+    let started = Arc::new(Notify::new());
+    let mut writer = RecordingCanonicalControl::new(writer);
+    writer.stalled_recovery_rpc = Some((rpc, Arc::clone(&started)));
+    let server_cancel = CancellationToken::new();
+    let _server_guard = server_cancel.clone().drop_guard();
+    let endpoint = spawn_canonical_control(listener, writer.clone(), server_cancel)?;
+    let mut control = CanonicalWriterControlClient::connect(&endpoint, None, None).await?;
+    let mut config = park_config(root.path(), &endpoint, "127.0.0.1:0".parse()?)?;
+    config.fence_convergence_timeout = if cancelled {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(2)
+    };
+    let mut lease =
+        acquire_following_retention_lease(&mut control, wallet_source, Duration::from_secs(1))
+            .await?;
+    let expiry = lease.expires_at();
+    let cancel = CancellationToken::new();
+    let mut pending = Box::pin(recover_wallet_transition(
+        &mut slot,
+        &mut control,
+        wallet_source,
+        TransitionLease {
+            lease: &mut lease,
+            first_retained_event_sequence: None,
+        },
+        &config,
+        &cancel,
+        fence.visible_tip().height,
+        |_, _| {
+            Err(ProjectorError::CanonicalEventPageInvalid {
+                reason: "the fixture RPC must stall before application",
+            })
+        },
+    ));
+    tokio::select! {
+        outcome = &mut pending => return Err(format!("recovery ended before the stalled RPC started: {outcome:?}").into()),
+        started = tokio::time::timeout(Duration::from_secs(5), started.notified()) => started?,
+    }
+    if cancelled {
+        cancel.cancel();
+    }
+    let outcome = tokio::time::timeout(Duration::from_secs(5), pending).await?;
+    if cancelled {
+        assert!(matches!(outcome?, WalletTransitionOutcome::Cancelled));
+    } else {
+        assert!(matches!(
+            outcome,
+            Err(ProjectorError::CanonicalStore(zinder_store::CanonicalStoreError::AdmissionRefused { path, reason }))
+                if path == config.canonical_path && reason == "canonical secondary recovery timed out"
+        ));
+    }
+    let calls = writer.calls.snapshot();
+    assert_eq!(calls.writer_statuses, 1);
+    assert_eq!(calls.event_pages, 1);
+    assert_eq!(
+        calls.renews,
+        u32::from(rpc == StalledRecoveryRpc::RenewLease)
+    );
+    assert_eq!(slot.get()?.event_fence(), fence);
+    assert_eq!(lease.expires_at(), expiry);
+    Ok(())
 }
 
 #[allow(
@@ -1104,6 +1202,13 @@ struct RecordingCanonicalControl {
     shutdown_on_acquire: Option<CancellationToken>,
     refuse_renewal_during_shutdown: Option<CancellationToken>,
     release_error: Option<Code>,
+    stalled_recovery_rpc: Option<(StalledRecoveryRpc, Arc<Notify>)>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StalledRecoveryRpc {
+    EventPage,
+    RenewLease,
 }
 
 impl RecordingCanonicalControl {
@@ -1114,6 +1219,16 @@ impl RecordingCanonicalControl {
             shutdown_on_acquire: None,
             refuse_renewal_during_shutdown: None,
             release_error: None,
+            stalled_recovery_rpc: None,
+        }
+    }
+
+    async fn stall_recovery_rpc(&self, rpc: StalledRecoveryRpc) {
+        if let Some((stalled, started)) = &self.stalled_recovery_rpc
+            && *stalled == rpc
+        {
+            started.notify_one();
+            std::future::pending::<()>().await;
         }
     }
 
@@ -1220,6 +1335,7 @@ impl CanonicalControl for RecordingCanonicalControl {
         request: Request<CanonicalEventPageRequest>,
     ) -> Result<Response<CanonicalEventPageResponse>, Status> {
         self.calls.event_pages.fetch_add(1, Ordering::SeqCst);
+        self.stall_recovery_rpc(StalledRecoveryRpc::EventPage).await;
         let request = request.into_inner();
         let max_events = NonZeroU32::new(request.max_events)
             .ok_or_else(|| Status::invalid_argument("the page limit must be nonzero"))?;
@@ -1277,6 +1393,8 @@ impl CanonicalControl for RecordingCanonicalControl {
         request: Request<RenewCanonicalProjectionBuildLeaseRequest>,
     ) -> Result<Response<CanonicalProjectionBuildLeaseResponse>, Status> {
         self.calls.renews.fetch_add(1, Ordering::SeqCst);
+        self.stall_recovery_rpc(StalledRecoveryRpc::RenewLease)
+            .await;
         if let Some(cancel) = &self.refuse_renewal_during_shutdown {
             cancel.cancel();
             return Err(Status::failed_precondition("build lease renewal refused"));
