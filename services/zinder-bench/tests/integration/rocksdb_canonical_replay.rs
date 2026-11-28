@@ -32,7 +32,7 @@ fn rocksdb_store_properties_reports_the_resolved_construction_budget() -> Result
     );
     let store = CanonicalWriterFixture::publish(&baseline, &sample_regtest_upgrade_activations())?;
     let scratch = tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
+    let output = Command::new(zinder_testkit::bin_exe!("zinder-bench"))
         .arg("rocksdb-store-properties")
         .arg("--fixture")
         .arg(fixture_directory.path())
