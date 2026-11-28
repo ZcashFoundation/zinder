@@ -1,7 +1,0 @@
-kind: changed
-body: Zinder refreshes its Rust dependencies and container base images. The bundled observability stack uses Grafana 13.3.2, and the lightwalletd compatibility suite uses the Go v0.6.3 reference.
-time: 2026-11-28T15:10:33.935766094Z
-custom:
-    Bump: patch
-    PR: "768"
-    Upgrade: compatible
