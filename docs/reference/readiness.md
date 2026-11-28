@@ -360,9 +360,14 @@ status RPC. The pair alone decides readiness. The reasons are recorded in
 | `storage_unavailable`, `schema_mismatch` | Fail closed at once, as does a writer fence that disagrees with the pair. |
 
 `storage.secondary_replica_lag_threshold_chain_epochs` (4 by default) decides
-when lag becomes a reported warning. The staleness ceiling alone decides when
-traffic stops. When the reader refuses traffic, new gRPC calls fail with
-`UNAVAILABLE`, `SERVICE_NOT_READY`, and the cause in
+when lag becomes a reported warning; there is no hard block-lag readiness
+withdrawal bound. Withdrawing readiness once a reader trails the writer by a
+block count would pull every reader sharing that store out of rotation at once
+when the projector lags briefly, causing cluster-wide `503`/`NOT_SERVING`
+flaps even though `TipWait` already resolves benign inter-reader skew behind
+multi-reader balancers. The staleness ceiling (`storage.serving_pair_staleness_ceiling_ms`)
+alone decides when traffic stops. When the reader refuses traffic, new gRPC
+calls fail with `UNAVAILABLE`, `SERVICE_NOT_READY`, and the cause in
 `ErrorInfo.metadata["readiness_cause"]`.
 
 ### Reader dependency health
