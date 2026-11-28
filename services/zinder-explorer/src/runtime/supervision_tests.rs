@@ -7,7 +7,13 @@ use std::{
 };
 
 use eyre::{Result, eyre};
-use tokio::{net::TcpListener, sync::Notify, time::timeout};
+use prost::Message as _;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::Notify,
+    time::timeout,
+};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{
     Code, Status,
@@ -17,14 +23,22 @@ use tonic::{
 };
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_types::StatusExt as _;
+use zinder_core::{BlockHeight, Network, wire::encode_rpc_block_hash_hex};
+use zinder_materialized_views::{BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer};
 use zinder_proto::v1::explorer::{
-    MempoolSummaryRequest, ServerInfoRequest, explorer_query_client::ExplorerQueryClient,
+    BlockDetailRequest, BlockSummary, BlockSummaryRecord, MempoolSummaryRequest, ServerInfoRequest,
+    block_detail_request, explorer_query_client::ExplorerQueryClient,
     explorer_query_server::SERVICE_NAME,
 };
 use zinder_runtime::{
     AuthenticatedChannel, BearerTokenClientInterceptor, RuntimeSupervisionError, RuntimeTaskFailure,
 };
-use zinder_testkit::{PROBE_WAIT_LIMIT, PublicListenerProbe, next_watch_status, watch_ends};
+use zinder_store::DEFAULT_SETTLED_SEGMENT_BLOCKS;
+use zinder_testkit::{
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, PROBE_WAIT_LIMIT, PublicListenerProbe,
+    next_watch_status, open_test_materialized_view_store_for_canonical,
+    sample_regtest_upgrade_activations, watch_ends,
+};
 
 use super::*;
 
@@ -321,5 +335,206 @@ async fn losing_the_operations_endpoint_stops_explorer() -> Result<()> {
         ),
         "{outcome:?}"
     );
+    Ok(())
+}
+
+async fn scrape_ops_metrics(ops_addr: SocketAddr) -> Result<String> {
+    let mut stream = TcpStream::connect(ops_addr).await?;
+    stream
+        .write_all(
+            format!("GET /metrics HTTP/1.1\r\nHost: {ops_addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    let text = String::from_utf8(response)?;
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| eyre!("malformed /metrics HTTP response"))?;
+    eyre::ensure!(
+        head.starts_with("HTTP/1.1 200 OK"),
+        "unexpected /metrics status: {head}"
+    );
+    Ok(body.to_owned())
+}
+
+fn settled_segment_metric(exposition: &str, suffix: &str, kind: &str) -> Result<u64> {
+    let prefix = format!("zinder_store_settled_segment_{suffix}{{kind=\"{kind}\"}} ");
+    let value = exposition
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .ok_or_else(|| eyre!("missing settled-segment metric line `{prefix}`"))?;
+    Ok(value.trim().parse()?)
+}
+
+fn seed_settled_explorer_fixture() -> Result<CanonicalWriterFixture> {
+    let chain =
+        ChainFixture::new(Network::ZcashRegtest).extend_blocks(DEFAULT_SETTLED_SEGMENT_BLOCKS);
+    let mut canonical = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain)
+            .through(BlockHeight::new(DEFAULT_SETTLED_SEGMENT_BLOCKS - 1)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    canonical.append_settled_blocks(&chain)?;
+    let target_block = chain
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("missing fixture block 1"))?;
+    let mv_primary =
+        open_test_materialized_view_store_for_canonical(canonical.canonical_primary_path())?;
+    let summary_record = BlockSummaryRecord {
+        summary: Some(BlockSummary {
+            block_height: 1,
+            block_hash: encode_rpc_block_hash_hex(target_block.hash),
+            previous_block_hash: encode_rpc_block_hash_hex(target_block.parent_hash),
+            block_time_unix_seconds: i64::from(target_block.block_time_seconds),
+            transaction_count: 0,
+            total_size_bytes: u64::try_from(target_block.raw_block_bytes.len())?,
+            confirmations: DEFAULT_SETTLED_SEGMENT_BLOCKS,
+            is_canonical: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    mv_primary.put_consumer(
+        BLOCK_SUMMARY_COLUMN_FAMILY,
+        &BlockSummaryConsumer::key_for_height(BlockHeight::new(1)),
+        &summary_record.encode_to_vec(),
+    )?;
+    Ok(canonical)
+}
+
+async fn await_settled_histograms(ops: SocketAddr) -> Result<String> {
+    // Histograms drain on zinder-runtime's 5s upkeep interval.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let body = scrape_ops_metrics(ops).await?;
+            let ready = ["shielded", "supplement"].into_iter().all(|kind| {
+                settled_segment_metric(&body, "pread_duration_seconds_count", kind)
+                    .is_ok_and(|count| count > 0)
+            });
+            if ready {
+                break Ok::<String, eyre::Report>(body);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await?
+}
+
+async fn await_explorer_ready(
+    grpc: SocketAddr,
+    ops: SocketAddr,
+    server: &mut tokio::task::JoinHandle<Result<(), ExplorerConfigError>>,
+) -> Result<PublicListenerProbe> {
+    let mut last_probe_status = String::from("not yet connected");
+    timeout(PROBE_WAIT_LIMIT, async {
+        loop {
+            match PublicListenerProbe::connect(grpc, ops).await {
+                Ok(probe) => match probe.agreed_status().await {
+                    Ok(ServingStatus::Serving) => break Ok(probe),
+                    Ok(status) => last_probe_status = format!("status={status:?}"),
+                    Err(error) => last_probe_status = format!("agreed_status err={error}"),
+                },
+                Err(error) => last_probe_status = format!("connect err={error}"),
+            }
+            tokio::select! {
+                outcome = &mut *server => {
+                    break Err(eyre!("explorer server exited before ready: {outcome:?}"));
+                }
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    })
+    .await
+    .map_err(|_| eyre!("timed out waiting for explorer readiness ({last_probe_status})"))?
+}
+
+#[tokio::test]
+async fn explorer_startup_exports_settled_segment_metrics_from_opened_readers() -> Result<()> {
+    let seeded = seed_settled_explorer_fixture()?;
+
+    let grpc_port = TcpListener::bind("127.0.0.1:0").await?;
+    let ops_port = PortReservation::bind("127.0.0.1:0")?;
+    let grpc = grpc_port.local_addr()?;
+    let ops = ops_port.local_addr()?;
+    let dir = tempfile::tempdir()?;
+    let secondary_root = dir.path().join("secondary");
+    std::fs::create_dir_all(&secondary_root)?;
+    let token_path = dir.path().join("explorer.token");
+    std::fs::write(&token_path, "test-token")?;
+    let config = config::load_explorer_config(
+        None,
+        ExplorerConfigOverrides {
+            network: Some("zcash-regtest".to_owned()),
+            storage_path: Some(seeded.canonical_primary_path().to_path_buf()),
+            secondary_path: Some(secondary_root),
+            bearer_token_path: Some(token_path),
+            listen_addr: Some(grpc),
+            ops_listen_addr: Some(ops),
+            wallet_query_endpoint: None,
+        },
+    )?;
+
+    let runtime = SupervisedRuntime::new(RuntimeService::Explorer)
+        .with_grpc_drain_timeout(Duration::from_millis(50));
+    let shutdown = runtime.shutdown_request();
+    let readiness = Readiness::default();
+    drop(ops_port);
+    let mut server = tokio::spawn(serve_explorer(config, runtime, readiness, Some(grpc_port)));
+    let probe = await_explorer_ready(grpc, ops, &mut server).await?;
+
+    let initial_metrics = scrape_ops_metrics(ops).await?;
+    for kind in ["shielded", "supplement"] {
+        assert_eq!(
+            settled_segment_metric(&initial_metrics, "cache_open_readers", kind)?,
+            1
+        );
+        assert!(settled_segment_metric(&initial_metrics, "cache_index_heap_bytes", kind)? > 0);
+        assert_eq!(
+            settled_segment_metric(&initial_metrics, "cache_misses_total", kind)?,
+            1
+        );
+        assert!(settled_segment_metric(&initial_metrics, "pread_bytes_total", kind)? > 0);
+    }
+    let initial_supplement_pread_bytes =
+        settled_segment_metric(&initial_metrics, "pread_bytes_total", "supplement")?;
+
+    let token = "test-token".parse()?;
+    let mut explorer = ExplorerQueryClient::with_interceptor(
+        probe.channel(),
+        BearerTokenClientInterceptor::new(Some(&token))?,
+    );
+    for _ in 0..2 {
+        let response = explorer
+            .block_transactions(BlockDetailRequest {
+                selector: Some(block_detail_request::Selector::BlockHeight(1)),
+                at_epoch_id: None,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(
+            response
+                .summary
+                .as_ref()
+                .map(|summary| summary.block_height),
+            Some(1)
+        );
+    }
+
+    let final_metrics = await_settled_histograms(ops).await?;
+    assert!(settled_segment_metric(&final_metrics, "cache_hits_total", "supplement")? >= 2);
+    assert_eq!(
+        settled_segment_metric(&final_metrics, "cache_misses_total", "supplement")?,
+        1
+    );
+    assert!(
+        settled_segment_metric(&final_metrics, "pread_bytes_total", "supplement")?
+            > initial_supplement_pread_bytes
+    );
+
+    shutdown.request();
+    timeout(PROBE_WAIT_LIMIT, server).await???;
+    drop(seeded);
     Ok(())
 }
