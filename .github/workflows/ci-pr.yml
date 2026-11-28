@@ -428,6 +428,9 @@ jobs:
       - name: Test deployment admission
         run: scripts/test-deployment-admission.sh
 
+      - name: Test native systemd listener defaults
+        run: scripts/test-native-systemd-config.sh
+
       - name: Test compatibility Caddyfile
         run: scripts/test-compat-lightwalletd-caddyfile.sh
 

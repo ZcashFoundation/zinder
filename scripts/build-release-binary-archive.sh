@@ -89,6 +89,11 @@ done
 
 cp "$repository_root/LICENSE" "$staging_root/LICENSE"
 cp "$repository_root/README.md" "$staging_root/README.md"
+if [[ "$rust_target" == *-linux-gnu ]]; then
+  native_units="$repository_root/deploy/systemd/native"
+  mkdir -p "$staging_root/systemd"
+  cp "$native_units"/*.service "$native_units"/*.target "$native_units/zinder.env" "$staging_root/systemd/"
+fi
 jq -n \
   --arg version "$version" \
   --arg tag "$release_tag" \
@@ -116,13 +121,8 @@ jq -n \
 
 (
   cd "$staging_root"
-  find bin -maxdepth 1 -type f -printf '%p\n' \
-    | LC_ALL=C sort \
-    | xargs sha256sum
-  printf '%s\n' BUILD-INFO.json LICENSE README.md \
-    | LC_ALL=C sort \
-    | xargs sha256sum
-) | LC_ALL=C sort -k2 > "$staging_root/SHA256SUMS"
+  find . -type f ! -path './SHA256SUMS' -printf '%P\n' | LC_ALL=C sort | xargs sha256sum
+) > "$staging_root/SHA256SUMS"
 
 find "$staging_root" -type d -exec chmod 0755 {} +
 find "$staging_root" -type f -exec chmod 0644 {} +

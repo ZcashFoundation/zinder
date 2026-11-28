@@ -36,6 +36,8 @@ the release claiming precision it does not have for native libraries.
    `config`, and `healthcheck`, covering ingest, projector, query,
    lightwalletd compatibility, Explorer, and Cipherscan adapter), plus build
    metadata, the license, a README, and checksums.
+   GNU/Linux archives also include the native units and environment sample
+   under `systemd/`.
    `deploy/release-images.json` lists the single OCI image (`zinder`).
    Benchmark (`zinder-bench`) and code-generation binaries are excluded.
 3. **Builds are deterministic and proven by reproduction.** The build pins
@@ -176,3 +178,4 @@ The release procedure and how operators verify a download are in
 - 2026-11-27. Added Apple Silicon and baseline x86-64 archives to the reproducible release workflow and included the personal-node Compose manifest in the signed asset catalog.
 - 2026-11-27. Removed the retired shielded history publisher role from decision 2 after Canonical Schema v2 cutover.
 - 2026-11-27. Consolidated the five runtime executables and separate runtime/single-volume images into the single `bin/zinder` archive binary and single distroless `ghcr.io/zcashfoundation/zinder` OCI image (`deploy/release-images.json`).
+- 2026-11-28. Added native systemd units and a loopback environment sample to the GNU/Linux archives.

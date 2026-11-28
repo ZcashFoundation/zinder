@@ -230,6 +230,8 @@ done
 
 Each image must list amd64 and arm64 manifests. Each binary archive contains
 `bin/zinder`, `BUILD-INFO.json`, `LICENSE`, `README.md`, and its own `SHA256SUMS`.
+GNU/Linux archives also contain the native units and environment sample under
+`systemd/`.
 
 When a release publishes an image name for the first time, GHCR creates the
 package as private. An organization admin must make it public once. An

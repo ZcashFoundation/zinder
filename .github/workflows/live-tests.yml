@@ -27,13 +27,20 @@ on:
       - "rust-toolchain.toml"
       - ".config/nextest.toml"
       - "crates/**"
+      - "services/zinder/**"
       - "services/zinder-bench/**"
+      - "services/zinder-compat-cipherscan/**"
       - "services/zinder-compat-lightwalletd/**"
       - "services/zinder-explorer/**"
       - "services/zinder-ingest/**"
+      - "services/zinder-projector/**"
       - "services/zinder-query/**"
+      - "deploy/systemd/**"
       - "deploy/zakura/**"
       - "deploy/zebra/**"
+      - "scripts/build-release-binary-archive.sh"
+      - "scripts/release-binary-platform.sh"
+      - "scripts/test-native-systemd-regtest.sh"
       - "scripts/mine-live-regtest.sh"
       - "scripts/test-light-wallet-qualification.sh"
       - "scripts/generate-live-indexer-tls.sh"
@@ -262,6 +269,22 @@ jobs:
         run: |
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
             -E 'test(/^live::nu7_activation::/)'
+
+      - name: Smoke-test the native systemd installation
+        if: matrix.node == 'zebra'
+        timeout-minutes: 8
+        run: |
+          scripts/install-ci-tool.sh grpcurl
+          cargo build --locked -p zinder
+          scratch="$(mktemp -d)"
+          trap 'rm -rf -- "$scratch"' EXIT
+          install -D -m 0755 target/debug/zinder "$scratch/bin/zinder"
+          scripts/build-release-binary-archive.sh \
+            --binaries "$scratch/bin" --output "$scratch" \
+            --version 0.0.0-ci --tag v0.0.0-ci --commit "$(git rev-parse HEAD)" \
+            --target x86_64-unknown-linux-gnu --cpu-baseline x86-64 --pasta-asm 0 \
+            --source-date-epoch "$(git show -s --format=%ct HEAD)"
+          scripts/test-native-systemd-regtest.sh "$scratch/zinder-0.0.0-ci-x86_64-unknown-linux-gnu.tar.gz"
 
       - name: Run T3 live tests against regtest
         env:

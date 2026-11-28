@@ -1,0 +1,39 @@
+[Unit]
+Description=Zinder ExplorerQuery
+Requires=zinder-native-query.service
+After=zinder-native-query.service
+PartOf=zinder-native.target
+
+[Service]
+Type=exec
+User=zinder
+Group=zinder
+StateDirectory=zinder zinder/explorer
+StateDirectoryMode=0750
+ConfigurationDirectory=zinder/native
+ConfigurationDirectoryMode=0750
+Environment=ZINDER_OPS__LISTEN_ADDR=127.0.0.1:9069
+EnvironmentFile=/etc/zinder/native/zinder.env
+ExecStart=/usr/local/bin/zinder run explorer
+ExecStartPost=/bin/sh -c 'while kill -0 "$$MAINPID" 2>/dev/null; do /usr/local/bin/zinder healthcheck --ready 2>/dev/null && exit 0; sleep 2; done; exit 1'
+TimeoutStartSec=infinity
+TimeoutStopSec=120
+Restart=on-failure
+RestartMode=direct
+RestartSec=5
+LimitNOFILE=65536
+UMask=0027
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=zinder-native.target

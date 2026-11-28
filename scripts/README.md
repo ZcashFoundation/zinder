@@ -20,6 +20,8 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 | [test-changelog.sh](test-changelog.sh) | Self-tests changelog fragment validation and release prep scripts |
 | [test-deployment-admission.sh](test-deployment-admission.sh) | Self-tests deployment admission checks against passing and failing deployment fixtures |
 | [test-compat-lightwalletd-caddyfile.sh](test-compat-lightwalletd-caddyfile.sh) | Validates the reference Caddyfile and checks its TLS protocols, readiness gate, and upstream forwarding with Docker |
+| [test-native-systemd-config.sh](test-native-systemd-config.sh) | Checks that the shipped native systemd configuration uses distinct loopback listeners |
+| [test-native-systemd-regtest.sh](test-native-systemd-regtest.sh) | Installs a GNU/Linux archive on a disposable systemd host and probes its services against the CI Regtest chain |
 | [test-install-ci-tool.sh](test-install-ci-tool.sh) | Self-tests `install-ci-tool.sh` checksum verification and download failures |
 | [test-lthash16-backends.sh](test-lthash16-backends.sh) | Verifies `lthash16` backend equivalence across feature flags |
 | [test-personal-compose.sh](test-personal-compose.sh) | Starts the personal-node Compose bundle on a disposable Regtest chain and checks readiness |

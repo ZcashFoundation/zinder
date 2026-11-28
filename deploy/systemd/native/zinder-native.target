@@ -1,0 +1,6 @@
+[Unit]
+Description=Zinder wallet services
+Requires=zinder-native-index.service zinder-native-projector.service zinder-native-query.service zinder-native-compat-lightwalletd.service
+
+[Install]
+WantedBy=multi-user.target

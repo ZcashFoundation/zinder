@@ -53,7 +53,18 @@ The [Tor overlay](docker-compose.tor.yml) adds a Tor v3 sidecar on the shared Zi
 
 ## Systemd
 
-[systemd/zinder.service](systemd/zinder.service) wraps the Compose topology cleanly on Linux hosts using `/etc/zinder/deploy.env` (pointing `DEPLOY_ZINDER_ENV` at `/etc/zinder/zinder.env`, plus optional writer-only `/etc/zinder/index.env`). Optionally add `COMPOSE_PROFILES=observability` to `/etc/zinder/deploy.env` to include Prometheus and Grafana.
+The GNU/Linux archives include the [native units and loopback environment
+file](systemd/native/). On a host with systemd 254 or later, install them with
+the archive's `bin/zinder` to run the wallet services directly on the host,
+with optional Explorer and Cipherscan services. Follow the
+[native systemd runbook](../docs/runbooks/deploying-on-a-vm.md#run-the-release-binary-without-docker).
+
+[systemd/zinder.service](systemd/zinder.service) wraps the Compose topology on
+Linux hosts using `/etc/zinder/deploy.env`. Set
+`DEPLOY_ZINDER_ENV=/etc/zinder/zinder.env` for the shared runtime settings and
+optionally `DEPLOY_INDEX_ENV=/etc/zinder/index.env` for writer-only settings.
+Add `COMPOSE_PROFILES=observability` to `/etc/zinder/deploy.env` to include
+Prometheus and Grafana.
 
 ## TLS reverse proxy
 
