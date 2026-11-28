@@ -1175,8 +1175,8 @@ EOF
 
   if [[ "$(grep -Fc 'uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2' "$release_workflow")" -ne 5 ]] \
     || [[ "$(grep -Fc 'create-storage-record: false' "$release_workflow")" -ne 5 ]] \
-    || [[ "$(grep -Fc 'uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3' "$release_workflow")" -ne 2 ]] \
-    || [[ "$(grep -Fc 'uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3' "$release_workflow")" -ne 3 ]] \
+    || [[ "$(grep -Fc 'uses: anchore/sbom-action/download-syft@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4' "$release_workflow")" -ne 2 ]] \
+    || [[ "$(grep -Fc 'uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4' "$release_workflow")" -ne 3 ]] \
     || [[ "$(grep -Fc 'scripts/install-release-gh.sh' "$release_workflow")" -ne 4 ]] \
     || grep -Fq 'artifact-metadata:' "$release_workflow" \
     || ! grep -Fq 'scripts/check-release-image-evidence.sh' "$release_workflow" \

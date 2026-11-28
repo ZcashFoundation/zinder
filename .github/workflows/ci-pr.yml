@@ -277,7 +277,7 @@ jobs:
     timeout-minutes: 30
     services:
       postgres:
-        image: postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402
+        image: postgres:18.7-bookworm@sha256:e742a2668255221388004f3a42b6150a2103f5054ab3a4a93ae9e4f01e551c35
         env:
           POSTGRES_DB: zinder_bench
           POSTGRES_USER: zinder_bench

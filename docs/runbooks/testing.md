@@ -743,7 +743,7 @@ The Mainnet-only tests are
 ### Parity against a reference lightwalletd
 
 These tests compare `zinder-compat-lightwalletd` with the pinned
-`electriccoinco/lightwalletd` v0.6.0, both reading the same Regtest node. CI
+`electriccoinco/lightwalletd` v0.6.3, both reading the same Regtest node. CI
 mines the [Regtest through NU7](#regtest-through-nu7) chain to height 150, so
 the compared range crosses NU7. The tests compare only the fields that the
 [lightwalletd compatibility reference](../reference/lightwalletd-compatibility.md)
@@ -758,7 +758,7 @@ refuse `Ping`.
 ```bash
 scripts/mine-live-regtest.sh http://127.0.0.1:39232 150
 docker run -d --name lightwalletd-reference --network host \
-  docker.io/electriccoinco/lightwalletd:v0.6.2@sha256:75e5742df686094556abef66e69c37bc114de23a0706712aee324f332ca52951 \
+  docker.io/electriccoinco/lightwalletd:v0.6.3@sha256:40d72a159150e152e099f888c154077273babb21ade60b2281ab932b7d2c752e \
   --grpc-bind-addr 0.0.0.0:9088 \
   --rpchost 127.0.0.1 --rpcport 39232 --rpcuser zebra --rpcpassword zebra \
   --no-tls-very-insecure --data-dir /tmp/lwd --log-file /dev/stdout

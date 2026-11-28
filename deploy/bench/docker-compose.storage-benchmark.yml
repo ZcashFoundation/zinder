@@ -138,7 +138,7 @@ services:
       - --database-memory-limit-bytes
       - ${ZINDER_BENCH_POSTGRES_DATABASE_MEMORY_LIMIT_BYTES:-8589934592}
       - --database-image-reference
-      - ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402}
+      - ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:e742a2668255221388004f3a42b6150a2103f5054ab3a4a93ae9e4f01e551c35}
       - --storage-class
       - ${ZINDER_BENCH_STORAGE_CLASS:?set ZINDER_BENCH_STORAGE_CLASS to the measured volume and host storage class}
       - --image-reference
@@ -147,7 +147,7 @@ services:
       - /benchmark/results/postgres-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
 
   postgres-database:
-    image: ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402}
+    image: ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:e742a2668255221388004f3a42b6150a2103f5054ab3a4a93ae9e4f01e551c35}
     profiles: [postgres, comparison, postgres-segmented]
     restart: "no"
     cgroup: private
@@ -248,7 +248,7 @@ services:
       retries: 30
 
   postgres-pgbouncer:
-    image: ${ZINDER_BENCH_PGBOUNCER_IMAGE:-edoburu/pgbouncer:v1.24.1-p1@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e}
+    image: ${ZINDER_BENCH_PGBOUNCER_IMAGE:-edoburu/pgbouncer:v1.26.0-p0@sha256:b17551c776ef7e5769ef80b956d20f85e2fd25dd8912d31d58f782aad495b711}
     profiles: [postgres-segmented]
     restart: "no"
     cpus: ${ZINDER_BENCH_PGBOUNCER_CPUS:-0.5}
@@ -341,13 +341,13 @@ services:
       - --database-memory-limit-bytes
       - ${ZINDER_BENCH_POSTGRES_DATABASE_MEMORY_LIMIT_BYTES:-8589934592}
       - --database-image-reference
-      - ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402}
+      - ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:e742a2668255221388004f3a42b6150a2103f5054ab3a4a93ae9e4f01e551c35}
       - --pooler-cpu-limit-cores
       - ${ZINDER_BENCH_PGBOUNCER_CPUS:-0.5}
       - --pooler-memory-limit-bytes
       - ${ZINDER_BENCH_PGBOUNCER_MEMORY_LIMIT_BYTES:-536870912}
       - --pooler-image-reference
-      - ${ZINDER_BENCH_PGBOUNCER_IMAGE:-edoburu/pgbouncer:v1.24.1-p1@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e}
+      - ${ZINDER_BENCH_PGBOUNCER_IMAGE:-edoburu/pgbouncer:v1.26.0-p0@sha256:b17551c776ef7e5769ef80b956d20f85e2fd25dd8912d31d58f782aad495b711}
       - --storage-class
       - ${ZINDER_BENCH_STORAGE_CLASS:?set ZINDER_BENCH_STORAGE_CLASS to the measured volume and host storage class}
       - --image-reference

@@ -67,7 +67,7 @@ env:
   # The reference must parse the version-6 (NU6.3 and later) transactions that
   # every block from height 6 carries on the shared Regtest schedule in
   # deploy/zebra/regtest.toml and deploy/zakura/regtest.toml.
-  REFERENCE_LIGHTWALLETD_IMAGE: docker.io/electriccoinco/lightwalletd:v0.6.2@sha256:75e5742df686094556abef66e69c37bc114de23a0706712aee324f332ca52951
+  REFERENCE_LIGHTWALLETD_IMAGE: docker.io/electriccoinco/lightwalletd:v0.6.3@sha256:40d72a159150e152e099f888c154077273babb21ade60b2281ab932b7d2c752e
   # Past NU7 (height 140), so the fixed fence covers blocks on both sides of
   # the activation.
   PARITY_REGTEST_TIP: "150"

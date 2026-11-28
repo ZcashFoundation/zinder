@@ -10,8 +10,8 @@
 #
 # name            version  url                                                                                                                                       sha256
 cargo-nextest     0.9.152  https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.152/cargo-nextest-0.9.152-x86_64-unknown-linux-gnu.tar.gz        d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a
-cargo-deny        0.21.0   https://github.com/EmbarkStudios/cargo-deny/releases/download/0.21.0/cargo-deny-0.21.0-x86_64-unknown-linux-musl.tar.gz                   a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903
+cargo-deny        0.22.2  https://github.com/EmbarkStudios/cargo-deny/releases/download/0.22.2/cargo-deny-0.22.2-x86_64-unknown-linux-musl.tar.gz                           9f831cfb5d03a5093c0810091a7bd3b5e4724a1288cbe5718d8ce8cef2590adf
 cargo-machete     0.10.1   https://github.com/bnjbvr/cargo-machete/releases/download/v0.10.1/cargo-machete-v0.10.1-x86_64-unknown-linux-musl.tar.gz                  785d381985140ffa172246d82089adeb7f2eb9c774d961c48f77a4494023afb5
-cargo-llvm-cov    0.9.1    https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz                        b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a
+cargo-llvm-cov    0.9.2   https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.2/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz                                 1e0ed5c64f11e9217f7b9d7c776b3125eab26f27d49313919c909881a2fc7cff
 cargo-mutants     27.1.0   https://github.com/sourcefrog/cargo-mutants/releases/download/v27.1.0/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz                      dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e
-grpcurl            1.9.1     https://github.com/fullstorydev/grpcurl/releases/download/v1.9.1/grpcurl_1.9.1_linux_x86_64.tar.gz 588c9c429476d9ed66cd3b2ae32283a6da36e0cfbb7e446f5d6a1b68dc770214
+grpcurl           1.9.4   https://github.com/fullstorydev/grpcurl/releases/download/v1.9.4/grpcurl_1.9.4_linux_x86_64.tar.gz                                                97e13d58d2733a0e62cd2571d1d5f0c02823f0d25282f08bddedf1ad9c5d1736

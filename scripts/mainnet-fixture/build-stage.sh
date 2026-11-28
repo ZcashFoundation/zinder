@@ -12,10 +12,10 @@ set -euo pipefail
 
 # Zebra 7.1.0, the node runtime pinned in CLAUDE.md and the live lanes.
 ZEBRA_IMAGE=docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba
-JQ_URL=https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
-JQ_SHA256=5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5
-GRPCURL_URL=https://github.com/fullstorydev/grpcurl/releases/download/v1.9.1/grpcurl_1.9.1_linux_x86_64.tar.gz
-GRPCURL_SHA256=588c9c429476d9ed66cd3b2ae32283a6da36e0cfbb7e446f5d6a1b68dc770214
+JQ_URL=https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+JQ_SHA256=b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+GRPCURL_URL=https://github.com/fullstorydev/grpcurl/releases/download/v1.9.4/grpcurl_1.9.4_linux_x86_64.tar.gz
+GRPCURL_SHA256=97e13d58d2733a0e62cd2571d1d5f0c02823f0d25282f08bddedf1ad9c5d1736
 
 binaries="" out="" upload=""
 while [[ $# -gt 0 ]]; do

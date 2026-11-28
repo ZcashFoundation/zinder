@@ -11,7 +11,7 @@ name: ${ZINDER_PG_TESTING_GROUND_PROJECT:-zinder-pg-testing-ground}
 
 services:
   postgres:
-    image: ${ZINDER_PG_TESTING_GROUND_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402}
+    image: ${ZINDER_PG_TESTING_GROUND_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:e742a2668255221388004f3a42b6150a2103f5054ab3a4a93ae9e4f01e551c35}
     environment:
       POSTGRES_DB: zinder_testing
       POSTGRES_USER: postgres
@@ -39,7 +39,7 @@ services:
       retries: 20
 
   pgbouncer:
-    image: edoburu/pgbouncer:v1.25.1-p0@sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108
+    image: edoburu/pgbouncer:v1.26.0-p0@sha256:b17551c776ef7e5769ef80b956d20f85e2fd25dd8912d31d58f782aad495b711
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,7 +60,7 @@ services:
       retries: 20
 
   mock-r2:
-    image: python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e
+    image: python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd
     command: ["python3", "/app/server.py"]
     read_only: true
     tmpfs:
@@ -82,7 +82,7 @@ services:
       retries: 15
 
   probe-reader-a:
-    image: python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e
+    image: python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd
     depends_on:
       pgbouncer:
         condition: service_healthy
@@ -114,7 +114,7 @@ services:
       retries: 15
 
   probe-reader-b:
-    image: python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e
+    image: python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd
     depends_on:
       pgbouncer:
         condition: service_healthy

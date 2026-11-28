@@ -34,7 +34,7 @@ services:
       retries: 6
 
   grafana:
-    image: grafana/grafana:13.3.1
+    image: grafana/grafana:13.3.2
     container_name: zinder_grafana
     restart: unless-stopped
     <<: *common
