@@ -81,6 +81,57 @@ if grep -Eq 'zinder[^[:space:]]*:latest' \
   fail "the deployment Compose file or Kubernetes manifest defaults Zinder to :latest"
 fi
 
+personal_compose="$repository_root/deploy/personal/compose.yaml"
+personal_compose_env=(
+  env -u ZINDER_IMAGE -u ZINDER_VERSION -u ZINDER_SERVE_MEMORY_LIMIT
+  -u ZINDER_NETWORK__NAME -u ZEBRA_NETWORK__NETWORK -u ZINDER_NODE__JSON_RPC_ADDR
+)
+"${personal_compose_env[@]}" ZINDER_VERSION=v0.27.0 \
+  docker compose --env-file /dev/null -f "$personal_compose" config --format json \
+  | jq -e '
+    .services.zinder.command == ["serve", "--preset", "light-wallet"]
+    and (.services.zinder.mem_limit | tonumber) == 8589934592
+    and .services.zinder.stop_grace_period == "30s"
+    and .services.zinder.image == "ghcr.io/zcashfoundation/zinder:v0.27.0"
+    and .services.zinder.environment.ZINDER_NETWORK__NAME == "zcash-mainnet"
+    and .services.zinder.environment.ZINDER_NODE__JSON_RPC_ADDR == "http://zebra:8232"
+    and .services.zebra.environment.ZEBRA_NETWORK__NETWORK == "Mainnet"
+    and .services.zinder.environment.ZINDER_NODE__AUTH__METHOD == "cookie"
+    and .services.zebra.environment.ZEBRA_RPC__ENABLE_COOKIE_AUTH == "true"
+    and (.services.zebra.ports // []) == []
+    and (.services.zinder.ports | map([.host_ip, .target]) | sort) == [
+      ["127.0.0.1", 9067], ["127.0.0.1", 9108]
+    ]
+    and ([.services.zinder.volumes[] | select(.read_only != true) | .target] == ["/var/lib/zinder"])
+    and any(.services.zinder.volumes[]; .source == "zebra-auth" and .read_only == true)
+  ' >/dev/null || fail "personal Compose changed its default configuration"
+
+"${personal_compose_env[@]}" ZINDER_SERVE_MEMORY_LIMIT=4g ZINDER_IMAGE=zinder:local ZINDER_VERSION=local \
+  ZINDER_NETWORK__NAME=zcash-testnet ZEBRA_NETWORK__NETWORK=Testnet \
+  ZINDER_NODE__JSON_RPC_ADDR=http://zebra:18232 \
+  docker compose --env-file /dev/null -f "$personal_compose" config --format json \
+  | jq -e '
+    (.services.zinder.mem_limit | tonumber) == 4294967296
+    and .services.zinder.image == "zinder:local"
+    and .services.zinder.environment.ZINDER_NETWORK__NAME == "zcash-testnet"
+    and .services.zinder.environment.ZINDER_NODE__JSON_RPC_ADDR == "http://zebra:18232"
+    and .services.zebra.environment.ZEBRA_NETWORK__NETWORK == "Testnet"
+  ' >/dev/null || fail "personal Compose did not apply supported overrides"
+
+zinder_image_digest="sha256:$(printf '%064d' 1)"
+release_compose="$temporary_directory/zinder-personal-compose.yaml"
+"${personal_compose_env[@]}" "$repository_root/scripts/render-personal-compose.sh" \
+  "$zinder_image_digest" > "$release_compose"
+"${personal_compose_env[@]}" ZINDER_IMAGE=zinder:local \
+  docker compose --env-file /dev/null -f "$release_compose" config --format json \
+  | jq -e --arg digest "$zinder_image_digest" '
+    .services.zinder.image == ("ghcr.io/zcashfoundation/zinder@" + $digest)
+    and (.services.zebra.image | test("@sha256:[0-9a-f]{64}$"))
+  ' >/dev/null || fail "personal Compose release did not pin both image digests"
+if "$repository_root/scripts/render-personal-compose.sh" latest >/dev/null 2>&1; then
+  fail "personal Compose release accepted an image tag"
+fi
+
 deployment_env_names=(mainnet testnet regtest zakura-mainnet zakura-testnet)
 
 env_file_value() {

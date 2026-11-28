@@ -1,4 +1,4 @@
-# ADR-0022: Ship reproducible Linux binaries with verifiable provenance
+# ADR-0022: Ship reproducible binaries with verifiable provenance
 
 Status: Accepted
 
@@ -16,11 +16,21 @@ the release claiming precision it does not have for native libraries.
 
 ## Decision
 
-1. **Every release tag produces two GNU/Linux archives.** One targets
-   `x86_64-v3-unknown-linux-gnu` (`x86-64-v3` plus `BMI2`, `ADX`, and
-   `PCLMULQDQ` for `pasta_curves/asm` and pipelined CRC32C), the other
-   `aarch64-unknown-linux-gnu` (`Armv8-A`, which also enables
-   `pasta_curves/asm` within the baseline ISA). The x86 file name and `BUILD-INFO.json` preserve the `x86-64-v3` slug and `cpu_baseline` for schema compatibility, while `required_cpu_features` explicitly records `["adx","pclmulqdq"]` on default x86-64 assembly archives (and `[]` on AArch64) so compatibility checkers catch hosts lacking `ADX` or `PCLMULQDQ`.
+1. **Every release tag produces four native archives.**
+
+   | Release platform | CPU baseline | Runtime |
+   | --- | --- | --- |
+   | `x86_64-v3-unknown-linux-gnu` | x86-64-v3 with ADX and PCLMULQDQ | GNU/Linux |
+   | `x86_64-unknown-linux-gnu` | x86-64 with portable Pasta arithmetic | GNU/Linux |
+   | `aarch64-unknown-linux-gnu` | Armv8-A | GNU/Linux |
+   | `aarch64-apple-darwin` | Armv8-A | Apple Silicon, macOS 11.0 or later |
+
+   Both AArch64 builds use the Pasta assembly backend within the baseline ISA.
+   The optimized x86 build uses BMI2 and ADX for Pasta assembly and
+   PCLMULQDQ for pipelined CRC32C. The baseline x86 build selects
+   `target-cpu=x86-64` and disables Pasta assembly. `BUILD-INFO.json` records
+   the Rust target, release platform, CPU baseline, extra CPU features, and
+   platform-specific system library requirements.
 2. **An archive holds the single unified `zinder` executable.** It contains
    `bin/zinder` (`serve`, `index`, `run <role>`, `snapshot`, `backup`, `config`,
    and `healthcheck`, covering ingest, projector, query, lightwalletd
@@ -36,10 +46,13 @@ the release claiming precision it does not have for native libraries.
 4. **The single image reuses the proven binary.** `ghcr.io/zcashfoundation/zinder`
    copies `bin/zinder` from the compared archive instead of compiling again,
    and the image binary matches its archive binary byte for byte.
-5. **The C library stays dynamic with a fixed ceiling.** RocksDB and its
-   compression libraries are linked statically. GNU libc and `libstdc++` stay
-   dynamic. The release checker rejects symbols newer than `GLIBC_2.34` or
-   `GLIBCXX_3.4.30` and runs each binary on a clean supported Debian image.
+5. **System libraries stay dynamic.** RocksDB and its compression libraries
+   are linked statically. On Linux, the release checker rejects GNU libc and
+   `libstdc++` symbols newer than `GLIBC_2.34` and `GLIBCXX_3.4.30`, and CI
+   runs each binary on Debian 12. On macOS, the checker requires arm64 Mach-O,
+   the declared deployment target, and system-provided dynamic libraries
+   including `libSystem` and `libc++`. The workflow builds and runs the binary
+   on an Apple Silicon runner using Xcode 16.4.
 6. **No credentials before approval.** Builds run with a read-only token and
    no OIDC token. A protected `release` environment gates crate publication,
    signing, attestation, and every registry write.
@@ -68,10 +81,12 @@ The release procedure and how operators verify a download are in
 ## Consequences
 
 - Operators run any preset (`light-wallet`, `wallet`, `explorer`) or individual role from the single `bin/zinder` binary without extracting a container image.
-- x86 hosts running published binaries must support `x86-64-v3` plus `ADX`
-  (Broadwell+ / Zen 1+ for `pasta_curves/asm`, checked at startup;
-  pre-Broadwell/Haswell hosts without `ADX` can rebuild from source with
-  `--build-arg ZINDER_PASTA_ASM=0`), and hosts need glibc 2.34 or newer.
+- x86 hosts without AVX2 or ADX can use the baseline GNU/Linux archive.
+  The AMD64 OCI image continues to use the optimized x86-64-v3 archive.
+- The personal-node Compose manifest is a release asset covered by the signed
+  `SHA256SUMS`. It pins both images by digest. The Zinder image digest comes
+  from the verified multi-platform release index. See [Deploying Zinder](../runbooks/deploying.md#personal-node-compose)
+  for sizing and operating instructions.
 - A binary that fails to build, reproduce, or package stops the whole
   release before any crate, image, or GitHub Release is published.
 - Approval is requested only after the slowest build finishes, so release
@@ -113,5 +128,6 @@ The release procedure and how operators verify a download are in
 
 ## Revision history
 
+- 2026-11-27. Added Apple Silicon and baseline x86-64 archives to the reproducible release workflow and included the personal-node Compose manifest in the signed asset catalog.
 - 2026-11-27. Removed the retired shielded history publisher role from decision 2 after Canonical Schema v2 cutover.
 - 2026-11-27. Consolidated the five runtime executables and separate runtime/single-volume images into the single `bin/zinder` archive binary and single distroless `ghcr.io/zcashfoundation/zinder` OCI image (`deploy/release-images.json`).

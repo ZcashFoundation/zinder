@@ -26,9 +26,10 @@ Canonical Schema `v2` removes `storage.raw_blob_policy = "transactions"` and ref
 | Option | Status | Pick it when | Guide |
 | --- | --- | --- | --- |
 | **Docker Compose + systemd on a Linux VM** *(recommended production)* | Supported | You run a long-lived two-container deployment (`zinder-index` writer + `zinder-serve --readers-only`) on a VM you manage, or alongside a Z3/Zakura stack. | [Testnet quickstart](#quickstart-with-docker-compose) below; [Deploying on a VM](deploying-on-a-vm.md) and [deploy/README.md](../../deploy/README.md) |
+| **Personal-node Compose** | Supported | You want a private light-wallet endpoint and a bundled Zebra node. | [Personal-node Compose](#personal-node-compose) |
 | **Single-volume container (`ghcr.io/zcashfoundation/zinder`)** | Supported | Your PaaS attaches one persistent volume to one container (`zinder serve`), such as Railway. | [Deploying the single-volume container](deploying-single-volume.md) |
 | **Kubernetes (`StatefulSet`)** | Supported *(Single-host RWO)* | You run single-replica pods on a cluster with a `ReadWriteOnce` `PersistentVolumeClaim` (`deploy/kubernetes/statefulset.yaml`, `fsGroup: 10001`). | [Kubernetes StatefulSet](deploying-single-volume.md#kubernetes-statefulset) |
-| **Standalone `zinder` binary** | Supported | You supervise `zinder serve`, `zinder index`, or `zinder run <role>` natively via systemd without Docker. | [Run the release binary without Docker](deploying-on-a-vm.md#run-the-release-binaries-without-docker) |
+| **Standalone `zinder` binary** | Supported | You run Zinder natively on Linux or Apple Silicon macOS. | [Run the release binary without Docker](deploying-on-a-vm.md#run-the-release-binaries-without-docker) |
 | **Stateless serverless (Cloud Run, Cloudflare Containers)** | Not supported *(Planned M3)* | You expect stateless scale-to-zero containers without attached RWO disks. | See [Cloud and serverless boundaries](#cloud-and-serverless-boundaries) below |
 | **Public Foundation endpoints** | Supported | You want to evaluate or integrate a client without operating an indexer. | [Integration surfaces](../reference/integration-surfaces.md#endpoints) |
 
@@ -47,13 +48,13 @@ You need an archive Zebra or Zakura node on the same network. Ingest reads every
 
 ### Private or standard Mainnet VM
 
-- **CPU:** 8+ vCPUs (Broadwell+/Zen+ `x86-64` supporting `x86-64-v3` + `ADX`, or `AArch64`). Published release binaries, images, and Compose builds enable the Pasta assembly backend by default (`ZINDER_PASTA_ASM=1`; pass `ZINDER_PASTA_ASM=0` only when building for pre-Broadwell/Haswell x86-64 hosts without `ADX`, checked at startup). Wallet accumulators select AVX-512F/VL at run time when available and AVX2 otherwise; both produce identical store bytes. Hosts with fewer than 8 logical CPUs take longer to sync; see [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
+- **CPU:** 8+ vCPUs (Broadwell+/Zen+ `x86-64` supporting `x86-64-v3` + `ADX`, or `AArch64`). The AMD64 image uses the optimized archive. Choose the baseline GNU/Linux archive if your CPU lacks the optimized build’s features. Optimized wallet accumulators can use AVX-512F/VL when available. Hosts with fewer than 8 logical CPUs take longer to sync; see [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
 - **RAM:** 32 GiB RAM. Give `zinder-index` enough memory for canonical + wallet construction (`14g`–`24g` on Mainnet), keep `4g`+ on `zinder-serve` for private endpoints (raise for high-concurrency range reads), and give single-volume containers (`zinder serve`) at least 8–16 GB.
 - **Disk:** Fast local SSD/NVMe formatted **`ext4 -O verity`** (when protecting canonical settled segments with optional Linux fs-verity). Reserve **240+ GB free** for `wallet` (pre-v2 Schema `v1` steady-state was ~102 GB canonical + wallet at Mainnet height 3,593,347 and growing, plus ~130 GB temporary sort spill headroom during initial wallet construction). Enabling `--full-blocks` (`storage.full_blocks = true`, `raw_blob_policy = "all"`) stores a single Zstd-compressed copy of full consensus blocks plus 40-byte transaction slice descriptors (`ZSBLKB01` + `live_tail_raw_block`), so budget additional free NVMe capacity beyond the ~250+ GiB raw chain data and wallet sort spill headroom.
 
 ### Public high-concurrency Mainnet endpoint
 
-- **CPU:** 8–16+ vCPUs (Broadwell+/Zen+ `x86-64` with `BMI2 + ADX`, or `AArch64`). Shipped release images and binary archives enable `pasta_curves/asm` by default (`ZINDER_PASTA_ASM=1`; pass `--features pasta_curves/asm` when compiling directly with Cargo), saving ~6.7–8.2% on Orchard Merkle hashing and canonical construction benchmarks while failing closed at startup if `ADX` is missing.
+- **CPU:** 8–16+ vCPUs (Broadwell+/Zen+ `x86-64` with `BMI2 + ADX`, or `AArch64`). Release images and optimized binary archives enable `pasta_curves/asm` (`ZINDER_PASTA_ASM=1`; pass `--features pasta_curves/asm` when compiling directly with Cargo), saving ~6.7–8.2% on Orchard Merkle hashing and canonical construction benchmarks while failing closed at startup if `ADX` is missing.
 - **RAM:** **64+ GiB RAM** and size `zinder-serve`'s cgroup memory limit above **32 GiB** (`ZINDER_SERVE_MEMORY_LIMIT`). Under cgroup v2, the OS page cache for canonical `ZSHRNG02` settled segments counts against the container reading those segments; keeping headroom above the active settled-segment working set prevents page-cache thrashing and `wait_timeout` refusals under concurrent range syncs.
 - **Node feed:** Set `ZINDER_NODE__INDEXER_GRPC_ADDR` and `ZINDER_INGEST__SOURCE=zebra-indexer-grpc` (in your Compose env file or exported environment) to stream mempool events and fetch blocks as binary protobufs instead of polling the full mempool over JSON-RPC on every block.
 - **Edge proxy:** Put a TLS proxy with per-client connection, request, and stream limits in front of the listeners ([Exposing over TLS](exposing-over-tls.md)).
@@ -64,6 +65,62 @@ You need an archive Zebra or Zakura node on the same network. Ingest reads every
 | --- | --- | --- |
 | **Testnet** | `12g` / `4g` | Fits within a few hours on SSD/NVMe. |
 | **Regtest** | `4g` / `2g` | Minutes from genesis. |
+
+## Personal-node Compose
+
+Use Docker Engine with the Compose plugin on AMD64 Linux that supports the
+optimized CPU baseline, ARM64 Linux, or Apple Silicon with Docker Desktop.
+The bundle starts an archive Zebra node and `zinder serve --preset light-wallet`.
+Give the stack at least 12 GiB of container memory plus headroom for the host
+or Docker VM. The manifest caps Zebra at 4 GiB and Zinder at 8 GiB by default.
+Use `ZINDER_SERVE_MEMORY_LIMIT=4g` for a small Regtest stack. For Mainnet,
+reserve the [Zinder disk space above](#choose-a-profile), plus initial-sync
+headroom and [Zebra's separate disk budget](https://zebra.zfnd.org/user/requirements.html).
+
+1. Download the manifest from a release that includes it. Verify the downloaded
+   asset with GitHub CLI before you start it.
+
+   ```bash
+   release=vX.Y.Z
+   gh release download "$release" --repo ZcashFoundation/zinder \
+     --pattern zinder-personal-compose.yaml
+   gh release verify-asset "$release" zinder-personal-compose.yaml \
+     --repo ZcashFoundation/zinder
+   ```
+
+2. Start the bundle. The release manifest pins both images by digest.
+
+   ```bash
+   docker compose -f zinder-personal-compose.yaml up -d
+   ```
+
+   The defaults use Mainnet and `http://zebra:8232`. For Testnet, export
+   `ZINDER_NETWORK__NAME=zcash-testnet` and `ZEBRA_NETWORK__NETWORK=Testnet`
+   before starting. Keep these variables set for subsequent commands. If the
+   bundled node needs a different RPC service address, set
+   `ZINDER_NODE__JSON_RPC_ADDR`. Zinder authenticates with the bundled
+   node's cookie and generates its own internal control tokens. The two
+   published host ports bind only to `127.0.0.1`. Keep the default loopback
+   mappings when using a proxy.
+
+3. Check progress and readiness. The container health check reports liveness
+   while the node syncs and Zinder builds its canonical store.
+
+   ```bash
+   docker compose -f zinder-personal-compose.yaml ps
+   curl -fsS http://127.0.0.1:9108/readyz
+   ```
+
+   When readiness returns HTTP 200, point a local lightwalletd-compatible
+   client at `127.0.0.1:9067`. For another device, follow
+   [Exposing over TLS](exposing-over-tls.md) and proxy only the wallet port.
+
+4. Stop the bundle and keep its state. The Zinder store and Zebra chain state
+   live in separate named volumes.
+
+   ```bash
+   docker compose -f zinder-personal-compose.yaml down
+   ```
 
 <a id="what-you-deploy"></a>
 
@@ -155,7 +212,7 @@ This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](h
 
 ### Build from source
 
-To run an unreleased checkout instead of published images, leave `ZINDER_VERSION` unset (export `ZINDER_PASTA_ASM=0` only if building for a pre-Broadwell/Haswell `x86-64` host without `ADX`) and run:
+To run an unreleased checkout, leave `ZINDER_VERSION` unset and build the images:
 
 ```bash
 docker compose --env-file deploy/.env.testnet \

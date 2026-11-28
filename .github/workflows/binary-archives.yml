@@ -12,9 +12,12 @@ on:
       - "README.md"
       - "crates/**"
       - "deploy/Dockerfile"
+      - ".github/actions/build-macos-release-binary/**"
+      - ".github/actions/setup-rust/**"
       - ".github/actions/buildkit-cargo-cache/**"
       - "deploy/release-images.json"
       - "rust-toolchain.toml"
+      - "scripts/release-binary-platform.sh"
       - "scripts/build-release-binary-archive.sh"
       - "scripts/check-release-binary-archive.sh"
       - "scripts/check-release-sbom.sh"
@@ -38,9 +41,12 @@ on:
       - "README.md"
       - "crates/**"
       - "deploy/Dockerfile"
+      - ".github/actions/build-macos-release-binary/**"
+      - ".github/actions/setup-rust/**"
       - ".github/actions/buildkit-cargo-cache/**"
       - "deploy/release-images.json"
       - "rust-toolchain.toml"
+      - "scripts/release-binary-platform.sh"
       - "scripts/build-release-binary-archive.sh"
       - "scripts/check-release-binary-archive.sh"
       - "scripts/check-release-sbom.sh"
@@ -75,26 +81,46 @@ jobs:
             rust: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             jemalloc_page_size: 4096
+          - name: x86_64-unknown-linux-gnu
+            arch: amd64
+            docker: linux/amd64
+            rust: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            jemalloc_page_size: 4096
+            cpu_baseline: x86-64
+            pasta_asm: '0'
           - name: aarch64-unknown-linux-gnu
             arch: arm64
             docker: linux/arm64
             rust: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             jemalloc_page_size: 65536
+          - name: aarch64-apple-darwin
+            rust: aarch64-apple-darwin
+            runner: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build native Apple Silicon binary
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/build-macos-release-binary
+        with:
+          commit: ${{ github.sha }}
 
       # `docker buildx build --cache-from/--cache-to type=gha` and the cache
       # action read the Actions cache service from ACTIONS_* variables, which
       # run steps do not see unless an action exports them.
       - name: Expose the Actions cache runtime
+        if: runner.os == 'Linux'
         uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
 
       - name: Set up Docker Buildx
+        if: runner.os == 'Linux'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Restore the BuildKit Cargo cache
+        if: runner.os == 'Linux'
         uses: ./.github/actions/buildkit-cargo-cache
         with:
           mode: restore
@@ -108,6 +134,9 @@ jobs:
       - name: Build and verify binary archive
         env:
           BUILD_BASE_CACHE: zinder-build-base-${{ matrix.platform.arch }}
+          CPU_BASELINE: ${{ matrix.platform.cpu_baseline }}
+          PASTA_ASM: ${{ matrix.platform.pasta_asm || '1' }}
+          PLATFORM_NAME: ${{ matrix.platform.name }}
           JEMALLOC_PAGE_SIZE: ${{ matrix.platform.jemalloc_page_size }}
           RUST_TARGET: ${{ matrix.platform.rust }}
           TARGET_PLATFORM: ${{ matrix.platform.docker }}
@@ -118,16 +147,20 @@ jobs:
           release_tag="v${version}"
           commit="$(git rev-parse HEAD)"
           source_date_epoch="$(git show -s --format=%ct HEAD)"
-          docker buildx build \
-            --platform "$TARGET_PLATFORM" \
-            --target release-binaries \
-            --build-arg "RELEASE_CACHE_SCOPE=shared" \
-            --cache-from "type=gha,scope=${BUILD_BASE_CACHE}" \
-            --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
-            --build-arg "ZINDER_BUILD_GIT_COMMIT=${commit}" \
-            --output "type=local,dest=${RUNNER_TEMP}/binary-export" \
-            --file deploy/Dockerfile \
-            .
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            docker buildx build \
+              --platform "$TARGET_PLATFORM" \
+              --target release-binaries \
+              --build-arg "RELEASE_CACHE_SCOPE=${CPU_BASELINE:-shared}" \
+              --build-arg "ZINDER_X86_64_CPU_BASELINE=${CPU_BASELINE:-x86-64-v3}" \
+              --build-arg "ZINDER_PASTA_ASM=${PASTA_ASM}" \
+              --cache-from "type=gha,scope=${BUILD_BASE_CACHE}" \
+              --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
+              --build-arg "ZINDER_BUILD_GIT_COMMIT=${commit}" \
+              --output "type=local,dest=${RUNNER_TEMP}/binary-export" \
+              --file deploy/Dockerfile \
+              .
+          fi
           scripts/build-release-binary-archive.sh \
             --binaries "${RUNNER_TEMP}/binary-export/bin" \
             --output dist \
@@ -135,6 +168,8 @@ jobs:
             --tag "$release_tag" \
             --commit "$commit" \
             --target "$RUST_TARGET" \
+            --cpu-baseline "$CPU_BASELINE" \
+            --pasta-asm "$PASTA_ASM" \
             --source-date-epoch "$source_date_epoch"
           archive_path="$(find dist -maxdepth 1 -type f -name '*.tar.gz')"
           scripts/check-release-binary-archive.sh "$archive_path" \
@@ -142,39 +177,64 @@ jobs:
             --tag "$release_tag" \
             --commit "$commit" \
             --target "$RUST_TARGET" \
+            --cpu-baseline "$CPU_BASELINE" \
+            --pasta-asm "$PASTA_ASM" \
             --source-date-epoch "$source_date_epoch"
-          platform="$(jq -r '.release_platform' < <(tar -xOzf "$archive_path" --wildcards '*/BUILD-INFO.json'))"
-          sbom_path="dist/zinder-${version}-${platform}.spdx.json"
+          [[ "$(basename -- "$archive_path")" == "zinder-${version}-${PLATFORM_NAME}.tar.gz" ]]
+          sbom_path="dist/zinder-${version}-${PLATFORM_NAME}.spdx.json"
           scripts/generate-release-sbom.sh \
             --archive "$archive_path" \
             --output "$sbom_path" \
             --version "$version" \
-            --platform "$platform" \
+            --platform "$PLATFORM_NAME" \
             --commit "$commit"
           scripts/check-release-sbom.sh "$sbom_path" \
             --archive "$archive_path" \
             --version "$version" \
-            --platform "$platform" \
+            --platform "$PLATFORM_NAME" \
             --commit "$commit"
-          docker run --rm \
-            --platform "$TARGET_PLATFORM" \
-            --env JEMALLOC_PAGE_SIZE \
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            docker run --rm \
+              --platform "$TARGET_PLATFORM" \
+              --env JEMALLOC_PAGE_SIZE \
+              --volume "${RUNNER_TEMP}/binary-export/bin:/opt/zinder/bin:ro" \
+              debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 \
+              sh -ec '
+                apt-get update >/dev/null
+                apt-get install -y --no-install-recommends ca-certificates libstdc++6 >/dev/null
+                for binary in /opt/zinder/bin/*; do
+                  "$binary" --version
+                  "$binary" --help >/dev/null
+                  MALLOC_CONF=stats_print:true "$binary" --version 2>&1 >/dev/null \
+                    | grep -Fqx "Page size: ${JEMALLOC_PAGE_SIZE}" \
+                    || { echo "$binary: jemalloc page size is not ${JEMALLOC_PAGE_SIZE}" >&2; exit 1; }
+                done
+              '
+          fi
+
+      - name: Check baseline x86-64 without AVX2 or ADX
+        if: matrix.platform.cpu_baseline == 'x86-64'
+        env:
+          ZINDER_NETWORK__NAME: zcash-regtest
+          ZINDER_NODE__JSON_RPC_ADDR: http://127.0.0.1:8232
+          ZINDER_NODE__AUTH__METHOD: none
+        run: |
+          # The runner may ship an amd64v3 loader that uses AVX before Zinder starts.
+          docker run --rm --platform linux/amd64 \
+            --env ZINDER_NETWORK__NAME \
+            --env ZINDER_NODE__JSON_RPC_ADDR \
+            --env ZINDER_NODE__AUTH__METHOD \
             --volume "${RUNNER_TEMP}/binary-export/bin:/opt/zinder/bin:ro" \
             debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 \
             sh -ec '
               apt-get update >/dev/null
-              apt-get install -y --no-install-recommends ca-certificates libstdc++6 >/dev/null
-              for binary in /opt/zinder/bin/*; do
-                "$binary" --version
-                "$binary" --help >/dev/null
-                MALLOC_CONF=stats_print:true "$binary" --version 2>&1 >/dev/null \
-                  | grep -Fqx "Page size: ${JEMALLOC_PAGE_SIZE}" \
-                  || { echo "$binary: jemalloc page size is not ${JEMALLOC_PAGE_SIZE}" >&2; exit 1; }
-              done
+              apt-get install -y --no-install-recommends libstdc++6 qemu-user >/dev/null
+              ulimit -c 0
+              qemu-x86_64 -cpu qemu64 /opt/zinder/bin/zinder run ingest --print-config >/dev/null
             '
 
       - name: Save the BuildKit Cargo cache
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && runner.os == 'Linux' && matrix.platform.cpu_baseline == ''
         uses: ./.github/actions/buildkit-cargo-cache
         with:
           mode: save

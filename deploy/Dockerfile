@@ -43,11 +43,12 @@ ARG DEBIAN_IMAGE_DIGEST=sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96
 ARG DISTROLESS_IMAGE_DIGEST=sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 ARG ZINDER_BINARIES_SOURCE=zinder-binaries
 # Pasta assembly backend. Enabled by default (`1`) so shipped images and
-# release archives build with `--features pasta_curves/asm` (x86-64 BMI2 + ADX,
+# optimized release archives build with `--features pasta_curves/asm` (x86-64 BMI2 + ADX,
 # verified at startup, or baseline AArch64 ARMv8-A). Set to `0` for a portable
-# build on pre-Broadwell/Haswell x86-64 hosts without ADX. Any other value
-# fails the build instead of silently falling back to portable arithmetic.
+# Pasta backend. Pair with ZINDER_X86_64_CPU_BASELINE=x86-64 for hosts
+# below x86-64-v3.
 ARG ZINDER_PASTA_ASM=1
+ARG ZINDER_X86_64_CPU_BASELINE=x86-64-v3
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE}@${RUST_IMAGE_DIGEST} AS zinder-build-base
 
@@ -106,6 +107,7 @@ ARG TARGETARCH
 ARG TARGETVARIANT
 ARG RELEASE_CACHE_SCOPE=shared
 ARG ZINDER_PASTA_ASM=1
+ARG ZINDER_X86_64_CPU_BASELINE
 
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
@@ -115,6 +117,11 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
     && case "${ZINDER_PASTA_ASM}" in \
         0|1) ;; \
         *) printf '%s\n' "ZINDER_PASTA_ASM must be 0 or 1, got '${ZINDER_PASTA_ASM}'" >&2; exit 1 ;; \
+    esac \
+    && case "${ZINDER_X86_64_CPU_BASELINE}:${TARGETARCH}:${ZINDER_PASTA_ASM}" in \
+        x86-64-v3:*) ;; \
+        x86-64:amd64:0) export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64 --remap-path-prefix=/workspace=/usr/src/zinder --remap-path-prefix=/usr/local/cargo=/cargo" ;; \
+        *) printf '%s\n' 'x86-64 baseline requires amd64 and ZINDER_PASTA_ASM=0' >&2; exit 1 ;; \
     esac \
     && pasta_asm_flag="$(if [ "${ZINDER_PASTA_ASM}" = "1" ]; then printf '%s' '--features pasta_curves/asm'; else printf '%s' ''; fi)" \
     && rustup target add "$rust_target" \

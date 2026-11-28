@@ -5,11 +5,12 @@ usage() {
   cat >&2 <<'EOF'
 Usage: check-release-binary-archive.sh ARCHIVE \
   --version VERSION --tag TAG --commit SHA --target RUST_TARGET \
-  --source-date-epoch EPOCH [--pasta-asm 0|1]
+  --source-date-epoch EPOCH [--cpu-baseline ISA] [--pasta-asm 0|1]
 EOF
   exit 2
 }
 
+repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 [[ $# -ge 1 ]] || usage
 archive_path="$1"
 shift
@@ -19,6 +20,7 @@ commit=""
 rust_target=""
 source_date_epoch=""
 pasta_asm=1
+requested_cpu_baseline=""
 while [[ $# -gt 0 ]]; do
   [[ $# -ge 2 ]] || usage
   case "$1" in
@@ -27,6 +29,7 @@ while [[ $# -gt 0 ]]; do
     --commit) commit="$2"; shift 2 ;;
     --target) rust_target="$2"; shift 2 ;;
     --source-date-epoch) source_date_epoch="$2"; shift 2 ;;
+    --cpu-baseline) requested_cpu_baseline="$2"; shift 2 ;;
     --pasta-asm) pasta_asm="$2"; shift 2 ;;
     *) usage ;;
   esac
@@ -41,25 +44,9 @@ case "$pasta_asm" in
     exit 1
     ;;
 esac
-case "$rust_target" in
-  x86_64-unknown-linux-gnu)
-    release_platform=x86_64-v3-unknown-linux-gnu
-    cpu_baseline=x86-64-v3
-    if [[ "$pasta_asm" == "1" ]]; then
-      required_cpu_features='["adx","pclmulqdq"]'
-    else
-      required_cpu_features='["pclmulqdq"]'
-    fi
-    elf_machine='Advanced Micro Devices X86-64'
-    ;;
-  aarch64-unknown-linux-gnu)
-    release_platform=aarch64-unknown-linux-gnu
-    cpu_baseline=armv8-a
-    required_cpu_features='[]'
-    elf_machine=AArch64
-    ;;
-  *) usage ;;
-esac
+# shellcheck source=scripts/release-binary-platform.sh
+source "$repository_root/scripts/release-binary-platform.sh"
+resolve_release_binary_platform "$rust_target" "$requested_cpu_baseline" "$pasta_asm"
 
 archive_root="zinder-${version}-${release_platform}"
 member_list="$(tar -tzf "$archive_path")"
@@ -176,6 +163,7 @@ jq -e \
   --arg rust_target "$rust_target" \
   --arg release_platform "$release_platform" \
   --arg cpu_baseline "$cpu_baseline" \
+  --argjson libc "$libc" \
   --argjson required_cpu_features "$required_cpu_features" \
   --argjson source_date_epoch "$source_date_epoch" '
     .schema_version == 1
@@ -186,10 +174,7 @@ jq -e \
     and .release_platform == $release_platform
     and .cpu_baseline == $cpu_baseline
     and .required_cpu_features == $required_cpu_features
-    and .libc.family == "glibc"
-    and .libc.minimum_runtime_version == "2.34"
-    and .libc.dynamic_libstdcpp == true
-    and .libc.minimum_libstdcpp_symbol == "GLIBCXX_3.4.30"
+    and .libc == $libc
     and .source_date_epoch == $source_date_epoch
     and ([.binaries[].name] | sort) == [
       "zinder"
@@ -202,11 +187,21 @@ while IFS= read -r binary_name; do
   expected_size="$(jq -r --arg name "$binary_name" '.binaries[] | select(.name == $name) | .size' "$build_info")"
   [[ "$(sha256sum "$binary_path" | awk '{print $1}')" == "$expected_sha256" ]]
   [[ "$(stat -c '%s' "$binary_path")" == "$expected_size" ]]
-  [[ "$("$binary_path" --version)" == "$binary_name $version" ]]
-  "$binary_path" --help >/dev/null
-  strings "$binary_path" | grep -F "$commit" >/dev/null
-
-  if [[ "${ZINDER_RELEASE_SKIP_ELF_CHECKS:-false}" != true ]]; then
+  if [[ "$rust_target" == aarch64-apple-darwin ]]; then
+    [[ "$(lipo -archs "$binary_path")" == arm64 ]]
+    vtool -show-build "$binary_path" | awk '
+      $1 == "platform" && $2 == "MACOS" { macos = 1 }
+      $1 == "minos" && $2 == "11.0" { baseline = 1 }
+      END { exit !(macos && baseline) }
+    '
+    otool -L "$binary_path" | awk '
+      NR == 1 { next }
+      $1 == "/usr/lib/libSystem.B.dylib" { has_libsystem = 1 }
+      $1 == "/usr/lib/libc++.1.dylib" { cxx = 1 }
+      $1 !~ /^\/(usr\/lib|System\/Library)\// { external = 1 }
+      END { exit !(has_libsystem && cxx && !external) }
+    '
+  elif [[ "${ZINDER_RELEASE_SKIP_ELF_CHECKS:-false}" != true ]]; then
     grep -Fq 'ELF 64-bit' <<< "$(file "$binary_path")"
     actual_machine="$(
       readelf -h "$binary_path" \
@@ -214,7 +209,10 @@ while IFS= read -r binary_name; do
     )"
     [[ "$actual_machine" == "$elf_machine" ]]
     ldd_output="$(ldd "$binary_path")"
-    ! grep -Fq 'not found' <<< "$ldd_output"
+    if grep -Fq 'not found' <<< "$ldd_output"; then
+      echo >&2 "$binary_name requires a missing dynamic library"
+      exit 1
+    fi
     grep -Fq 'libstdc++.so.6' <<< "$ldd_output"
     glibc_ceiling="$(
       readelf --version-info "$binary_path" \
@@ -239,4 +237,7 @@ while IFS= read -r binary_name; do
       exit 1
     }
   fi
+  [[ "$("$binary_path" --version)" == "$binary_name $version" ]]
+  "$binary_path" --help >/dev/null
+  strings "$binary_path" | grep -F "$commit" >/dev/null
 done < <(jq -r '.binaries[].name' "$build_info")

@@ -978,9 +978,9 @@ EOF
     || [[ "$(grep -Fc -- '--no-cache' <<< "$reproduction_job")" -ne 1 ]] \
     || [[ "$(grep -Fc -- '--target release-binaries' <<< "$compile_job")" -ne 1 ]] \
     || ! grep -Fq -- '--target release-binaries' <<< "$reproduction_job" \
-    || ! grep -Fq 'RELEASE_CACHE_SCOPE: release-${{ needs.validate.outputs.commit }}-${{ matrix.platform.rust }}-1' \
+    || ! grep -Fq 'RELEASE_CACHE_SCOPE: release-${{ needs.validate.outputs.commit }}-${{ matrix.platform.name }}-1' \
       <<< "$compile_job" \
-    || ! grep -Fq 'RELEASE_CACHE_SCOPE=release-${RELEASE_COMMIT}-${RUST_TARGET}-2' \
+    || ! grep -Fq 'RELEASE_CACHE_SCOPE=release-${RELEASE_COMMIT}-${PLATFORM_NAME}-2' \
       <<< "$reproduction_job" \
     || [[ "$(grep -Fc -- '--build-arg "RELEASE_CACHE_SCOPE=${RELEASE_CACHE_SCOPE}"' <<< "$compile_job")" -ne 1 ]] \
     || [[ "$(grep -Fc -- '--build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}"' <<< "$compile_job")" -ne 1 ]] \
@@ -993,6 +993,10 @@ EOF
     || ! grep -Fq 'aarch64-unknown-linux-gnu' <<< "$compile_job" \
     || ! grep -Fq 'x86_64-v3-unknown-linux-gnu' <<< "$reproduction_job" \
     || ! grep -Fq 'aarch64-unknown-linux-gnu' <<< "$reproduction_job" \
+    || ! grep -Fq -- '- name: x86_64-unknown-linux-gnu' <<< "$compile_job" \
+    || ! grep -Fq -- '- name: x86_64-unknown-linux-gnu' <<< "$reproduction_job" \
+    || ! grep -Fq -- '- name: aarch64-apple-darwin' <<< "$compile_job" \
+    || ! grep -Fq -- '- name: aarch64-apple-darwin' <<< "$reproduction_job" \
     || ! grep -Fq 'scripts/generate-release-sbom.sh' <<< "$compile_job" \
     || ! grep -Fq 'scripts/check-release-sbom.sh' <<< "$compile_job" \
     || ! grep -Fq 'name: release-build-${{ matrix.platform.name }}' <<< "$compile_job" \
@@ -1031,7 +1035,7 @@ EOF
     || ! grep -Fq 'name: release-assets-final' <<< "$prepare_release_job"; then
     cat >&2 <<'EOF'
 release admission rejected: release binaries must build in 2 independent
-uncached jobs for both GNU platforms and compare identical before approval,
+uncached jobs for all archive platforms and compare identical before approval,
 images must package the proven archive binaries only through
 scripts/package-release-images.sh push, exact SBOMs must be generated and
 attested, and the archives must be assembled into the final draft GitHub
@@ -1043,6 +1047,15 @@ EOF
   # These literals are workflow expressions and shell variables being inspected.
   # shellcheck disable=SC2016
   archive_build_line="$(grep -nF 'scripts/build-release-binary-archive.sh' <<< "$reproduction_job" | head -n 1 | cut -d: -f1 || true)"
+  reproduction_conditions="$(
+    grep -E '^[[:space:]]+(-[[:space:]]+)?if:' <<< "$reproduction_job" || true
+  )"
+  expected_reproduction_conditions="$(cat <<'CONDITIONS'
+        if: runner.os == 'macOS'
+        if: runner.os == 'Linux'
+        if: matrix.platform.name == 'x86_64-v3-unknown-linux-gnu' || matrix.platform.name == 'aarch64-unknown-linux-gnu'
+CONDITIONS
+  )"
   image_smoke_line="$(grep -nF 'scripts/package-release-images.sh check ' <<< "$reproduction_job" | head -n 1 | cut -d: -f1 || true)"
   reproduction_permissions="$(
     awk '
@@ -1061,14 +1074,16 @@ EOF
     || ! grep -Fq -- '--platform "$TARGET_PLATFORM"' <<< "$image_smoke_invocation" \
     || grep -Eq -- '--(registry|digests)' <<< "$image_smoke_invocation" \
     || ! grep -Fq 'RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}' <<< "$reproduction_job" \
-    || grep -Eq '^[[:space:]]+(-[[:space:]]+)?(continue-on-error|if):' <<< "$reproduction_job" \
+    || [[ "$reproduction_conditions" != "$expected_reproduction_conditions" ]] \
+    || grep -Eq '^[[:space:]]+(-[[:space:]]+)?continue-on-error:' <<< "$reproduction_job" \
     || grep -Eq 'docker/login-action|docker login|secrets\.|github\.token' <<< "$reproduction_job" \
     || [[ "$reproduction_permissions" != '      contents: read' ]]; then
     cat >&2 <<'EOF'
 release admission rejected: the reproduce job must package every release image
 from its own archive with scripts/package-release-images.sh check after
-building it, with only a read-only repository token, no registry login, and no
-step that may skip or ignore the packaging smoke.
+building it. Only the native and Docker build setup and the image platform
+selection may conditionally run. The job must use a read-only repository
+token and no registry login.
 EOF
     exit 1
   fi

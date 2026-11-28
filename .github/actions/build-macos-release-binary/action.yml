@@ -1,0 +1,45 @@
+name: Build macOS release binary
+description: Build the auditable Apple Silicon binary and set up GNU archive tooling.
+inputs:
+  commit:
+    description: Full source commit recorded in the binary.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/setup-rust
+
+    - name: Install GNU archive tools
+      shell: bash
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: "1"
+      run: |
+        brew install bash coreutils findutils gnu-tar
+        printf '%s\n' "$(brew --prefix bash)/bin" >> "$GITHUB_PATH"
+        for package in coreutils findutils gnu-tar; do
+          printf '%s\n' "$(brew --prefix "$package")/libexec/gnubin" >> "$GITHUB_PATH"
+        done
+
+    - name: Build native Apple Silicon binary
+      shell: bash
+      env:
+        CARGO_INCREMENTAL: "0"
+        CARGO_PROFILE_RELEASE_STRIP: symbols
+        DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+        MACOSX_DEPLOYMENT_TARGET: "11.0"
+        ZINDER_BUILD_GIT_COMMIT: ${{ inputs.commit }}
+        ZERO_AR_DATE: "1"
+      run: |
+        set -euo pipefail
+        [[ "$(uname -m)" == arm64 ]]
+        SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$ZINDER_BUILD_GIT_COMMIT")"
+        export SOURCE_DATE_EPOCH
+        export LIBCLANG_PATH="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+        export CARGO_TARGET_DIR="$RUNNER_TEMP/macos-target"
+        export CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/usr/src/zinder --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+        export CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/usr/src/zinder -ffile-prefix-map=$RUNNER_TEMP=/tmp"
+        export CXXFLAGS="$CFLAGS"
+        cargo install cargo-auditable --version 0.7.7 --locked
+        cargo auditable build --locked --release --target aarch64-apple-darwin --features pasta_curves/asm --bin zinder
+        install -D -m 0755 "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/zinder" "$RUNNER_TEMP/binary-export/bin/zinder"
+        printf 'DEVELOPER_DIR=%s\n' "$DEVELOPER_DIR" >> "$GITHUB_ENV"

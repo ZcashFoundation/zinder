@@ -136,6 +136,25 @@ cmp "$sbom" "$second_sbom"
 "$repository_root/scripts/check-release-sbom.sh" "$sbom" \
   --archive "$archive" --version "$version" --platform "$platform" --commit "$commit"
 
+for archive_platform in aarch64-apple-darwin x86_64-unknown-linux-gnu; do
+  platform_options=(--target "$archive_platform")
+  if [[ "$archive_platform" == x86_64-unknown-linux-gnu ]]; then
+    platform_options+=(--cpu-baseline x86-64 --pasta-asm 0)
+  fi
+  "$repository_root/scripts/build-release-binary-archive.sh" \
+    --binaries "$scratch/bin" --output "$archive_directory" \
+    --version "$version" --tag "v$version" --commit "$commit" --source-date-epoch 1700000000 \
+    "${platform_options[@]}"
+  platform_archive="$archive_directory/zinder-${version}-${archive_platform}.tar.gz"
+  platform_sbom="$scratch/zinder-${version}-${archive_platform}.spdx.json"
+  ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$fixture" \
+    "$repository_root/scripts/generate-release-sbom.sh" \
+      --archive "$platform_archive" --output "$platform_sbom" \
+      --version "$version" --platform "$archive_platform" --commit "$commit"
+  "$repository_root/scripts/check-release-sbom.sh" "$platform_sbom" \
+    --archive "$platform_archive" --version "$version" --platform "$archive_platform" --commit "$commit"
+done
+
 missing_file="$scratch/zinder-${version}-${platform}.missing-file.spdx.json"
 jq 'del(.files[] | select(.fileName == "./bin/zinder"))' "$sbom" > "$missing_file"
 cp "$missing_file" "$sbom"

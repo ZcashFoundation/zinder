@@ -14,11 +14,12 @@ fail() {
 
 fixture_binaries="$temporary_directory/binaries"
 mkdir -p "$fixture_binaries"
-for binary_name in zinder; do
-  printf '#!/usr/bin/env bash\n# 0123456789abcdef0123456789abcdef01234567\nprintf "%%s 0.5.0-rc.1\\n" "$(basename "$0")"\n' \
-    > "$fixture_binaries/$binary_name"
-  chmod 755 "$fixture_binaries/$binary_name"
-done
+cat > "$fixture_binaries/zinder" <<'FIXTURE'
+#!/usr/bin/env bash
+# 0123456789abcdef0123456789abcdef01234567
+printf '%s 0.5.0-rc.1\n' "$(basename "$0")"
+FIXTURE
+chmod 755 "$fixture_binaries/zinder"
 
 first_output="$temporary_directory/first"
 second_output="$temporary_directory/second"
@@ -54,23 +55,23 @@ jq -e '.required_cpu_features == ["adx","pclmulqdq"]' \
   < <(tar -xOzf "$first_asset" "zinder-0.5.0-rc.1-x86_64-v3-unknown-linux-gnu/BUILD-INFO.json") \
   >/dev/null || fail "default x86_64 archive did not record expected required_cpu_features"
 
-portable_output="$temporary_directory/portable-x86"
-mkdir -p "$portable_output"
+no_asm_output="$temporary_directory/v3-without-asm"
+mkdir -p "$no_asm_output"
 "$builder" \
   --binaries "$fixture_binaries" \
-  --output "$portable_output" \
+  --output "$no_asm_output" \
   --version 0.5.0-rc.1 \
   --tag v0.5.0-rc.1 \
   --commit 0123456789abcdef0123456789abcdef01234567 \
   --target x86_64-unknown-linux-gnu \
   --source-date-epoch 1735689600 \
   --pasta-asm 0
-portable_asset="$portable_output/$asset_name"
+no_asm_asset="$no_asm_output/$asset_name"
 jq -e '.required_cpu_features == ["pclmulqdq"]' \
-  < <(tar -xOzf "$portable_asset" "zinder-0.5.0-rc.1-x86_64-v3-unknown-linux-gnu/BUILD-INFO.json") \
-  >/dev/null || fail "portable x86_64 archive did not record expected required_cpu_features"
+  < <(tar -xOzf "$no_asm_asset" "zinder-0.5.0-rc.1-x86_64-v3-unknown-linux-gnu/BUILD-INFO.json") \
+  >/dev/null || fail "x86-64-v3 archive without assembly did not record expected required_cpu_features"
 ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
-  "$checker" "$portable_asset" \
+  "$checker" "$no_asm_asset" \
     --version 0.5.0-rc.1 \
     --tag v0.5.0-rc.1 \
     --commit 0123456789abcdef0123456789abcdef01234567 \
@@ -78,14 +79,69 @@ ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
     --source-date-epoch 1735689600 \
     --pasta-asm 0
 if ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
-  "$checker" "$portable_asset" \
+  "$checker" "$no_asm_asset" \
     --version 0.5.0-rc.1 \
     --tag v0.5.0-rc.1 \
     --commit 0123456789abcdef0123456789abcdef01234567 \
     --target x86_64-unknown-linux-gnu \
     --source-date-epoch 1735689600 >/dev/null 2>&1; then
-  fail "a portable x86_64 archive passed the default assembly check"
+  fail "a x86-64-v3 archive without assembly passed the default assembly check"
 fi
+
+archive_options=(
+  --version 0.5.0-rc.1
+  --tag v0.5.0-rc.1
+  --commit 0123456789abcdef0123456789abcdef01234567
+  --source-date-epoch 1735689600
+)
+baseline_platform=x86_64-unknown-linux-gnu
+baseline_output="$temporary_directory/baseline"
+baseline_root="zinder-0.5.0-rc.1-$baseline_platform"
+baseline_asset="$baseline_output/$baseline_root.tar.gz"
+baseline_options=(--target "$baseline_platform" --cpu-baseline x86-64 --pasta-asm 0)
+"$builder" --binaries "$fixture_binaries" --output "$baseline_output" \
+  "${archive_options[@]}" "${baseline_options[@]}"
+jq -e '.cpu_baseline == "x86-64" and .required_cpu_features == []' \
+  < <(tar -xOzf "$baseline_asset" "$baseline_root/BUILD-INFO.json") >/dev/null
+ZINDER_RELEASE_SKIP_ELF_CHECKS=true "$checker" "$baseline_asset" \
+  "${archive_options[@]}" "${baseline_options[@]}"
+if "$builder" --binaries "$fixture_binaries" --output "$baseline_output" \
+  "${archive_options[@]}" --target "$baseline_platform" --cpu-baseline x86-64 >/dev/null 2>&1; then
+  fail "baseline x86-64 accepted Pasta assembly"
+fi
+if ZINDER_RELEASE_SKIP_ELF_CHECKS=true "$checker" "$first_asset" \
+  "${archive_options[@]}" "${baseline_options[@]}" >/dev/null 2>&1; then
+  fail "baseline x86-64 accepted an x86-64-v3 archive"
+fi
+
+mac_output="$temporary_directory/macos"
+mac_root=zinder-0.5.0-rc.1-aarch64-apple-darwin
+"$builder" --binaries "$fixture_binaries" --output "$mac_output" \
+  "${archive_options[@]}" --target aarch64-apple-darwin
+jq -e '.rust_target == "aarch64-apple-darwin" and .cpu_baseline == "armv8-a"
+  and .libc == {family:"libSystem", minimum_macos_version:"11.0", dynamic_libcxx:true}' \
+  < <(tar -xOzf "$mac_output/$mac_root.tar.gz" "$mac_root/BUILD-INFO.json") >/dev/null
+
+mac_tools="$temporary_directory/macos-tools"
+mkdir -p "$mac_tools"
+cat > "$mac_tools/inspect-mach-o" <<'FIXTURE'
+#!/usr/bin/env bash
+case "${0##*/}" in
+  lipo) printf '%s\n' arm64 ;;
+  vtool) printf '%s\n' '      platform MACOS' '         minos 11.0' ;;
+  otool)
+    printf '%s\n' "$2:" \
+      '  /usr/lib/libSystem.B.dylib (compatibility version 1.0.0)' \
+      '  /usr/lib/libc++.1.dylib (compatibility version 1.0.0)'
+    ;;
+esac
+FIXTURE
+chmod 0755 "$mac_tools/inspect-mach-o"
+for tool in lipo vtool otool; do
+  ln -s inspect-mach-o "$mac_tools/$tool"
+done
+PATH="$mac_tools:$PATH" "$checker" "$mac_output/$mac_root.tar.gz" \
+  "${archive_options[@]}" --target aarch64-apple-darwin
 
 arm_output="$temporary_directory/arm"
 mkdir -p "$arm_output"
