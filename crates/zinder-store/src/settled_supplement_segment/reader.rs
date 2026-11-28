@@ -15,7 +15,7 @@ use zstd::bulk::Decompressor;
 
 use crate::{
     HeightOrder,
-    positional_source::{ByteRange, PositionalByteSource},
+    positional_source::{ByteRange, PositionalByteSource, SegmentSource},
     segment_verity,
 };
 
@@ -897,7 +897,7 @@ impl SettledSupplementSegmentIndex {
 
 /// Authenticated positional reader for one settled `ZSTSUP01` supplement segment.
 pub struct SettledSupplementSegmentReader<S = File> {
-    source: S,
+    source: SegmentSource<S>,
     index: SettledSupplementSegmentIndex,
 }
 
@@ -944,7 +944,12 @@ impl SettledSupplementSegmentReader<File> {
         if options.require_fs_verity && !verity_verified {
             return Err(SettledSupplementSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(file, expected, options, verity_verified)
+        Self::admit_with_verity(
+            SegmentSource::file(file, "supplement"),
+            expected,
+            options,
+            verity_verified,
+        )
     }
 }
 
@@ -964,11 +969,21 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         if options.require_fs_verity {
             return Err(SettledSupplementSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(source, expected, options, false)
+        Self::admit_with_verity(SegmentSource::unmeasured(source), expected, options, false)
+    }
+
+    pub(crate) fn index_heap_bytes(&self) -> usize {
+        std::mem::size_of_val(self.index.rows.as_ref())
+            + std::mem::size_of_val(self.index.chunks.as_ref())
+            + self
+                .index
+                .row_index_page_digests
+                .as_deref()
+                .map_or(0, std::mem::size_of_val)
     }
 
     fn admit_with_verity(
-        source: S,
+        source: SegmentSource<S>,
         expected: &SupplementSegmentIdentity,
         options: SettledSupplementSegmentOpenOptions,
         kernel_verified: bool,

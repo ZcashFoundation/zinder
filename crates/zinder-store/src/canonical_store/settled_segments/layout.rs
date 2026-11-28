@@ -65,6 +65,14 @@ pub(crate) enum SettledSegmentKind {
 }
 
 impl SettledSegmentKind {
+    pub(super) const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Shielded => "shielded",
+            Self::Supplement => "supplement",
+            Self::RawBlock => "block_blob",
+        }
+    }
+
     /// Returns the subdirectory name under `segments/`.
     #[must_use]
     pub(crate) const fn subdir_name(self) -> &'static str {
