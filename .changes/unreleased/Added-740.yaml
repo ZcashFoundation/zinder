@@ -1,0 +1,7 @@
+kind: added
+body: Run zinder dev darkside in wallet SDK CI to script compact-block sync, reorgs, and transaction broadcasts over gRPC or gRPC-Web without a Zcash node.
+time: 2026-11-27T23:35:53.605459151Z
+custom:
+    Bump: minor
+    Upgrade: compatible
+    PR: "740"
