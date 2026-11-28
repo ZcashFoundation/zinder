@@ -8,6 +8,7 @@ use zinder_core::{
     BlockHeight, BlockHeightRange, ChainEpochId, CompactBlockArtifact, CompactBlockNullifiers,
     CompactPool, CompactTransactionNullifiers,
 };
+use zinder_proto::compat::lightwalletd::EncodedBlock;
 use zinder_store::{
     EncodedCompactBlockOutput, EncodedCompactBlockPayload, EncodedCompactBlockRangeRequest,
     HeightOrder, ShieldedProjectionSelection,
@@ -253,21 +254,46 @@ pub(crate) async fn read_nullifiers(
             reason: "a nullifier block read returned batched frames".to_owned(),
         });
     };
-    let blocks = blocks
+    Ok(CompactRangePage {
+        blocks: decode_nullifier_page(blocks, encoded.covered, read.order)?,
+        last_height: Some(encoded.last_link.height),
+    })
+}
+
+fn decode_nullifier_page(
+    blocks: Vec<EncodedBlock>,
+    covered: BlockHeightRange,
+    order: HeightOrder,
+) -> Result<Vec<CompactBlockNullifiers>, QueryError> {
+    let heights = covered.into_iter();
+    let first = match order {
+        HeightOrder::Ascending => covered.start,
+        HeightOrder::Descending => covered.end,
+    };
+    if blocks.len() != heights.len() {
+        return Err(QueryError::CompactBlockPayloadMalformed {
+            height: first,
+            reason: "nullifier page length does not match its covered heights".to_owned(),
+        });
+    }
+    blocks
         .into_iter()
-        .map(|block| {
+        .zip(heights)
+        .map(|(block, height)| {
+            let height = match order {
+                HeightOrder::Ascending => height,
+                HeightOrder::Descending => {
+                    BlockHeight::new(covered.end.value() - (height.value() - covered.start.value()))
+                }
+            };
             zinder_proto::wire::decode_projected_block_nullifiers(&block.payload()).map_err(
                 |error| QueryError::CompactBlockPayloadMalformed {
-                    height: encoded.first_link.height,
+                    height,
                     reason: error.to_string(),
                 },
             )
         })
-        .collect::<Result<_, _>>()?;
-    Ok(CompactRangePage {
-        blocks,
-        last_height: Some(encoded.last_link.height),
-    })
+        .collect()
 }
 
 fn project_nullifiers(
@@ -321,5 +347,40 @@ fn project_nullifiers(
         previous_block_hash: block.previous_block_hash,
         time: block.time,
         transactions,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zinder_proto::compat::lightwalletd::CompactBlock;
+
+    #[test]
+    fn malformed_nullifier_page_reports_the_second_block_height() -> eyre::Result<()> {
+        let range = BlockHeightRange::inclusive(BlockHeight::new(10), BlockHeight::new(13));
+        for (order, heights) in [
+            (HeightOrder::Ascending, [10, 11, 12, 13]),
+            (HeightOrder::Descending, [13, 12, 11, 10]),
+        ] {
+            let blocks = heights
+                .iter()
+                .enumerate()
+                .map(|(offset, &height)| {
+                    EncodedBlock::encode(&CompactBlock {
+                        height,
+                        hash: vec![1; if offset == 1 { 31 } else { 32 }],
+                        prev_hash: vec![2; 32],
+                        ..CompactBlock::default()
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let decoded = decode_nullifier_page(blocks, range, order);
+            assert!(matches!(
+                decoded,
+                Err(QueryError::CompactBlockPayloadMalformed { height, .. })
+                    if u64::from(height.value()) == heights[1]
+            ));
+        }
+        Ok(())
     }
 }
