@@ -45,8 +45,8 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 - A misconfigured node endpoint is still advertised. Every broadcast through it fails with the retryable `NODE_UNAVAILABLE`, and the operator sees a degraded dependency instead of a missing capability.
 - A client that read `ServerInfo` early never loses a capability later.
 - Changing raw-blob retention needs a new store, not a restart.
-- A workflow pinned to one epoch survives new blocks for one minute. Longer workflows get a typed expiry and restart.
-- Retention and slow reads delay a publication by at most about 90 seconds and never stop it. A burst of blocks that no request observes does not wait on the retention window.
+- An observed epoch stays pinnable after replacement for 60 seconds by default. Native query accepts a configured window of 60 to 300 seconds. Reads that outlast retention get a typed expiry and restart.
+- The publisher coalesces updates while retained pairs and slow reads occupy the four generation slots. A longer retention window can extend the delay before another generation is available. A burst of blocks that no request observes does not wait on the retention window.
 - A block-range stream can end early during a reorg in the unsettled suffix. The client requests again from the height it needs. An `OK` stream is one chain as read, not a promise that the chain is still best.
 - A new capability needs a registry entry, an implementation, evidence derivation, positive and negative tests, and a production consumer flow.
 
@@ -82,3 +82,5 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 - 2026-11-24. Decision 13 sizes the wallet listener's and consumer's HTTP/2 windows for WAN bandwidth-delay products, recorded as judgment backed by the client `SETTINGS`/`WINDOW_UPDATE` wire test; post-change WAN throughput has not yet been re-measured.
 - 2026-11-27. Decisions 11 and 12 retire `history-publisher` and the external signed `ZSHRNG01` catalog; `zinder-compat-lightwalletd` streams directly from canonical `ZSHRNG02` settled segments and `live_tail_block`.
 - 2026-11-24. Decision 11 covers both default projections and the signed body digest.
+
+- 2026-11-27. Decisions 7 and 8 allow native query to configure the pin window within the fixed generation limit.

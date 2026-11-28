@@ -13,11 +13,12 @@ use tracing::Instrument as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion,
-    CanonicalHistoryBounds, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip,
-    MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MinedTransaction, MinedTransactionChainContext,
-    NetworkUpgradeActivations, RawTransactionBytes, StandardFee, TransactionId,
-    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint, TransparentOutpointSpendStatus, TxStatus,
+    CanonicalHistoryBounds, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockNullifiers,
+    CompactPool, MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MinedTransaction,
+    MinedTransactionChainContext, NetworkUpgradeActivations, RawTransactionBytes, StandardFee,
+    TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutpointSpendStatus,
+    TxStatus,
 };
 use zinder_proto::capabilities::{
     WALLET_BROADCAST_TRANSACTION_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
@@ -36,18 +37,18 @@ use zinder_wallet_projection::{
 
 use crate::{
     AdmittedIngestControl, ArtifactKey, BlockHeaderAtEpoch, BlockIdAtEpoch,
-    COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY, COMPACT_BLOCK_STREAM_SUB_READ_BYTES, ChainEvents,
-    CompactBlock, CompactBlockRange, CompactBlockStream, DEFAULT_MAX_COMPACT_BLOCK_RANGE,
-    DEFAULT_MAX_FULL_BLOCK_RANGE, FULL_BLOCK_STREAM_CHANNEL_CAPACITY,
-    FULL_BLOCK_STREAM_SUB_READ_BLOCKS, FullBlock, FullBlockStream,
-    NativeWalletEndpointCapabilities, OrderedBroadcaster, QueryError, RawTransaction,
-    ServedTipSnapshot, ServedTreeStateHex, SettledTipBlock, SpendStatusReadEnd, SubtreeRoots,
-    Transaction, TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
-    TransparentOutpointSpendStatuses, TreeState, TreeStateFrontiers, UpstreamNodeCapabilities,
-    VisibleTipBlock, WalletQueryApi, WalletServingPairSlot, WalletServingReadPair,
+    COMPACT_BLOCK_STREAM_SUB_READ_BYTES, ChainEvents, CompactBlock, CompactBlockRange,
+    CompactBlockStream, DEFAULT_MAX_COMPACT_BLOCK_RANGE, DEFAULT_MAX_FULL_BLOCK_RANGE,
+    FULL_BLOCK_STREAM_CHANNEL_CAPACITY, FULL_BLOCK_STREAM_SUB_READ_BLOCKS, FullBlock,
+    FullBlockStream, NativeWalletEndpointCapabilities, OrderedBroadcaster, QueryError,
+    RawTransaction, ServedTipSnapshot, ServedTreeStateHex, SettledTipBlock, SpendStatusReadEnd,
+    SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
+    TreeStateFrontiers, UpstreamNodeCapabilities, VisibleTipBlock, WalletQueryApi,
+    WalletServingPairSlot, WalletServingReadPair,
     broadcast_byte_budget::BroadcastByteBudget,
-    grpc::CompactBlockStreamSlot,
+    compact_range_stream::{self, CompactRangeRead},
     node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{
@@ -1236,69 +1237,41 @@ where
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockStream, QueryError> {
-        let requested_blocks = Some(block_range.into_iter().len());
-        let sub_read_bytes = self.compact_block_stream_sub_read_bytes;
-        // A storage read outlives a cancelled request or a dropped stream, so
-        // the first read and the task issuing the later ones each run in a
-        // task of their own that keeps the adapter's stream slot until they
-        // end.
-        let stream_slot = CompactBlockStreamSlot::current();
-        serving_read::record("compact_blocks_in_range", requested_blocks, async {
-            validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
-            // The first read checks the whole range against retained history,
-            // so a range the epoch cannot answer fails here, before any block.
-            let first_read_slot = stream_slot.clone();
-            let serving_pair_slot = self.serving_pair_slot.clone();
-            let first_read = tokio::spawn(
-                async move {
-                    let _stream_slot = first_read_slot;
-                    let pin = serving_read::SlotPin::new(&serving_pair_slot, at_epoch_id);
-                    serving_read::read_at(pin, move |pair| async move {
-                        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                        let first_blocks = pair
-                            .canonical()
-                            .compact_blocks_in_range_up_to(
-                                block_range,
-                                HeightOrder::Ascending,
-                                sub_read_bytes,
-                            )
-                            .await
-                            .map_err(QueryError::canonical_read)?;
-                        Ok((pair, chain_epoch, first_blocks))
-                    })
-                    .await
-                }
-                .in_current_span(),
-            );
-            let (pair, chain_epoch, first_blocks) =
-                first_read
-                    .await
-                    .map_err(|join_error| QueryError::BlockingTaskFailed {
-                        reason: join_error.to_string(),
-                    })??;
-            let (blocks, receiver) = mpsc::channel(COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY);
-            let range_drive = drive_serving_pair_compact_block_range(
-                self.serving_pair_slot.clone(),
-                pair,
-                CompactBlockRangeReads {
-                    last_height: block_range.end,
-                    sub_read_bytes,
-                },
-                first_blocks,
-                blocks,
-            );
-            tokio::spawn(
-                async move {
-                    let _stream_slot = stream_slot;
-                    range_drive.await;
-                }
-                .in_current_span(),
-            );
-            Ok(CompactBlockStream {
-                chain_epoch,
-                blocks: receiver,
-            })
-        })
+        self.ordered_compact_block_stream(block_range, HeightOrder::Ascending, at_epoch_id)
+            .await
+    }
+
+    async fn ordered_compact_block_stream(
+        &self,
+        block_range: BlockHeightRange,
+        order: HeightOrder,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockStream, QueryError> {
+        compact_range_stream::open(
+            "compact_blocks_in_range",
+            self.serving_pair_slot.clone(),
+            CompactRangeRead::new(block_range, order, self.compact_block_stream_sub_read_bytes),
+            at_epoch_id,
+            compact_range_stream::read_blocks,
+        )
+        .await
+    }
+
+    async fn compact_nullifier_stream(
+        &self,
+        block_range: BlockHeightRange,
+        order: HeightOrder,
+        pools: Vec<CompactPool>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockStream<CompactBlockNullifiers>, QueryError> {
+        let selection = compact_range_stream::nullifier_selection(&pools);
+        compact_range_stream::open(
+            "compact_nullifiers_in_range",
+            self.serving_pair_slot.clone(),
+            CompactRangeRead::new(block_range, order, self.compact_block_stream_sub_read_bytes),
+            at_epoch_id,
+            move |pair, read| compact_range_stream::read_nullifiers(pair, read, selection),
+        )
         .await
     }
 
@@ -1520,6 +1493,33 @@ where
                 self.serving_pair_slot.clone(),
                 pair,
                 &request,
+                chain_epoch,
+            ))
+        })
+        .await
+    }
+
+    async fn transparent_addresses_unspent_outputs(
+        &self,
+        mut addresses: Vec<TransparentAddressScriptHash>,
+        start_height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+        serving_read::record("transparent_addresses_unspent_outputs", None, async {
+            if !(1..=zinder_core::MAX_TRANSPARENT_ADDRESSES_PER_BATCH).contains(&addresses.len()) {
+                return Err(QueryError::InvalidAddress {
+                    reason: "transparent address batch must contain 1 to 256 addresses",
+                });
+            }
+            let mut seen = HashSet::new();
+            addresses.retain(|address| seen.insert(*address));
+            let pair = self.serving_pair_slot.capture_at(at_epoch_id);
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            Ok(TransparentAddressUnspentOutputs::spawn_addresses(
+                self.serving_pair_slot.clone(),
+                pair,
+                addresses,
+                start_height,
                 chain_epoch,
             ))
         })
@@ -1966,108 +1966,6 @@ async fn drive_serving_pair_full_block_range(
             }
         }
     }
-}
-
-/// Where a compact-block stream ends and how much each of its reads keeps.
-#[derive(Clone, Copy)]
-struct CompactBlockRangeReads {
-    last_height: BlockHeight,
-    sub_read_bytes: usize,
-}
-
-/// Sends `blocks`, then reads and sends the rest of the range through
-/// `reads.last_height` from `pair`, one byte-capped read at a time.
-///
-/// Every read is pinned to `pair`'s epoch, so the whole stream answers from
-/// the epoch its header names. Revocation of the pair ends the stream after
-/// the blocks already sent.
-async fn drive_serving_pair_compact_block_range(
-    slot: WalletServingPairSlot,
-    mut pair: Arc<WalletServingReadPair>,
-    reads: CompactBlockRangeReads,
-    mut blocks: Vec<zinder_core::CompactBlockArtifact>,
-    block_sender: mpsc::Sender<Result<zinder_core::CompactBlockArtifact, QueryError>>,
-) {
-    let chain_epoch_id = pair.canonical_fence().chain_epoch_id();
-    loop {
-        let next_height = blocks
-            .last()
-            .and_then(|last| last.height().next())
-            .filter(|next| *next <= reads.last_height);
-        // A consumer that stops reading blocks this send. Revocation ends the
-        // range so the stalled stream cannot keep a released pair open.
-        let forwarded = tokio::select! {
-            biased;
-            () = pair.reads_revoked() => None,
-            forwarded = forward_compact_blocks(&block_sender, blocks) => Some(forwarded),
-        };
-        match forwarded {
-            Some(true) => {}
-            Some(false) => return,
-            None => {
-                let error = pair.revoked_read_error();
-                return fail_compact_block_range(pair, &block_sender, error).await;
-            }
-        }
-        let Some(next_height) = next_height else {
-            return;
-        };
-        if pair.are_reads_revoked() {
-            let error = pair.revoked_read_error();
-            return fail_compact_block_range(pair, &block_sender, error).await;
-        }
-        let remaining = BlockHeightRange::inclusive(next_height, reads.last_height);
-        let sub_read =
-            serving_read::read_pair(&slot, pair, Some(chain_epoch_id), move |pair| async move {
-                let blocks = pair
-                    .canonical()
-                    .compact_blocks_in_range_up_to(
-                        remaining,
-                        HeightOrder::Ascending,
-                        reads.sub_read_bytes,
-                    )
-                    .await
-                    .map_err(QueryError::canonical_read)?;
-                Ok((pair, blocks))
-            })
-            .await;
-        match sub_read {
-            Ok((read_pair, read_blocks)) => {
-                pair = read_pair;
-                blocks = read_blocks;
-            }
-            Err(error) => {
-                // The failed read has already released the pair.
-                let _ = block_sender.send(Err(error)).await;
-                return;
-            }
-        }
-    }
-}
-
-/// Sends `blocks` in order, returning `false` once the consumer is gone.
-async fn forward_compact_blocks(
-    block_sender: &mpsc::Sender<Result<zinder_core::CompactBlockArtifact, QueryError>>,
-    blocks: Vec<zinder_core::CompactBlockArtifact>,
-) -> bool {
-    for block in blocks {
-        if block_sender.send(Ok(block)).await.is_err() {
-            return false;
-        }
-    }
-    true
-}
-
-/// Releases `pair` and then ends a compact-block range with `error`.
-///
-/// The pair is dropped first because the send can wait on a stalled client.
-async fn fail_compact_block_range(
-    pair: Arc<WalletServingReadPair>,
-    block_sender: &mpsc::Sender<Result<zinder_core::CompactBlockArtifact, QueryError>>,
-    error: QueryError,
-) {
-    drop(pair);
-    let _ = block_sender.send(Err(error)).await;
 }
 
 /// Releases `pair` and then ends a full-block range with `error`.
@@ -3350,7 +3248,10 @@ mod compact_block_stream_tests {
         )
         .await;
         assert!(cancelled.is_err(), "the stream opened without reading");
-        assert_slot_taken(&adapter).await?;
+        let competing =
+            WalletQueryService::compact_nullifiers_in_range(&adapter, nullifier_request(1, 3))
+                .await;
+        assert!(matches!(competing, Err(status) if status.code() == Code::ResourceExhausted));
 
         held_pool.release().await?;
         wait_for_free_slot(&adapter).await
@@ -3445,6 +3346,286 @@ mod compact_block_stream_tests {
             Err(QueryError::ChainEpochPinUnavailable { chain_epoch_id }) if chain_epoch_id == unserved
         ));
         Ok(())
+    }
+
+    struct NativeCompactScan {
+        adapter: WalletQueryGrpcAdapter<NativeQuery>,
+        pair: Arc<WalletServingReadPair>,
+        reader: Arc<crate::observed_canonical_reader::ObservedCanonicalReader>,
+        blocks: Vec<zinder_core::CompactBlockArtifact>,
+        _store: WalletServingStoreFixture,
+        _ingest: IngestControlFixture,
+    }
+
+    impl NativeCompactScan {
+        async fn new(encoded_ranges: bool) -> Result<Self, Box<dyn Error>> {
+            use crate::observed_canonical_reader::ObservedCanonicalReader;
+
+            let activations = sample_regtest_upgrade_activations();
+            let mut chain = zinder_testkit::with_note_commitments(
+                &ChainFixture::new(Network::ZcashRegtest).extend_blocks(4),
+                &activations,
+            )?;
+            let mut nullifier_tag = 0_u8;
+            for block in chain.compact_block_artifacts() {
+                let mut block = block.into_parts();
+                for transaction in &mut block.transactions {
+                    for action in &mut transaction.data.orchard_actions {
+                        nullifier_tag = nullifier_tag.checked_add(1).ok_or("too many actions")?;
+                        action.nullifier[0] = nullifier_tag;
+                    }
+                }
+                chain = chain.with_compact_block_artifact(zinder_core::CompactBlockArtifact::new(
+                    block.block_id,
+                    block.previous_block_hash,
+                    block.time,
+                    block.transactions,
+                    block.chain_metadata,
+                )?);
+            }
+            let mut store =
+                WalletServingStoreFixture::from_chain_after_live_append(&chain, &activations)?;
+            let (canonical, wallet) = store.take_readers()?;
+            let reader = ObservedCanonicalReader::new(RocksDbCanonicalReader::new(canonical)?);
+            let reader = Arc::new(if encoded_ranges {
+                reader
+            } else {
+                reader.without_encoded_ranges()
+            });
+            let pair = Arc::new(WalletServingReadPair::new(
+                reader.clone(),
+                Arc::new(RocksDbWalletReader::new(wallet)),
+            )?);
+            let ingest = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+            let admitted =
+                AdmittedIngestControl::connect(ingest.endpoint(), None, Network::ZcashRegtest)
+                    .await?;
+            let mut query = WalletServingQuery::from_admitted_native_serving_pair(
+                WalletServingPairSlot::new(Arc::clone(&pair)),
+                admitted,
+            );
+            query.compact_block_stream_sub_read_bytes = 1;
+            let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default())
+                .with_max_concurrent_compact_block_streams(NonZeroU32::MIN);
+            Ok(Self {
+                adapter,
+                pair,
+                reader,
+                blocks: chain.compact_block_artifacts(),
+                _store: store,
+                _ingest: ingest,
+            })
+        }
+
+        fn expected_view(&self) -> wallet::ChainView {
+            zinder_store::chain_view_message(self.pair.chain_epoch())
+        }
+
+        fn expected_blocks(&self, start: u32, end: u32) -> Vec<&zinder_core::CompactBlockArtifact> {
+            let mut blocks: Vec<_> = self
+                .blocks
+                .iter()
+                .filter(|block| (start.min(end)..=start.max(end)).contains(&block.height().value()))
+                .collect();
+            if start > end {
+                blocks.reverse();
+            }
+            blocks
+        }
+
+        async fn assert_compact_range(&self, start: u32, end: u32) -> Result<(), Box<dyn Error>> {
+            use wallet::compact_blocks_in_range_chunk::Body;
+            use zinder_core::CompactPool;
+            use zinder_proto::wire::compact_block_message_for_pools;
+            let reads = self.reader.reads();
+            let mut stream = WalletQueryService::compact_blocks_in_range(
+                &self.adapter,
+                Request::new(wallet::CompactBlocksInRangeRequest {
+                    start_height: start,
+                    end_height: end,
+                    at_epoch_id: Some(self.pair.chain_epoch().id.value()),
+                    pool_types: vec![wallet::CompactPool::Orchard as i32],
+                }),
+            )
+            .await?
+            .into_inner();
+            assert_eq!(
+                stream.next().await.ok_or("missing chain view")??.body,
+                Some(Body::Header(self.expected_view()))
+            );
+            let outcome = WalletQueryService::compact_nullifiers_in_range(
+                &self.adapter,
+                nullifier_request(start, end),
+            )
+            .await;
+            assert!(matches!(outcome, Err(status) if status.code() == Code::ResourceExhausted));
+
+            for block in self.expected_blocks(start, end) {
+                let compact = stream.next().await.ok_or("missing compact block")??;
+                assert_eq!(
+                    compact.body,
+                    Some(Body::Item(compact_block_message_for_pools(
+                        block,
+                        &[CompactPool::Orchard]
+                    ))),
+                );
+            }
+            assert!(stream.next().await.is_none());
+            assert_eq!(
+                self.reader.reads() - reads,
+                start.abs_diff(end) as usize + 1
+            );
+            Ok(())
+        }
+
+        async fn assert_nullifier_range(&self, start: u32, end: u32) -> Result<(), Box<dyn Error>> {
+            use wallet::compact_nullifiers_in_range_chunk::Body;
+            let reads = self.reader.reads();
+            let mut stream = WalletQueryService::compact_nullifiers_in_range(
+                &self.adapter,
+                nullifier_request(start, end),
+            )
+            .await?
+            .into_inner();
+            assert_eq!(
+                stream.next().await.ok_or("missing chain view")??.body,
+                Some(Body::Header(self.expected_view()))
+            );
+            assert_slot_taken(&self.adapter).await?;
+            for expected in self.expected_blocks(start, end) {
+                let Some(Body::Block(block)) =
+                    stream.next().await.ok_or("missing nullifier block")??.body
+                else {
+                    return Err("expected nullifier block after chain view".into());
+                };
+                assert_orchard_projection(block, expected)?;
+            }
+            assert!(stream.next().await.is_none());
+            assert_eq!(
+                self.reader.reads() - reads,
+                start.abs_diff(end) as usize + 1
+            );
+            Ok(())
+        }
+    }
+
+    fn assert_orchard_projection(
+        block: wallet::CompactBlockNullifiers,
+        expected: &zinder_core::CompactBlockArtifact,
+    ) -> Result<(), Box<dyn Error>> {
+        let block = zinder_proto::wire::compact_block_nullifiers_from_message(block)?;
+        assert_eq!(block.height, expected.height());
+        assert_eq!(block.block_hash, expected.block_hash());
+        assert_eq!(block.previous_block_hash, expected.previous_block_hash());
+        assert_eq!(block.time, expected.time());
+        let expected_transactions: Vec<_> = expected
+            .transactions()
+            .iter()
+            .filter(|tx| !tx.data.orchard_actions.is_empty())
+            .map(|tx| zinder_core::CompactTransactionNullifiers {
+                index: tx.index,
+                transaction_id: tx.transaction_id,
+                sapling_nullifiers: Vec::new(),
+                orchard_nullifiers: tx
+                    .data
+                    .orchard_actions
+                    .iter()
+                    .map(|action| action.nullifier)
+                    .collect(),
+                ironwood_nullifiers: Vec::new(),
+            })
+            .collect();
+        assert_eq!(block.transactions, expected_transactions);
+        Ok(())
+    }
+
+    fn nullifier_request(start: u32, end: u32) -> Request<wallet::CompactNullifiersInRangeRequest> {
+        Request::new(wallet::CompactNullifiersInRangeRequest {
+            start_height: start,
+            end_height: end,
+            at_epoch_id: None,
+            pool_types: vec![wallet::CompactPool::Orchard as i32],
+        })
+    }
+
+    #[tokio::test]
+    async fn native_compact_scans_cross_settlement_in_byte_capped_reads()
+    -> Result<(), Box<dyn Error>> {
+        let scan = NativeCompactScan::new(true).await?;
+        assert_eq!(
+            scan.pair.chain_epoch().settled_tip_height,
+            BlockHeight::new(3)
+        );
+        for (start, end) in [(1, 4), (4, 1)] {
+            scan.assert_compact_range(start, end).await?;
+            scan.assert_nullifier_range(start, end).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_nullifier_capability_covers_structured_only_readers()
+    -> Result<(), Box<dyn Error>> {
+        use zinder_proto::capabilities::WALLET_READ_COMPACT_NULLIFIER_RANGE_V1;
+        let scan = NativeCompactScan::new(false).await?;
+        let server = WalletQueryService::server_info(
+            &scan.adapter,
+            Request::new(wallet::ServerInfoRequest {}),
+        )
+        .await?
+        .into_inner()
+        .info
+        .and_then(|wallet| wallet.common)
+        .ok_or("missing server descriptor")?;
+        assert!(
+            server
+                .capabilities
+                .iter()
+                .any(|capability| capability == WALLET_READ_COMPACT_NULLIFIER_RANGE_V1)
+        );
+        scan.assert_nullifier_range(1, 4).await?;
+        scan.assert_nullifier_range(4, 1).await
+    }
+
+    #[test]
+    fn revoked_native_nullifier_stream_ends_after_partial_delivery() -> Result<(), Box<dyn Error>> {
+        use tonic_types::StatusExt as _;
+        one_blocking_thread_runtime()?.block_on(async {
+            let scan = NativeCompactScan::new(true).await?;
+            let mut stream = WalletQueryService::compact_nullifiers_in_range(
+                &scan.adapter,
+                nullifier_request(4, 1),
+            )
+            .await?
+            .into_inner();
+            let held_pool = HeldBlockingPool::hold().await?;
+            assert!(matches!(
+                stream.next().await.ok_or("missing chain view")??.body,
+                Some(wallet::compact_nullifiers_in_range_chunk::Body::Header(_))
+            ));
+            let Some(wallet::compact_nullifiers_in_range_chunk::Body::Block(first)) =
+                stream.next().await.ok_or("missing first block")??.body
+            else {
+                return Err("expected first nullifier block".into());
+            };
+            assert_eq!(first.height, 4);
+            assert_slot_taken(&scan.adapter).await?;
+            assert!(scan.pair.revoke_reads());
+            held_pool.release().await?;
+            let error = stream
+                .next()
+                .await
+                .ok_or("missing terminal status")?
+                .err()
+                .ok_or("revoked stream continued")?;
+            let details = error.get_error_details();
+            assert_eq!(
+                details.error_info().map(|error| error.reason.as_str()),
+                Some(zinder_proto::v1::ops::ErrorReason::ChainEpochPinUnavailable.as_str_name())
+            );
+            assert!(stream.next().await.is_none());
+            Ok(())
+        })
     }
 
     /// The visible tip answers from the admitted pair even while every

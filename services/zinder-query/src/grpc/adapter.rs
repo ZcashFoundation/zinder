@@ -11,8 +11,9 @@ use zinder_core::wire::{
     encode_rpc_transaction_id_hex,
 };
 use zinder_core::{
-    BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId, Network,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionId,
+    BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId, CompactPool,
+    MAX_TRANSPARENT_ADDRESSES_PER_BATCH, Network, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootIndex, SubtreeRootRange, TransactionId, TransparentAddressScriptHash,
 };
 use zinder_proto::{
     capabilities, status_for_reason, status_with_reason,
@@ -21,21 +22,25 @@ use zinder_proto::{
         ops::ErrorReason,
         wallet::{self, wallet_query_server},
     },
-    wire::{CHAIN_EVENT_FAMILY_HEADER, TransactionAbsence, outpoint_from_message},
+    wire::{
+        CHAIN_EVENT_FAMILY_HEADER, TransactionAbsence, compact_block_message_for_pools,
+        compact_block_nullifiers_message, compact_pool_from_message, outpoint_from_message,
+        standard_fee_message,
+    },
 };
 use zinder_runtime::{AuthenticatedChannel, Readiness, RepeatedFieldGuard};
 
 use crate::record_proxy_outcome;
 use zinder_store::{
-    ChainEventStreamFamily, StreamCursorTokenV1, chain_event_stream_family_from_request,
-    event_stream_start_from_request,
+    ChainEventStreamFamily, HeightOrder, StreamCursorTokenV1,
+    chain_event_stream_family_from_request, event_stream_start_from_request,
 };
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
 
 use crate::{
-    QueryError, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest,
-    WalletQueryApi, WalletServingQuery,
+    QueryError, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, WalletQueryApi, WalletServingQuery,
     ingest_control::{
         WALLET_INGEST_CONTROL_REQUEST_TIMEOUT, typed_ingest_control_status,
         wallet_ingest_control_request,
@@ -59,6 +64,7 @@ use super::native::{
     transaction_response, transparent_address_unspent_outputs_response,
     transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
 };
+use super::request_limits::MAX_COMPACT_RANGE_POOLS;
 use super::shutdown_stream::end_on_shutdown;
 use super::status_from_query_error;
 
@@ -195,8 +201,8 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
         }
     }
 
-    /// Serves at most `max_streams` `CompactBlocksInRange` streams at once,
-    /// and refuses the rest with `RESOURCE_EXHAUSTED`.
+    /// Admits up to `max_streams` active compact-block and nullifier ranges.
+    /// Additional streams fail with `RESOURCE_EXHAUSTED`.
     ///
     /// The default is
     /// [`DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS`](crate::DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS).
@@ -252,6 +258,40 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
         )
     }
 
+    fn decode_address_batch(
+        &self,
+        addresses: Vec<wallet::AddressLookup>,
+    ) -> Result<Vec<TransparentAddressScriptHash>, Status> {
+        if !(1..=MAX_TRANSPARENT_ADDRESSES_PER_BATCH).contains(&addresses.len()) {
+            return Err(Status::invalid_argument(format!(
+                "addresses must contain between 1 and {MAX_TRANSPARENT_ADDRESSES_PER_BATCH} selectors",
+            )));
+        }
+        let network = self.server_info_network()?;
+        addresses
+            .into_iter()
+            .map(|address| {
+                address_lookup_to_script_hash(Some(address), network)
+                    .map_err(|error| status_from_query_error(&error))
+            })
+            .collect()
+    }
+
+    fn unspent_outputs_stream(
+        &self,
+        response: TransparentAddressUnspentOutputs,
+    ) -> Response<TransparentUnspentOutputsStream> {
+        let header = Ok(build_transparent_unspent_outputs_header(
+            response.chain_epoch,
+        ));
+        let outputs = response.map(|output| {
+            output
+                .map(|output| build_transparent_unspent_output_message(&output))
+                .map_err(|error| status_from_query_error(&error))
+        });
+        self.server_stream(Box::pin(stream::once(header).chain(outputs)))
+    }
+
     fn require_endpoint_capability(&self, capability: &'static str) -> Result<(), Status> {
         if self
             .query_api
@@ -295,36 +335,110 @@ where
     type CompactNullifiersInRangeStream = WalletGrpcStream<wallet::CompactNullifiersInRangeChunk>;
     type TransparentAddressesUnspentOutputsStream = Self::TransparentAddressUnspentOutputsStream;
 
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "The stream closure holds its admission slot until the client drops the stream."
+    )]
     async fn compact_nullifiers_in_range(
         &self,
-        _: Request<wallet::CompactNullifiersInRangeRequest>,
+        request: Request<wallet::CompactNullifiersInRangeRequest>,
     ) -> Result<Response<Self::CompactNullifiersInRangeStream>, Status> {
-        Err(Status::unimplemented(
-            "compact nullifier ranges are unavailable",
-        ))
+        use wallet::compact_nullifiers_in_range_chunk::Body;
+
+        self.require_endpoint_capability(capabilities::WALLET_READ_COMPACT_NULLIFIER_RANGE_V1)?;
+        let request = request.into_inner();
+        let pools = decode_compact_pools(request.pool_types)?;
+        if pools.contains(&CompactPool::Transparent) {
+            return Err(Status::invalid_argument(
+                "nullifier ranges accept shielded pools only",
+            ));
+        }
+        let (range, order) = ordered_block_range(request.start_height, request.end_height);
+        crate::validate_block_range(range, crate::DEFAULT_MAX_COMPACT_BLOCK_RANGE)
+            .map_err(|error| status_from_query_error(&error))?;
+        let slot = self
+            .compact_block_streams
+            .try_open()
+            .map_err(|error| status_from_query_error(&error))?;
+        let open = self.query_api.compact_nullifier_stream(
+            range,
+            order,
+            pools,
+            chain_epoch_id_from_request(request.at_epoch_id),
+        );
+        let response = slot
+            .clone()
+            .hold_during(open)
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        let header = stream::once(Ok(wallet::CompactNullifiersInRangeChunk {
+            body: Some(Body::Header(build_chain_view_message(response.chain_epoch))),
+        }));
+        let blocks = ReceiverStream::new(response.blocks).map(move |block| {
+            let _stream_slot = &slot;
+            block
+                .map(|block| wallet::CompactNullifiersInRangeChunk {
+                    body: Some(Body::Block(compact_block_nullifiers_message(&block))),
+                })
+                .map_err(|error| status_from_query_error(&error))
+        });
+        Ok(self.server_stream(Box::pin(header.chain(blocks))))
     }
 
     async fn standard_fee(
         &self,
         _: Request<wallet::StandardFeeRequest>,
     ) -> Result<Response<wallet::StandardFeeResponse>, Status> {
-        Err(Status::unimplemented("standard fee is unavailable"))
+        self.require_endpoint_capability(capabilities::WALLET_READ_STANDARD_FEE_V1)?;
+        let fee = self
+            .query_api
+            .standard_fee()
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        Ok(Response::new(standard_fee_message(fee)))
     }
 
     async fn transparent_address_balances(
         &self,
-        _: Request<wallet::TransparentAddressBalancesRequest>,
+        request: Request<wallet::TransparentAddressBalancesRequest>,
     ) -> Result<Response<wallet::TransparentAddressBalancesResponse>, Status> {
-        Err(Status::unimplemented("address balances are unavailable"))
+        self.require_endpoint_capability(capabilities::WALLET_ADDRESS_TRANSPARENT_BALANCES_V1)?;
+        let request = request.into_inner();
+        let addresses = self.decode_address_batch(request.addresses)?;
+        let balance = self
+            .query_api
+            .transparent_address_balance(
+                addresses,
+                chain_epoch_id_from_request(request.at_epoch_id),
+            )
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        Ok(Response::new(wallet::TransparentAddressBalancesResponse {
+            chain_view: Some(build_chain_view_message(balance.chain_epoch)),
+            confirmed_zat: balance.confirmed_zat,
+            address_count: balance.address_count,
+        }))
     }
 
     async fn transparent_addresses_unspent_outputs(
         &self,
-        _: Request<wallet::TransparentAddressesUnspentOutputsRequest>,
+        request: Request<wallet::TransparentAddressesUnspentOutputsRequest>,
     ) -> Result<Response<Self::TransparentAddressesUnspentOutputsStream>, Status> {
-        Err(Status::unimplemented(
-            "batched unspent outputs are unavailable",
-        ))
+        self.require_endpoint_capability(
+            capabilities::WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1,
+        )?;
+        let request = request.into_inner();
+        let addresses = self.decode_address_batch(request.addresses)?;
+        let response = self
+            .query_api
+            .transparent_addresses_unspent_outputs(
+                addresses,
+                BlockHeight::new(request.start_height),
+                chain_epoch_id_from_request(request.at_epoch_id),
+            )
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        Ok(self.unspent_outputs_stream(response))
     }
 
     type CompactBlocksInRangeStream = CompactBlocksInRangeStream;
@@ -485,15 +599,11 @@ where
     ) -> Result<Response<Self::CompactBlocksInRangeStream>, Status> {
         self.require_endpoint_capability(capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V2)?;
         let request = request.into_inner();
-        if !request.pool_types.is_empty() {
-            return Err(Status::unimplemented(
-                "pool selection is unavailable for compact block ranges",
-            ));
+        let (block_range, order) = ordered_block_range(request.start_height, request.end_height);
+        if order == HeightOrder::Descending || !request.pool_types.is_empty() {
+            self.require_endpoint_capability(capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V3)?;
         }
-        let block_range = BlockHeightRange::inclusive(
-            BlockHeight::new(request.start_height),
-            BlockHeight::new(request.end_height),
-        );
+        let pools = decode_compact_pools(request.pool_types)?;
         let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
         // Only a valid range takes a slot. The query rejects any other range
         // before it reads, and records that rejection with its own error.
@@ -513,7 +623,9 @@ where
         // The query's blocking reads and the task issuing them take clones of
         // the slot, so a cancelled request or a dropped stream keeps it until
         // the read already on the blocking pool ends.
-        let open = self.query_api.compact_block_stream(block_range, at_epoch);
+        let open = self
+            .query_api
+            .ordered_compact_block_stream(block_range, order, at_epoch);
         let compact_block_stream = match stream_slot.clone() {
             Some(slot) => slot.hold_during(open).await,
             None => open.await,
@@ -527,7 +639,16 @@ where
         let items = ReceiverStream::new(compact_block_stream.blocks).map(move |block| {
             let _stream_slot = &stream_slot;
             block
-                .map(|compact_block| compact_blocks_in_range_item(&compact_block))
+                .map(|compact_block| {
+                    if pools.is_empty() {
+                        return compact_blocks_in_range_item(&compact_block);
+                    }
+                    wallet::CompactBlocksInRangeChunk {
+                        body: Some(wallet::compact_blocks_in_range_chunk::Body::Item(
+                            compact_block_message_for_pools(&compact_block, &pools),
+                        )),
+                    }
+                })
                 .map_err(|error| status_from_query_error(&error))
         });
 
@@ -762,17 +883,7 @@ where
         )
         .await
         .map_err(|error| status_from_query_error(&error))?;
-        let header = Ok(build_transparent_unspent_outputs_header(
-            response.chain_epoch,
-        ));
-        let items = response.map(|output| {
-            output
-                .map(|output| build_transparent_unspent_output_message(&output))
-                .map_err(|error| status_from_query_error(&error))
-        });
-        let messages = stream::once(header).chain(items);
-
-        Ok(self.server_stream(Box::pin(messages)))
+        Ok(self.unspent_outputs_stream(response))
     }
 
     async fn transparent_address_tx_ids_in_range(
@@ -862,6 +973,34 @@ where
             .map(Response::new)
             .map_err(|error| status_from_query_error(&error))
     }
+}
+
+fn decode_compact_pools(pools: Vec<i32>) -> Result<Vec<CompactPool>, Status> {
+    if pools.len() > MAX_COMPACT_RANGE_POOLS {
+        return Err(Status::invalid_argument(
+            "pool_types may contain at most four entries",
+        ));
+    }
+    pools
+        .into_iter()
+        .map(|pool| {
+            compact_pool_from_message(pool).ok_or_else(|| {
+                Status::invalid_argument("pool_types contains an unknown or unspecified pool")
+            })
+        })
+        .collect()
+}
+
+fn ordered_block_range(start: u32, end: u32) -> (BlockHeightRange, HeightOrder) {
+    let (first, last, order) = if start > end {
+        (end, start, HeightOrder::Descending)
+    } else {
+        (start, end, HeightOrder::Ascending)
+    };
+    (
+        BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last)),
+        order,
+    )
 }
 
 fn transparent_address_tx_ids_in_range_request_from_message(

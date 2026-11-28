@@ -31,7 +31,7 @@ use zinder_store::{
 };
 
 use crate::{
-    DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+    DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, EpochPinRetention,
     ForwardedReadConfig, MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
 };
 
@@ -74,6 +74,8 @@ pub struct QueryConfig {
     pub canonical_reorg_policy: CanonicalReorgPolicy,
     /// Maximum bounded attempts to converge the serving read pair.
     pub pair_convergence_attempts: NonZeroU8,
+    /// Retention after a response's chain epoch is replaced.
+    pub epoch_pin_retention: EpochPinRetention,
     /// Longest a tree-state rebuild waits for a rebuild slot.
     pub tree_state_replay_wait: Duration,
     /// Most tree-state rebuilds that wait for each rebuild slot.
@@ -248,6 +250,7 @@ struct QuerySection {
     listen_addr: Option<String>,
     reorg_window_blocks: Option<u32>,
     pair_convergence_attempts: Option<u8>,
+    epoch_pin_retention_seconds: Option<u64>,
     tree_state_replay_wait_ms: Option<u64>,
     tree_state_replay_waiters_per_slot: Option<u32>,
     forwarded_read_max_concurrent: Option<u32>,
@@ -360,13 +363,6 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         config.query.reorg_window_blocks,
         "query.reorg_window_blocks",
     )?)?;
-    let pair_convergence_attempts =
-        require_pair_convergence_attempts(config.query.pair_convergence_attempts)?;
-    let tree_state_replay_wait =
-        require_tree_state_replay_wait(config.query.tree_state_replay_wait_ms)?;
-    let tree_state_replay_waiters_per_slot = require_tree_state_replay_waiters_per_slot(
-        config.query.tree_state_replay_waiters_per_slot,
-    )?;
     let forwarded_reads = ForwardedReadConfig::resolve(
         config.query.forwarded_read_max_concurrent,
         config.query.forwarded_read_wait_ms,
@@ -402,9 +398,16 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         proxy_protocol,
         range_admission: config.query.range_admission,
         canonical_reorg_policy,
-        pair_convergence_attempts,
-        tree_state_replay_wait,
-        tree_state_replay_waiters_per_slot,
+        pair_convergence_attempts: require_pair_convergence_attempts(
+            config.query.pair_convergence_attempts,
+        )?,
+        epoch_pin_retention: resolve_epoch_pin_retention(config.query.epoch_pin_retention_seconds)?,
+        tree_state_replay_wait: require_tree_state_replay_wait(
+            config.query.tree_state_replay_wait_ms,
+        )?,
+        tree_state_replay_waiters_per_slot: require_tree_state_replay_waiters_per_slot(
+            config.query.tree_state_replay_waiters_per_slot,
+        )?,
         forwarded_reads,
         node,
         node_fallbacks,
@@ -440,6 +443,19 @@ fn require_pair_convergence_attempts(configured: Option<u8>) -> Result<NonZeroU8
         )));
     }
     Ok(attempts)
+}
+
+fn resolve_epoch_pin_retention(seconds: Option<u64>) -> Result<EpochPinRetention, ConfigError> {
+    let Some(seconds) = seconds else {
+        return Ok(EpochPinRetention::default());
+    };
+    EpochPinRetention::from_seconds(seconds).ok_or_else(|| {
+        ConfigError::invalid(format!(
+            "query.epoch_pin_retention_seconds must be in {}..={}",
+            EpochPinRetention::MIN_SECONDS,
+            EpochPinRetention::MAX_SECONDS,
+        ))
+    })
 }
 
 fn require_tree_state_replay_wait(configured_ms: Option<u64>) -> Result<Duration, ConfigError> {
@@ -574,6 +590,7 @@ impl QueryConfigToml {
                 listen_addr: config.listen_addr.to_string(),
                 reorg_window_blocks: config.canonical_reorg_policy.reorg_window_blocks(),
                 pair_convergence_attempts: config.pair_convergence_attempts.get(),
+                epoch_pin_retention_seconds: config.epoch_pin_retention.seconds(),
                 tree_state_replay_wait_ms: u64::try_from(config.tree_state_replay_wait.as_millis())
                     .unwrap_or(u64::MAX),
                 tree_state_replay_waiters_per_slot: config.tree_state_replay_waiters_per_slot.get(),
@@ -599,6 +616,7 @@ struct QueryToml {
     listen_addr: String,
     reorg_window_blocks: u32,
     pair_convergence_attempts: u8,
+    epoch_pin_retention_seconds: u64,
     tree_state_replay_wait_ms: u64,
     tree_state_replay_waiters_per_slot: u32,
     forwarded_read_max_concurrent: u32,

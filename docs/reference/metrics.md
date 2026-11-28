@@ -377,7 +377,7 @@ at a wallet, collect the client's outcome as well.
 | --- | --- | --- | --- |
 | `zinder_query_request_total` | counter | `operation`, `status`, `error_class` | Wallet reads. One protocol request can record several reads. |
 | `zinder_query_request_duration_seconds` | histogram | `operation`, `status`, `error_class` | Duration of each read, including any tree-state rebuild and the node call of a broadcast. |
-| `zinder_query_compact_block_range_block_count` | histogram | `status` | Blocks each compact-block range read asked for. |
+| `zinder_query_compact_block_range_block_count` | histogram | `status` | Requested block count for compact-block and nullifier range reads. |
 | `zinder_query_tree_state_reads_total` | counter | `source`, `height_band` | Counts each request when the query returns its tree state. `source` is `stored` for an exact checkpoint, `replayed` for the caller that started the rebuild, `coalesced` for a caller sharing that rebuild, and `cached` for an in-memory cache hit. A caller that disconnects while awaiting the result adds no served read. |
 | `zinder_query_tree_state_replayed_blocks` | histogram | `height_band` | Blocks processed by each completed reconstruction, from 1 to 99. The worker records its work once even if its first caller disconnects. |
 | `zinder_query_tree_state_replayed_commitments` | histogram | `pool`, `height_band` | Note commitments appended to each pool (`sapling`, `orchard`, `ironwood`) by each completed reconstruction. A pool with no new commitments in that reconstruction records 0. |
@@ -385,7 +385,7 @@ at a wallet, collect the client's outcome as well.
 | `zinder_query_tree_state_replay_refusals_total` | counter | `reason` | Tree-state reads refused a rebuild slot: `wait_expired` when no slot freed within the wait, `waiters_full` when every waiting place was taken. |
 | `zinder_query_tree_state_replay_wait_duration_seconds` | histogram | | Time each admitted or refused rebuild waited for a rebuild slot. |
 | `zinder_query_tree_state_replay_duration_seconds` | histogram | `height_band` | Time each completed rebuild took, from the start of its storage read until it answered: reading and replaying compact blocks, and any wait for a blocking thread. |
-| `zinder_query_compact_block_range_stream_refusals_total` | counter | | Native `CompactBlocksInRange` streams refused because 100 were already open. |
+| `zinder_query_compact_block_range_stream_refusals_total` | counter | | Native compact-block and nullifier range streams refused because 100 were already open. |
 | `zinder_query_broadcast_budget_refusals_total` | counter | | Broadcasts refused because 16 MiB of transactions were already in flight. |
 
 `height_band` is the first height of the read's 250,000-block band, such as
@@ -446,7 +446,7 @@ it as the writer commits.
 | `zinder_wallet_serving_pair_publisher_teardown_duration_seconds` | histogram | `status` | Time to close a retired pair. |
 | `zinder_wallet_serving_pair_publisher_candidate_prepared_total` | counter | `kind` | Candidates prepared: `cold` for a new slot, `recycled` for a reused one. More than four `cold` means refreshes keep failing. |
 | `zinder_wallet_serving_pair_publisher_open_generations` | gauge | | Pair slots holding open stores, at most four. |
-| `zinder_wallet_serving_pair_publisher_retained_pairs` | gauge | | Replaced pairs kept for one minute for pinned reads. |
+| `zinder_wallet_serving_pair_publisher_retained_pairs` | gauge | | Replaced pairs retained for epoch pins. Native query defaults to 60 seconds and accepts 60 to 300 seconds within the four-generation limit. |
 | `zinder_wallet_serving_pair_publisher_pinned_retired_pairs` | gauge | | Retired pairs that requests still hold. |
 | `zinder_wallet_serving_pair_publisher_generation_wait_total` | counter | `reason` | Refreshes that published nothing because every slot was taken: `retention_window` or `in_flight_requests`. |
 | `zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds` | histogram | `reason`, `outcome` | Elapsed time from the first blocked slot check to the first observation of a free slot (`available`), a different reason (`reason_changed`), or a failed or unnecessary refresh or shutdown (`interrupted`). Repeated checks with the same reason share one observation. |

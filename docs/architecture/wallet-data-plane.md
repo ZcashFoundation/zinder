@@ -22,13 +22,13 @@ The settled tip is the height at or below which ingest never replaces a block. T
 
 ### How long an epoch stays readable
 
-A replaced epoch that a response exposed stays readable for one minute after a newer one replaces it, however many blocks arrive in that minute. An epoch that no response exposed has nothing to pin, so the server releases it as soon as a newer one replaces it. `GetLatestBlock` and `GetLightdInfo` on the compatibility listener expose no epoch, so polling them never extends retention. A workflow that finishes within that minute completes across new blocks. After it, a pinned read fails with `FAILED_PRECONDITION` and `CHAIN_EPOCH_PIN_UNAVAILABLE`. The client takes a new snapshot and restarts the whole workflow, not only the failed read. `zinder-client` reports this as `IndexerError::ChainEpochPinUnavailable` with `RetryPolicy::RefreshChainEpoch`.
+A replaced epoch that a response exposed stays readable for the [configured epoch-pin retention window](../reference/configuration.md#environment-variables) after replacement. An epoch that no response exposed has nothing to pin, so the server releases it as soon as a newer one replaces it. `GetLatestBlock` and `GetLightdInfo` on the compatibility listener expose no epoch, so polling them never extends retention. A workflow that finishes within that window completes across new blocks. After it, a pinned read fails with `FAILED_PRECONDITION` and `CHAIN_EPOCH_PIN_UNAVAILABLE`. The client takes a new snapshot and restarts the whole workflow, not only the failed read. `zinder-client` reports this as `IndexerError::ChainEpochPinUnavailable` with `RetryPolicy::RefreshChainEpoch`.
 
 A retained epoch still answers after a reorg replaces its blocks, because a pin promises that epoch's view, not the current best chain.
 
-`TransparentAddressUnspentOutputs`, `CompactBlocksInRange`, and `FullBlocksInRange` hold their epoch across many storage reads. If one of these streams is still running 30 seconds after its epoch leaves retention, the server ends it with `CHAIN_EPOCH_PIN_UNAVAILABLE` after the items it already sent. Those items are not a complete answer. Discard them and read again at a newer epoch. Every other read is one bounded storage read and finishes on its own.
+`TransparentAddressUnspentOutputs`, `TransparentAddressesUnspentOutputs`, `CompactBlocksInRange`, `CompactNullifiersInRange`, and `FullBlocksInRange` hold their epoch across many storage reads. If one of these streams is still running 30 seconds after its epoch leaves retention, the server ends it with `CHAIN_EPOCH_PIN_UNAVAILABLE` after the items it already sent. Those items are not a complete answer. Discard them and read again at a newer epoch. Every other read is one bounded storage read and finishes on its own.
 
-A reader keeps at most three replaced epochs open. While retained epochs and slow streams hold all of them, it postpones publishing new blocks. Together they delay a new block by at most about 90 seconds. A burst of blocks that no workflow reads by epoch does not wait on retention.
+A reader keeps at most three replaced epochs open. While retained epochs and slow streams hold all of them, it postpones publishing new blocks. After the last retained epoch expires, streams have up to 30 seconds to release their read views. All generations share the configured block cache for each store. The [storage backend](storage-backend.md#how-readers-pin-a-consistent-view) describes the per-generation memory. A burst of blocks that no workflow reads by epoch does not wait on retention.
 
 ## Methods
 
@@ -40,6 +40,7 @@ The service advertises a method's capability string only when this deployment ca
 | `BlockIdBySelector` | Height and hash for a height or hash selector | Always |
 | `BlockHeaderBySelector` | Zinder header read model | Never |
 | `CompactBlock`, `CompactBlocksInRange` | Compact blocks | Always |
+| `CompactNullifiersInRange` | Shielded nullifiers per block | Always |
 | `FullBlock`, `FullBlocksInRange` | Consensus-serialized blocks | Ingest retains block blobs (`storage.raw_blob_policy = "all"`) |
 | `TreeStateAtHeight`, `LatestTreeStateCheckpoint` | Sapling, Orchard, and Ironwood tree states | Always |
 | `SubtreeRoots` | Completed shielded subtree roots | Always |
@@ -47,10 +48,12 @@ The service advertises a method's capability string only when this deployment ca
 | `Transaction` | Mined or mempool status of one transaction | Always; mined bytes need transaction retention |
 | `ChainEvents` | Replayable chain events | Always |
 | `MempoolSnapshot`, `MempoolEvents` | Live mempool contents and changes | Always |
-| `TransparentAddressUnspentOutputs` | Unspent outputs of one transparent address | Always |
+| `TransparentAddressUnspentOutputs`, `TransparentAddressesUnspentOutputs` | Unspent outputs of one or more transparent addresses | Always |
+| `TransparentAddressBalances` | Confirmed balance across transparent addresses | Always |
 | `TransparentAddressTxIdsInRange` | Transaction ids that touch one transparent address | Always |
 | `TransparentOutpointSpendStatus` | Spend status of up to 1,024 outpoints | Always |
 | `ChainValuePoolsAtTip` | Chain value-pool totals | Never |
+| `StandardFee` | Recommended marginal fee and estimator version | A `[node]` endpoint is configured |
 | `BroadcastTransaction` | Typed broadcast outcome | A `[node]` endpoint is configured |
 | `ServerInfo` | Network, contract revision, capabilities, broadcast node | Always, not gated |
 
@@ -58,14 +61,16 @@ The service advertises a method's capability string only when this deployment ca
 
 ## Compact blocks
 
-`CompactBlock(height, at_epoch_id)` returns one stored compact block. `CompactBlocksInRange(start_height, end_height, at_epoch_id)` streams an inclusive ascending range of at most 1,000 blocks: first one header message (`body.header`) with the `ChainView` that answers the whole range, then one `CompactBlock` per height (`body.item`). The server reads about 2 MiB of stored blocks at a time and queues at most 16 blocks beyond that read, so a slow client does not make it hold the whole range. A range outside retained history or an unavailable epoch pin fails before the header. One process serves at most 100 of these streams at once and refuses more with `RESOURCE_EXHAUSTED` and `COMPACT_BLOCK_STREAM_LIMIT_REACHED`; retry after a short delay. A stream the client cancels or drops keeps its place until the read it has already started ends.
+`CompactBlock(height, at_epoch_id)` returns one stored compact block. `CompactBlocksInRange(start_height, end_height, at_epoch_id)` streams at most 1,000 blocks from the first endpoint through the last: first one header message (`body.header`) with the `ChainView` that answers the whole range, then one `CompactBlock` per height (`body.item`). The server reads about 2 MiB of stored blocks at a time and queues at most 16 blocks beyond that read, so a slow client does not make it hold the whole range. A range outside retained history or an unavailable epoch pin fails before the header. One process serves at most 100 of these streams at once and refuses more with `RESOURCE_EXHAUSTED` and `COMPACT_BLOCK_STREAM_LIMIT_REACHED`; retry after a short delay. A stream the client cancels or drops keeps its place until the read it has already started ends.
 
-Ingest builds compact blocks when it commits a block. Query never fetches a block from the node or builds one on demand.
+Set `start_height` above `end_height` to scan from newest to oldest. With `pool_types`, each block carries only the selected Sapling, Orchard, Ironwood, or transparent scan fields and transactions that contribute those fields. The chain metadata still gives the full block's commitment-tree sizes. An empty selection includes every pool. Check the [range capability](../reference/capabilities.md) before sending descending endpoints or a pool selection.
+
+Use `CompactNullifiersInRange` for spend detection without downloading note commitments, ciphertexts, or transparent fields. Each block carries its identity and the selected shielded nullifiers in transaction order. The server reads those nullifiers from canonical `ZSHRNG02` settled segments and the live tail. Both range methods share the same stream admission limit.
 
 | Condition | Status and reason |
 | --- | --- |
 | Range wider than 1,000 blocks | `INVALID_ARGUMENT`, `BLOCK_RANGE_TOO_LARGE` |
-| Start above end | `INVALID_ARGUMENT`, `INVALID_BLOCK_RANGE` |
+| More than four pool entries, an unknown pool, or transparent selected for a nullifier scan | `INVALID_ARGUMENT` |
 | Height above the visible tip or below the retained history | `NOT_FOUND`, `ARTIFACT_UNAVAILABLE` naming the first missing height |
 | Block missing inside retained history | `UNAVAILABLE`, `STORAGE_UNAVAILABLE` (store damage) |
 
@@ -189,6 +194,8 @@ These reads come from the wallet store that `zinder-projector` writes. Its histo
 
 The server reads the set in pages of 1,024 outputs and reads the next page only when the client has taken the previous one. It holds at most three pages per stream. A client that stops reading stalls the storage reads. Cancelling the stream releases them. A stream ends without an error only after the address's last output.
 
+Use `TransparentAddressesUnspentOutputs` to read several addresses at one epoch. The request takes 1 to 256 selectors before deduplication. The stream groups outputs by the first occurrence of each distinct address. The same page buffer serves the entire batch.
+
 An in-process caller that opens many of these streams for one request can use `WalletQueryApi::transparent_address_unspent_outputs_on_demand` instead. It returns the same outputs in the same order at the same pinned epoch, but reads nothing until the stream is first polled and never reads ahead: it reads the next page only when the caller has taken every output of the previous one. The caller chooses the first page's size, at most 1,024 outputs, from how many streams it holds. Later pages double up to 1,024 as the caller consumes them, so such a stream holds at most the page its caller is reading, and a stream not yet polled holds none.
 
 The compatibility adapter uses one on-demand stream per distinct address.
@@ -226,7 +233,11 @@ A request with no outpoints or more than 1,024 fails with `INVALID_ARGUMENT` and
 
 ### Balance
 
-The wallet store keeps a balance for each transparent address. The compatibility runtime serves those balances through the lightwalletd `GetTaddressBalance` methods, as [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md) describes. Native wallets sum the unspent outputs they read, because the native service has no balance method. Explorer clients use `ExplorerQuery.TransparentAddressActivity`.
+Call `TransparentAddressBalances` with 1 to 256 selectors to sum confirmed unspent balances at a single epoch. Duplicate addresses count once. The response gives the total in zatoshis and the number of distinct addresses. Explorer clients use `ExplorerQuery.TransparentAddressActivity` for address activity.
+
+## Standard fee
+
+`StandardFee` returns the upstream node's recommended [ZIP 317](https://zips.z.cash/zip-0317) fee per logical action and the estimator version. The server queries only verified nodes and tries a verified fallback when an earlier node is unavailable, rate-limited, or lacks the method. Estimator version zero identifies the static estimate.
 
 ## Value pools
 

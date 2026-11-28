@@ -36,6 +36,7 @@ pub(crate) struct ObservedCanonicalReader {
     reads: AtomicUsize,
     fail_latest_checkpoint: AtomicBool,
     replays: Arc<ReplayGate>,
+    encoded_ranges: bool,
 }
 
 /// Holds every tree-state replay of an [`ObservedCanonicalReader`] until
@@ -74,6 +75,7 @@ impl ObservedCanonicalReader {
             reads: AtomicUsize::new(0),
             fail_latest_checkpoint: AtomicBool::new(false),
             replays: Arc::new(replays),
+            encoded_ranges: true,
         }
     }
 
@@ -92,9 +94,16 @@ impl ObservedCanonicalReader {
                 reads: AtomicUsize::new(0),
                 fail_latest_checkpoint: AtomicBool::new(false),
                 replays: Arc::clone(&replays),
+                encoded_ranges: true,
             },
             replays,
         )
+    }
+
+    /// Exercises structured range reads by making the wire projection unavailable.
+    pub(crate) fn without_encoded_ranges(mut self) -> Self {
+        self.encoded_ranges = false;
+        self
     }
 
     /// Forces the next `tree_state_checkpoint_at_or_before` call to fail with
@@ -222,9 +231,13 @@ impl CanonicalReader for ObservedCanonicalReader {
         request: EncodedCompactBlockRangeRequest,
         cancel: Option<Arc<AtomicBool>>,
     ) -> Result<Option<EncodedCompactBlockRange>, StorageReadError> {
-        self.count()
-            .encoded_compact_block_range_up_to(request, cancel)
-            .await
+        if self.encoded_ranges {
+            self.count()
+                .encoded_compact_block_range_up_to(request, cancel)
+                .await
+        } else {
+            Ok(None)
+        }
     }
 
     async fn block_blob_at(
