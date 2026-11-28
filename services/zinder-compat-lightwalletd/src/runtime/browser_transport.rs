@@ -4,16 +4,15 @@ use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Versi
 use tokio::net::TcpListener;
 use tonic::{Status, body::Body, server::NamedService};
 use tonic_web::GrpcWebLayer;
-use tower::{
-    Layer, Service, ServiceBuilder,
-    layer::util::{Identity, Stack},
-    util::Either,
-};
+use tower::{Layer, Service, ServiceBuilder};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     validate_request::{ValidateRequest, ValidateRequestHeaderLayer},
 };
 use zinder_proto::compat::lightwalletd::compact_tx_streamer_server::SERVICE_NAME;
+use zinder_runtime::{
+    ClientAddressSource, GrpcProxyProtocol, GrpcRangeAdmission, WalletRpcMetricsLayer,
+};
 
 use super::config::{LightwalletdConfig, LightwalletdConfigError};
 
@@ -47,6 +46,8 @@ where
     let listener = BrowserListener {
         browser_origins: &config.browser_origins,
         client_address: config.client_address_source,
+        proxy_protocol: config.proxy_protocol.clone(),
+        range_admission: config.range_admission,
     };
     serve_listener(runtime, wallet_service, incoming, &listener, readiness)
 }
@@ -54,7 +55,9 @@ where
 /// The settings of the compatibility listener that its transport reads.
 pub(super) struct BrowserListener<'a> {
     pub(super) browser_origins: &'a [HeaderValue],
-    pub(super) client_address: zinder_runtime::ClientAddressSource,
+    pub(super) client_address: ClientAddressSource,
+    pub(super) proxy_protocol: GrpcProxyProtocol,
+    pub(super) range_admission: GrpcRangeAdmission,
 }
 
 pub(super) fn serve_listener<S>(
@@ -84,9 +87,14 @@ where
         readiness,
         |server| {
             server
+                .with_proxy_protocol(listener.proxy_protocol.clone())
                 .accept_http1(enabled)
                 .transport_layer(transport)
-                .layer(wallet_layers(enabled))
+                .layer(wallet_layers(
+                    enabled,
+                    listener.range_admission,
+                    listener.client_address,
+                ))
         },
     )?;
     Ok(Box::pin(router.serve_with_incoming_shutdown(
@@ -123,14 +131,28 @@ where
         .into_inner()
 }
 
-type WalletLayers = Stack<
-    Either<ValidateRequestHeaderLayer<UnsupportedBrowserCall>, Identity>,
-    Stack<zinder_runtime::WalletRpcMetricsLayer, Identity>,
->;
-
-fn wallet_layers(enabled: bool) -> WalletLayers {
+fn wallet_layers<S>(
+    enabled: bool,
+    policy: GrpcRangeAdmission,
+    source: ClientAddressSource,
+) -> impl Layer<
+    S,
+    Service: Service<
+        Request<Body>,
+        Response = Response<Body>,
+        Error = S::Error,
+        Future: Send + 'static,
+    > + Clone
+                 + Send
+                 + 'static,
+> + Clone
++ use<S>
+where
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
     ServiceBuilder::new()
-        .layer(zinder_runtime::WalletRpcMetricsLayer::Lightwalletd)
+        .layer(WalletRpcMetricsLayer::Lightwalletd.with_range_admission(policy, source))
         .option_layer(enabled.then(|| ValidateRequestHeaderLayer::custom(UnsupportedBrowserCall)))
         .into_inner()
 }

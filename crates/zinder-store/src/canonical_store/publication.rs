@@ -1954,18 +1954,6 @@ fn decode_chain_epoch(encoded: &[u8]) -> Result<DecodedChainEpoch, CanonicalStor
     })
 }
 
-pub(super) fn canonical_event_created_at(
-    db: &DB,
-    event_sequence: u64,
-) -> Result<UnixTimestampMillis, CanonicalStoreError> {
-    Ok(decode_chain_epoch(&read_family_row(
-        db,
-        CHAIN_EPOCH_COLUMN_FAMILY,
-        &event_sequence.to_be_bytes(),
-    )?)?
-    .created_at)
-}
-
 pub(super) fn read_chain_epoch_tips(
     db: &DB,
     chain_epoch_id: ChainEpochId,
@@ -2210,9 +2198,18 @@ impl<'db> CachedSequenceCursor<'db> {
         family_name: &'static str,
         first_sequence: u64,
     ) -> Result<Self, CanonicalStoreError> {
+        Self::open_from_sequence_with_cache(db, family_name, first_sequence, true)
+    }
+
+    fn open_from_sequence_with_cache(
+        db: &'db DB,
+        family_name: &'static str,
+        first_sequence: u64,
+        fill_cache: bool,
+    ) -> Result<Self, CanonicalStoreError> {
         let family = column_family(db, family_name)?;
         let mut read_options = ReadOptions::default();
-        read_options.fill_cache(true);
+        read_options.fill_cache(fill_cache);
         let iterator = db.raw_iterator_cf_opt(&family, read_options);
         let mut cursor = Self {
             family_name,
@@ -2314,6 +2311,36 @@ impl<'db> CachedSequenceCursor<'db> {
         self.iterator
             .status()
             .map_err(|source| CanonicalStoreError::RocksDbOperation { operation, source })
+    }
+}
+
+pub(super) struct ChainEpochCreatedAtCursor<'db> {
+    cursor: CachedSequenceCursor<'db>,
+}
+
+impl<'db> ChainEpochCreatedAtCursor<'db> {
+    pub(super) fn open_from_sequence(
+        db: &'db DB,
+        first_sequence: u64,
+    ) -> Result<Self, CanonicalStoreError> {
+        Ok(Self {
+            cursor: CachedSequenceCursor::open_from_sequence_with_cache(
+                db,
+                CHAIN_EPOCH_COLUMN_FAMILY,
+                first_sequence,
+                false,
+            )?,
+        })
+    }
+
+    pub(super) fn read_expected_created_at_and_advance(
+        &mut self,
+        expected_sequence: u64,
+    ) -> Result<UnixTimestampMillis, CanonicalStoreError> {
+        Ok(self
+            .cursor
+            .read_expected_and_advance(expected_sequence, decode_chain_epoch)?
+            .created_at)
     }
 }
 

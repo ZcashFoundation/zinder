@@ -6,14 +6,14 @@
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::eyre;
 use parking_lot::Mutex;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_stream::{Stream, StreamExt as _, wrappers::UnboundedReceiverStream};
 use tonic::{Code, Request};
 use zinder_compat_lightwalletd::{
@@ -1466,4 +1466,688 @@ fn decode_snapshot_page_index(cursor: Option<&[u8]>) -> Result<usize, MempoolSur
     index_bytes.copy_from_slice(cursor_bytes);
     let index = u64::from_be_bytes(index_bytes);
     usize::try_from(index).map_err(|_| MempoolSurfaceError::CursorInvalid)
+}
+
+#[derive(Clone)]
+enum ScriptedSnapshotPageError {
+    Unavailable(String),
+    CursorExpired,
+    CursorInvalid,
+}
+
+impl ScriptedSnapshotPageError {
+    fn to_surface_error(&self) -> MempoolSurfaceError {
+        match self {
+            Self::Unavailable(reason) => MempoolSurfaceError::Unavailable {
+                reason: reason.clone(),
+            },
+            Self::CursorExpired => MempoolSurfaceError::CursorExpired,
+            Self::CursorInvalid => MempoolSurfaceError::CursorInvalid,
+        }
+    }
+
+    const fn expected_code(&self) -> Code {
+        match self {
+            Self::Unavailable(_) => Code::Unavailable,
+            Self::CursorExpired => Code::FailedPrecondition,
+            Self::CursorInvalid => Code::InvalidArgument,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ScriptedSnapshotPage {
+    Entries(Vec<MempoolEntry>),
+    Error(ScriptedSnapshotPageError),
+}
+
+struct ScriptedPageGate {
+    page_index: usize,
+    reached_flag: Arc<AtomicBool>,
+    reached_notify: Arc<Notify>,
+    release_rx: watch::Receiver<bool>,
+    cancelled_tx: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+struct ScriptedPageGateHandle {
+    reached_flag: Arc<AtomicBool>,
+    reached_notify: Arc<Notify>,
+    release_tx: watch::Sender<bool>,
+}
+
+impl ScriptedPageGateHandle {
+    async fn wait_until_reached(&self, timeout_duration: Duration) -> eyre::Result<()> {
+        tokio::time::timeout(timeout_duration, async {
+            loop {
+                let notified = self.reached_notify.notified();
+                if self.reached_flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| eyre!("timed out waiting for gated snapshot page"))
+    }
+
+    fn release(&self) -> eyre::Result<()> {
+        self.release_tx
+            .send(true)
+            .map_err(|_| eyre!("gated snapshot page receiver dropped"))
+    }
+}
+
+struct InFlightPageDropGuard {
+    cancelled_tx: Option<oneshot::Sender<()>>,
+}
+
+impl InFlightPageDropGuard {
+    fn disarm(&mut self) {
+        self.cancelled_tx = None;
+    }
+}
+
+impl Drop for InFlightPageDropGuard {
+    fn drop(&mut self) {
+        if let Some(sender) = self.cancelled_tx.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+struct ScriptedPagedSnapshotSurface {
+    pages: Vec<ScriptedSnapshotPage>,
+    fetched_pages: Arc<AtomicUsize>,
+    gate: Option<ScriptedPageGate>,
+}
+
+impl ScriptedPagedSnapshotSurface {
+    fn new(pages: Vec<ScriptedSnapshotPage>) -> (Self, Arc<AtomicUsize>) {
+        let fetched_pages = Arc::new(AtomicUsize::new(0));
+        let surface = Self {
+            pages,
+            fetched_pages: Arc::clone(&fetched_pages),
+            gate: None,
+        };
+        (surface, fetched_pages)
+    }
+
+    fn with_page_gate(
+        mut self,
+        page_index: usize,
+    ) -> (Self, ScriptedPageGateHandle, oneshot::Receiver<()>) {
+        let reached_flag = Arc::new(AtomicBool::new(false));
+        let reached_notify = Arc::new(Notify::new());
+        let (release_tx, release_rx) = watch::channel(false);
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        let handle = ScriptedPageGateHandle {
+            reached_flag: Arc::clone(&reached_flag),
+            reached_notify: Arc::clone(&reached_notify),
+            release_tx,
+        };
+        self.gate = Some(ScriptedPageGate {
+            page_index,
+            reached_flag,
+            reached_notify,
+            release_rx,
+            cancelled_tx: Mutex::new(Some(cancelled_tx)),
+        });
+        (self, handle, cancelled_rx)
+    }
+}
+
+#[async_trait]
+impl MempoolSurface for ScriptedPagedSnapshotSurface {
+    async fn mempool_snapshot_page(
+        &self,
+        _max_entries: u32,
+        from_cursor: Option<Vec<u8>>,
+    ) -> Result<MempoolSnapshotPage, MempoolSurfaceError> {
+        let page_index = decode_snapshot_page_index(from_cursor.as_deref())?;
+        self.fetched_pages.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &self.gate
+            && gate.page_index == page_index
+        {
+            let mut guard = InFlightPageDropGuard {
+                cancelled_tx: gate.cancelled_tx.lock().take(),
+            };
+            gate.reached_flag.store(true, Ordering::SeqCst);
+            gate.reached_notify.notify_waiters();
+            let mut release_rx = gate.release_rx.clone();
+            while !*release_rx.borrow_and_update() {
+                if release_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            guard.disarm();
+        }
+
+        let page = self
+            .pages
+            .get(page_index)
+            .ok_or_else(|| MempoolSurfaceError::Unavailable {
+                reason: format!("missing scripted snapshot page {page_index}"),
+            })?;
+        let entries = match page {
+            ScriptedSnapshotPage::Entries(entries) => entries.clone(),
+            ScriptedSnapshotPage::Error(err) => return Err(err.to_surface_error()),
+        };
+        let next_page_index = page_index.saturating_add(1);
+        let next_cursor = if next_page_index < self.pages.len() {
+            Some(
+                u64::try_from(next_page_index)
+                    .unwrap_or(u64::MAX)
+                    .to_be_bytes()
+                    .to_vec(),
+            )
+        } else {
+            None
+        };
+        Ok(MempoolSnapshotPage {
+            chain_epoch_id: ChainEpochId::new(7),
+            events_resume_cursor: None,
+            entries,
+            next_cursor,
+        })
+    }
+
+    async fn mempool_events(
+        &self,
+        _from_cursor: Option<StreamCursorTokenV1>,
+    ) -> Result<MempoolEventEnvelopeStream, MempoolSurfaceError> {
+        Err(MempoolSurfaceError::Unavailable {
+            reason: "unused in paged snapshot test".to_owned(),
+        })
+    }
+
+    async fn mempool_transaction(
+        &self,
+        _transaction_id: TransactionId,
+    ) -> Result<MempoolTransactionLookup, MempoolSurfaceError> {
+        Err(MempoolSurfaceError::Unavailable {
+            reason: "unused in paged snapshot test".to_owned(),
+        })
+    }
+}
+
+fn orchard_only_entry_with_transaction_id(
+    transaction_id_bytes: [u8; 32],
+    chain_epoch: ChainEpoch,
+) -> eyre::Result<MempoolEntry> {
+    let payload_byte = transaction_id_bytes[0];
+    synthetic_entry_with_compact_tx(
+        transaction_id_bytes,
+        chain_epoch,
+        &lightwalletd::CompactTx {
+            index: 0,
+            txid: transaction_id_bytes.to_vec(),
+            fee: 0,
+            spends: Vec::new(),
+            outputs: Vec::new(),
+            actions: vec![lightwalletd::CompactOrchardAction {
+                nullifier: vec![payload_byte; 32],
+                cmx: vec![payload_byte; 32],
+                ephemeral_key: vec![payload_byte; 32],
+                ciphertext: vec![payload_byte; 52],
+            }],
+            ironwood_actions: Vec::new(),
+            vin: Vec::new(),
+            vout: Vec::new(),
+        },
+    )
+}
+
+fn oversized_fee_transparent_entry(
+    transaction_id_byte: u8,
+    chain_epoch: ChainEpoch,
+) -> eyre::Result<MempoolEntry> {
+    let compact_transaction_data = CompactTransactionData {
+        fee_zat: Some(u64::from(u32::MAX) + 1),
+        transparent_outputs: vec![CompactTransparentOutput {
+            value_zat: 100,
+            script_pub_key: vec![0xAB; 25],
+        }],
+        ..CompactTransactionData::default()
+    };
+    MempoolEntry::new(
+        TransactionId::from_bytes([transaction_id_byte; 32]),
+        Some(AuthDigest::from_bytes([transaction_id_byte; 32])),
+        RawTransactionBytes::new(vec![transaction_id_byte; 16]),
+        compact_transaction_data,
+        MempoolObservation {
+            first_seen_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
+            first_seen_chain_epoch: chain_epoch,
+        },
+    )
+    .map_err(|error| eyre!("invalid oversized-fee mempool entry: {error}"))
+}
+
+async fn collect_compact_txs<S>(mut stream: S) -> eyre::Result<Vec<lightwalletd::CompactTx>>
+where
+    S: tokio_stream::Stream<Item = Result<lightwalletd::CompactTx, tonic::Status>> + Unpin,
+{
+    let mut messages = Vec::new();
+    while let Some(next_message) = stream.next().await {
+        messages.push(next_message?);
+    }
+    Ok(messages)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_tx_streams_page_one_before_page_two_completes() -> eyre::Result<()>
+{
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let epoch = synthetic_chain_epoch();
+    let (surface, _fetched_pages) = ScriptedPagedSnapshotSurface::new(vec![
+        ScriptedSnapshotPage::Entries(vec![synthetic_entry(0xA1, epoch)?]),
+        ScriptedSnapshotPage::Entries(vec![synthetic_entry(0xB2, epoch)?]),
+    ]);
+    let (surface, page_two_gate, _cancelled_rx) = surface.with_page_gate(1);
+    let adapter =
+        LightwalletdGrpcAdapter::new(wallet_query).with_mempool_surface(Arc::new(surface));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(
+        zinder_runtime::public_grpc_server(zinder_runtime::ClientAddressSource::Connection)
+            .add_service(adapter.into_server())
+            .serve_with_incoming(listener),
+    );
+
+    let mut client =
+        lightwalletd::compact_tx_streamer_client::CompactTxStreamerClient::connect(endpoint)
+            .await?;
+    let mut response_stream = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get_mempool_tx(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: Vec::new(),
+            pool_types: Vec::new(),
+        }),
+    )
+    .await??
+    .into_inner();
+
+    let first_tx = tokio::time::timeout(Duration::from_secs(2), response_stream.next())
+        .await?
+        .ok_or_else(|| eyre!("expected page-1 mempool transaction before page 2 completes"))??;
+    assert_eq!(first_tx.txid, vec![0xA1; 32]);
+
+    page_two_gate
+        .wait_until_reached(Duration::from_secs(2))
+        .await?;
+    let stalled_poll =
+        tokio::time::timeout(Duration::from_millis(100), response_stream.next()).await;
+    assert!(
+        stalled_poll.is_err(),
+        "page-2 poll must wait while page 2 is gated; got {stalled_poll:?}"
+    );
+
+    page_two_gate.release()?;
+    let second_tx = tokio::time::timeout(Duration::from_secs(2), response_stream.next())
+        .await?
+        .ok_or_else(|| eyre!("expected page-2 mempool transaction after gate release"))??;
+    assert_eq!(second_tx.txid, vec![0xB2; 32]);
+    let trailing = tokio::time::timeout(Duration::from_secs(2), response_stream.next()).await?;
+    assert!(trailing.is_none(), "expected stream end, got {trailing:?}");
+    server.abort();
+    Ok(())
+}
+
+async fn assert_large_page_cancellation_bounds_read_ahead(
+    wallet_query: WalletServingQuery<()>,
+    epoch: ChainEpoch,
+) -> eyre::Result<()> {
+    let mut multi_entry_pages = Vec::with_capacity(10);
+    for page_idx in 0..10_u8 {
+        let mut page_entries = Vec::with_capacity(20);
+        for entry_idx in 0..20_u8 {
+            let mut txid = [0_u8; 32];
+            txid[0] = page_idx.saturating_add(1);
+            txid[1] = entry_idx;
+            page_entries.push(synthetic_entry_with_transaction_id(txid, epoch)?);
+        }
+        multi_entry_pages.push(ScriptedSnapshotPage::Entries(page_entries));
+    }
+    let (large_surface, large_fetched) = ScriptedPagedSnapshotSurface::new(multi_entry_pages);
+    let large_adapter =
+        LightwalletdGrpcAdapter::new(wallet_query).with_mempool_surface(Arc::new(large_surface));
+    let mut large_stream = large_adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: Vec::new(),
+            pool_types: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    for _ in 0..20 {
+        let next_tx = tokio::time::timeout(Duration::from_secs(2), large_stream.next())
+            .await?
+            .ok_or_else(|| eyre!("expected 20 entries on page 1"))??;
+        assert_eq!(next_tx.txid[0], 1);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(large_stream);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let large_pages_fetched = large_fetched.load(Ordering::SeqCst);
+    assert!(
+        large_pages_fetched <= 2,
+        "expected at most 2 pages fetched for 20-entry pages, got {large_pages_fetched}"
+    );
+    Ok(())
+}
+
+async fn assert_single_entry_page_cancellation_bounds_read_ahead(
+    wallet_query: WalletServingQuery<()>,
+    epoch: ChainEpoch,
+) -> eyre::Result<()> {
+    let mut single_entry_pages = Vec::with_capacity(40);
+    for page_idx in 0..40_u8 {
+        single_entry_pages.push(ScriptedSnapshotPage::Entries(vec![synthetic_entry(
+            page_idx.saturating_add(1),
+            epoch,
+        )?]));
+    }
+    let (single_surface, single_fetched) = ScriptedPagedSnapshotSurface::new(single_entry_pages);
+    let single_adapter =
+        LightwalletdGrpcAdapter::new(wallet_query).with_mempool_surface(Arc::new(single_surface));
+    let mut single_stream = single_adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: Vec::new(),
+            pool_types: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let first_single = tokio::time::timeout(Duration::from_secs(2), single_stream.next())
+        .await?
+        .ok_or_else(|| eyre!("expected first single-entry page"))??;
+    assert_eq!(first_single.txid, vec![1; 32]);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(single_stream);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let single_pages_fetched = single_fetched.load(Ordering::SeqCst);
+    assert!(
+        single_pages_fetched <= 17,
+        "expected at most 17 single-entry pages fetched (1 initial + 16 buffered), got {single_pages_fetched}"
+    );
+    Ok(())
+}
+
+async fn assert_in_flight_page_cancellation_on_drop(
+    wallet_query: WalletServingQuery<()>,
+    epoch: ChainEpoch,
+) -> eyre::Result<()> {
+    let (gated_surface, gated_fetched) = ScriptedPagedSnapshotSurface::new(vec![
+        ScriptedSnapshotPage::Entries(vec![synthetic_entry(0x11, epoch)?]),
+        ScriptedSnapshotPage::Entries(vec![synthetic_entry(0x22, epoch)?]),
+        ScriptedSnapshotPage::Entries(vec![synthetic_entry(0x33, epoch)?]),
+    ]);
+    let (gated_surface, page_two_gate, cancelled_rx) = gated_surface.with_page_gate(1);
+    let gated_adapter =
+        LightwalletdGrpcAdapter::new(wallet_query).with_mempool_surface(Arc::new(gated_surface));
+    let mut gated_stream = gated_adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: Vec::new(),
+            pool_types: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let first_gated = tokio::time::timeout(Duration::from_secs(2), gated_stream.next())
+        .await?
+        .ok_or_else(|| eyre!("expected page-1 entry before page-2 gate"))??;
+    assert_eq!(first_gated.txid, vec![0x11; 32]);
+    page_two_gate
+        .wait_until_reached(Duration::from_secs(2))
+        .await?;
+    drop(gated_stream);
+    tokio::time::timeout(Duration::from_secs(2), cancelled_rx)
+        .await
+        .map_err(|_| eyre!("in-flight page 2 was not cancelled on stream drop"))?
+        .map_err(|_| eyre!("page-2 cancellation sender disappeared"))?;
+    assert_eq!(gated_fetched.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_tx_cancellation_bounds_read_ahead_and_skips_trailing_pages()
+-> eyre::Result<()> {
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let epoch = synthetic_chain_epoch();
+    assert_large_page_cancellation_bounds_read_ahead(wallet_query.clone(), epoch).await?;
+    assert_single_entry_page_cancellation_bounds_read_ahead(wallet_query.clone(), epoch).await?;
+    assert_in_flight_page_cancellation_on_drop(wallet_query, epoch).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_tx_empty_exclusions_matches_buffered_wire_parity()
+-> eyre::Result<()> {
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let epoch = synthetic_chain_epoch();
+
+    let empty_snapshot_pages = vec![ScriptedSnapshotPage::Entries(Vec::new())];
+    let multi_pool_pages = vec![
+        ScriptedSnapshotPage::Entries(Vec::new()),
+        ScriptedSnapshotPage::Entries(vec![
+            synthetic_entry_with_transaction_id([0x11; 32], epoch)?,
+            transparent_only_entry(0x22, epoch)?,
+        ]),
+        ScriptedSnapshotPage::Entries(Vec::new()),
+        ScriptedSnapshotPage::Entries(vec![
+            orchard_only_entry_with_transaction_id([0x33; 32], epoch)?,
+            ironwood_only_entry_with_transaction_id([0x44; 32], epoch)?,
+        ]),
+        ScriptedSnapshotPage::Entries(Vec::new()),
+    ];
+
+    let pool_filters = [
+        Vec::new(),
+        vec![lightwalletd::PoolType::Sapling as i32],
+        vec![lightwalletd::PoolType::Orchard as i32],
+        vec![lightwalletd::PoolType::Ironwood as i32],
+        vec![lightwalletd::PoolType::Transparent as i32],
+        vec![
+            lightwalletd::PoolType::Sapling as i32,
+            lightwalletd::PoolType::Transparent as i32,
+        ],
+        vec![-1, 99],
+    ];
+
+    for pages in [empty_snapshot_pages, multi_pool_pages] {
+        let (surface, _) = ScriptedPagedSnapshotSurface::new(pages);
+        let adapter = LightwalletdGrpcAdapter::new(wallet_query.clone())
+            .with_mempool_surface(Arc::new(surface));
+        for pool_types in &pool_filters {
+            let streaming_stream = adapter
+                .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+                    exclude_txid_suffixes: Vec::new(),
+                    pool_types: pool_types.clone(),
+                }))
+                .await?
+                .into_inner();
+            let streamed = collect_compact_txs(streaming_stream).await?;
+
+            let buffered_stream = adapter
+                .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+                    exclude_txid_suffixes: vec![vec![0xFF; 32]],
+                    pool_types: pool_types.clone(),
+                }))
+                .await?
+                .into_inner();
+            let buffered = collect_compact_txs(buffered_stream).await?;
+            assert_eq!(
+                streamed, buffered,
+                "wire parity mismatch for {pool_types:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn assert_later_page_surface_error(
+    wallet_query: &WalletServingQuery<()>,
+    epoch: ChainEpoch,
+    page_error: ScriptedSnapshotPageError,
+) -> eyre::Result<()> {
+    let expected_code = page_error.expected_code();
+    let pages = vec![
+        ScriptedSnapshotPage::Entries(vec![synthetic_entry(0xA1, epoch)?]),
+        ScriptedSnapshotPage::Error(page_error),
+        ScriptedSnapshotPage::Entries(vec![synthetic_entry(0xB2, epoch)?]),
+    ];
+
+    let (streaming_surface, streaming_fetched) = ScriptedPagedSnapshotSurface::new(pages.clone());
+    let streaming_adapter = LightwalletdGrpcAdapter::new(wallet_query.clone())
+        .with_mempool_surface(Arc::new(streaming_surface));
+    let mut streaming_response = streaming_adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: Vec::new(),
+            pool_types: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let first_tx = streaming_response
+        .next()
+        .await
+        .ok_or_else(|| eyre!("expected page-1 entry before page-2 surface error"))??;
+    assert_eq!(first_tx.txid, vec![0xA1; 32]);
+    let second_outcome = streaming_response
+        .next()
+        .await
+        .ok_or_else(|| eyre!("expected page-2 surface error"))?;
+    let status = second_outcome
+        .err()
+        .ok_or_else(|| eyre!("expected Err status from page 2"))?;
+    assert_eq!(status.code(), expected_code);
+    assert!(streaming_response.next().await.is_none());
+    assert_eq!(streaming_fetched.load(Ordering::SeqCst), 2);
+
+    let (buffered_surface, buffered_fetched) = ScriptedPagedSnapshotSurface::new(pages);
+    let buffered_adapter = LightwalletdGrpcAdapter::new(wallet_query.clone())
+        .with_mempool_surface(Arc::new(buffered_surface));
+    let buffered_outcome = buffered_adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: vec![vec![0xFF; 32]],
+            pool_types: Vec::new(),
+        }))
+        .await;
+    let buffered_status = buffered_outcome
+        .err()
+        .ok_or_else(|| eyre!("expected buffered path to fail on page 2"))?;
+    assert_eq!(buffered_status.code(), expected_code);
+    assert_eq!(buffered_fetched.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+async fn assert_later_page_encode_error(
+    wallet_query: &WalletServingQuery<()>,
+    epoch: ChainEpoch,
+) -> eyre::Result<()> {
+    let encode_error_pages = vec![
+        ScriptedSnapshotPage::Entries(vec![synthetic_entry(0xA1, epoch)?]),
+        ScriptedSnapshotPage::Entries(vec![oversized_fee_transparent_entry(0xC2, epoch)?]),
+        ScriptedSnapshotPage::Entries(vec![synthetic_entry(0xB2, epoch)?]),
+    ];
+    let (encode_surface, _) = ScriptedPagedSnapshotSurface::new(encode_error_pages.clone());
+    let encode_adapter = LightwalletdGrpcAdapter::new(wallet_query.clone())
+        .with_mempool_surface(Arc::new(encode_surface));
+    let mut encode_stream = encode_adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: Vec::new(),
+            pool_types: vec![lightwalletd::PoolType::Sapling as i32],
+        }))
+        .await?
+        .into_inner();
+    let page_one_tx = encode_stream
+        .next()
+        .await
+        .ok_or_else(|| eyre!("expected page-1 entry before encode error"))??;
+    assert_eq!(page_one_tx.txid, vec![0xA1; 32]);
+    let encode_failure = encode_stream
+        .next()
+        .await
+        .ok_or_else(|| eyre!("expected page-2 fee overflow error"))?;
+    let encode_status = encode_failure
+        .err()
+        .ok_or_else(|| eyre!("expected DataLoss error on oversized fee"))?;
+    assert_eq!(encode_status.code(), Code::DataLoss);
+    assert!(encode_stream.next().await.is_none());
+
+    let (buffered_encode_surface, _) = ScriptedPagedSnapshotSurface::new(encode_error_pages);
+    let buffered_encode_adapter = LightwalletdGrpcAdapter::new(wallet_query.clone())
+        .with_mempool_surface(Arc::new(buffered_encode_surface));
+    let buffered_encode_status = buffered_encode_adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: vec![vec![0xFF; 32]],
+            pool_types: vec![lightwalletd::PoolType::Sapling as i32],
+        }))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expected buffered path to fail on page-2 fee overflow"))?;
+    assert_eq!(buffered_encode_status.code(), Code::DataLoss);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_tx_propagates_later_page_errors_after_page_one()
+-> eyre::Result<()> {
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let epoch = synthetic_chain_epoch();
+
+    for page_error in [
+        ScriptedSnapshotPageError::Unavailable("upstream page 2 outage".to_owned()),
+        ScriptedSnapshotPageError::CursorExpired,
+        ScriptedSnapshotPageError::CursorInvalid,
+    ] {
+        assert_later_page_surface_error(&wallet_query, epoch, page_error).await?;
+    }
+    assert_later_page_encode_error(&wallet_query, epoch).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_tx_non_empty_exclusions_waits_for_full_snapshot_uniqueness()
+-> eyre::Result<()> {
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let epoch = synthetic_chain_epoch();
+    let mut tx_a = [0x11; 32];
+    tx_a[31] = 0xAA;
+    let mut tx_b = [0x22; 32];
+    tx_b[31] = 0xAA;
+    let mut tx_c = [0x33; 32];
+    tx_c[31] = 0xBB;
+
+    let (surface, _fetched) = ScriptedPagedSnapshotSurface::new(vec![
+        ScriptedSnapshotPage::Entries(vec![synthetic_entry_with_transaction_id(tx_a, epoch)?]),
+        ScriptedSnapshotPage::Entries(vec![
+            ironwood_only_entry_with_transaction_id(tx_b, epoch)?,
+            synthetic_entry_with_transaction_id(tx_c, epoch)?,
+        ]),
+    ]);
+    let (surface, page_two_gate, _cancelled_rx) = surface.with_page_gate(1);
+    let adapter = Arc::new(
+        LightwalletdGrpcAdapter::new(wallet_query).with_mempool_surface(Arc::new(surface)),
+    );
+
+    let adapter_task = Arc::clone(&adapter);
+    let mut request_task = tokio::spawn(async move {
+        adapter_task
+            .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+                exclude_txid_suffixes: vec![vec![0xAA], vec![0xBB]],
+                pool_types: vec![lightwalletd::PoolType::Sapling as i32],
+            }))
+            .await
+    });
+
+    page_two_gate
+        .wait_until_reached(Duration::from_secs(2))
+        .await?;
+    let premature = tokio::time::timeout(Duration::from_millis(50), &mut request_task).await;
+    assert!(
+        premature.is_err(),
+        "non-empty exclusions must wait for full snapshot observation before returning response"
+    );
+
+    page_two_gate.release()?;
+    let response = tokio::time::timeout(Duration::from_secs(2), request_task)
+        .await???
+        .into_inner();
+    let collected = collect_compact_txids(response).await?;
+    assert_eq!(collected, vec![tx_a.to_vec()]);
+    Ok(())
 }

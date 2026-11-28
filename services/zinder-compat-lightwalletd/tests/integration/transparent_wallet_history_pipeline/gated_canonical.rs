@@ -123,6 +123,24 @@ impl CanonicalReader for GatedBatchCanonicalReader {
         self.inner.compact_block_at(height).await
     }
 
+    async fn encoded_compact_block_at(
+        &self,
+        height: BlockHeight,
+        selection: zinder_store::CompactBlockSpliceSelection,
+    ) -> Result<zinder_query::EncodedCompactBlockLookup, StorageReadError> {
+        self.inner.encoded_compact_block_at(height, selection).await
+    }
+
+    async fn encoded_compact_block_by_hash(
+        &self,
+        block_hash: BlockHash,
+        selection: zinder_store::CompactBlockSpliceSelection,
+    ) -> Result<zinder_query::EncodedCompactBlockLookup, StorageReadError> {
+        self.inner
+            .encoded_compact_block_by_hash(block_hash, selection)
+            .await
+    }
+
     async fn compact_blocks_in_range(
         &self,
         range: BlockHeightRange,

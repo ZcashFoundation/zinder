@@ -24,10 +24,11 @@ use zinder_core::{
     TransparentOutPoint, TransparentOutpointSpendStatus, TxStatus,
 };
 use zinder_proto::capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1;
+use zinder_proto::compat::lightwalletd::EncodedBlock;
 use zinder_source::SourceError;
 use zinder_store::{
     ArtifactFamily, ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume,
-    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EncodedCompactBlockRange,
+    CompactBlockSpliceSelection, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EncodedCompactBlockRange,
     EncodedCompactBlockRangeRequest, EventStreamStartPosition, HeightOrder, StoreError,
     StreamCursorTokenV1,
 };
@@ -92,8 +93,8 @@ pub use ordered_transactions::{
 pub use rocksdb_serving_readers::MinedTransactionDigest;
 pub use rocksdb_serving_readers::{RocksDbCanonicalReader, RocksDbWalletReader};
 pub use serving_readers::{
-    CanonicalReader, IndexedTransaction, SpendStatusReadEnd, StorageReadError,
-    WalletProjectionReader, read_on_blocking_thread,
+    CanonicalReader, EncodedCompactBlockLookup, IndexedTransaction, SpendStatusReadEnd,
+    StorageReadError, WalletProjectionReader, read_on_blocking_thread,
 };
 pub use transparent_unspent_output_stream::{
     TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressUnspentOutputs,
@@ -231,6 +232,18 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlock, QueryError>;
+
+    /// Reads one pre-encoded lightwalletd compact-block wire payload at `height`
+    /// directly from canonical `ZSHRNG02` + `ZSTSUP01` or `live_tail_block`, or
+    /// returns `Ok(None)` when the implementation does not expose segment framing.
+    async fn encoded_compact_block_at(
+        &self,
+        _height: BlockHeight,
+        _selection: CompactBlockSpliceSelection,
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<Option<EncodedCompactBlock>, QueryError> {
+        Ok(None)
+    }
 
     /// Reads compact block artifacts for an inclusive height range.
     async fn compact_blocks_in_range(
@@ -864,6 +877,15 @@ pub struct CompactBlock {
     pub chain_epoch: ChainEpoch,
     /// Compact block artifact at the requested height.
     pub compact_block: CompactBlockArtifact,
+}
+
+/// Pre-encoded single compact block wire payload bound to one chain epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedCompactBlock {
+    /// Chain epoch used to answer the query.
+    pub chain_epoch: ChainEpoch,
+    /// Length-delimited gRPC-framed protobuf `CompactBlock` payload.
+    pub compact_block: EncodedBlock,
 }
 
 /// Compact block range response bound to one chain epoch.

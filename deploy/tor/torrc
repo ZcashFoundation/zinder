@@ -1,0 +1,10 @@
+DataDirectory /var/lib/tor
+Log notice stdout
+SocksPort 0
+ControlPort 0
+ORPort 0
+
+HiddenServiceDir /var/lib/tor/zinder
+HiddenServiceVersion 3
+HiddenServicePort 9067 127.0.0.1:9067
+HiddenServicePort 9102 127.0.0.1:9102

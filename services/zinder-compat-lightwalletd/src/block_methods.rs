@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use prost::Message as _;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Status};
@@ -32,8 +33,11 @@ use zinder_core::{
         encode_internal_block_hash,
     },
 };
-use zinder_proto::compat::lightwalletd::{self, LIGHTWALLETD_PROTOCOL_VERSION};
-use zinder_store::{EncodedCompactBlockRange, EncodedCompactBlockRangeRequest, HeightOrder};
+use zinder_proto::compat::lightwalletd::{self, EncodedBlock, LIGHTWALLETD_PROTOCOL_VERSION};
+use zinder_store::{
+    CompactBlockSpliceSelection, EncodedCompactBlockRange, EncodedCompactBlockRangeRequest,
+    HeightOrder,
+};
 
 use crate::block_range::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES, BlockRangeChunks,
@@ -227,6 +231,18 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
         view: &Self::View,
         block: RequestedBlock,
     ) -> impl Future<Output = Result<CompactBlockArtifact, Status>> + Send;
+
+    /// Reads one pre-encoded unary compact block directly from canonical
+    /// `ZSHRNG02` + `ZSTSUP01` or `live_tail_block` when supported, or returns
+    /// `Ok(None)` so [`compact_block`] falls back to [`Self::read_compact_block`].
+    fn read_encoded_compact_block(
+        &self,
+        _view: &Self::View,
+        _block: RequestedBlock,
+        _selection: CompactBlockSpliceSelection,
+    ) -> impl Future<Output = Result<Option<EncodedBlock>, Status>> + Send {
+        std::future::ready(Ok(None))
+    }
 
     /// Streams encoded compact-block wire payloads directly from `ZSHRNG02`
     /// settled segments and `live_tail_block`, or defers to
@@ -704,8 +720,20 @@ pub(crate) async fn compact_block<Reads: CompactBlockReads>(
     if let RequestedBlock::Height(height) = block {
         reject_future_block_height(height, Reads::view_chain_epoch(&view).visible_tip_height)?;
     }
-    let compact_block = reads.read_compact_block(&view, block).await?;
-    let compact_block = shape.message(compact_block)?;
+    let compact_block = if let Some(selection) = shape.unary_splice_selection()
+        && let Some(encoded) = reads
+            .read_encoded_compact_block(&view, block, selection)
+            .await?
+    {
+        lightwalletd::CompactBlock::decode(encoded.payload()).map_err(|error| {
+            Status::data_loss(format!(
+                "failed to decode encoded compact block protobuf: {error}"
+            ))
+        })?
+    } else {
+        let compact_block = reads.read_compact_block(&view, block).await?;
+        shape.message(compact_block)?
+    };
     if !block_id.hash.is_empty() && block_id.hash != compact_block.hash {
         return Err(Status::not_found(
             "requested block hash does not match indexed block",

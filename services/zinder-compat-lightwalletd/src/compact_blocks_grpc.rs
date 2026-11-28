@@ -15,13 +15,13 @@ use arc_swap::ArcSwap;
 use tokio::sync::watch;
 use tonic::{Request, Response, Status};
 use zinder_core::{ChainEpoch, CompactBlockArtifact, NetworkUpgradeActivations};
-use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
+use zinder_proto::compat::lightwalletd::{self, EncodedBlock, compact_tx_streamer_server};
 use zinder_query::{
-    ArtifactKey, CanonicalReader, QueryError, RocksDbCanonicalReader, StorageReadError,
-    read_on_blocking_thread, status_from_query_error,
+    ArtifactKey, CanonicalReader, EncodedCompactBlockLookup, QueryError, RocksDbCanonicalReader,
+    StorageReadError, read_on_blocking_thread, status_from_query_error,
 };
 use zinder_runtime::RepeatedFieldGuard;
-use zinder_store::{ArtifactFamily, EncodedCompactBlockRangeRequest};
+use zinder_store::{ArtifactFamily, CompactBlockSpliceSelection, EncodedCompactBlockRangeRequest};
 
 use crate::block_methods::{
     self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
@@ -162,6 +162,40 @@ impl CompactBlockReads for CanonicalReaderSlot {
                 .await
                 .map_err(storage_status)?
                 .ok_or_else(|| status_from_query_error(&QueryError::BlockNotInBestChain)),
+        }
+    }
+
+    async fn read_encoded_compact_block(
+        &self,
+        view: &Arc<RocksDbCanonicalReader>,
+        block: RequestedBlock,
+        selection: CompactBlockSpliceSelection,
+    ) -> Result<Option<EncodedBlock>, Status> {
+        let lookup = match block {
+            RequestedBlock::Height(height) => view
+                .encoded_compact_block_at(height, selection)
+                .await
+                .map_err(storage_status)?,
+            // The reader resolves the hash and splices its block in one storage read.
+            RequestedBlock::Hash(block_hash) => view
+                .encoded_compact_block_by_hash(block_hash, selection)
+                .await
+                .map_err(storage_status)?,
+        };
+        match lookup {
+            EncodedCompactBlockLookup::Block(encoded) => Ok(Some(encoded)),
+            EncodedCompactBlockLookup::NotFound => Err(match block {
+                RequestedBlock::Height(height) => {
+                    status_from_query_error(&QueryError::ArtifactUnavailable {
+                        family: ArtifactFamily::CompactBlock,
+                        key: ArtifactKey::BlockHeight(height),
+                    })
+                }
+                RequestedBlock::Hash(_) => {
+                    status_from_query_error(&QueryError::BlockNotInBestChain)
+                }
+            }),
+            EncodedCompactBlockLookup::Unsupported => Ok(None),
         }
     }
 

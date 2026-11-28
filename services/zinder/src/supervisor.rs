@@ -21,7 +21,8 @@ use crate::{
     config::{RoleLaunchSpec, SupervisionPlan},
     ops::{
         RoleOpsSnapshot, SharedOpsState, StartupStage, SupervisorOpsError, SupervisorOpsHandle,
-        fetch_child_capabilities, fetch_child_readyz, spawn_supervisor_ops,
+        fetch_child_capabilities, fetch_child_readyz, fetch_child_served_chain,
+        spawn_supervisor_ops,
     },
 };
 
@@ -339,6 +340,7 @@ async fn poll_children_and_publish(
             Ok(Some(status)) => {
                 "exited".clone_into(&mut entry.snapshot.state);
                 entry.snapshot.ready = false;
+                entry.snapshot.served_chain = None;
                 entry.snapshot.detail = Some(format!("exited with {status}"));
                 exited_role = Some((entry.spec.role.label(), status));
                 break;
@@ -367,7 +369,19 @@ async fn poll_children_and_publish(
 }
 
 async fn refresh_child_snapshot(entry: &mut ManagedChild) {
-    if let Some((is_ready, payload)) = fetch_child_readyz(entry.ops_addr).await {
+    let serves_wallet_chain = matches!(
+        entry.spec.role,
+        ServiceRole::Query | ServiceRole::CompatLightwalletd
+    );
+    let (readyz, served_chain) = tokio::join!(fetch_child_readyz(entry.ops_addr), async {
+        if serves_wallet_chain {
+            fetch_child_served_chain(entry.ops_addr).await
+        } else {
+            None
+        }
+    });
+    entry.snapshot.served_chain = served_chain;
+    if let Some((is_ready, payload)) = readyz {
         if !entry.snapshot.capabilities_loaded
             && let Some(capabilities) = fetch_child_capabilities(entry.ops_addr).await
         {

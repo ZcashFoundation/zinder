@@ -1,14 +1,16 @@
-use std::{num::NonZeroU32, path::Path};
+use std::{cell::RefCell, num::NonZeroU32, path::Path};
 
 use tempfile::TempDir;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockId, Network, UnixTimestampMillis,
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpochId, Network, UnixTimestampMillis,
 };
 
 use super::{
-    CanonicalLiveAppend, CanonicalReorgPolicy, CanonicalStoreError, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore,
-    live_replacement_tests::{published_store, replacement_block},
+    CanonicalEventRetentionStepBudget, CanonicalEventRetentionStepStop, CanonicalLiveAppend,
+    CanonicalReorgPolicy, CanonicalStoreError, ProjectionBuildLease, ProjectionBuildLeaseId,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    live_replacement_tests::{open_store, published_store, replacement_block},
+    publication::read_chain_epoch_tips,
 };
 use crate::{
     ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily,
@@ -376,4 +378,511 @@ fn event_sequences(envelopes: &[ChainEventEnvelope]) -> Vec<u64> {
         .iter()
         .map(|envelope| envelope.event_sequence)
         .collect()
+}
+
+fn retention_budget(
+    max_inspected: u32,
+    max_deleted: u32,
+) -> Result<CanonicalEventRetentionStepBudget, Box<dyn std::error::Error>> {
+    Ok(CanonicalEventRetentionStepBudget::new(
+        NonZeroU32::new(max_inspected).ok_or("max_inspected must be nonzero")?,
+        NonZeroU32::new(max_deleted).ok_or("max_deleted must be nonzero")?,
+    ))
+}
+
+fn store_with_ten_events(
+    directory: &Path,
+) -> Result<(RocksDbCanonicalStore, RocksDbCanonicalSecondary), Box<dyn std::error::Error>> {
+    let store_path = directory.join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let mut store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    for height in 5_u8..=13 {
+        let created_at_offset = if height <= 11 {
+            u64::from(height - 4)
+        } else {
+            u64::from(height - 11) * 100
+        };
+        store = append_block(
+            store,
+            &activations,
+            height,
+            BlockHeight::new(u32::from(height - 2)),
+            created_at_offset,
+        )?;
+    }
+    let secondary = open_secondary(&store_path, &directory.join("secondary"))?;
+    Ok((store, secondary))
+}
+
+fn assert_observed_step(
+    store: &RocksDbCanonicalStore,
+    cutoff: UnixTimestampMillis,
+    now: UnixTimestampMillis,
+    budget: CanonicalEventRetentionStepBudget,
+) -> Result<(super::CanonicalEventRetentionStepOutcome, Vec<u64>), Box<dyn std::error::Error>> {
+    let inspected = RefCell::new(Vec::new());
+    let outcome =
+        store.advance_canonical_event_retention_with_observer(cutoff, now, budget, |sequence| {
+            inspected.borrow_mut().push(sequence);
+        })?;
+    Ok((outcome, inspected.into_inner()))
+}
+
+fn assert_cursor_expired(
+    secondary: &RocksDbCanonicalSecondary,
+    cursor: &crate::StreamCursorTokenV1,
+    expected_sequence: u64,
+    expected_floor: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let error = wallet_history(secondary, Some(cursor), ChainEventStreamFamily::Visible, 10)
+        .err()
+        .ok_or("expected expired cursor")?;
+    assert!(
+        matches!(
+            error,
+            CanonicalStoreError::CanonicalEventCursorExpired {
+                event_sequence,
+                oldest_retained_sequence,
+            } if event_sequence == expected_sequence
+                && oldest_retained_sequence == expected_floor
+        ),
+        "unexpected cursor error: {error:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn bounded_retention_noop_when_floor_at_head_or_unexpired() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temporary = TempDir::new()?;
+    let (store, _secondary) = store_with_ten_events(temporary.path())?;
+    let budget = retention_budget(4, 4)?;
+    let before_all = UnixTimestampMillis::new(BASELINE_CREATED_AT);
+    let (unexpired_step, inspected_unexpired) =
+        assert_observed_step(&store, before_all, before_all, budget)?;
+    assert_eq!(inspected_unexpired, vec![1]);
+    assert_eq!(unexpired_step.inspected_event_count, 1);
+    assert_eq!(unexpired_step.report.oldest_retained_sequence, 1);
+    assert_eq!(unexpired_step.report.pruned_event_count, 0);
+    assert_eq!(
+        unexpired_step.stop,
+        CanonicalEventRetentionStepStop::ReachedUnexpiredEvent
+    );
+
+    store.prune_canonical_events_before(10, before_all)?;
+    let far_future = UnixTimestampMillis::new(BASELINE_CREATED_AT + 1_000);
+    let (at_head_step, inspected_at_head) =
+        assert_observed_step(&store, far_future, far_future, budget)?;
+    assert_eq!(inspected_at_head, [] as [u64; 0]);
+    assert_eq!(at_head_step.inspected_event_count, 0);
+    assert_eq!(at_head_step.report.oldest_retained_sequence, 10);
+    assert_eq!(at_head_step.report.pruned_event_count, 0);
+    assert_eq!(
+        at_head_step.stop,
+        CanonicalEventRetentionStepStop::ReachedHead
+    );
+    Ok(())
+}
+
+#[test]
+fn bounded_retention_resumes_across_asymmetric_budgets_restarts_and_preserves_epochs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let (store, mut secondary) = store_with_ten_events(temporary.path())?;
+    let events = wallet_history(&secondary, None, ChainEventStreamFamily::Visible, 10)?;
+    assert_eq!(event_sequences(&events), (1..=10).collect::<Vec<_>>());
+    let cutoff = UnixTimestampMillis::new(BASELINE_CREATED_AT + 50);
+
+    let (step_one, inspected_one) =
+        assert_observed_step(&store, cutoff, cutoff, retention_budget(3, 2)?)?;
+    assert_eq!(inspected_one, vec![1, 2, 3]);
+    assert_eq!(step_one.inspected_event_count, 3);
+    assert_eq!(step_one.report.oldest_retained_sequence, 4);
+    assert_eq!(step_one.report.pruned_event_count, 2);
+    assert_eq!(
+        step_one.stop,
+        CanonicalEventRetentionStepStop::BudgetExhausted
+    );
+    assert!(step_one.has_immediate_work());
+
+    drop(store);
+    let store = open_store(&store_path, &activations, REORG_WINDOW)?;
+    assert_eq!(store.canonical_event_retention_floor()?, 4);
+    secondary.try_catch_up()?;
+    assert_cursor_expired(&secondary, &events[1].cursor, 2, 4)?;
+    assert_eq!(
+        event_sequences(&wallet_history(
+            &secondary,
+            Some(&events[2].cursor),
+            ChainEventStreamFamily::Visible,
+            2,
+        )?),
+        vec![4, 5]
+    );
+
+    let (step_two, inspected_two) =
+        assert_observed_step(&store, cutoff, cutoff, retention_budget(2, 5)?)?;
+    assert_eq!(inspected_two, vec![4, 5]);
+    assert_eq!(step_two.report.oldest_retained_sequence, 6);
+    assert_eq!(step_two.report.pruned_event_count, 2);
+    assert_eq!(
+        step_two.stop,
+        CanonicalEventRetentionStepStop::BudgetExhausted
+    );
+
+    let (step_three, inspected_three) =
+        assert_observed_step(&store, cutoff, cutoff, retention_budget(10, 10)?)?;
+    assert_eq!(inspected_three, vec![6, 7, 8, 9]);
+    assert_eq!(step_three.report.oldest_retained_sequence, 9);
+    assert_eq!(step_three.report.pruned_event_count, 3);
+    assert_eq!(
+        step_three.stop,
+        CanonicalEventRetentionStepStop::ReachedUnexpiredEvent
+    );
+
+    secondary.try_catch_up()?;
+    assert_cursor_expired(&secondary, &events[6].cursor, 7, 9)?;
+    assert_eq!(
+        event_sequences(&wallet_history(
+            &secondary,
+            Some(&events[7].cursor),
+            ChainEventStreamFamily::Visible,
+            10,
+        )?),
+        vec![9, 10]
+    );
+    for epoch in 1_u64..=10 {
+        let _tips = read_chain_epoch_tips(&store.bounded_open.db, ChainEpochId::new(epoch))?;
+    }
+    Ok(())
+}
+
+fn acquire_test_lease(
+    store: &RocksDbCanonicalStore,
+    tag: u8,
+    anchor: super::ProjectionBuildAnchor,
+    expires_at: UnixTimestampMillis,
+    now: UnixTimestampMillis,
+) -> Result<ProjectionBuildLease, Box<dyn std::error::Error>> {
+    Ok(store.acquire_projection_build_lease(
+        ProjectionBuildLease::new(
+            ProjectionBuildLeaseId::from_bytes([tag; 16]),
+            anchor,
+            expires_at,
+        ),
+        now,
+    )?)
+}
+
+fn assert_pinned_lease_blocks_scans(
+    store: &RocksDbCanonicalStore,
+    cutoff: UnixTimestampMillis,
+    now: UnixTimestampMillis,
+    expected_floor: u64,
+    expected_anchor: super::ProjectionBuildAnchor,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pinned_step, inspected_pinned) =
+        assert_observed_step(store, cutoff, now, retention_budget(5, 5)?)?;
+    assert_eq!(inspected_pinned, [] as [u64; 0]);
+    assert_eq!(pinned_step.report.oldest_retained_sequence, expected_floor);
+    assert_eq!(
+        pinned_step.report.lease_protected_anchor,
+        Some(expected_anchor)
+    );
+    assert_eq!(
+        pinned_step.stop,
+        CanonicalEventRetentionStepStop::LeaseProtected
+    );
+    let (_, inspected_again) = assert_observed_step(store, cutoff, now, retention_budget(5, 5)?)?;
+    assert_eq!(inspected_again, [] as [u64; 0]);
+    Ok(())
+}
+
+fn setup_pinned_test_leases(
+    store: &RocksDbCanonicalStore,
+    t0: UnixTimestampMillis,
+) -> Result<
+    (
+        ProjectionBuildLease,
+        ProjectionBuildLease,
+        ProjectionBuildLease,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let events = store.canonical_event_history(super::CanonicalEventHistoryRequest::new(
+        None,
+        NonZeroU32::new(10).ok_or("limit must be nonzero")?,
+    ))?;
+    let lease_one = acquire_test_lease(
+        store,
+        1,
+        events[0].projection_build_anchor(),
+        UnixTimestampMillis::new(t0.value() + 100),
+        t0,
+    )?;
+    let lease_five = acquire_test_lease(
+        store,
+        5,
+        events[4].projection_build_anchor(),
+        UnixTimestampMillis::new(t0.value() + 500),
+        t0,
+    )?;
+    let expired_lease_two = acquire_test_lease(
+        store,
+        2,
+        events[1].projection_build_anchor(),
+        UnixTimestampMillis::new(t0.value() + 10),
+        t0,
+    )?;
+    Ok((lease_one, lease_five, expired_lease_two))
+}
+
+#[test]
+fn bounded_retention_skips_lease_pinned_prefix_and_cleans_expired_leases_atomically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let (store, mut secondary) = store_with_ten_events(temporary.path())?;
+    let first_cursor = wallet_history(&secondary, None, ChainEventStreamFamily::Visible, 1)?
+        .into_iter()
+        .next()
+        .ok_or("expected baseline wallet event")?
+        .cursor;
+    let t0 = UnixTimestampMillis::new(BASELINE_CREATED_AT + 1_000);
+    let cutoff = t0;
+    let (lease_one, lease_five, expired_lease_two) = setup_pinned_test_leases(&store, t0)?;
+
+    let t_after_two = UnixTimestampMillis::new(t0.value() + 20);
+    assert_pinned_lease_blocks_scans(&store, cutoff, t_after_two, 1, lease_one.anchor())?;
+    assert!(
+        store
+            .active_projection_build_lease(expired_lease_two.id(), t0)?
+            .is_none(),
+        "expired lease must be deleted atomically even when pruning is pinned"
+    );
+
+    let t_after_one = UnixTimestampMillis::new(t0.value() + 150);
+    let (step_one, inspected_one) =
+        assert_observed_step(&store, cutoff, t_after_one, retention_budget(2, 2)?)?;
+    assert_eq!(inspected_one, vec![1, 2]);
+    assert_eq!(step_one.report.oldest_retained_sequence, 3);
+    assert_eq!(
+        step_one.stop,
+        CanonicalEventRetentionStepStop::BudgetExhausted
+    );
+    assert!(
+        store
+            .active_projection_build_lease(lease_one.id(), t0)?
+            .is_none()
+    );
+
+    let (step_two, inspected_two) =
+        assert_observed_step(&store, cutoff, t_after_one, retention_budget(5, 5)?)?;
+    assert_eq!(inspected_two, vec![3, 4]);
+    assert_eq!(step_two.report.oldest_retained_sequence, 5);
+    assert_eq!(
+        step_two.stop,
+        CanonicalEventRetentionStepStop::LeaseProtected
+    );
+    assert_pinned_lease_blocks_scans(&store, cutoff, t_after_one, 5, lease_five.anchor())?;
+
+    let t_after_five = UnixTimestampMillis::new(t0.value() + 600);
+    let (drain_one, _) =
+        assert_observed_step(&store, cutoff, t_after_five, retention_budget(3, 3)?)?;
+    assert_eq!(drain_one.report.oldest_retained_sequence, 8);
+    assert_eq!(
+        drain_one.stop,
+        CanonicalEventRetentionStepStop::BudgetExhausted
+    );
+    assert!(
+        store
+            .active_projection_build_lease(lease_five.id(), t0)?
+            .is_none()
+    );
+    let (drain_two, _) =
+        assert_observed_step(&store, cutoff, t_after_five, retention_budget(3, 3)?)?;
+    assert_eq!(drain_two.report.oldest_retained_sequence, 10);
+    assert_eq!(drain_two.stop, CanonicalEventRetentionStepStop::ReachedHead);
+
+    secondary.try_catch_up()?;
+    assert_eq!(
+        event_sequences(&wallet_history(
+            &secondary,
+            None,
+            ChainEventStreamFamily::Visible,
+            10,
+        )?),
+        vec![10]
+    );
+    assert_cursor_expired(&secondary, &first_cursor, 1, 10)?;
+    for epoch in 1_u64..=10 {
+        let _tips = read_chain_epoch_tips(&store.bounded_open.db, ChainEpochId::new(epoch))?;
+    }
+    Ok(())
+}
+
+fn setup_explicit_multi_chunk_prune_leases(
+    store: &RocksDbCanonicalStore,
+    t0: UnixTimestampMillis,
+) -> Result<(ProjectionBuildLease, ProjectionBuildLease), Box<dyn std::error::Error>> {
+    let canonical_events =
+        store.canonical_event_history(super::CanonicalEventHistoryRequest::new(
+            None,
+            NonZeroU32::new(10).ok_or("limit must be nonzero")?,
+        ))?;
+    let expired_lease = acquire_test_lease(
+        store,
+        2,
+        canonical_events[1].projection_build_anchor(),
+        UnixTimestampMillis::new(t0.value() + 10),
+        t0,
+    )?;
+    let live_lease = acquire_test_lease(
+        store,
+        9,
+        canonical_events[8].projection_build_anchor(),
+        UnixTimestampMillis::new(t0.value() + 500),
+        t0,
+    )?;
+    Ok((expired_lease, live_lease))
+}
+
+#[derive(Clone, Copy)]
+struct ExplicitPruneReopenExpectation<'a> {
+    store_path: &'a Path,
+    activations: &'a zinder_core::NetworkUpgradeActivations,
+    expected_floor: u64,
+    expired_sequence: u64,
+    expired_cursor: &'a crate::StreamCursorTokenV1,
+    resume_cursor: &'a crate::StreamCursorTokenV1,
+    expected_visible_sequences: &'a [u64],
+}
+
+fn assert_reopened_explicit_prune_state(
+    secondary: &mut RocksDbCanonicalSecondary,
+    expectation: ExplicitPruneReopenExpectation<'_>,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    let store = open_store(
+        expectation.store_path,
+        expectation.activations,
+        REORG_WINDOW,
+    )?;
+    assert_eq!(
+        store.canonical_event_retention_floor()?,
+        expectation.expected_floor
+    );
+    secondary.try_catch_up()?;
+    assert_cursor_expired(
+        secondary,
+        expectation.expired_cursor,
+        expectation.expired_sequence,
+        expectation.expected_floor,
+    )?;
+    assert_eq!(
+        event_sequences(&wallet_history(
+            secondary,
+            Some(expectation.resume_cursor),
+            ChainEventStreamFamily::Visible,
+            10,
+        )?),
+        expectation.expected_visible_sequences
+    );
+    for epoch in 1_u64..=10 {
+        let _tips = read_chain_epoch_tips(&store.bounded_open.db, ChainEpochId::new(epoch))?;
+    }
+    Ok(store)
+}
+
+#[test]
+fn explicit_multi_chunk_prune_recovers_after_interruption_reopen_and_resume()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let (store, mut secondary) = store_with_ten_events(temporary.path())?;
+    let events = wallet_history(&secondary, None, ChainEventStreamFamily::Visible, 10)?;
+    let t0 = UnixTimestampMillis::new(BASELINE_CREATED_AT + 1_000);
+    let (expired_lease, live_lease) = setup_explicit_multi_chunk_prune_leases(&store, t0)?;
+
+    let now = UnixTimestampMillis::new(t0.value() + 100);
+    let err = store
+        .prune_canonical_events_before_with_chunk_hook(10, now, 3, |chunk_index| {
+            (chunk_index != 1)
+                .then_some(())
+                .ok_or_else(|| CanonicalStoreError::publication("interrupted chunk 1"))
+        })
+        .err()
+        .ok_or("expected simulated multi-chunk interruption")?;
+    assert!(matches!(
+        err,
+        CanonicalStoreError::PublicationRefused { .. }
+    ));
+
+    drop(store);
+    let store = assert_reopened_explicit_prune_state(
+        &mut secondary,
+        ExplicitPruneReopenExpectation {
+            store_path: &store_path,
+            activations: &activations,
+            expected_floor: 4,
+            expired_sequence: 2,
+            expired_cursor: &events[1].cursor,
+            resume_cursor: &events[2].cursor,
+            expected_visible_sequences: &[4, 5, 6, 7, 8, 9, 10],
+        },
+    )?;
+    assert!(
+        store
+            .active_projection_build_lease(expired_lease.id(), t0)?
+            .is_none()
+    );
+    assert_eq!(
+        store.active_projection_build_lease(live_lease.id(), now)?,
+        Some(live_lease)
+    );
+
+    let mut resumed_chunks = Vec::new();
+    let resumed_report =
+        store.prune_canonical_events_before_with_chunk_hook(10, now, 3, |chunk_index| {
+            resumed_chunks.push(chunk_index);
+            Ok(())
+        })?;
+    assert_eq!(resumed_chunks, vec![0, 1]);
+    assert_eq!(resumed_report.oldest_retained_sequence, 9);
+    assert_eq!(resumed_report.pruned_event_count, 5);
+    assert_eq!(
+        resumed_report.lease_protected_anchor,
+        Some(live_lease.anchor())
+    );
+
+    drop(store);
+    let store = assert_reopened_explicit_prune_state(
+        &mut secondary,
+        ExplicitPruneReopenExpectation {
+            store_path: &store_path,
+            activations: &activations,
+            expected_floor: 9,
+            expired_sequence: 7,
+            expired_cursor: &events[6].cursor,
+            resume_cursor: &events[7].cursor,
+            expected_visible_sequences: &[9, 10],
+        },
+    )?;
+    let final_report =
+        store.prune_canonical_events_before(10, UnixTimestampMillis::new(t0.value() + 600))?;
+    assert_eq!(final_report.oldest_retained_sequence, 10);
+    assert_eq!(final_report.pruned_event_count, 1);
+    assert_eq!(final_report.lease_protected_anchor, None);
+    assert!(
+        store
+            .active_projection_build_lease(live_lease.id(), t0)?
+            .is_none()
+    );
+    Ok(())
 }

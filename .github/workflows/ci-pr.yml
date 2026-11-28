@@ -386,7 +386,10 @@ jobs:
         run: scripts/test-install-ci-tool.sh
 
       - name: Lint runbook shell blocks
-        run: scripts/runbook-lint.sh docs/runbooks/testing.md
+        run: |
+          scripts/test-runbook-lint.sh
+          scripts/runbook-lint.sh docs/runbooks/testing.md
+          scripts/runbook-lint.sh docs/runbooks/exposing-over-tls.md
 
       - name: Require release note fragment or waiver
         if: github.event_name == 'pull_request'
@@ -424,6 +427,9 @@ jobs:
 
       - name: Test deployment admission
         run: scripts/test-deployment-admission.sh
+
+      - name: Test compatibility Caddyfile
+        run: scripts/test-compat-lightwalletd-caddyfile.sh
 
       - name: Test release image publication
         run: scripts/test-release-image-publication.sh
@@ -587,6 +593,11 @@ jobs:
         with:
           cache-key: sdk
           save-cache: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check domain-only SDK for WebAssembly
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --locked -p zinder-core -p zinder-client --no-default-features --target wasm32-unknown-unknown
 
       - name: Verify registry packages and extracted consumer
         run: scripts/verify-sdk-packages.sh

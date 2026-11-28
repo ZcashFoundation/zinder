@@ -81,12 +81,15 @@ For traffic by protocol method, use the [wallet RPC listener metrics](../referen
 
 On Linux, every service binary allocates through jemalloc, and jemalloc also serves the C `malloc` that RocksDB calls. Tune it with `MALLOC_CONF`. Glibc variables such as `MALLOC_ARENA_MAX` have no effect. `MALLOC_CONF=stats_print:true` prints allocator statistics when the process exits, and `MALLOC_CONF=background_thread:true` returns freed memory to the kernel while the process is idle. [ADR-0005](../adrs/0005-bounded-process-memory.md) records why.
 
+When trace export is enabled, each serving process owns its own provider.
+It flushes the bounded export queue after supervised serving tasks drain.
+
 ## Security boundary
 
 Zinder protects the integrity of the chain data it stores and serves. Transport security belongs to the proxy in front of it. Every Zinder listener serves plaintext, and your proxy terminates TLS and enforces authentication, rate limits, and quotas. Certificate provisioning, rotation, and client policy therefore stay in your proxy, as [ADR-0011](../adrs/0011-ingest-control-transport-security.md) records. Before you expose a deployment, do three things:
 
 1. **Put the wallet listeners behind your proxy.** The native wallet gRPC listener (`zinder-query`), the lightwalletd listener (`zinder-compat-lightwalletd`), and the Cipherscan REST adapter serve plaintext without client authentication. The Explorer listener serves plaintext and can require one shared bearer token for `ExplorerQuery` (`explorer.bearer_token_path`). Health and reflection accept calls without a token. [Exposing over TLS](../runbooks/exposing-over-tls.md) shows one setup.
-2. **Keep the operational endpoint private.** `/healthz`, `/readyz`, and `/metrics` serve without authentication. The endpoint accepts at most 64 connections, so any client that reaches it can make your health probes and metric scrapes fail. Bind `ops.listen_addr` to loopback or to a private network that your orchestrator and metrics scraper alone reach.
+2. **Keep the operational endpoint private.** `/healthz`, `/readyz`, and `/metrics` serve without authentication. The endpoint accepts at most 64 connections, so any client that reaches it can make your health probes and metric scrapes fail. Bind `ops.listen_addr` to loopback or to a private network that your orchestrator and metrics scraper alone reach. For a public dashboard, expose the [status route](../reference/readiness.md#public-status) through your proxy.
 3. **Keep the control endpoints private.** The ingest control endpoint serves writer status, chain events, and the mempool to readers. Ingest refuses a non-loopback `ingest_control.listen_addr` without `ingest_control.bearer_token_path`. The token travels in plaintext, so keep the endpoint on loopback, as the reference topology does. The projector control endpoint binds to loopback and always requires a bearer token.
 
 Zinder refuses to bind any listener to `0.0.0.0`, `::`, or a public address unless you set `security.allow_public_bind = true`. Loopback and private ranges are always allowed. Setting the flag logs a warning. The flag permits the bind, and the protection comes from your proxy and network.

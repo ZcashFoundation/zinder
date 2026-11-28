@@ -35,6 +35,14 @@ custom:
       - major
       - minor
       - patch
+  - key: Upgrade
+    label: Upgrade class
+    type: enum
+    enumOptions:
+      - compatible
+      - additive-schema
+      - projection-layout
+      - canonical-layout
   - key: PR
     label: Pull request number
     type: int

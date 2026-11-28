@@ -39,8 +39,8 @@ use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 use zinder_client::{
     EndpointBackedIndex, EventStreamStart, IndexerError, MempoolEntry, MempoolEvent,
-    MempoolEventCursor, MempoolSnapshotRequest, Network, RemoteChainIndex, RemoteOpenOptions,
-    RetryPolicy, TransactionId, TransparentAddressScriptHash,
+    MempoolEventCursor, MempoolSnapshotRequest, Network, RemoteChainIndex, RemoteClientOptions,
+    RemoteOpenOptions, RetryPolicy, TransactionId, TransparentAddressScriptHash,
 };
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -112,10 +112,13 @@ async fn run(endpoint: String, network: Network, address: String) -> Result<(), 
 }
 
 async fn observe_once(endpoint: &str, network: Network, address: &str) -> Result<(), IndexerError> {
-    let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
-        endpoint: endpoint.to_owned(),
-        network,
-    })?;
+    let chain_index = RemoteChainIndex::connect_with_options(
+        RemoteOpenOptions {
+            endpoint: endpoint.to_owned(),
+            network,
+        },
+        RemoteClientOptions::default().with_read_retries(),
+    )?;
 
     let script_hash = transparent_address_script_hash(address)?;
     let (watched, resume_cursor) = snapshot_mempool(&chain_index, script_hash, address).await?;

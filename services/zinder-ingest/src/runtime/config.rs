@@ -80,6 +80,8 @@ pub struct IngestCommandConfig {
     pub ingest_control_checkpoint_staging_root: PathBuf,
     /// Operational HTTP endpoint address, or `None` when disabled.
     pub ops_listen_addr: Option<SocketAddr>,
+    /// Optional trace export settings.
+    pub observability: zinder_runtime::ObservabilityConfig,
     /// Whether non-loopback listener binds are allowed.
     pub allow_public_bind: bool,
     /// Retained event-history and mempool cleanup schedule.
@@ -345,6 +347,7 @@ struct IngestConfig {
     deployment: DeploymentSection,
     network: NetworkSection,
     ops: OpsSection,
+    observability: zinder_runtime::ObservabilityConfig,
     node: NodeSection,
     node_fallbacks: NodeFallbackSections,
     storage: IngestPrimaryStorageSection,
@@ -846,6 +849,7 @@ fn resolve_ingest_config(
         ingest_control_checkpoint_bearer_token,
         ingest_control_checkpoint_staging_root,
         ops_listen_addr,
+        observability: config.observability,
         allow_public_bind,
         retention,
         tree_state_densification,
@@ -1016,6 +1020,8 @@ struct RedactedIngestConfigToml {
     deployment: DeploymentToml,
     network: NetworkToml,
     ops: OpsToml,
+    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
+    observability: zinder_runtime::ObservabilityConfig,
     security: SecurityToml,
     node: NodeToml,
     #[serde(skip_serializing_if = "NodeFallbacksToml::is_empty")]
@@ -1037,6 +1043,7 @@ impl RedactedIngestConfigToml {
             deployment: DeploymentToml::from_resolved(config.profile),
             network: NetworkToml::from_network(runtime_config.node.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
+            observability: config.observability.clone(),
             security: SecurityToml::from_resolved(config.allow_public_bind),
             node: NodeToml::from_node_target(&runtime_config.node),
             node_fallbacks: NodeFallbacksToml::from_node_targets(&runtime_config.node_fallbacks),

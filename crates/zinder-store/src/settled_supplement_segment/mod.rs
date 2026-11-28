@@ -45,6 +45,7 @@ pub(crate) use format::{
 pub use format::{
     DEFAULT_MAX_BYTES as DEFAULT_SETTLED_SUPPLEMENT_SEGMENT_MAX_BYTES, SupplementSegmentHeader,
 };
+pub(crate) use reader::SupplementSpliceRequest;
 pub use reader::{
     SettledSupplementSegmentIndex, SettledSupplementSegmentOpenOptions,
     SettledSupplementSegmentReader, SupplementChunkReadStep, SupplementRangePlan,

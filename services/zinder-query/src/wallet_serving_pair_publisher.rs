@@ -56,7 +56,7 @@ use tokio::{
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
-use zinder_core::{ChainEpochId, Network, UnixTimestampMillis};
+use zinder_core::{ChainEpochId, Network};
 use zinder_proto::{
     v1::{
         ingest::{
@@ -638,10 +638,10 @@ impl WalletServingReadiness {
         self.composed.publish_admission(pair_state);
     }
 
-    fn publish_served_epoch(&self, committed_at: UnixTimestampMillis) {
+    fn publish_served_epoch(&self, epoch: &zinder_core::ChainEpoch) {
         self.composed
             .runtime_readiness()
-            .set_served_epoch_committed_at(committed_at);
+            .set_served_chain_epoch(epoch);
     }
 
     fn publish_node_source_cause(&self, node_source_cause: ReadinessCause) {
@@ -2124,8 +2124,7 @@ impl WalletServingPairPublisher {
         if refusal.is_none() {
             self.writer_attestation.attest();
         }
-        self.readiness
-            .publish_served_epoch(pair.chain_epoch().created_at);
+        self.readiness.publish_served_epoch(&pair.chain_epoch());
         self.readiness
             .publish_pair_state(refusal.unwrap_or_else(|| ReadinessState::ready(visible_height)));
         metrics::counter!("zinder_wallet_serving_pair_publisher_publications_total").increment(1);

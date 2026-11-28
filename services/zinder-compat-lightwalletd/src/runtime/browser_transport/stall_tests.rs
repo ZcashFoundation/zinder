@@ -199,6 +199,8 @@ async fn serve_with_response_delay(response_delay: Duration) -> Result<TestServe
     let listener = BrowserListener {
         browser_origins: &origins,
         client_address: ClientAddressSource::Connection,
+        proxy_protocol: zinder_runtime::GrpcProxyProtocol::default(),
+        range_admission: zinder_runtime::GrpcRangeAdmission::default(),
     };
     tokio::spawn(serve_listener(
         &runtime, streamer, incoming, &listener, &readiness,

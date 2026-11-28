@@ -3743,6 +3743,21 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         self.inner.compact_block_at(height, at_epoch_id).await
     }
 
+    async fn encoded_compact_block_at(
+        &self,
+        height: BlockHeight,
+        selection: zinder_store::CompactBlockSpliceSelection,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<Option<zinder_query::EncodedCompactBlock>, QueryError> {
+        if !self.expose_encoded_range {
+            return Ok(None);
+        }
+        self.record(at_epoch_id);
+        self.inner
+            .encoded_compact_block_at(height, selection, at_epoch_id)
+            .await
+    }
+
     async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,

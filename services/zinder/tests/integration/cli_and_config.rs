@@ -75,6 +75,58 @@ fn run_subcommand_accepts_every_role_and_alias() -> eyre::Result<()> {
 }
 
 #[test]
+fn role_startup_distinguishes_config_sources_from_observability_settings() -> eyre::Result<()> {
+    let sandbox = TempDir::new()?;
+    let missing = sandbox.path().join("private-missing-config.toml");
+    let missing_path = missing
+        .to_str()
+        .ok_or_else(|| eyre::eyre!("non-UTF-8 config path"))?;
+    for role in [
+        "ingest",
+        "projector",
+        "query",
+        "compat-lightwalletd",
+        "explorer",
+        "compat-cipherscan",
+    ] {
+        let output = zinder_command(&["run", role, "--config", missing_path]).output()?;
+        assert!(!output.status.success(), "{role}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("failed to load configuration sources"),
+            "{role}: {stderr}"
+        );
+        assert!(!stderr.contains("observability"), "{role}: {stderr}");
+        assert!(
+            !stderr.contains("private-missing-config"),
+            "{role}: {stderr}"
+        );
+    }
+
+    for (contents, diagnostic) in [
+        (
+            "[node]\npassword = \"private-config-token",
+            "failed to load configuration sources",
+        ),
+        (
+            "[observability]\notlp_endpoint = \"http://collector.internal?token=private-config-token\"\n",
+            "invalid observability configuration",
+        ),
+    ] {
+        let config = write_test_config(sandbox.path(), contents)?;
+        let path = config
+            .to_str()
+            .ok_or_else(|| eyre::eyre!("non-UTF-8 config path"))?;
+        let output = zinder_command(&["run", "query", "--config", path]).output()?;
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains(diagnostic), "{stderr}");
+        assert!(!stderr.contains("private-config-token"), "{stderr}");
+    }
+    Ok(())
+}
+
+#[test]
 fn config_validate_and_print_cover_all_presets_with_redaction() -> eyre::Result<()> {
     let sandbox = TempDir::new()?;
     let storage_root = sandbox.path().join("store-root");
@@ -85,7 +137,9 @@ fn config_validate_and_print_cover_all_presets_with_redaction() -> eyre::Result<
             "[node]\njson_rpc_addr = \"http://rpcuser:super-secret-url@127.0.0.1:18232/?token=url-secret\"\n",
             "[node.auth]\nmethod = \"basic\"\nusername = \"rpcuser\"\npassword = \"secret-password\"\n\n",
             "[ingest_control]\nbearer_token = \"secret-control-token\"\n",
-            "checkpoint_bearer_token = \"secret-checkpoint-token\"\n"
+            "checkpoint_bearer_token = \"secret-checkpoint-token\"\n\n",
+            "[observability]\notlp_endpoint = \"http://private-collector.internal:4317\"\n",
+            "sampling_rate = 0.25\n"
         ),
         storage_root.display()
     );
@@ -106,6 +160,7 @@ fn config_validate_and_print_cover_all_presets_with_redaction() -> eyre::Result<
         );
 
         let printed = zinder_command(&["config", "print", "--preset", preset, "--config", cfg_str])
+            .env("ZINDER_OBSERVABILITY__SAMPLING_RATE", "0.5")
             .output()?;
         assert!(
             printed.status.success(),
@@ -119,12 +174,24 @@ fn config_validate_and_print_cover_all_presets_with_redaction() -> eyre::Result<
             "url-secret",
             "secret-control-token",
             "secret-checkpoint-token",
+            "private-collector.internal",
         ] {
             assert!(
                 !stdout.contains(leaked),
                 "preset `{preset}` leaked `{leaked}`:\n{stdout}"
             );
         }
+        let config: toml::Table = toml::from_str(&stdout)?;
+        assert_eq!(
+            config["observability"]["otlp_endpoint"].as_str(),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            config["observability"]["sampling_rate"]
+                .as_float()
+                .map(f64::to_bits),
+            Some(0.5_f64.to_bits())
+        );
         assert!(
             stdout.contains("[REDACTED]"),
             "expected redaction marker:\n{stdout}"
@@ -345,5 +412,62 @@ fn legacy_transactions_raw_blob_policy_fails_closed() -> eyre::Result<()> {
     );
     let stderr = String::from_utf8_lossy(&validate.stderr);
     assert!(stderr.contains("transactions"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn combined_explorer_rejects_a_query_listener_requiring_proxy_protocol() -> eyre::Result<()> {
+    let sandbox = TempDir::new()?;
+    let base = format!(
+        "[network]\nname = \"zcash-regtest\"\n[storage]\ndata_dir = \"{}\"\n[node]\njson_rpc_addr = \"http://127.0.0.1:18232\"\n",
+        sandbox.path().display()
+    );
+    let config = write_test_config(sandbox.path(), &base)?;
+    let config = config
+        .to_str()
+        .ok_or_else(|| eyre::eyre!("non-UTF-8 path"))?;
+    let allowlist = "192.0.2.10/32";
+
+    let env_rejected = zinder_command(&[
+        "serve",
+        "--print-config",
+        "--preset",
+        "explorer",
+        "--config",
+        config,
+    ])
+    .env("ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS", allowlist)
+    .output()?;
+    std::fs::write(
+        config,
+        format!("{base}\n[query]\nproxy_protocol_trusted_cidrs = \"{allowlist}\"\n"),
+    )?;
+    let file_rejected = zinder_command(&[
+        "config", "validate", "--preset", "explorer", "--config", config,
+    ])
+    .output()?;
+    for rejected in [env_rejected, file_rejected] {
+        assert!(!rejected.status.success());
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            stderr.contains("incompatible with the combined explorer preset"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains(allowlist));
+    }
+
+    let wallet = zinder_command(&[
+        "config", "validate", "--preset", "wallet", "--config", config,
+    ])
+    .output()?;
+    assert!(
+        wallet.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wallet.stderr)
+    );
     Ok(())
 }

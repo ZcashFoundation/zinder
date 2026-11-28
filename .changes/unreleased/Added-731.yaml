@@ -1,0 +1,6 @@
+kind: added
+body: Limit concurrent wallet block ranges per client and optionally shed new ranges when Tokio scheduling falls behind. Refused calls include gRPC retry pushback.
+time: 2026-11-27T23:16:20.005440324Z
+custom:
+    Bump: minor
+    PR: "731"

@@ -4,6 +4,7 @@
 use std::{
     cell::RefCell,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Instant,
 };
@@ -21,8 +22,11 @@ use zinder_proto::{
     v1::{ops::ErrorReason, wallet},
 };
 
-use super::MessageBoundaries;
-use super::grpc_timeout::DeadlineExpiry;
+use super::{
+    ClientAddressSource, GrpcRangeAdmission, MessageBoundaries,
+    grpc_timeout::DeadlineExpiry,
+    range_admission::{RangeAdmissions, RangePermit},
+};
 
 const REQUESTS: &str = "zinder_wallet_rpc_requests_total";
 const READINESS_REFUSALS: &str = "zinder_wallet_rpc_readiness_refusals_total";
@@ -52,7 +56,7 @@ enum RpcShape {
 }
 
 impl WalletRpcMetricsLayer {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::WalletQuery => "wallet_query",
             Self::Lightwalletd => "lightwalletd",
@@ -116,6 +120,22 @@ impl WalletRpcMetricsLayer {
                 ("GetStandardFee", Unary),
                 ("Ping", Unary),
             ],
+        }
+    }
+
+    /// Adds per-client block-range admission to wallet RPC metrics. Use the
+    /// same address source as the listener and apply the layer inside transport
+    /// translation.
+    #[must_use]
+    pub fn with_range_admission<S>(
+        self,
+        policy: GrpcRangeAdmission,
+        source: ClientAddressSource,
+    ) -> impl Layer<S, Service = WalletRpcMetrics<S>> + Clone {
+        WalletRangeAdmissionLayer {
+            surface: self,
+            policy,
+            source,
         }
     }
 
@@ -233,7 +253,29 @@ impl<S> Layer<S> for WalletRpcMetricsLayer {
         WalletRpcMetrics {
             inner,
             surface: *self,
+            range_admissions: None,
         }
+    }
+}
+
+#[derive(Clone)]
+struct WalletRangeAdmissionLayer {
+    surface: WalletRpcMetricsLayer,
+    policy: GrpcRangeAdmission,
+    source: ClientAddressSource,
+}
+
+impl<S> Layer<S> for WalletRangeAdmissionLayer {
+    type Service = WalletRpcMetrics<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        let mut service = self.surface.layer(inner);
+        service.range_admissions = Some(RangeAdmissions::new(
+            self.policy,
+            self.source,
+            self.surface.label(),
+        ));
+        service
     }
 }
 
@@ -242,6 +284,7 @@ impl<S> Layer<S> for WalletRpcMetricsLayer {
 pub struct WalletRpcMetrics<S> {
     inner: S,
     surface: WalletRpcMetricsLayer,
+    range_admissions: Option<Arc<RangeAdmissions>>,
 }
 
 impl<S> Service<Request<Body>> for WalletRpcMetrics<S>
@@ -262,7 +305,14 @@ where
             return Either::Left(self.inner.call(request));
         };
         if request.method() != http::Method::POST {
-            return Either::Left(self.inner.call(request));
+            return Either::Right(Box::pin(async {
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = http::StatusCode::METHOD_NOT_ALLOWED;
+                response
+                    .headers_mut()
+                    .insert(http::header::ALLOW, http::HeaderValue::from_static("POST"));
+                Ok(response)
+            }));
         }
         let method = WalletRpcMethod {
             surface: self.surface.label(),
@@ -271,6 +321,15 @@ where
         request.extensions_mut().insert(method);
         let mut rpc = ObservedRpc::start(method, shape);
         rpc.deadline = request.extensions().get::<DeadlineExpiry>().cloned();
+        if let Some(admissions) = self.range_admissions.as_ref().filter(|_| rpc.is_range()) {
+            match admissions.claim(&request, self.surface) {
+                Ok(permit) => rpc.range_permit = Some(permit),
+                Err(status) => {
+                    rpc.outcome = Outcome::from_status(&status);
+                    return Either::Right(Box::pin(async move { Ok(status.into_http()) }));
+                }
+            }
+        }
         let request = if shape == RpcShape::Upload {
             request.map(|body| {
                 Body::new(ObservedUpload {
@@ -282,8 +341,13 @@ where
         } else {
             request
         };
-        let response = self.inner.call(request);
-        Either::Right(Box::pin(async move {
+        let response = if let Some(span) = rpc.span.as_ref() {
+            span.in_scope(|| self.inner.call(request))
+        } else {
+            self.inner.call(request)
+        };
+        let span = rpc.span.clone();
+        let observed = async move {
             match response.await {
                 Ok(response) => Ok(rpc.observe_response(response)),
                 Err(error) => {
@@ -292,7 +356,11 @@ where
                     Err(error)
                 }
             }
-        }))
+        };
+        Either::Right(match span {
+            Some(span) => Box::pin(tracing::Instrument::instrument(observed, span)),
+            None => Box::pin(observed),
+        })
     }
 }
 
@@ -376,12 +444,14 @@ impl WalletRpcMethod {
 }
 
 struct ObservedRpc {
+    span: Option<tracing::Span>,
     method: WalletRpcMethod,
     shape: RpcShape,
     in_flight: metrics::Gauge,
     started: Instant,
     stream_opened: Option<Instant>,
     range_messages: f64,
+    range_permit: Option<RangePermit>,
     outcome: Outcome,
     /// Set when the client's `grpc-timeout` bounds the call, so a call the
     /// deadline abandoned records `DEADLINE_EXCEEDED`, the status the client
@@ -395,12 +465,14 @@ impl ObservedRpc {
             metrics::gauge!(IN_FLIGHT, "surface" => method.surface, "method" => method.name);
         in_flight.increment(1);
         Self {
+            span: crate::logging::wallet_rpc_span(method.surface, method.name),
             method,
             shape,
             in_flight,
             started: Instant::now(),
             stream_opened: None,
             range_messages: 0.0,
+            range_permit: None,
             outcome: Outcome::plain(Code::Cancelled),
             deadline: None,
         }
@@ -579,9 +651,13 @@ impl http_body::Body for ObservedBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
         let this = &mut *self;
-        let frame = Pin::new(&mut this.body).poll_frame(cx);
         let Some(rpc) = &mut this.rpc else {
-            return frame;
+            return Pin::new(&mut this.body).poll_frame(cx);
+        };
+        let frame = if let Some(span) = &rpc.span {
+            span.in_scope(|| Pin::new(&mut this.body).poll_frame(cx))
+        } else {
+            Pin::new(&mut this.body).poll_frame(cx)
         };
         let outcome = match &frame {
             Poll::Pending => return frame,
@@ -668,6 +744,38 @@ mod tests {
             assert_eq!(described, measured);
             assert_eq!(described.len(), surface.methods().len());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_non_post_native_block_range_never_reaches_dispatch() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let service = WalletRpcMetricsLayer::WalletQuery
+            .with_range_admission(
+                GrpcRangeAdmission::default(),
+                ClientAddressSource::Connection,
+            )
+            .layer(service_fn(|_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                future::ready(Ok::<_, Infallible>(Response::new(Body::empty())))
+            }));
+        let request = |method| {
+            Request::builder()
+                .method(method)
+                .uri("/zinder.v1.wallet.WalletQuery/CompactBlocksInRange")
+                .body(Body::empty())
+        };
+
+        let refused = service.clone().oneshot(request(http::Method::GET)?).await?;
+        assert_eq!(refused.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(refused.headers()[http::header::ALLOW], "POST");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let admitted = service.oneshot(request(http::Method::POST)?).await?;
+        assert_eq!(admitted.status(), http::StatusCode::OK);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
         Ok(())
     }
 

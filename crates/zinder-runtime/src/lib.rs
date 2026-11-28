@@ -105,7 +105,10 @@ pub use http_listener::{
     DEFAULT_HTTP_MAX_REQUEST_BODY_BYTES, DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
     DEFAULT_HTTP_WRITE_STALL_TIMEOUT, HttpListenerLimits, serve_http,
 };
-pub use logging::{TracingSubscriberError, install_tracing_subscriber};
+pub use logging::{
+    RuntimeTracing, TracingSubscriberError, install_runtime_tracing_subscriber,
+    install_tracing_subscriber, trace_ingest_control, trace_node_rpc,
+};
 pub use memory_budget::{
     CgroupMemorySnapshot, canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
     container_memory_budget_bytes, container_memory_snapshot,
@@ -119,8 +122,8 @@ pub use metrics::{
     install_metrics_recorder_for_service,
 };
 pub use ops_endpoint::{
-    OpsEndpointHandle, OpsServer, OpsServerError, serve_ops_endpoint, spawn_ops_endpoint,
-    spawn_ops_endpoint_for,
+    OpsEndpointHandle, OpsServer, OpsServerError, OpsStatus, ServedChainStatus, serve_ops_endpoint,
+    spawn_ops_endpoint, spawn_ops_endpoint_for,
 };
 pub use ops_healthcheck::{
     DEFAULT_OPS_HEALTHCHECK_PATH, OPS_HEALTHCHECK_TIMEOUT, OPS_LISTEN_ADDR_ENV_VAR,
@@ -131,11 +134,12 @@ pub use process::ProcessMemory;
 pub use public_grpc_server::{
     ClientAddressSource, DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT,
     DEFAULT_GRPC_SEND_STALL_TIMEOUT, GrpcCallTermination, GrpcCallTerminationFuture,
-    GrpcCallTerminationLayer, GrpcDeadline, GrpcReceiveLimit, GrpcReceiveLimitLayer,
-    GrpcReceiveLimits, GrpcSendStall, GrpcSendStallLayer, HTTP2_MAX_LOCAL_ERROR_RESETS,
-    MAX_CONCURRENT_STREAMS_PER_CONNECTION, PROXY_CLIENT_ADDRESS_HEADER, PublicGrpcLayers,
-    PublicGrpcRouter, PublicGrpcServer, WalletRpcMetrics, WalletRpcMetricsLayer,
-    public_grpc_reflection, public_grpc_server, public_grpc_server_with,
+    GrpcCallTerminationLayer, GrpcDeadline, GrpcProxyProtocol, GrpcRangeAdmission,
+    GrpcReceiveLimit, GrpcReceiveLimitLayer, GrpcReceiveLimits, GrpcSendStall, GrpcSendStallLayer,
+    HTTP2_MAX_LOCAL_ERROR_RESETS, MAX_CONCURRENT_STREAMS_PER_CONNECTION,
+    PROXY_CLIENT_ADDRESS_HEADER, PublicGrpcLayers, PublicGrpcRouter, PublicGrpcServer,
+    RangeClientKey, WalletRpcMetrics, WalletRpcMetricsLayer, public_grpc_reflection,
+    public_grpc_server, public_grpc_server_with,
 };
 pub use readiness::{
     ActiveNodeEndpoint, FollowWaitReason, IngestPhase, NodeUnavailableDetail, Readiness,
@@ -153,15 +157,15 @@ pub use runtime_supervision::{
 pub use sections::{
     CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, DEFAULT_ALLOW_PUBLIC_BIND,
     DeploymentProfile, DeploymentSection, DeploymentToml, IngestControlReaderToml,
-    IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml, ProjectorControlSection,
-    ProjectorControlToml, ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader,
-    ResolvedIngestControlWriter, ResolvedProjectorControl, ResolvedRetention,
-    ResolvedSecondaryStorage, RetentionSection, RetentionToml, RocksDbResourceBudgetSection,
-    RocksDbResourceBudgetToml, RuntimeService, SecondaryStorageSection, SecondaryStorageToml,
-    SecuritySection, SecurityToml, StorageRoleSection, StorageRoleToml,
-    defaults as section_defaults, derive_canonical_path, derive_canonical_secondary_path,
-    derive_checkpoints_path, derive_explorer_secondary_path, derive_wallet_path,
-    derive_wallet_secondary_path, resolve_allow_public_bind,
+    IngestControlSection, IngestControlWriterToml, ObservabilityConfig, OpsSection, OpsToml,
+    ProjectorControlSection, ProjectorControlToml, ResolvedCanonicalSecondaryStorage,
+    ResolvedIngestControlReader, ResolvedIngestControlWriter, ResolvedProjectorControl,
+    ResolvedRetention, ResolvedSecondaryStorage, RetentionSection, RetentionToml,
+    RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, RuntimeService,
+    SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
+    StorageRoleSection, StorageRoleToml, defaults as section_defaults, derive_canonical_path,
+    derive_canonical_secondary_path, derive_checkpoints_path, derive_explorer_secondary_path,
+    derive_wallet_path, derive_wallet_secondary_path, resolve_allow_public_bind,
     resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
     resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_reader,
     resolve_ingest_control_writer, resolve_ingest_control_writer_with_data_dir,

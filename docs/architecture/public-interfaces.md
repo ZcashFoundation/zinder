@@ -34,9 +34,9 @@ are optional explorer aggregates. Use `canonical`, `wallet projection`, and
 | `MempoolEvent` | A live-pool change: added, invalidated, or mined. | `zinder-store`, `zinder-client` |
 
 Native services advertise network contract revision 15. Store admission checks
-the on-disk persistence schema independently. The schema v1 cutover requires fresh
-canonical, wallet, and materialized-view stores. State bundles and recovery
-archives must be captured again from the rebuilt stores.
+the on-disk persistence schema independently (`CANONICAL_STORE_SCHEMA_VERSION = 2`).
+Schema cutovers require fresh canonical, wallet, and materialized-view stores;
+state bundles and recovery archives must be captured again from the rebuilt stores.
 
 ### Serving
 
@@ -145,6 +145,11 @@ On a public gRPC listener, register application middleware with
 those layers do after readiness and before the response starts. Register
 gRPC-Web and CORS adapters with `PublicGrpcServer::transport_layer` so
 they can format a deadline response for the client.
+On a listener reserved for an allowlisted TCP proxy, pass the resolved
+`GrpcProxyProtocol` to `PublicGrpcServer::with_proxy_protocol` and use
+`ClientAddressSource::Connection` to identify the forwarded client.
+On wallet routes, attach `WalletRpcMetricsLayer::with_range_admission` with
+the resolved `GrpcRangeAdmission` policy and the listener's address source.
 
 - Public operations accept and return domain types, not RocksDB handles,
   column families, or untyped byte maps.

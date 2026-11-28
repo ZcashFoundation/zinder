@@ -7,7 +7,10 @@
 
 use std::{
     convert::Infallible,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
 };
 
@@ -24,7 +27,7 @@ use tonic::{
 use tonic_types::ErrorDetails;
 use zinder_client::{
     BlockHeight, ChainEpochId, ChainIndex, ErrorReason, IndexerError, Network, RemoteChainIndex,
-    RemoteOpenOptions, RetryPolicy, TransactionId, TxStatus,
+    RemoteClientOptions, RemoteOpenOptions, RetryPolicy, TransactionId, TxStatus,
 };
 use zinder_proto::status_with_reason;
 use zinder_proto::v1::{ops, wallet};
@@ -315,21 +318,75 @@ async fn query_server_proves_pinned_absence_and_flags_an_untyped_mempool_miss() 
     ingest_control_fixture.shutdown().await
 }
 
+#[tokio::test]
+async fn retry_enabled_transaction_lookup_keeps_absence_terminal() -> eyre::Result<()> {
+    let pin = ChainEpochId::new(7);
+    let missing_artifact = status_with_reason(
+        ops::ErrorReason::ArtifactUnavailable,
+        "transaction bytes are unavailable",
+        ErrorDetails::new(),
+    );
+    let (outcome, attempts) = scripted_lookup(
+        missing_artifact,
+        Some(pin),
+        RemoteClientOptions::default().with_read_retries(),
+    )
+    .await?;
+    let Err(error @ IndexerError::TransactionAbsenceUnverified { .. }) = outcome else {
+        return Err(eyre!(
+            "expected unverified transaction absence: {outcome:?}"
+        ));
+    };
+    assert_eq!(error.retry_policy(), RetryPolicy::OperatorActionRequired);
+    assert_eq!(attempts, 1);
+
+    let absence = TransactionAbsence {
+        chain_epoch_id: pin,
+        first_covered_height: BlockHeight::new(1),
+        visible_tip_height: BlockHeight::new(120),
+        covers_mempool: false,
+    };
+    let (outcome, attempts) = scripted_lookup(
+        absence.into_status("absent"),
+        Some(pin),
+        RemoteClientOptions::default().with_read_retries(),
+    )
+    .await?;
+    assert!(matches!(outcome, Ok(TxStatus::NotFound)), "{outcome:?}");
+    assert_eq!(attempts, 1);
+    Ok(())
+}
+
 async fn lookup(
     status: Status,
     at_epoch_id: Option<ChainEpochId>,
 ) -> eyre::Result<Result<TxStatus, IndexerError>> {
-    let endpoint = spawn_service(ScriptedTransactionService {
+    let (outcome, _) = scripted_lookup(status, at_epoch_id, RemoteClientOptions::default()).await?;
+    Ok(outcome)
+}
+
+async fn scripted_lookup(
+    status: Status,
+    at_epoch_id: Option<ChainEpochId>,
+    options: RemoteClientOptions,
+) -> eyre::Result<(Result<TxStatus, IndexerError>, usize)> {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let endpoint = spawn_service(ScriptedTransaction {
         status: Arc::new(status),
+        attempts: Arc::clone(&attempts),
     })
     .await?;
-    let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
-        endpoint,
-        network: Network::ZcashRegtest,
-    })?;
-    Ok(chain_index
+    let chain_index = RemoteChainIndex::connect_with_options(
+        RemoteOpenOptions {
+            endpoint,
+            network: Network::ZcashRegtest,
+        },
+        options,
+    )?;
+    let outcome = chain_index
         .transaction_by_id(TRANSACTION_ID, at_epoch_id)
-        .await)
+        .await;
+    Ok((outcome, attempts.load(Ordering::Relaxed)))
 }
 
 async fn spawn_service<S>(service: S) -> eyre::Result<String>
@@ -356,15 +413,16 @@ where
 
 /// `WalletQuery` service that answers `Transaction` with one fixed status.
 #[derive(Clone)]
-struct ScriptedTransactionService {
+struct ScriptedTransaction {
     status: Arc<Status>,
+    attempts: Arc<AtomicUsize>,
 }
 
-impl NamedService for ScriptedTransactionService {
+impl NamedService for ScriptedTransaction {
     const NAME: &'static str = "zinder.v1.wallet.WalletQuery";
 }
 
-impl<B> Service<http::Request<B>> for ScriptedTransactionService
+impl<B> Service<http::Request<B>> for ScriptedTransaction
 where
     B: Body + Send + 'static,
     B::Error: Into<StdError> + Send + 'static,
@@ -395,6 +453,7 @@ where
                 Ok(Status::new(Code::Unimplemented, "scripted service").into_http())
             });
         }
+        self.attempts.fetch_add(1, Ordering::Relaxed);
         let status = Arc::clone(&self.status);
         Box::pin(async move {
             let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());

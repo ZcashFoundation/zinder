@@ -13,11 +13,11 @@ use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
     ClientAddressSource, ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection,
-    DeploymentToml, IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml,
-    NodeFallbacksToml, NodeToml, OpsSection, OpsServerError, OpsToml,
-    ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, RocksDbResourceBudgetSection,
-    RocksDbResourceBudgetToml, RuntimeService, SecuritySection, SecurityToml,
-    derive_canonical_path, derive_canonical_secondary_path, derive_wallet_path,
+    DeploymentToml, GrpcProxyProtocol, GrpcRangeAdmission, IngestControlReaderToml,
+    IngestControlSection, NetworkSection, NetworkToml, NodeFallbacksToml, NodeToml, OpsSection,
+    OpsServerError, OpsToml, ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader,
+    RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, RuntimeService, SecuritySection,
+    SecurityToml, derive_canonical_path, derive_canonical_secondary_path, derive_wallet_path,
     derive_wallet_secondary_path, guard_optional_serving_bind, guard_serving_bind,
     parse_socket_addr, require_field, resolve_allow_public_bind,
     resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
@@ -60,10 +60,16 @@ pub struct QueryConfig {
     pub listen_addr: SocketAddr,
     /// Operational HTTP endpoint listen address, or `None` when disabled.
     pub ops_listen_addr: Option<SocketAddr>,
+    /// Optional trace export settings.
+    pub observability: zinder_runtime::ObservabilityConfig,
     /// Whether public or unspecified bind addresses are permitted.
     pub allow_public_bind: bool,
     /// How the gRPC listener tells clients apart for its receive limit.
     pub client_address_source: ClientAddressSource,
+    /// Trusted TCP proxy peers for a listener requiring PROXY protocol.
+    pub proxy_protocol: GrpcProxyProtocol,
+    /// Client quotas and overload policy for block-range RPCs.
+    pub range_admission: GrpcRangeAdmission,
     /// Canonical reorg-window identity enforced on admitted stores.
     pub canonical_reorg_policy: CanonicalReorgPolicy,
     /// Maximum bounded attempts to converge the serving read pair.
@@ -226,6 +232,7 @@ struct QueryRawConfig {
     deployment: DeploymentSection,
     network: NetworkSection,
     ops: OpsSection,
+    observability: zinder_runtime::ObservabilityConfig,
     storage: CanonicalSecondaryStorageSection,
     wallet: WalletSection,
     ingest_control: IngestControlSection,
@@ -248,6 +255,8 @@ struct QuerySection {
     forwarded_read_waiters_per_slot: Option<u32>,
     forwarded_transaction_cache_bytes: Option<u64>,
     trust_proxy_client_address: Option<bool>,
+    proxy_protocol_trusted_cidrs: Option<String>,
+    range_admission: GrpcRangeAdmission,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -321,7 +330,6 @@ fn derive_query_storage_paths(config: &mut QueryRawConfig) -> Result<(), ConfigE
 fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, QueryConfigError> {
     apply_deployment_profile(&mut config)?;
     derive_query_storage_paths(&mut config)?;
-    let profile = config.deployment.profile;
     let network = config.network.resolve()?;
     let storage = resolve_canonical_secondary_storage(config.storage)?;
     let wallet_primary_path = require_field(config.wallet.path, "wallet.path")?;
@@ -366,18 +374,18 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         config.query.forwarded_transaction_cache_bytes,
     )
     .map_err(|error| ConfigError::invalid(format!("query.{error}")))?;
-    let node = config
-        .node
-        .map(|section| NodeTarget::resolve(network, section))
-        .transpose()
-        .map_err(ConfigError::from)?;
-    let node_fallbacks =
-        NodeTarget::resolve_fallbacks(network, config.node_fallbacks).map_err(ConfigError::from)?;
-    NodeTarget::require_primary_for_fallbacks(node.as_ref(), &node_fallbacks)
-        .map_err(ConfigError::from)?;
+    let (node, node_fallbacks) = resolve_query_nodes(network, config.node, config.node_fallbacks)?;
+
+    let client_address_source = ClientAddressSource::from_trust_proxy_client_address(
+        config.query.trust_proxy_client_address.unwrap_or(false),
+    );
+    let proxy_protocol = GrpcProxyProtocol::resolve(
+        config.query.proxy_protocol_trusted_cidrs.as_deref(),
+        client_address_source,
+    )?;
 
     Ok(QueryConfig {
-        profile,
+        profile: config.deployment.profile,
         network,
         storage,
         wallet_primary_path,
@@ -388,10 +396,11 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         ingest_control_bearer_token,
         listen_addr,
         ops_listen_addr,
+        observability: config.observability,
         allow_public_bind,
-        client_address_source: ClientAddressSource::from_trust_proxy_client_address(
-            config.query.trust_proxy_client_address.unwrap_or(false),
-        ),
+        client_address_source,
+        proxy_protocol,
+        range_admission: config.query.range_admission,
         canonical_reorg_policy,
         pair_convergence_attempts,
         tree_state_replay_wait,
@@ -400,6 +409,21 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         node,
         node_fallbacks,
     })
+}
+
+fn resolve_query_nodes(
+    network: Network,
+    node: Option<NodeSection>,
+    fallbacks: NodeFallbackSections,
+) -> Result<(Option<NodeTarget>, Vec<NodeTarget>), ConfigError> {
+    let node = node
+        .map(|section| NodeTarget::resolve(network, section))
+        .transpose()
+        .map_err(ConfigError::from)?;
+    let fallbacks = NodeTarget::resolve_fallbacks(network, fallbacks).map_err(ConfigError::from)?;
+    NodeTarget::require_primary_for_fallbacks(node.as_ref(), &fallbacks)
+        .map_err(ConfigError::from)?;
+    Ok((node, fallbacks))
 }
 
 const DEFAULT_PAIR_CONVERGENCE_ATTEMPTS: u8 = 12;
@@ -510,6 +534,8 @@ struct QueryConfigToml {
     deployment: DeploymentToml,
     network: NetworkToml,
     ops: OpsToml,
+    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
+    observability: zinder_runtime::ObservabilityConfig,
     security: SecurityToml,
     storage: CanonicalSecondaryStorageToml,
     wallet: WalletToml,
@@ -530,6 +556,7 @@ impl QueryConfigToml {
         Self {
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
+            observability: config.observability.clone(),
             security: SecurityToml::from_resolved(config.allow_public_bind),
             deployment: DeploymentToml::from_resolved(config.profile),
             storage,
@@ -558,6 +585,8 @@ impl QueryConfigToml {
                 trust_proxy_client_address: config
                     .client_address_source
                     .trust_proxy_client_address(),
+                proxy_protocol_trusted_cidrs: config.proxy_protocol.redacted_cidrs(),
+                range_admission: config.range_admission,
             },
             node: config.node.as_ref().map(NodeToml::from_node_target),
             node_fallbacks: NodeFallbacksToml::from_node_targets(&config.node_fallbacks),
@@ -577,6 +606,9 @@ struct QueryToml {
     forwarded_read_waiters_per_slot: u32,
     forwarded_transaction_cache_bytes: u64,
     trust_proxy_client_address: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proxy_protocol_trusted_cidrs: Option<&'static str>,
+    range_admission: GrpcRangeAdmission,
 }
 
 #[derive(Serialize)]

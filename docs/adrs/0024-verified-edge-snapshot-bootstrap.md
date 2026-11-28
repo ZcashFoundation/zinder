@@ -22,7 +22,7 @@ that boundary. The publisher keeps its own store and credentials.
 
 - `manifest.v1.json`, a UTF-8 JSON object with `format`, `anchors`, and `files`.
   Anchors carry the canonical schema version, network ID, genesis hash,
-  v1 activation-table fingerprint, canonical workload, raw blob retention,
+  v1 activation-table fingerprint, raw blob retention,
   reorg window, first retained block and snapshot block identities, and three
   tree entries in Sapling, Orchard, and Ironwood order. Each active tree entry
   records its size, final root, and terminal completed subtree, if any. A
@@ -35,8 +35,10 @@ that boundary. The publisher keeps its own store and credentials.
   signs the ASCII format identifier followed by a NUL byte and the exact JSON
   bytes on disk. The receiver checks the signature against at least one
   operator-configured raw 32-byte public key.
-- `canonical-rocksdb/`, the RocksDB checkpoint and canonical construction
-  manifest required for READY admission. Export clears projection build leases
+- `canonical-rocksdb/`, the RocksDB checkpoint, canonical construction
+  manifest (`canonical-construction-manifest.v2.json`), pinned external settled
+  segment manifest (`segments-manifest.json`), and settled segment files
+  (`segments/{shielded,supplement,raw_block}/`) required for READY admission. Export clears projection build leases
   and durable mempool events, replaces the publisher's cursor key in the copy,
   and compacts the affected families before checkpointing the export.
 
@@ -133,5 +135,6 @@ its validator. Run `zinder-ingest bootstrap-from-snapshot --source BUNDLE
 
 ## Revision history
 
+- 2026-11-27. Removed `canonical workload` from `ManifestAnchors` and documented `segments-manifest.json` / `segments/` within `canonical-rocksdb/` for Canonical Schema v2.
 - 2026-11-27. Retired the optional `sealed-history/` snapshot sidecar (`--include-sealed-history` / `--sealed-history-output`) after cutting lightwalletd streaming over directly to canonical `ZSHRNG02` segments inside the canonical store.
 - 2026-11-24. Renamed topology identifier `rocksdb-single-host` to `rocksdb` to match ADR-0004.

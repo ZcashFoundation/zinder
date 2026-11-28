@@ -95,6 +95,8 @@ pub struct ProjectorConfig {
     pub projector_control: zinder_runtime::ResolvedProjectorControl,
     /// Operational HTTP endpoint address, or `None` when disabled.
     pub ops_listen_addr: Option<SocketAddr>,
+    /// Optional trace export settings.
+    pub observability: zinder_runtime::ObservabilityConfig,
     /// Whether public or unspecified bind addresses are permitted.
     pub allow_public_bind: bool,
 }
@@ -550,6 +552,7 @@ struct ProjectorRawConfig {
     ingest_control: IngestControlSection,
     projector_control: ProjectorControlSection,
     ops: OpsSection,
+    observability: zinder_runtime::ObservabilityConfig,
     security: SecuritySection,
 }
 
@@ -713,6 +716,7 @@ fn resolve_projector_config(
         ingest_control_bearer_token: ingest_control.bearer_token,
         projector_control,
         ops_listen_addr,
+        observability: raw.observability,
         allow_public_bind,
     })
 }
@@ -1081,6 +1085,8 @@ struct ProjectorConfigToml {
     ingest_control: IngestControlReaderToml,
     projector_control: ProjectorControlToml,
     ops: OpsToml,
+    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
+    observability: zinder_runtime::ObservabilityConfig,
     security: SecurityToml,
 }
 
@@ -1120,6 +1126,7 @@ impl ProjectorConfigToml {
             }),
             projector_control: ProjectorControlToml::from_control(&config.projector_control),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
+            observability: config.observability.clone(),
             security: SecurityToml::from_resolved(config.allow_public_bind),
         }
     }
@@ -1485,6 +1492,7 @@ mod tests {
                 checkpoint_staging_root: root.path().join("staging"),
             },
             ops_listen_addr: None,
+            observability: zinder_runtime::ObservabilityConfig::default(),
             allow_public_bind: false,
         };
         let first_owner = super::ensure_build_owner(&mut config)?;

@@ -7,7 +7,7 @@ use zinder_core::{
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
-use zinder_store::ShieldedProjectionSelection;
+use zinder_store::{CompactBlockSpliceSelection, ShieldedProjectionSelection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Payload {
@@ -68,6 +68,12 @@ impl CompactBlockShape {
     /// its nullifiers with an empty chain metadata envelope.
     pub(crate) const DEFAULT_NULLIFIER_RANGE: Self = Self {
         payload: Payload::Nullifiers,
+        ..Self::DEFAULT_RANGE
+    };
+
+    /// All shielded pools plus transparent transactions in range mode.
+    pub(crate) const DEFAULT_TRANSPARENT_RANGE: Self = Self {
+        transparent: true,
         ..Self::DEFAULT_RANGE
     };
 
@@ -257,27 +263,41 @@ impl CompactBlockShape {
                     || (self.payload != Payload::Mempool && !scan.transparent_inputs.is_empty())))
     }
 
-    /// Classifies how canonical `ZSHRNG02` settled segments and `live_tail_block`
-    /// stream this shape directly, or returns `None` when the shape requires
-    /// full-artifact canonical reads (such as transparent inputs/outputs,
-    /// unary full/nullifier blocks, or mempool filtering).
-    pub(crate) const fn shielded_projection(self) -> Option<ShieldedProjectionSelection> {
-        if self.transparent || !matches!(self.payload, Payload::SelectedPools | Payload::Nullifiers)
-        {
+    /// Classifies how canonical `ZSHRNG02` + `ZSTSUP01` settled segments and
+    /// `live_tail_block` stream a range shape directly as
+    /// `(shielded_projection, include_transparent)`, or returns `None` for
+    /// unary shapes and mempool filtering.
+    pub(crate) const fn encoded_range_selection(
+        self,
+    ) -> Option<(ShieldedProjectionSelection, bool)> {
+        if !matches!(self.payload, Payload::SelectedPools | Payload::Nullifiers) {
             return None;
         }
-        Some(ShieldedProjectionSelection::new(
-            self.sapling,
-            self.orchard,
-            self.ironwood,
-            self.payload.is_nullifiers_only(),
+        Some((
+            ShieldedProjectionSelection::new(
+                self.sapling,
+                self.orchard,
+                self.ironwood,
+                self.payload.is_nullifiers_only(),
+            ),
+            self.transparent,
         ))
+    }
+
+    /// Returns the unary wire-splice selection for `GetBlock` (`FULL_BLOCK`) and
+    /// `GetBlockNullifiers` (`BLOCK_NULLIFIERS`), or `None` for range and mempool shapes.
+    pub(crate) const fn unary_splice_selection(self) -> Option<CompactBlockSpliceSelection> {
+        match self.payload {
+            Payload::FullBlock => Some(CompactBlockSpliceSelection::FULL_BLOCK),
+            Payload::BlockNullifiers => Some(CompactBlockSpliceSelection::BLOCK_NULLIFIERS),
+            Payload::SelectedPools | Payload::Nullifiers | Payload::Mempool => None,
+        }
     }
 
     /// Returns whether canonical `ZSHRNG02` / `live_tail_block` wire streaming
     /// serves this shape.
     pub(crate) const fn uses_canonical_encoded_range(self) -> bool {
-        self.shielded_projection().is_some()
+        self.encoded_range_selection().is_some()
     }
 
     /// Returns whether this shape is one of the two default all-pool
@@ -302,6 +322,8 @@ impl CompactBlockShape {
             Some(Self::DEFAULT_RANGE)
         } else if without_ironwood_choice == Self::DEFAULT_NULLIFIER_RANGE {
             Some(Self::DEFAULT_NULLIFIER_RANGE)
+        } else if without_ironwood_choice == Self::DEFAULT_TRANSPARENT_RANGE {
+            Some(Self::DEFAULT_TRANSPARENT_RANGE)
         } else {
             None
         }
@@ -459,52 +481,88 @@ mod tests {
             CompactBlockShape::DEFAULT_NULLIFIER_RANGE
         );
         assert_eq!(
-            CompactBlockShape::DEFAULT_NULLIFIER_RANGE.shielded_projection(),
-            Some(ShieldedProjectionSelection::new(true, true, true, true))
+            CompactBlockShape::DEFAULT_NULLIFIER_RANGE.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(true, true, true, true),
+                false
+            ))
         );
         assert_eq!(
-            CompactBlockShape::DEFAULT_RANGE.shielded_projection(),
-            Some(ShieldedProjectionSelection::new(true, true, true, false))
+            CompactBlockShape::DEFAULT_RANGE.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(true, true, true, false),
+                false
+            ))
         );
         assert!(CompactBlockShape::DEFAULT_NULLIFIER_RANGE.is_default_shielded_shape());
         assert!(CompactBlockShape::DEFAULT_RANGE.is_default_shielded_shape());
+        let orchard_nullifiers =
+            CompactBlockShape::for_nullifier_range(&[lightwalletd::PoolType::Orchard as i32])?;
+        assert!(!orchard_nullifiers.is_default_shielded_shape());
+        assert_eq!(
+            orchard_nullifiers.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(false, true, false, true),
+                false
+            ))
+        );
+        let sapling_nullifiers =
+            CompactBlockShape::for_nullifier_range(&[lightwalletd::PoolType::Sapling as i32])?;
+        assert_eq!(
+            sapling_nullifiers.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(true, false, false, true),
+                false
+            ))
+        );
+        let empty_nullifiers = CompactBlockShape::for_nullifier_range(&[99])?;
+        assert_eq!(
+            empty_nullifiers.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(false, false, false, true),
+                false
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unary_and_transparent_shapes_map_to_splice_and_range_selections() -> eyre::Result<()> {
+        assert_eq!(
+            CompactBlockShape::FULL_BLOCK.unary_splice_selection(),
+            Some(CompactBlockSpliceSelection::FULL_BLOCK)
+        );
+        assert_eq!(
+            CompactBlockShape::BLOCK_NULLIFIERS.unary_splice_selection(),
+            Some(CompactBlockSpliceSelection::BLOCK_NULLIFIERS)
+        );
         assert!(!CompactBlockShape::BLOCK_NULLIFIERS.uses_canonical_encoded_range());
         assert!(!CompactBlockShape::FULL_BLOCK.uses_canonical_encoded_range());
         assert!(
             !CompactBlockShape::for_mempool(&[lightwalletd::PoolType::Orchard as i32])?
                 .uses_canonical_encoded_range()
         );
-        assert!(
-            !CompactBlockShape::for_range(&[
-                lightwalletd::PoolType::Transparent as i32,
-                lightwalletd::PoolType::Orchard as i32,
-            ])?
-            .uses_canonical_encoded_range()
+        let transparent_orchard = CompactBlockShape::for_range(&[
+            lightwalletd::PoolType::Transparent as i32,
+            lightwalletd::PoolType::Orchard as i32,
+        ])?;
+        assert!(transparent_orchard.uses_canonical_encoded_range());
+        assert_eq!(
+            transparent_orchard.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(false, true, false, false),
+                true
+            ))
         );
         let orchard_range =
             CompactBlockShape::for_range(&[lightwalletd::PoolType::Orchard as i32])?;
         assert!(!orchard_range.is_default_shielded_shape());
         assert_eq!(
-            orchard_range.shielded_projection(),
-            Some(ShieldedProjectionSelection::new(false, true, false, false))
-        );
-        let orchard_nullifiers =
-            CompactBlockShape::for_nullifier_range(&[lightwalletd::PoolType::Orchard as i32])?;
-        assert!(!orchard_nullifiers.is_default_shielded_shape());
-        assert_eq!(
-            orchard_nullifiers.shielded_projection(),
-            Some(ShieldedProjectionSelection::new(false, true, false, true))
-        );
-        let sapling_nullifiers =
-            CompactBlockShape::for_nullifier_range(&[lightwalletd::PoolType::Sapling as i32])?;
-        assert_eq!(
-            sapling_nullifiers.shielded_projection(),
-            Some(ShieldedProjectionSelection::new(true, false, false, true))
-        );
-        let empty_nullifiers = CompactBlockShape::for_nullifier_range(&[99])?;
-        assert_eq!(
-            empty_nullifiers.shielded_projection(),
-            Some(ShieldedProjectionSelection::new(false, false, false, true))
+            orchard_range.encoded_range_selection(),
+            Some((
+                ShieldedProjectionSelection::new(false, true, false, false),
+                false
+            ))
         );
         Ok(())
     }

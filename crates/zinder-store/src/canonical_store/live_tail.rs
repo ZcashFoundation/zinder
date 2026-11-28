@@ -24,7 +24,10 @@ use crate::{
     settled_raw_block_segment::{
         RawBlockTransactionSlice, SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES,
     },
-    settled_shielded_segment::{PoolPresenceMask, SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES},
+    settled_shielded_segment::{
+        ExpectedShieldedBlock, PoolPresenceMask, SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES,
+        validate_live_tail_shielded_block_wire,
+    },
     settled_supplement_segment::{
         BlockSupplementRecord, CanonicalBlockSupplement, CanonicalTransactionSupplement,
         CompactTransparentSupplementTx, SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
@@ -360,6 +363,20 @@ pub(crate) struct LiveTailShieldedWire<'a> {
     pub(crate) has_unrepresentable_wire_fee: bool,
 }
 
+/// Authenticated shielded wire payload paired with decoded Tag-1 transparent
+/// supplement transactions from a `live_tail_block` `V1` row, skipping
+/// `canonical_facts` decoding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LiveTailSpliceWire<'a> {
+    pub(crate) block_id: BlockId,
+    pub(crate) previous_block_hash: BlockHash,
+    pub(crate) time: u32,
+    pub(crate) shielded_payload: &'a [u8],
+    pub(crate) pool_presence: PoolPresenceMask,
+    pub(crate) transparent_transactions: Vec<CompactTransparentSupplementTx>,
+    pub(crate) has_unrepresentable_wire_fee: bool,
+}
+
 /// Encoding toggles for [`LiveTailBlockRecord::encode_from_compact_block_v1`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LiveTailEncodeOptions {
@@ -513,19 +530,50 @@ impl LiveTailBlockRecord {
             )?;
         }
         cursor.finish("LiveTailBlockRecord")?;
-        let _ = decode_and_validate_shielded_payload(
-            shielded_payload,
-            header.block_id,
-            header.previous_block_hash,
-            header.block_time,
-            header.pool_presence,
-        )?;
+        validate_shielded_payload_wire_zero_alloc(&header, shielded_payload)?;
         Ok(LiveTailShieldedWire {
             block_id: header.block_id,
             previous_block_hash: header.previous_block_hash,
             time: header.block_time,
             shielded_payload,
             pool_presence: header.pool_presence,
+            has_unrepresentable_wire_fee,
+        })
+    }
+
+    /// Authenticates a `V1` record, borrows its raw shielded `CompactBlock` protobuf
+    /// payload zero-copy alongside header links and wide-fee detection, and decodes
+    /// Tag-1 transparent supplement entries without decoding `canonical_facts`.
+    pub(crate) fn decode_splice_wire_v1(
+        bytes: &[u8],
+        expected_height: BlockHeight,
+    ) -> Result<LiveTailSpliceWire<'_>, SettledSegmentsError> {
+        let (header, mut cursor) = parse_authenticated_header_v1(bytes, expected_height)?;
+        let shielded_payload = cursor.read_len_prefixed_slice(
+            SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES,
+            "live_tail.shielded",
+        )?;
+        let (transparent_transactions, has_unrepresentable_wire_fee) =
+            if (header.flags & LIVE_TAIL_FLAG_SUPPLEMENT) != 0 {
+                decode_tag1_and_scan_wide_fee(&mut cursor)?
+            } else {
+                (Vec::new(), false)
+            };
+        if (header.flags & LIVE_TAIL_FLAG_CANONICAL_FACTS) != 0 {
+            let _ = cursor.read_len_prefixed_slice(
+                SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
+                "live_tail.facts",
+            )?;
+        }
+        cursor.finish("LiveTailBlockRecord")?;
+        validate_shielded_payload_wire_zero_alloc(&header, shielded_payload)?;
+        Ok(LiveTailSpliceWire {
+            block_id: header.block_id,
+            previous_block_hash: header.previous_block_hash,
+            time: header.block_time,
+            shielded_payload,
+            pool_presence: header.pool_presence,
+            transparent_transactions,
             has_unrepresentable_wire_fee,
         })
     }
@@ -1003,6 +1051,31 @@ fn validate_raw_block_size(byte_len: usize) -> Result<(), SettledSegmentsError> 
     Ok(())
 }
 
+fn validate_shielded_payload_wire_zero_alloc(
+    header: &LiveTailHeader,
+    shielded_payload: &[u8],
+) -> Result<(), SettledSegmentsError> {
+    if shielded_payload.len() > SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES {
+        return Err(SettledSegmentsError::InvalidFormat(
+            "live-tail shielded payload exceeds size bound".to_owned(),
+        ));
+    }
+    crate::settled_supplement_segment::validate_shielded_block_wire(shielded_payload)?;
+    let block_hash_wire = encode_internal_block_hash(header.block_id.hash);
+    let prev_hash_wire = encode_internal_block_hash(header.previous_block_hash);
+    validate_live_tail_shielded_block_wire(
+        shielded_payload,
+        ExpectedShieldedBlock {
+            height: header.block_id.height,
+            block_hash_wire: &block_hash_wire,
+            prev_hash_wire: &prev_hash_wire,
+            block_time: header.block_time,
+            pool_presence: header.pool_presence,
+        },
+    )?;
+    Ok(())
+}
+
 fn decode_and_validate_shielded_payload(
     shielded_payload: &[u8],
     expected_block_id: BlockId,
@@ -1152,6 +1225,48 @@ fn opt_u64_exceeds_u32(
     }
 }
 
+fn scan_tag2_for_wide_fee(cursor: &mut ByteReader<'_>) -> Result<bool, SettledSegmentsError> {
+    if !cursor.read_bool("supplement.has_canonical_metadata")? {
+        return Ok(false);
+    }
+    let mut has_wide_fee = false;
+    let _ = cursor.read_slice(32, "canonical_sup.serialized_bytes_digest")?;
+    let meta_tx_count =
+        read_bounded_count(cursor, MAX_LIVE_TAIL_TX_COUNT, "canonical_sup.tx_count")?;
+    for _ in 0..meta_tx_count {
+        if scan_canonical_tx_supplement_for_wide_fee(cursor)? {
+            has_wide_fee = true;
+        }
+    }
+    Ok(has_wide_fee)
+}
+
+fn decode_tag1_and_scan_wide_fee(
+    cursor: &mut ByteReader<'_>,
+) -> Result<(Vec<CompactTransparentSupplementTx>, bool), SettledSegmentsError> {
+    let tx_count = read_bounded_count(
+        cursor,
+        MAX_LIVE_TAIL_TX_COUNT,
+        "supplement.transparent_count",
+    )?;
+    let mut transparent = Vec::with_capacity(tx_count.min(MAX_LIVE_TAIL_PREALLOC_COUNT));
+    let mut has_wide_fee = false;
+    for _ in 0..tx_count {
+        let sup_tx = decode_transparent_supplement_tx(cursor)?;
+        if sup_tx
+            .fee_zat
+            .is_some_and(|fee_zat| u32::try_from(fee_zat).is_err())
+        {
+            has_wide_fee = true;
+        }
+        transparent.push(sup_tx);
+    }
+    if scan_tag2_for_wide_fee(cursor)? {
+        has_wide_fee = true;
+    }
+    Ok((transparent, has_wide_fee))
+}
+
 fn scan_supplement_for_wide_fee(cursor: &mut ByteReader<'_>) -> Result<bool, SettledSegmentsError> {
     let mut has_wide_fee = false;
     let tx_count = read_bounded_count(
@@ -1186,15 +1301,8 @@ fn scan_supplement_for_wide_fee(cursor: &mut ByteReader<'_>) -> Result<bool, Set
             )?;
         }
     }
-    if cursor.read_bool("supplement.has_canonical_metadata")? {
-        let _ = cursor.read_slice(32, "canonical_sup.serialized_bytes_digest")?;
-        let meta_tx_count =
-            read_bounded_count(cursor, MAX_LIVE_TAIL_TX_COUNT, "canonical_sup.tx_count")?;
-        for _ in 0..meta_tx_count {
-            if scan_canonical_tx_supplement_for_wide_fee(cursor)? {
-                has_wide_fee = true;
-            }
-        }
+    if scan_tag2_for_wide_fee(cursor)? {
+        has_wide_fee = true;
     }
     Ok(has_wide_fee)
 }
@@ -2781,6 +2889,17 @@ mod tests {
         )?)
     }
 
+    fn assert_wire_decoders_reject(row: &[u8], height: BlockHeight, label: &str) {
+        assert!(
+            LiveTailBlockRecord::decode_shielded_wire_v1(row, height).is_err(),
+            "decode_shielded_wire_v1 must reject {label}",
+        );
+        assert!(
+            LiveTailBlockRecord::decode_splice_wire_v1(row, height).is_err(),
+            "decode_splice_wire_v1 must reject {label}",
+        );
+    }
+
     #[test]
     fn decode_shielded_wire_v1_rejects_malformed_or_mismatched_payload_despite_valid_checksum()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2795,42 +2914,65 @@ mod tests {
         let valid_encoded = record.encode_v1()?;
         let valid_wire = LiveTailBlockRecord::decode_shielded_wire_v1(&valid_encoded, height)?;
         assert_eq!(valid_wire.block_id.height, height);
+        let splice_wire = LiveTailBlockRecord::decode_splice_wire_v1(&valid_encoded, height)?;
+        assert_eq!(splice_wire.block_id.height, height);
 
         let base_proto = lightwalletd::CompactBlock::decode(valid_wire.shielded_payload)?;
 
-        let mut wrong_hash_proto = base_proto.clone();
-        wrong_hash_proto.hash = vec![0x99; 32];
-        let wrong_hash_row = build_raw_v1_record_with_outer_checksum(
-            &record,
-            valid_wire.pool_presence,
-            &wrong_hash_proto.encode_to_vec(),
-        )?;
-        assert!(LiveTailBlockRecord::decode_shielded_wire_v1(&wrong_hash_row, height).is_err());
+        let mut wrong_height = base_proto.clone();
+        wrong_height.height += 1;
+        let mut wrong_hash = base_proto.clone();
+        wrong_hash.hash = vec![0x99; 32];
+        let mut wrong_prev_hash = base_proto.clone();
+        wrong_prev_hash.prev_hash = vec![0x88; 32];
+        let mut wrong_time = base_proto.clone();
+        wrong_time.time = record.block_time + 1;
+        let mut non_empty_header = base_proto.clone();
+        non_empty_header.header = vec![0xaa];
+        let mut missing_meta = base_proto.clone();
+        missing_meta.chain_metadata = None;
+        let mut empty_shielded_tx = base_proto.clone();
+        empty_shielded_tx.vtx[0].spends.clear();
+        empty_shielded_tx.vtx[0].outputs.clear();
+        let mut transparent_in_shielded = base_proto;
+        transparent_in_shielded.vtx[0]
+            .vin
+            .push(lightwalletd::CompactTxIn {
+                prevout_txid: vec![0x12; 32],
+                prevout_index: 0,
+            });
 
-        let mut wrong_time_proto = base_proto;
-        wrong_time_proto.time = record.block_time + 1;
-        let wrong_time_row = build_raw_v1_record_with_outer_checksum(
-            &record,
-            valid_wire.pool_presence,
-            &wrong_time_proto.encode_to_vec(),
-        )?;
-        assert!(LiveTailBlockRecord::decode_shielded_wire_v1(&wrong_time_row, height).is_err());
+        for (label, mutated) in [
+            ("wrong height", wrong_height),
+            ("wrong hash", wrong_hash),
+            ("wrong prev_hash", wrong_prev_hash),
+            ("wrong time", wrong_time),
+            ("non-empty header", non_empty_header),
+            ("missing chain_metadata", missing_meta),
+            ("empty vtx", empty_shielded_tx),
+            ("transparent field in shielded vtx", transparent_in_shielded),
+        ] {
+            let row = build_raw_v1_record_with_outer_checksum(
+                &record,
+                valid_wire.pool_presence,
+                &mutated.encode_to_vec(),
+            )?;
+            assert_wire_decoders_reject(&row, height, label);
+        }
 
         let wrong_presence_row = build_raw_v1_record_with_outer_checksum(
             &record,
             PoolPresenceMask::ORCHARD,
             valid_wire.shielded_payload,
         )?;
-        assert!(LiveTailBlockRecord::decode_shielded_wire_v1(&wrong_presence_row, height).is_err());
+        assert_wire_decoders_reject(&wrong_presence_row, height, "mismatched pool_presence");
 
         let malformed_proto_row = build_raw_v1_record_with_outer_checksum(
             &record,
             valid_wire.pool_presence,
             &[0xff, 0xff, 0xff],
         )?;
-        assert!(
-            LiveTailBlockRecord::decode_shielded_wire_v1(&malformed_proto_row, height).is_err()
-        );
+        assert_wire_decoders_reject(&malformed_proto_row, height, "malformed protobuf");
         Ok(())
     }
 }

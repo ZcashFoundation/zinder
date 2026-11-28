@@ -185,10 +185,12 @@ impl tonic::service::Interceptor for BearerTokenServerInterceptor {
 }
 
 /// Tonic interceptor that attaches `authorization: Bearer <token>` to
-/// outgoing gRPC requests. When `token` is `None`, no metadata is added.
+/// outgoing gRPC requests when a token is configured. OTLP-enabled runtimes
+/// also forward W3C Trace Context from the current span.
 #[derive(Clone)]
 pub struct BearerTokenClientInterceptor {
     metadata_value: Option<tonic::metadata::AsciiMetadataValue>,
+    propagate_trace_context: bool,
 }
 
 impl std::fmt::Debug for BearerTokenClientInterceptor {
@@ -196,6 +198,7 @@ impl std::fmt::Debug for BearerTokenClientInterceptor {
         formatter
             .debug_struct("BearerTokenClientInterceptor")
             .field("token_attached", &self.metadata_value.is_some())
+            .field("propagate_trace_context", &self.propagate_trace_context)
             .finish()
     }
 }
@@ -207,12 +210,18 @@ impl BearerTokenClientInterceptor {
             Some(token) => Some(bearer_metadata(token)?),
             None => None,
         };
-        Ok(Self { metadata_value })
+        Ok(Self {
+            metadata_value,
+            propagate_trace_context: crate::logging::trace_export_enabled(),
+        })
     }
 }
 
 impl tonic::service::Interceptor for BearerTokenClientInterceptor {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        if self.propagate_trace_context {
+            crate::logging::inject_trace_context(request.metadata_mut());
+        }
         if let Some(metadata) = self.metadata_value.as_ref() {
             request
                 .metadata_mut()

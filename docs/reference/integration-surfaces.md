@@ -212,7 +212,37 @@ For a local endpoint, pass the network of your own deployment. For a Foundation 
 
 ### TLS
 
-The URL scheme selects the transport. An `http://` endpoint uses plaintext HTTP/2, which fits a Zinder on the same host or private network. An `https://` endpoint uses TLS, and the client verifies the server certificate against the operating system's trusted root certificates. Install your system's CA certificate package in a minimal container image. An endpoint whose certificate comes from a private certificate authority needs that authority in the system trust store.
+The URL scheme selects the transport. An `http://` endpoint uses plaintext HTTP/2, which fits a Zinder on the same host or private network. An `https://` endpoint uses TLS, and the client verifies the server certificate against the operating system's trusted root certificates. Install your system's CA certificate package in a minimal container image. For a private trust store, see [Remote client settings](#remote-client-settings).
+
+### Remote client settings
+
+Use `RemoteChainIndex::connect_with_options` with `RemoteClientOptions` to
+configure transport and retries. The default uses system TLS roots for HTTPS,
+a direct connection, and one attempt per RPC.
+
+- `with_tls_ca_pem` accepts a PEM bundle. `with_tls_ca_der` accepts a collection
+  of DER certificates. Either replaces system roots.
+- `with_tls_domain_name` overrides the verified server name and the HTTP/2
+  authority host. The endpoint URI still determines where the client connects.
+- `with_tls_spki_pin` requires a 32-byte SHA-256 digest of the server's leaf
+  certificate `SubjectPublicKeyInfo` in DER form. The client also verifies the
+  certificate chain and server name. All TLS overrides require HTTPS.
+- `with_socks5_proxy` accepts an unauthenticated `socks5h://host:port` or
+  `socks5://host:port` URI. Both send destination hostnames, including
+  `.onion` addresses, to the proxy for resolution. Every reconnect uses the
+  proxy. A named proxy can itself require local DNS.
+- `with_read_retries` allows up to four attempts for an idempotent read RPC
+  that fails with `RetryPolicy::RetryWithBackoff`. The client uses jittered
+  exponential backoff or the server's `grpc-retry-pushback-ms` delay.
+  Negative, malformed, duplicate, or greater-than-two-second pushback ends
+  the retry sequence. Dropping the read future cancels pending retry waits.
+  Range and history streams can retry their opening request. The caller
+  handles failures after the stream opens and resumes event subscriptions
+  from a cursor. Broadcast makes one attempt.
+
+For domain types, codecs, and `ChainIndex` without the native gRPC adapter,
+depend on `zinder-client` with `default-features = false`. This configuration
+builds for `wasm32-unknown-unknown` and leaves transport to the caller.
 
 ### A native endpoint is not a lightwalletd endpoint
 

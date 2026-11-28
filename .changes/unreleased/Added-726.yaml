@@ -1,0 +1,6 @@
+kind: added
+body: Connect zinder-client through private TLS roots and SOCKS5 proxies, verify a pinned server key, and enable bounded retries for read RPCs. Build the domain-only SDK for WebAssembly with default features disabled.
+time: 2026-11-27T23:09:08.21292253Z
+custom:
+    Bump: minor
+    PR: "726"

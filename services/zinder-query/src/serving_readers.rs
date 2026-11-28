@@ -32,11 +32,13 @@ use zinder_core::{
     SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
     TransparentAddressScriptHash, TransparentOutPoint, TransparentOutpointSpendStatus,
 };
+use zinder_proto::compat::lightwalletd::EncodedBlock;
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence,
-    ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume, EncodedCompactBlockRange,
-    EncodedCompactBlockRangeRequest, EventStreamStartPosition, HeightOrder, RawBlobRetention,
-    ServedTreeState, StreamCursorTokenV1, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
+    ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume,
+    CompactBlockSpliceSelection, EncodedCompactBlockRange, EncodedCompactBlockRangeRequest,
+    EventStreamStartPosition, HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1,
+    TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionHistoryPage, WalletAddressTransactionKey,
@@ -44,6 +46,17 @@ use zinder_wallet_projection::{
 };
 
 use crate::ArtifactKey;
+
+/// Outcome of reading a pre-encoded unary compact block from storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EncodedCompactBlockLookup {
+    /// Pre-encoded protobuf wire block matching the requested splice selection.
+    Block(EncodedBlock),
+    /// Block height or hash is not present in the reader's retained best-chain index.
+    NotFound,
+    /// This reader does not support direct unary wire splicing.
+    Unsupported,
+}
 
 /// Canonical chain data read at one immutable admitted fence.
 ///
@@ -121,6 +134,26 @@ pub trait CanonicalReader: Send + Sync + 'static {
         &self,
         height: BlockHeight,
     ) -> Result<Option<CompactBlockArtifact>, StorageReadError>;
+
+    /// Reads one wire-encoded unary compact block at `height` directly from canonical
+    /// `ZSHRNG02` + `ZSTSUP01` or `live_tail_block` when supported.
+    async fn encoded_compact_block_at(
+        &self,
+        _height: BlockHeight,
+        _selection: CompactBlockSpliceSelection,
+    ) -> Result<EncodedCompactBlockLookup, StorageReadError> {
+        Ok(EncodedCompactBlockLookup::Unsupported)
+    }
+
+    /// Reads one wire-encoded unary compact block by `block_hash` when supported,
+    /// resolving the best-chain height and splicing in one storage call.
+    async fn encoded_compact_block_by_hash(
+        &self,
+        _block_hash: BlockHash,
+        _selection: CompactBlockSpliceSelection,
+    ) -> Result<EncodedCompactBlockLookup, StorageReadError> {
+        Ok(EncodedCompactBlockLookup::Unsupported)
+    }
 
     /// Reads every compact block of an inclusive range in ascending height
     /// order.

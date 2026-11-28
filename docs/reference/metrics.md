@@ -356,6 +356,7 @@ reflection, and unknown method paths are outside this denominator.
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `zinder_wallet_rpc_requests_total` | counter | `surface`, `method`, `grpc_code`, `error_class` | Completed RPCs, including refusals and terminal stream errors. |
+| `zinder_grpc_block_range_admission_refusals_total` | counter | `surface`, `reason` | New block-range calls refused on `lightwalletd` or `wallet_query`. Reasons are `client_quota`, `client_capacity` when the client table is full, and `scheduling_delay` when adaptive shedding is active. |
 | `zinder_wallet_rpc_readiness_refusals_total` | counter | `surface`, `method` | Requests refused by the readiness interceptor. Each recognized method starts at zero. A refusal also contributes one terminal RPC outcome. |
 | `zinder_wallet_rpc_duration_seconds` | histogram | same as completed RPCs | Seconds from listener arrival through completion or cancellation. |
 | `zinder_wallet_rpc_in_flight` | gauge | `surface`, `method` | Calls from arrival until their final outcome. |
@@ -664,3 +665,13 @@ information and query.
 
 Startup phases log under the `zinder::startup` target, as
 [Service operations](../architecture/service-operations.md) describes.
+
+
+## Distributed traces
+
+To export spans, configure [trace export](configuration.md#trace-export).
+Wallet RPC spans identify the protocol surface and method. Ingest control
+spans share the trace ID when the caller forwards W3C Trace Context. Wallet
+transaction broadcasts also include a span for the upstream node call. Use
+that ID in your collector to relate control and node work to the wallet request.
+Collector export uses a bounded queue that can drop spans during overload.

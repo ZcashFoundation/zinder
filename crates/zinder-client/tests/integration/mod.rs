@@ -3,5 +3,6 @@ mod chain_event_resume;
 mod error_reason_roundtrip;
 mod public_vocabulary;
 mod remote_chain_index;
+mod remote_transport;
 mod rustdoc_coverage;
 mod transaction_lookup;

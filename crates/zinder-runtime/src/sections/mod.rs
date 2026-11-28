@@ -9,6 +9,7 @@
 pub mod defaults;
 mod deployment;
 mod ingest_control;
+mod observability;
 mod ops;
 mod projector_control;
 mod retention;
@@ -24,6 +25,7 @@ pub use ingest_control::{
     ResolvedIngestControlReader, ResolvedIngestControlWriter, resolve_ingest_control_reader,
     resolve_ingest_control_writer, resolve_ingest_control_writer_with_data_dir,
 };
+pub use observability::ObservabilityConfig;
 pub use ops::{OpsSection, OpsToml, resolve_ops_listen_addr};
 pub use projector_control::{
     ProjectorControlSection, ProjectorControlToml, ResolvedProjectorControl,

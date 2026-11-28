@@ -33,6 +33,7 @@ const DEFAULT_EXPLORER_ADDR: &str = "127.0.0.1:9068";
 const ALLOWED_TOP_LEVEL_SECTIONS: &[&str] = &[
     "deployment",
     "network",
+    "observability",
     "ops",
     "security",
     "storage",
@@ -571,6 +572,9 @@ fn filter_toml_for_role(
 }
 
 fn role_accepts_section(role: ServiceRole, section: &str, profile: DeploymentProfile) -> bool {
+    if section == "observability" {
+        return true;
+    }
     match role {
         ServiceRole::Ingest => matches!(
             section,

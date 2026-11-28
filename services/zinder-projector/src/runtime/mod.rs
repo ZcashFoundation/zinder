@@ -29,7 +29,7 @@ use zinder_proto::v1::ingest::{CreateStateBundleCaptureRequest, CreateStateBundl
 use zinder_runtime::{
     CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
     CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation, OpsHealthcheckArgs, OpsServer,
-    OpsServerError, Readiness, ReadinessState, StartupPhase, StartupPhaseGuard,
+    OpsServerError, Readiness, ReadinessState, RuntimeService, StartupPhase, StartupPhaseGuard,
     TracingSubscriberError, cancel_on_terminating_signal, compare_canonical_writer_fences,
     converge_on_canonical_writer_fence, expected_writer_fence, host_cpu_meets_compiled_baseline,
     host_cpu_meets_pasta_backend_baseline, install_metrics_recorder, install_tracing_subscriber,
@@ -174,28 +174,33 @@ impl From<Cli> for ProjectorConfigOverrides {
 
 /// Runs the standalone `zinder-projector` CLI from process arguments.
 pub async fn main_from_env(binary_name: &str) -> ExitCode {
-    let mut cli = Cli::parse();
-    let recovery = match cli.command.take() {
-        Some(Command::Healthcheck(healthcheck)) => {
-            return run_healthcheck(binary_name, &healthcheck, cli.config_path.as_deref());
-        }
-        Some(Command::Recovery(command)) => Some(command),
-        None => None,
-    };
-    if let Err(error) = install_tracing_subscriber() {
-        return emit_tracing_subscriber_error(binary_name, &error);
-    }
-    run_parsed_cli(binary_name, cli, recovery).await
+    dispatch_cli(binary_name, Cli::try_parse(), true).await
 }
 
-/// Runs `zinder-projector` from explicit CLI arguments when tracing is already
-/// initialized by a parent process such as `zinder run`.
+/// Runs this role as the process entry point, owning its tracing subscriber.
+pub async fn run_process_from_args<I, T>(binary_name: &str, args: I) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    dispatch_cli(binary_name, Cli::try_parse_from(args), true).await
+}
+
+/// Runs this role from explicit arguments using the caller's tracing subscriber.
 pub async fn run_from_args<I, T>(binary_name: &str, args: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let mut cli = match Cli::try_parse_from(args) {
+    dispatch_cli(binary_name, Cli::try_parse_from(args), false).await
+}
+
+async fn dispatch_cli(
+    binary_name: &str,
+    parsed: Result<Cli, clap::Error>,
+    owns_process_tracing: bool,
+) -> ExitCode {
+    let mut cli = match parsed {
         Ok(cli) => cli,
         Err(error) => return print_clap_error(&error),
     };
@@ -206,7 +211,34 @@ where
         Some(Command::Recovery(command)) => Some(command),
         None => None,
     };
-    run_parsed_cli(binary_name, cli, recovery).await
+    if owns_process_tracing {
+        run_with_process_tracing(binary_name, cli, recovery).await
+    } else {
+        run_parsed_cli(binary_name, cli, recovery).await
+    }
+}
+
+async fn run_with_process_tracing(
+    binary_name: &str,
+    cli: Cli,
+    recovery: Option<recovery::RecoveryCommand>,
+) -> ExitCode {
+    if cli.print_config || recovery.is_some() {
+        if let Err(error) = install_tracing_subscriber() {
+            return emit_tracing_subscriber_error(binary_name, &error);
+        }
+        return run_parsed_cli(binary_name, cli, recovery).await;
+    }
+    let tracing = match zinder_runtime::install_runtime_tracing_subscriber(
+        RuntimeService::Projector,
+        cli.config_path.as_deref(),
+    ) {
+        Ok(tracing) => tracing,
+        Err(error) => return emit_tracing_subscriber_error(binary_name, &error),
+    };
+    let exit = run_parsed_cli(binary_name, cli, recovery).await;
+    tracing.shutdown().await;
+    exit
 }
 
 async fn run_parsed_cli(

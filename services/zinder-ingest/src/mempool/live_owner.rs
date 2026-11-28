@@ -38,8 +38,8 @@ use zinder_source::{
     MempoolHydrationFailureReason, MempoolSource, MempoolSourceEvent, SourceError,
 };
 use zinder_store::{
-    EventStreamStartPosition, MempoolEvent, MempoolEventPosition, MempoolEventRetentionConfig,
-    MempoolEventRetentionStepBudget, MempoolEventRetentionStepOutcome,
+    CanonicalMempoolEventStreamStart, EventStreamStartPosition, MempoolEvent, MempoolEventPosition,
+    MempoolEventRetentionConfig, MempoolEventRetentionStepBudget, MempoolEventRetentionStepOutcome,
     MempoolEventRetentionStepStop, SNAPSHOT_PAGE_CURSOR_LEN, StreamCursorTokenV1,
     block_tip_message, chain_view_message, mempool_entry_message, mempool_event_envelope_message,
 };
@@ -356,21 +356,53 @@ impl LiveMempoolOwner {
     /// Observes loss of the current live tail even while a durable page read
     /// waits behind reconciliation. A timely replacement preserves continuity.
     pub(crate) fn live_tail_withdrawn(&self) -> impl Future<Output = Status> + '_ {
-        let guard = self.status.read();
         let mut changes = self.status_changes.subscribe();
-        let withdrawals = *changes.borrow_and_update();
-        let status = guard.clone();
-        drop(guard);
+        let initial_withdrawals = *changes.borrow_and_update();
         async move {
-            match status {
-                MempoolOwnerStatus::Serving { endpoint, .. } => {
-                    tokio::select! {
-                        _ = changes.wait_for(|current| *current != withdrawals) => {}
-                        () = endpoint.deactivated() => {}
-                    }
+            loop {
+                // Observe withdrawal count before cloning status so any status
+                // transition published after the read marks `changes` dirty.
+                let observed_withdrawals = *changes.borrow_and_update();
+                if observed_withdrawals != initial_withdrawals {
+                    break;
                 }
-                MempoolOwnerStatus::Halted(halt) => return halt.status(),
-                MempoolOwnerStatus::Hydrating | MempoolOwnerStatus::RebuildRequired => {}
+                let status = self.status.read().clone();
+                match status {
+                    MempoolOwnerStatus::Serving {
+                        endpoint,
+                        replacement_deadline: Some(deadline),
+                        ..
+                    } => {
+                        if TokioInstant::now() >= deadline {
+                            break;
+                        }
+                        tokio::select! {
+                            watch_update = changes.changed() => {
+                                if watch_update.is_err() {
+                                    break;
+                                }
+                            }
+                            () = endpoint.deactivated() => break,
+                            () = tokio::time::sleep_until(deadline) => {},
+                        }
+                    }
+                    MempoolOwnerStatus::Serving {
+                        endpoint,
+                        replacement_deadline: None,
+                        ..
+                    } => {
+                        tokio::select! {
+                            watch_update = changes.changed() => {
+                                if watch_update.is_err() {
+                                    break;
+                                }
+                            }
+                            () = endpoint.deactivated() => break,
+                        }
+                    }
+                    MempoolOwnerStatus::Halted(halt) => return halt.status(),
+                    MempoolOwnerStatus::Hydrating | MempoolOwnerStatus::RebuildRequired => break,
+                }
             }
             self.require_not_halted().err().unwrap_or_else(|| {
                 status_for_reason(
@@ -617,25 +649,16 @@ impl LiveMempoolOwner {
         Ok(self.index.snapshot_page(max_entries, None))
     }
 
-    /// Resolves a durable mempool stream start while excluding a concurrent index transition.
+    /// Resolves a durable mempool stream start and live head subscription while
+    /// excluding a concurrent index transition.
     pub(crate) async fn resolve_event_start(
         &self,
         canonical: &CanonicalControlHandle,
         start: EventStreamStartPosition,
-    ) -> Result<(Option<StreamCursorTokenV1>, Option<StreamCursorTokenV1>), Status> {
+    ) -> Result<CanonicalMempoolEventStreamStart, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
         self.require_not_halted()?;
-        let head = canonical
-            .resolve_mempool_event_start(EventStreamStartPosition::LiveTail)
-            .await?;
-        let after = match start {
-            EventStreamStartPosition::LiveTail => head.clone(),
-            EventStreamStartPosition::EarliestRetained => None,
-            start @ EventStreamStartPosition::AfterCursor(_) => {
-                canonical.resolve_mempool_event_start(start).await?
-            }
-        };
-        Ok((after, head))
+        canonical.resolve_mempool_event_start(start).await
     }
 
     /// Reads one durable mempool event page and encodes it for the public wire.
@@ -963,19 +986,25 @@ impl LiveMempoolOwner {
     /// A normal tip change keeps the serving generation: it still describes
     /// the mempool at its own tip, which is exactly what a reader whose
     /// canonical epoch has not moved yet needs.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "status notification must run under the status lock so live_tail_withdrawn observes replacement_deadline without racing"
+    )]
     fn begin_next_generation_locked(&self) -> Option<TokioInstant> {
         *self.staged_generation.lock() = Some(StagedMempoolGeneration::new());
+        let mut current = self.status.write();
         if let MempoolOwnerStatus::Serving {
             replacement_deadline,
             ..
-        } = &mut *self.status.write()
+        } = &mut *current
         {
             // Further tip changes cannot extend the lifetime of the same frozen index.
-            return Some(
-                *replacement_deadline
-                    .get_or_insert_with(|| TokioInstant::now() + MEMPOOL_TIP_TRANSITION_GRACE),
-            );
+            let deadline = *replacement_deadline
+                .get_or_insert_with(|| TokioInstant::now() + MEMPOOL_TIP_TRANSITION_GRACE);
+            self.status_changes.send_modify(|_| {});
+            return Some(deadline);
         }
+        drop(current);
         self.set_status(MempoolOwnerStatus::Hydrating);
         None
     }
@@ -1192,7 +1221,7 @@ impl LiveMempoolOwner {
         Ok(())
     }
 
-    async fn withdraw_for_rebuild(&self) {
+    pub(crate) async fn withdraw_for_rebuild(&self) {
         let _mutation_guard = self.mutation_gate.lock().await;
         self.staged_generation.lock().take();
         self.pinned_snapshots.lock().clear();

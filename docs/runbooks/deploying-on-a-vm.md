@@ -188,7 +188,13 @@ docker compose --env-file /etc/zinder/env \
 
 ## Upgrade, restart, and roll back
 
-Check release notes for store layout changes before upgrading. A layout change requires fresh empty store paths ([Schema admission](../architecture/storage-backend.md#schema-admission)). Keep previous binaries/images and their separate store if you need rollback.
+Starting at `v0.28.0`, every release declares an `**Upgrade class:**` line at the top of its release notes, replacing ad-hoc per-release store layout declarations. Each release's class describes compatibility against the immediately preceding release. When upgrading across skipped releases, inspect every intervening release between your running version and the target version, apply the most disruptive class (`compatible < additive-schema < projection-layout < canonical-layout`), and rebuild the union of all affected projections (`wallet`, `explorer`, or `materialized-view`) named across those releases (or follow the highest canonical rebuild contract if any intervening release is `canonical-layout`):
+
+- **`compatible` and `additive-schema`:** Upgrade in place against existing stores and schemas (provided no skipped intervening release has a higher class). Roll back by redeploying the previous release against the same store and schema.
+- **`projection-layout`:** Rebuild the affected projection(s) named across the release (and any skipped intervening releases) in fresh empty paths ([Schema admission](../architecture/storage-backend.md#schema-admission)).
+- **`canonical-layout`:** Rebuild the canonical store and dependent projections from scratch in fresh empty store paths ([Schema admission](../architecture/storage-backend.md#schema-admission)).
+
+Single-volume `rocksdb` hosts still restart every runtime at each release, whatever the class. For layout changes on `rocksdb`, keeping old and new store paths side by side for rollback is optional (~2x disk until you delete the old path); fallback rollback otherwise requires restoring a matching backup or snapshot ([Backups and Edge Snapshots](private-backups.md)) or rebuilding from empty in a clean path with the previous release. Seven-day superseded-schema retention applies strictly to future hosted `postgres` (planned M3, not yet implemented).
 
 **Upgrading an existing `transactions`-retaining store.** Volumes created by earlier releases with `raw_blob_policy = "transactions"` fail admission under `raw_blob_policy = "none"` or `"all"`, because changing persisted retention requires rebuilding the store. Either:
 
@@ -212,7 +218,7 @@ Check release notes for store layout changes before upgrading. A layout change r
 
 3. Restart `sudo systemctl restart zinder` (or restart `zinder-index` then `zinder-serve` cleanly; readers stop serving 5 minutes after `zinder-index` stops).
 
-To roll back, start the earlier release against the separate store you retained for it.
+To roll back across releases on `rocksdb`, apply the same multi-release rule across every version stepped back over: if all intervening releases are `compatible` or `additive-schema`, redeploy the earlier release against the existing store; if any intervening release between the running version and the rollback target is `projection-layout` or `canonical-layout`, start the earlier release against an optionally retained separate store path, restore a matching backup or snapshot, or rebuild the affected stores from empty in clean paths.
 
 ## Inspect a runtime container
 
