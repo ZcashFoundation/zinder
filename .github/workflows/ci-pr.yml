@@ -636,6 +636,17 @@ jobs:
             diff -u "${tempdir}/${proto}.local" "${tempdir}/${proto}.upstream"
           done
 
+      - name: Verify Darkside protocol pin
+        run: |
+          set -euo pipefail
+          vendor_dir=crates/zinder-proto/proto/compat/darkside
+          upstream_commit="$(cat "$vendor_dir/COMMIT")"
+          tempdir="$(mktemp -d)"
+          trap 'rm -rf "${tempdir}"' EXIT
+          curl -fsSL "https://raw.githubusercontent.com/zcash/lightwalletd/${upstream_commit}/walletrpc/darkside.proto" \
+            | perl -pe 's/[ \t]+$//' > "$tempdir/darkside.proto"
+          diff -u "$vendor_dir/darkside.proto" "$tempdir/darkside.proto"
+
       - name: Verify Zebra indexer protocol pin
         run: |
           set -euo pipefail

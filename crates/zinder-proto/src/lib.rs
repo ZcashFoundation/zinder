@@ -43,6 +43,12 @@ pub const LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat
     "/generated/lightwalletd_compat_descriptor.bin"
 ));
 
+/// Encoded descriptor set for Darkside test control and its wallet message imports.
+pub const DARKSIDE_FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/generated/darkside_descriptor.bin"
+));
+
 /// Native Zinder protocol modules.
 pub mod v1 {
     /// Private ingest control-plane protocol messages.
