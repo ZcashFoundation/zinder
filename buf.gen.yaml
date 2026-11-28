@@ -1,9 +1,8 @@
 # buf generation config for Zinder's public proto exports.
 #
-# OpenAPI output and descriptor sets are produced from the same proto module
-# declared in buf.yaml. The vendored lightwalletd schemas under proto/compat
-# are excluded; downstream consumers consuming `lightwalletd` already have its
-# public protocol.
+# OpenAPI output and the native descriptor use the module in buf.yaml.
+# The release workspace also includes vendored schemas and has its own
+# buf.gen.yaml for local client generation.
 #
 # Build invocation (used by release and protocol-contract workflows through
 # scripts/generate-api-artifacts.sh):

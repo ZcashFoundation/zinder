@@ -10,7 +10,9 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 | [check-sdk-dependency-requirement.sh](check-sdk-dependency-requirement.sh) | Checks dependency requirements for publishable SDK crates |
 | [check-sdk-package-policy.sh](check-sdk-package-policy.sh) | Enforces MSRV, metadata, and workspace policy for publishable SDK crates |
 | [check-zcash-upstream-alignment.sh](check-zcash-upstream-alignment.sh) | Checks pinned `zebra-chain`, `librustzcash` crate cohort, and Zebra/Zakura digests |
-| [generate-api-artifacts.sh](generate-api-artifacts.sh) | Generates and checks public API surface artifacts for SDK crates |
+| [generate-api-artifacts.sh](generate-api-artifacts.sh) | Builds API artifacts and packages the versioned archive when given a release tag |
+| [check-api-artifact.sh](check-api-artifact.sh) | Compares an API archive with its source and runs Buf and protoc from a standalone extraction |
+| [check-published-proto-compatibility.sh](check-published-proto-compatibility.sh) | Checks protobuf compatibility against the most recently published release and latest stable release carrying the contract archive |
 | [install-ci-tool.sh](install-ci-tool.sh) | Installs SHA-256 verified prebuilt CI tools pinned in `.github/ci-tools.lock` |
 | [regenerate-zinder-proto.sh](regenerate-zinder-proto.sh) | Regenerates (`--write`) or drift-checks (`--check`) `crates/zinder-proto/generated/` |
 | [runbook-lint.sh](runbook-lint.sh) | Lints documented test commands and `bash -n` syntax of fenced `bash` blocks in runbooks |

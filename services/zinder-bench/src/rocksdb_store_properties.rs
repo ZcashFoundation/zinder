@@ -11,7 +11,7 @@ use std::{
 
 use serde::Serialize;
 use zinder_bench::BenchError;
-use zinder_store::RocksDbCanonicalSecondary;
+use zinder_store::{ConstructionTreeStateCheckpointPolicy, RocksDbCanonicalSecondary};
 
 use crate::rocksdb_read_bench::{ReadEnvironment, ReadStoreArgs, ReadyFenceSummary};
 
@@ -23,6 +23,7 @@ pub(crate) struct StoreProperties {
     environment: ReadEnvironment,
     io_mode: &'static str,
     ready_fence: ReadyFenceSummary,
+    construction_tree_state_checkpoint_policy: Option<ConstructionTreeStateCheckpointPolicy>,
     column_families: BTreeMap<String, FamilyProperties>,
 }
 
@@ -70,6 +71,8 @@ pub(crate) fn run(args: &ReadStoreArgs) -> Result<StoreProperties, BenchError> {
         report_format_version: 1,
         io_mode: secondary.io_mode().as_str(),
         ready_fence: secondary.ready_evidence().into(),
+        construction_tree_state_checkpoint_policy: secondary
+            .construction_tree_state_checkpoint_policy(),
         environment,
         column_families,
     })

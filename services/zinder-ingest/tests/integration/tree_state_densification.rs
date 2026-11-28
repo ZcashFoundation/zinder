@@ -30,9 +30,9 @@ use zinder_query::{
 };
 use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, DensifiedTreeStateStride, RawBlobRetention,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
-    TreeStateCheckpointSelection, TreeStateStrideCommit,
+    CanonicalReorgPolicy, CanonicalStoreError, ConstructionTreeStateCheckpointPolicy,
+    DensifiedTreeStateStride, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget, TreeStateCheckpointSelection, TreeStateStrideCommit,
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, commitment_tree_checkpoints,
@@ -493,14 +493,20 @@ async fn an_unreadable_watermark_is_discarded() -> eyre::Result<()> {
 async fn a_changed_commitment_budget_rescans_and_records_progress_under_the_new_budget()
 -> eyre::Result<()> {
     let harness = Harness::new()?;
+    let manifest_path = harness
+        .primary_path()?
+        .join("canonical-construction-manifest.v2.json");
+    let construction_manifest = std::fs::read(&manifest_path)?;
+    let construction_digest = harness.manifest_sha256()?;
     let budget = |commitments| {
         NonZeroU32::new(commitments)
             .map(TreeStateCheckpointSelection::CommitmentBudget)
             .ok_or_else(|| eyre::eyre!("zero budget"))
     };
-    harness
+    let commits = harness
         .run_pass_to_completion(budget(20)?, &Hooks::default())
         .await?;
+    eyre::ensure!(!commits.is_empty(), "expected new checkpoint rows");
     eyre::ensure!(harness.watermark()?["commitment_budget"] == 20);
 
     // A looser budget needs no new rows, but its progress is its own.
@@ -514,6 +520,15 @@ async fn a_changed_commitment_budget_rescans_and_records_progress_under_the_new_
         watermark["commitment_budget"] == 30 && watermark["through_height"] == DENSIFIED_THROUGH,
         "unexpected watermark {watermark}"
     );
+    assert_eq!(std::fs::read(manifest_path)?, construction_manifest);
+    assert_eq!(harness.manifest_sha256()?, construction_digest);
+    harness.with_primary(|primary| {
+        assert_eq!(
+            primary.construction_tree_state_checkpoint_policy(),
+            Some(ConstructionTreeStateCheckpointPolicy::CadenceAndTip)
+        );
+        Ok(())
+    })?;
     Ok(())
 }
 

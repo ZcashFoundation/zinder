@@ -3173,6 +3173,53 @@ fn published_4096_boundary_store(
     Ok((store, activations))
 }
 
+#[test]
+fn settled_replay_range_rejects_a_malformed_header_key_between_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    use zinder_core::wire::encode_height_key_ascending;
+
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let (store, activations) = published_4096_boundary_store(&store_path)?;
+    let secondary = RocksDbCanonicalSecondary::open_ready(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
+        CanonicalReorgPolicy::new(8)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(secondary.sealed_segments.len(), 1);
+    let batch_end = BlockHeight::new(256);
+    let scan_end = BlockHeight::new(257);
+    let range = BlockHeightRange::inclusive(BlockHeight::new(1), scan_end);
+    let clean = secondary
+        .scan_canonical_replay_range(range)?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        clean
+            .iter()
+            .map(|replay| replay.facts().block_header.height)
+            .eq(range)
+    );
+
+    let db = &store.bounded_open.db;
+    let family = column_family(db, BLOCK_HEADER_COLUMN_FAMILY)?;
+    let mut malformed_key = encode_height_key_ascending(batch_end).to_vec();
+    malformed_key.push(0);
+    db.put_cf(&family, &malformed_key, [0xff])?;
+    db.flush_cf(&family)?;
+    secondary.bounded_open.db.try_catch_up_with_primary()?;
+
+    assert!(matches!(
+        secondary
+            .scan_canonical_replay_range(range)?
+            .collect::<Result<Vec<_>, _>>(),
+        Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+    ));
+    Ok(())
+}
+
 /// Consumes `RocksDB`'s `min(16, table_cache_capacity / 4)` open-time
 /// `table_reader_handle` pins on `default` (`CF 0`) so later column families
 /// (including `live_tail_block`) receive none at secondary open.

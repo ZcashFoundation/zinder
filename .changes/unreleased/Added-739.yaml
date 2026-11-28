@@ -1,0 +1,7 @@
+kind: added
+body: Add the generated Darkside test-control client and server and DARKSIDE_FILE_DESCRIPTOR_SET to zinder-proto for wallet SDK testing.
+time: 2026-11-27T23:53:20.954230657Z
+custom:
+    Bump: minor
+    Upgrade: compatible
+    PR: "739"

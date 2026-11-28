@@ -24,7 +24,7 @@ use zinder_rocksdb_bulk_load::{
 use super::{
     CanonicalBlockLoadEvidence, CanonicalStoreBuildPlan, CanonicalStoreError,
     CanonicalStoreReadyEvidence,
-    block_load::CanonicalStagedSstEvidence,
+    block_load::{CanonicalStagedSstEvidence, ConstructionTreeStateCheckpointPolicy},
     subtree_load::{CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence},
 };
 
@@ -63,6 +63,12 @@ pub struct CanonicalConstructionManifestBinding {
     pub version: u16,
     /// Domain-separated SHA-256 over the exact sidecar bytes.
     pub sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ConstructionManifestDetails {
+    pub(super) subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
+    pub(super) tree_state_checkpoint_policy: Option<ConstructionTreeStateCheckpointPolicy>,
 }
 
 /// One complete ordered family observation used by construction certification.
@@ -132,6 +138,7 @@ impl CanonicalConstructionFamilyEvidenceAccumulator {
 pub(super) struct CanonicalConstructionManifestDraft {
     evidence_provenance: CanonicalConstructionProofProvenance,
     build_plan: CanonicalStoreBuildPlan,
+    tree_state_checkpoint_policy: ConstructionTreeStateCheckpointPolicy,
     source_checkpoint: CommitmentTreeCheckpoint,
     block_evidence: CanonicalBlockLoadEvidence,
     subtree_evidence: CanonicalSubtreeRootLoadEvidence,
@@ -141,6 +148,7 @@ pub(super) struct CanonicalConstructionManifestDraft {
 
 pub(super) struct CanonicalConstructionManifestInputs {
     pub(super) build_plan: CanonicalStoreBuildPlan,
+    pub(super) tree_state_checkpoint_policy: ConstructionTreeStateCheckpointPolicy,
     pub(super) source_checkpoint: CommitmentTreeCheckpoint,
     pub(super) block_evidence: CanonicalBlockLoadEvidence,
     pub(super) subtree_evidence: CanonicalSubtreeRootLoadEvidence,
@@ -176,6 +184,7 @@ impl CanonicalConstructionManifestDraft {
         Ok(Self {
             evidence_provenance,
             build_plan: inputs.build_plan,
+            tree_state_checkpoint_policy: inputs.tree_state_checkpoint_policy,
             source_checkpoint: inputs.source_checkpoint,
             block_evidence: inputs.block_evidence,
             subtree_evidence: inputs.subtree_evidence,
@@ -184,8 +193,11 @@ impl CanonicalConstructionManifestDraft {
         })
     }
 
-    pub(super) const fn subtree_root_coverage(&self) -> CanonicalSubtreeRootLoadCoverage {
-        self.subtree_evidence.coverage
+    pub(super) const fn details(&self) -> ConstructionManifestDetails {
+        ConstructionManifestDetails {
+            subtree_root_coverage: self.subtree_evidence.coverage,
+            tree_state_checkpoint_policy: Some(self.tree_state_checkpoint_policy),
+        }
     }
 
     pub(super) fn persist(
@@ -212,7 +224,7 @@ pub(super) fn validate_ready_construction_manifest(
     store_path: &Path,
     ready: &CanonicalStoreReadyEvidence,
     build_plan: &CanonicalStoreBuildPlan,
-) -> Result<CanonicalSubtreeRootLoadCoverage, CanonicalStoreError> {
+) -> Result<ConstructionManifestDetails, CanonicalStoreError> {
     let (manifest, bytes) = read_construction_manifest(store_path)?;
     let binding = CanonicalConstructionManifestBinding {
         version: manifest.format_version,
@@ -227,7 +239,10 @@ pub(super) fn validate_ready_construction_manifest(
         ));
     }
     validate_manifest_control_identity(store_path, &manifest, build_plan)?;
-    Ok(manifest.subtree_evidence.coverage)
+    Ok(ConstructionManifestDetails {
+        subtree_root_coverage: manifest.subtree_evidence.coverage,
+        tree_state_checkpoint_policy: manifest.tree_state_checkpoint_policy,
+    })
 }
 
 fn read_construction_manifest(
@@ -430,6 +445,8 @@ struct PersistedConstructionManifest {
     format_version: u16,
     evidence_provenance: String,
     build_plan: PersistedBuildPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tree_state_checkpoint_policy: Option<ConstructionTreeStateCheckpointPolicy>,
     source_tip_checkpoint: PersistedCheckpoint,
     block_evidence: PersistedBlockEvidence,
     subtree_evidence: PersistedSubtreeEvidence,
@@ -450,6 +467,7 @@ impl PersistedConstructionManifest {
             format_version: CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
             evidence_provenance: draft.evidence_provenance.as_str().to_owned(),
             build_plan: PersistedBuildPlan::from_plan(&draft.build_plan),
+            tree_state_checkpoint_policy: Some(draft.tree_state_checkpoint_policy),
             source_tip_checkpoint: PersistedCheckpoint::from_checkpoint(&draft.source_checkpoint),
             block_evidence,
             subtree_evidence: PersistedSubtreeEvidence::from_evidence(draft.subtree_evidence),
@@ -1274,6 +1292,90 @@ mod tests {
 
         assert_eq!(persisted_none, original_none);
         assert_eq!(persisted_all, original_all);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_v2_store_authenticates_original_bytes_and_reports_unknown_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::{
+            CanonicalReorgPolicy, CanonicalStoreBuildState, RocksDbCanonicalStore,
+            control::{decode_store_control, encode_ready_store_control_with_revisions},
+            rocksdb::STORE_CONTROL_KEY,
+        };
+        use crate::{RawBlobRetention, RocksDbResourceBudget};
+        use rust_rocksdb::{DB, Options};
+        use zinder_core::Network;
+
+        let temporary = TempDir::new()?;
+        let path = temporary.path().join("canonical");
+        let reorg_policy = CanonicalReorgPolicy::new(2)?;
+        drop(
+            super::super::live_replacement_tests::published_store_with_retention(
+                &path,
+                reorg_policy.reorg_window_blocks(),
+                BlockHeight::new(4),
+                BlockHeight::new(2),
+                RawBlobRetention::None,
+            )?,
+        );
+        let (mut manifest, _) = read_construction_manifest(&path)?;
+        manifest.tree_state_checkpoint_policy = None;
+        // Use noncanonical whitespace so re-serializing before hashing would fail.
+        let legacy_bytes = serde_json::to_vec_pretty(&manifest)?;
+        let legacy_json: serde_json::Value = serde_json::from_slice(&legacy_bytes)?;
+        assert!(legacy_json.get("tree_state_checkpoint_policy").is_none());
+        let original_digest = manifest_digest(&legacy_bytes);
+        assert_ne!(
+            original_digest,
+            manifest_digest(&serde_json::to_vec(&manifest)?)
+        );
+        fs::write(manifest_path(&path), &legacy_bytes)?;
+
+        let options = Options::default();
+        let db = DB::open_cf(&options, &path, DB::list_cf(&options, &path)?)?;
+        let encoded = db
+            .get(STORE_CONTROL_KEY)?
+            .ok_or("READY control is absent")?;
+        let control = decode_store_control(&path, &encoded)?;
+        let CanonicalStoreBuildState::Ready(mut ready) = control.build_state else {
+            return Err("published control must be READY".into());
+        };
+        ready.construction_manifest_sha256 = original_digest;
+        db.put(
+            STORE_CONTROL_KEY,
+            encode_ready_store_control_with_revisions(
+                &control.build_plan,
+                control.cursor_auth_key,
+                &ready,
+                control.revisions(),
+            )?,
+        )?;
+        db.flush_wal(true)?;
+        drop(db);
+
+        let activations = super::super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let open = || {
+            RocksDbCanonicalStore::open_ready(
+                &path,
+                &activations,
+                RawBlobRetention::None,
+                reorg_policy,
+                RocksDbResourceBudget::for_local_tests(),
+            )
+        };
+        let reopened = open()?;
+        assert_eq!(reopened.construction_tree_state_checkpoint_policy(), None);
+        assert_eq!(
+            reopened.ready_evidence().construction_manifest_sha256,
+            original_digest
+        );
+        assert_eq!(fs::read(manifest_path(&path))?, legacy_bytes);
+        drop(reopened);
+
+        fs::write(manifest_path(&path), serde_json::to_vec(&manifest)?)?;
+        let error = open().err().ok_or("READY must reject different bytes")?;
+        assert!(error.to_string().contains("digest differs from READY"));
         Ok(())
     }
 

@@ -1,9 +1,14 @@
 use std::sync::Arc;
 
-use prost::Message as _;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use http::{Request, Version, header};
+use http_body_util::{BodyExt as _, Full};
+use prost::{Message as _, bytes::Bytes};
 use rust_rocksdb::{DB, DEFAULT_COLUMN_FAMILY_NAME, Options};
 use serde_json::json;
-use tonic::{Code, transport::Server};
+use tonic::{Code, Status, body::Body, transport::Server};
+use tonic_web::GrpcWebLayer;
+use tower::{ServiceBuilder, ServiceExt as _};
 use zinder_compat_lightwalletd::{
     CanonicalReaderSlot, CompactBlocksGrpcAdapter, LightwalletdGrpcAdapter,
 };
@@ -13,7 +18,9 @@ use zinder_core::{
     CompactTransactionData, CompactTransparentInput, CompactTransparentOutput, TransactionId,
     wire::encode_internal_block_hash,
 };
-use zinder_proto::compat::lightwalletd::{self, PoolType};
+use zinder_proto::compat::lightwalletd::{
+    self, PoolType, compact_tx_streamer_server::SERVICE_NAME,
+};
 use zinder_query::{
     CanonicalReader as _, DEFAULT_TREE_STATE_REPLAY_WAIT,
     DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, EncodedCompactBlockLookup, ForwardedReadLimit,
@@ -139,6 +146,13 @@ fn parity_block_txs(height_num: u32) -> Vec<CompactTransaction> {
 }
 
 fn build_mixed_parity_chain(total_blocks: u32) -> eyre::Result<ChainFixture> {
+    parity_chain(total_blocks, parity_block_txs)
+}
+
+fn parity_chain(
+    total_blocks: u32,
+    transactions: impl Fn(u32) -> Vec<CompactTransaction>,
+) -> eyre::Result<ChainFixture> {
     let mut chain = ChainFixture::new(NETWORK)
         .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(total_blocks);
@@ -147,7 +161,7 @@ fn build_mixed_parity_chain(total_blocks: u32) -> eyre::Result<ChainFixture> {
     let mut ironwood_tree = 0_u32;
     for h in 1_u32..=total_blocks {
         let blk = fixture_block(&chain, BlockHeight::new(h))?;
-        let txs = parity_block_txs(h);
+        let txs = transactions(h);
         for tx in &txs {
             sapling_tree += u32::try_from(tx.data.sapling_outputs.len())?;
             orchard_tree += u32::try_from(tx.data.orchard_actions.len())?;
@@ -394,6 +408,144 @@ async fn grpc_unary_and_transparent_range_presets_match_stock_wire_bytes() -> ey
         recorder.recorded_compact_block_ranges(),
         [] as [BlockHeightRange; 0]
     );
+    Ok(())
+}
+
+const GRPC: &str = "application/grpc";
+const WEB_BINARY: &str = "application/grpc-web+proto";
+const WEB_TEXT: &str = "application/grpc-web-text+proto";
+
+fn unary_request(method: &str, encoding: &str, height: u64) -> eyre::Result<Request<Body>> {
+    let block_id = lightwalletd::BlockId {
+        height,
+        hash: Vec::new(),
+    };
+    let mut frame = vec![0];
+    frame.extend_from_slice(&u32::try_from(block_id.encoded_len())?.to_be_bytes());
+    block_id.encode(&mut frame)?;
+    if encoding == WEB_TEXT {
+        frame = STANDARD.encode(frame).into_bytes();
+    }
+    let version = if encoding == GRPC {
+        Version::HTTP_2
+    } else {
+        Version::HTTP_11
+    };
+    Ok(Request::post(format!("/{SERVICE_NAME}/{method}"))
+        .version(version)
+        .header(header::CONTENT_TYPE, encoding)
+        .header(header::ACCEPT, encoding)
+        .body(Body::new(Full::new(Bytes::from(frame))))?)
+}
+
+#[tokio::test]
+async fn unary_passthrough_preserves_raw_grpc_and_grpc_web_frames() -> eyre::Result<()> {
+    let chain = parity_chain(8, |height| {
+        let mut transactions = parity_block_txs(height);
+        if matches!(height, 2 | 6)
+            && let Some(transaction) = transactions.first_mut()
+        {
+            transaction.data.fee_zat = Some(u64::from(u32::MAX) + 1);
+        }
+        transactions
+    })?;
+    let store = ReaderFixture::new(subset_writer(&chain)?.into_serving_store_fixture()?)?;
+    let actual = ServiceBuilder::new()
+        .layer(GrpcWebLayer::new())
+        .service(LightwalletdGrpcAdapter::new(direct_recorder(store.query.clone())).into_server());
+    let fallback = ServiceBuilder::new().layer(GrpcWebLayer::new()).service(
+        LightwalletdGrpcAdapter::new(EpochPinRecorder::new(store.query.clone())).into_server(),
+    );
+
+    for method in ["GetBlock", "GetBlockNullifiers"] {
+        for encoding in [GRPC, WEB_BINARY, WEB_TEXT] {
+            // Exercise both sides of the settled/live-tail boundary.
+            for height in [1, 3, 4, 5, 7, 8] {
+                let expected = fallback
+                    .clone()
+                    .oneshot(unary_request(method, encoding, height)?)
+                    .await?;
+                let response = actual
+                    .clone()
+                    .oneshot(unary_request(method, encoding, height)?)
+                    .await?;
+                assert_eq!(response.headers(), expected.headers());
+                let expected = expected.into_body().collect().await?;
+                let response = response.into_body().collect().await?;
+                assert_eq!(response.trailers(), expected.trailers());
+                let frame = response.to_bytes();
+                assert_eq!(
+                    frame,
+                    expected.to_bytes(),
+                    "{method} {encoding} at {height}"
+                );
+                if encoding == GRPC {
+                    let payload = frame
+                        .get(lightwalletd::EncodedBlock::PREFIX_LEN..)
+                        .ok_or_else(|| eyre::eyre!("missing gRPC frame prefix"))?;
+                    let decoded = lightwalletd::CompactBlock::decode(payload)?;
+                    assert_eq!(decoded.height, height);
+                    assert_eq!(
+                        lightwalletd::EncodedBlock::encode(&decoded)?.as_length_prefixed(),
+                        &frame
+                    );
+                }
+            }
+
+            for (height, code) in [
+                (0, Code::InvalidArgument),
+                (2, Code::DataLoss),
+                (6, Code::DataLoss),
+            ] {
+                let response = actual
+                    .clone()
+                    .oneshot(unary_request(method, encoding, height)?)
+                    .await?;
+                assert_eq!(
+                    Status::from_header_map(response.headers()).map(|status| status.code()),
+                    Some(code)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unary_passthrough_respects_tonic_message_size_limits() -> eyre::Result<()> {
+    use lightwalletd::compact_tx_streamer_server::CompactTxStreamerServer;
+
+    let chain = build_mixed_parity_chain(8)?;
+    let store = ReaderFixture::new(subset_writer(&chain)?.into_serving_store_fixture()?)?;
+    let adapter = LightwalletdGrpcAdapter::new(direct_recorder(store.query.clone()));
+    let server = CompactTxStreamerServer::new(adapter);
+    for method in ["GetBlock", "GetBlockNullifiers"] {
+        let request_limited = server
+            .clone()
+            .max_decoding_message_size(1)
+            .oneshot(unary_request(method, GRPC, 3)?)
+            .await?;
+        assert_eq!(
+            Status::from_header_map(request_limited.headers()).map(|status| status.code()),
+            Some(Code::OutOfRange),
+        );
+        let response_limited = server
+            .clone()
+            .max_encoding_message_size(1)
+            .oneshot(unary_request(method, GRPC, 3)?)
+            .await?;
+        let trailers = response_limited
+            .into_body()
+            .frame()
+            .await
+            .ok_or_else(|| eyre::eyre!("missing oversized-response status"))??
+            .into_trailers()
+            .map_err(|_| eyre::eyre!("oversized response emitted a data frame"))?;
+        assert_eq!(
+            Status::from_header_map(&trailers).map(|status| status.code()),
+            Some(Code::OutOfRange),
+        );
+    }
     Ok(())
 }
 

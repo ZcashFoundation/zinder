@@ -3511,6 +3511,52 @@ impl PositionalByteSource for CountingByteSource {
 }
 
 #[test]
+fn overlapping_reads_reuse_verified_chunks_but_a_new_open_checks_its_own_source() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = build_rich_corpus(800)?;
+    let (path, _, identity, _) = write_paired_segments(
+        dir.path(),
+        &blocks,
+        true,
+        SettledSupplementSegmentWriteOptions::default(),
+    )?;
+    let mut raw = fs::read(path)?;
+    let source = CountingByteSource::new(raw.clone());
+    let reader = SettledSupplementSegmentReader::open_source(
+        Arc::clone(&source),
+        &identity,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+    let start = BlockHeight::new(800);
+    let next = BlockHeight::new(801);
+    let plan = reader.index().plan_block_range(start, next)?;
+    let [step] = plan.chunks() else {
+        return Err("fixture needs two blocks in one chunk".into());
+    };
+    let chunk_range = step.compressed_range();
+    source.take_reads();
+    let first = reader.read_block(start)?;
+    assert_eq!(source.take_reads(), [plan.row_index_range(), chunk_range]);
+    assert_eq!(reader.read_range(start, next)?[0], first);
+    assert_eq!(source.take_reads(), [plan.row_index_range()]);
+
+    raw[usize::try_from(chunk_range.offset)?] ^= 0x55;
+    let corrupt = SettledSupplementSegmentReader::open_source(
+        Bytes::from(raw),
+        &identity,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+    for height in [start, next] {
+        assert!(matches!(
+            corrupt.read_block(height),
+            Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+        ));
+    }
+    assert_eq!(reader.read_block(start)?, first);
+    Ok(())
+}
+
+#[test]
 fn cold_open_source_reads_header_and_indexes_only_without_touching_chunks() -> TestOutcome {
     let dir = TempDir::new()?;
     let blocks = build_rich_corpus(800)?;

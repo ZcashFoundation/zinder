@@ -26,6 +26,7 @@ concurrency:
 
 env:
   BUF_VERSION: "1.75.0"
+  PROTOC_VERSION: "36.2"
   RELEASE_IMAGES_FILE: deploy/release-images.json
 
 jobs:
@@ -145,25 +146,20 @@ jobs:
           version: ${{ env.BUF_VERSION }}
           github_token: ${{ github.token }}
 
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ github.token }}
+
       - name: Generate and verify API artifacts
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          bash scripts/generate-api-artifacts.sh
-
-          mkdir -p dist/release
-          cp -R dist/openapi dist/release/openapi
-          cp -R dist/proto dist/release/proto
-          cp dist/zinder.v1.descriptor.bin dist/release/zinder.v1.descriptor.bin
-          bash scripts/check-native-proto-closure.sh dist/release
-          tar \
-            -C dist/release \
-            -czf "dist/zinder-api-docs-${RELEASE_TAG}.tar.gz" \
-            openapi \
-            proto \
-            zinder.v1.descriptor.bin
+          scripts/generate-api-artifacts.sh "$RELEASE_TAG"
+          scripts/check-api-artifact.sh "dist/zinder-api-docs-${RELEASE_TAG}.tar.gz"
 
       - name: Upload API artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
