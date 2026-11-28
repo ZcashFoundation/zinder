@@ -122,6 +122,8 @@ Then:
 
 `zinder-client` is the typed Rust SDK. It hides generated protobuf types and `tonic::Status` behind `ChainIndex`, `EndpointBackedIndex`, `ServerInfo`, and `IndexerError`. Releases publish `zinder-core`, `zinder-proto`, and `zinder-client` to crates.io at the product version.
 
+Before a wallet read that requires an advertised extension, the SDK allows up to 10 seconds for capability discovery. A timeout returns `IndexerError::ServiceUnavailable`.
+
 ### Quickstart
 
 This quickstart builds a small program that connects to a native endpoint, confirms the server and its network, and prints the chain tip from one pinned snapshot. You need Rust 1.100 or later and the address of a `zinder-query` endpoint.

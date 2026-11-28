@@ -1177,10 +1177,10 @@ pub(super) fn spawn_transport_wallet_query(
     tls: Option<tonic::transport::ServerTlsConfig>,
     interceptor: impl tonic::service::Interceptor + Clone + Send + Sync + 'static,
 ) -> eyre::Result<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>> {
-    let service = MalformedEventService::<wallet::ChainEventsRequest, wallet::ChainEventEnvelope> {
+    let service = ScriptedWalletStream::<wallet::ChainEventsRequest, wallet::ChainEventEnvelope> {
         method_path: "/zinder.v1.wallet.WalletQuery/ChainEvents",
         revision: WalletRevision::Reported(zinder_proto::CONTRACT_REVISION),
-        events: Arc::new(Vec::new()),
+        chunks: Arc::new(Vec::new()),
         request: PhantomData,
     };
     let mut server = Server::builder();
@@ -1261,6 +1261,28 @@ where
     });
 
     Ok(format!("http://{addr}"))
+}
+
+#[tokio::test]
+async fn stalled_capability_probe_bounds_standard_fee_call() -> eyre::Result<()> {
+    let endpoint =
+        spawn_malformed_event_service::<wallet::ChainEventsRequest, wallet::ChainEventEnvelope>(
+            "/zinder.v1.wallet.WalletQuery/ChainEvents",
+            Vec::new(),
+            WalletRevision::Stalled,
+        )
+        .await?;
+    let index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+
+    let fee = tokio::time::timeout(Duration::from_secs(15), index.standard_fee()).await?;
+    assert!(matches!(
+        fee,
+        Err(IndexerError::ServiceUnavailable { reason }) if reason == "wallet capability lookup timed out"
+    ));
+    Ok(())
 }
 
 #[tokio::test]

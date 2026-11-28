@@ -50,9 +50,8 @@ use crate::{
     ChainEventEnvelope, ChainEventStream, ChainEventStreamFamily, ChainIndex, ChainRangeReverted,
     CompactRangeQuery, EndpointBackedIndex, EventStreamStart, IndexStream, IndexerError,
     MempoolEvent, MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream,
-    MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView, NodeServerInfo, RetryPolicy,
-    ServerInfo,
-    TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
+    MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView, NodeServerInfo,
+    RetryPolicy, ServerInfo, TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
     TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
     TransparentOutpointSpendStatuses, TransparentUnspentOutputChunk,
@@ -318,7 +317,12 @@ impl RemoteChainIndex {
     }
 
     async fn require_capability(&self, capability: Capability) -> Result<(), IndexerError> {
-        ensure_advertised_capability(&self.server_info().await?, capability)
+        let descriptor = tokio::time::timeout(CONNECT_TIMEOUT, self.server_info())
+            .await
+            .map_err(|_| IndexerError::ServiceUnavailable {
+                reason: "wallet capability lookup timed out".to_owned(),
+            })??;
+        ensure_advertised_capability(&descriptor, capability)
     }
 
     fn unspent_outputs_stream(
@@ -773,13 +777,15 @@ impl ChainIndex for RemoteChainIndex {
         self.require_capability(Capability::CompactNullifierRange)
             .await?;
         let response = self
-            .client()
-            .compact_nullifiers_in_range(Request::new(wallet::CompactNullifiersInRangeRequest {
-                start_height: query.start_height.value(),
-                end_height: query.end_height.value(),
-                at_epoch_id: query.at_epoch_id.map(ChainEpochId::value),
-                pool_types: encode_compact_pools(&query.pools),
-            }))
+            .read_rpc(
+                wallet::CompactNullifiersInRangeRequest {
+                    start_height: query.start_height.value(),
+                    end_height: query.end_height.value(),
+                    at_epoch_id: query.at_epoch_id.map(ChainEpochId::value),
+                    pool_types: encode_compact_pools(&query.pools),
+                },
+                async |mut client, request| client.compact_nullifiers_in_range(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?;
         let recovery = self.clone();
@@ -1066,15 +1072,17 @@ impl ChainIndex for RemoteChainIndex {
         self.require_capability(Capability::TransparentAddressBalances)
             .await?;
         let response = self
-            .client()
-            .transparent_address_balances(Request::new(wallet::TransparentAddressBalancesRequest {
-                addresses: addresses
-                    .iter()
-                    .copied()
-                    .map(address_lookup_message)
-                    .collect(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::TransparentAddressBalancesRequest {
+                    addresses: addresses
+                        .iter()
+                        .copied()
+                        .map(address_lookup_message)
+                        .collect(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.transparent_address_balances(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -1104,8 +1112,7 @@ impl ChainIndex for RemoteChainIndex {
         self.require_capability(Capability::TransparentAddressesUnspentOutputs)
             .await?;
         let response = self
-            .client()
-            .transparent_addresses_unspent_outputs(Request::new(
+            .read_rpc(
                 wallet::TransparentAddressesUnspentOutputsRequest {
                     addresses: addresses
                         .iter()
@@ -1115,7 +1122,10 @@ impl ChainIndex for RemoteChainIndex {
                     start_height: start_height.value(),
                     at_epoch_id: at_epoch_id.map(ChainEpochId::value),
                 },
-            ))
+                async |mut client, request| {
+                    client.transparent_addresses_unspent_outputs(request).await
+                },
+            )
             .await
             .map_err(|status| self.map_status(status))?;
         Ok(self.unspent_outputs_stream(
@@ -1340,8 +1350,10 @@ impl EndpointBackedIndex for RemoteChainIndex {
     async fn standard_fee(&self) -> Result<StandardFee, IndexerError> {
         self.require_capability(Capability::StandardFee).await?;
         let response = self
-            .client()
-            .standard_fee(Request::new(wallet::StandardFeeRequest {}))
+            .read_rpc(
+                wallet::StandardFeeRequest {},
+                async |mut client, request| client.standard_fee(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
