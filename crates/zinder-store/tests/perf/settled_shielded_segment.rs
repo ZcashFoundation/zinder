@@ -1,6 +1,6 @@
 //! Performance gate for `ZSHRNG02` range projection over `#554`-shaped Mainnet ranges.
 
-use std::{error::Error, time::Instant};
+use std::{error::Error, path::PathBuf, time::Instant};
 
 use tempfile::{NamedTempFile, TempDir};
 use zinder_core::{
@@ -15,15 +15,24 @@ use zinder_store::{
 
 type TestOutcome<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
+#[cfg(target_os = "linux")]
+#[path = "../common/payload_page_probe.rs"]
+mod payload_page_probe;
+
 const TOTAL_BLOCKS: u32 = 165_205;
 const SEGMENT_BLOCKS: u32 = 4_096;
 const TARGET_ORCHARD_ACTIONS: usize = 256_055;
 const FIRST_HEIGHT: u32 = 3_428_143;
+const WARM_SCAN_BLOCKS: u32 = 8 * SEGMENT_BLOCKS;
 
 #[cfg(debug_assertions)]
 const MAX_NULLIFIER_SCAN_MS: u128 = 15_000;
 #[cfg(not(debug_assertions))]
 const MAX_NULLIFIER_SCAN_MS: u128 = 500;
+#[cfg(debug_assertions)]
+const MAX_WARM_SCAN_MS: u128 = 15_000;
+#[cfg(not(debug_assertions))]
+const MAX_WARM_SCAN_MS: u128 = 1_500;
 
 fn deterministic_hash(seed: u32) -> BlockHash {
     let mut bytes = [0_u8; 32];
@@ -55,9 +64,8 @@ fn sapling_output(seed: u8) -> CompactSaplingOutput {
     }
 }
 
-struct SegmentCorpus {
-    _dir: TempDir,
-    readers: Vec<SettledShieldedSegmentReader>,
+fn segment_path(dir: &TempDir, seg_idx: usize) -> PathBuf {
+    dir.path().join(format!("seg-{seg_idx:03}.zshrng02"))
 }
 
 fn build_corpus_templates() -> (
@@ -125,7 +133,7 @@ fn select_perf_block_txs(
 
 fn write_perf_segment(
     dir: &TempDir,
-    seg_idx: u32,
+    seg_idx: usize,
     offset: u32,
     count: u32,
     orchard_written: &mut usize,
@@ -134,7 +142,7 @@ fn write_perf_segment(
     let start = BlockHeight::new(FIRST_HEIGHT + offset);
     let end_height = BlockHeight::new(FIRST_HEIGHT + offset + count - 1);
     let end_block = BlockId::new(end_height, deterministic_hash(end_height.value()));
-    let seg_path = dir.path().join(format!("seg-{seg_idx:03}.zshrng02"));
+    let seg_path = segment_path(dir, seg_idx);
     let staged = NamedTempFile::new_in(dir.path())?;
     let mut writer = SettledShieldedSegmentWriter::create(
         &seg_path,
@@ -169,22 +177,24 @@ fn write_perf_segment(
     )?)
 }
 
-fn build_corpus() -> TestOutcome<SegmentCorpus> {
-    let dir = TempDir::new()?;
+fn build_corpus(
+    dir: &TempDir,
+    total_blocks: u32,
+) -> TestOutcome<Vec<SettledShieldedSegmentReader>> {
     let mut readers = Vec::new();
     let mut offset = 0_u32;
     let mut orchard_written = 0_usize;
-    let mut seg_idx = 0_u32;
-    while offset < TOTAL_BLOCKS {
-        let count = SEGMENT_BLOCKS.min(TOTAL_BLOCKS - offset);
-        let reader = write_perf_segment(&dir, seg_idx, offset, count, &mut orchard_written)?;
+    while offset < total_blocks {
+        let count = SEGMENT_BLOCKS.min(total_blocks - offset);
+        let reader = write_perf_segment(dir, readers.len(), offset, count, &mut orchard_written)?;
         readers.push(reader);
         offset += count;
-        seg_idx += 1;
     }
 
-    assert_eq!(orchard_written, TARGET_ORCHARD_ACTIONS);
-    Ok(SegmentCorpus { _dir: dir, readers })
+    if total_blocks == TOTAL_BLOCKS {
+        assert_eq!(orchard_written, TARGET_ORCHARD_ACTIONS);
+    }
+    Ok(readers)
 }
 
 fn read_all_segments(
@@ -211,26 +221,22 @@ fn read_all_segments(
 
 #[test]
 fn z554_nullifier_projection_across_165k_blocks_stays_under_budget() -> TestOutcome {
-    let corpus = build_corpus()?;
+    let dir = TempDir::new()?;
+    let readers = build_corpus(&dir, TOTAL_BLOCKS)?;
 
     let start_default_nf = Instant::now();
-    let (nf_all_blocks, nf_all_bytes) = read_all_segments(
-        &corpus.readers,
-        ShieldedProjectionSelection::DEFAULT_NULLIFIERS,
-    )?;
+    let (nf_all_blocks, nf_all_bytes) =
+        read_all_segments(&readers, ShieldedProjectionSelection::DEFAULT_NULLIFIERS)?;
     let default_nf_ms = start_default_nf.elapsed().as_millis();
 
     let orchard_only_nf = ShieldedProjectionSelection::new(false, true, false, true);
     let start_orchard_nf = Instant::now();
-    let (nf_orchard_blocks, nf_orchard_bytes) =
-        read_all_segments(&corpus.readers, orchard_only_nf)?;
+    let (nf_orchard_blocks, nf_orchard_bytes) = read_all_segments(&readers, orchard_only_nf)?;
     let orchard_nf_ms = start_orchard_nf.elapsed().as_millis();
 
     let start_default_range = Instant::now();
-    let (default_blocks, default_bytes) = read_all_segments(
-        &corpus.readers,
-        ShieldedProjectionSelection::DEFAULT_SHIELDED,
-    )?;
+    let (default_blocks, default_bytes) =
+        read_all_segments(&readers, ShieldedProjectionSelection::DEFAULT_SHIELDED)?;
     let default_range_ms = start_default_range.elapsed().as_millis();
 
     assert_eq!(nf_all_blocks, usize::try_from(TOTAL_BLOCKS)?);
@@ -247,7 +253,7 @@ fn z554_nullifier_projection_across_165k_blocks_stays_under_budget() -> TestOutc
         eprintln!(
             "zshrng02_perf blocks={} segments={} default_nf_ms={} orchard_nf_ms={} default_range_ms={} nf_all_bytes={} nf_orchard_bytes={} default_bytes={}",
             TOTAL_BLOCKS,
-            corpus.readers.len(),
+            readers.len(),
             default_nf_ms,
             orchard_nf_ms,
             default_range_ms,
@@ -262,4 +268,96 @@ fn z554_nullifier_projection_across_165k_blocks_stays_under_budget() -> TestOutc
         "nullifier projection exceeded budget ({MAX_NULLIFIER_SCAN_MS} ms): default_nf={default_nf_ms} ms, orchard_nf={orchard_nf_ms} ms"
     );
     Ok(())
+}
+
+#[test]
+fn unbounded_warm_cache_range_scan_preserves_residency_and_throughput() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let readers = build_corpus(&dir, WARM_SCAN_BLOCKS)?;
+    let scan = || read_all_segments(&readers, ShieldedProjectionSelection::DEFAULT_SHIELDED);
+    #[cfg(target_os = "linux")]
+    let probes = {
+        let mut probes = Vec::with_capacity(readers.len());
+        for (idx, reader) in readers.iter().enumerate() {
+            // The format header fits in the first page. Exclude that page and the index boundary.
+            let probe = payload_page_probe::PayloadPageProbe::open(
+                &segment_path(&dir, idx),
+                1,
+                reader.index().index_offset(),
+            )?;
+            probe.evict()?;
+            probes.push(probe);
+        }
+        probes
+    };
+    #[cfg(target_os = "linux")]
+    let calibration = sample_corpus_pages(&probes)?;
+    #[cfg(target_os = "linux")]
+    let calibrated = calibration.is_some_and(payload_page_probe::PageResidency::confirms_eviction);
+    #[cfg(not(target_os = "linux"))]
+    let calibrated = false;
+    let first_pass_label = if calibrated {
+        "cold_ms"
+    } else {
+        "first_pass_ms"
+    };
+
+    let started = Instant::now();
+    let first_pass = scan()?;
+    let first_pass_ms = started.elapsed().as_millis();
+    assert_eq!(first_pass.0, usize::try_from(WARM_SCAN_BLOCKS)?);
+    assert!(first_pass.1 > 4 * 1024 * 1024);
+    assert_eq!(scan()?, first_pass);
+    #[cfg(target_os = "linux")]
+    let warm_before = sample_corpus_pages(&probes)?;
+
+    let started = Instant::now();
+    let warm = scan()?;
+    let warm_ms = started.elapsed().as_millis();
+    #[cfg(target_os = "linux")]
+    let residency = {
+        let warm_after = sample_corpus_pages(&probes)?;
+        if calibrated {
+            for sample in [warm_before, warm_after] {
+                let pages = sample.ok_or("residency probe stopped working after calibration")?;
+                assert!(pages.mostly_resident(), "warm scan retained {pages:?}");
+            }
+        }
+        format!("calibration={calibration:?} warm_before={warm_before:?} warm_after={warm_after:?}")
+    };
+    #[cfg(not(target_os = "linux"))]
+    let residency = "residency=unavailable";
+    #[allow(
+        clippy::print_stderr,
+        reason = "reports first-pass and warm scan timings and page residency"
+    )]
+    {
+        eprintln!(
+            "zshrng02_warm_cache segments={} blocks={} payload_bytes={} {first_pass_label}={first_pass_ms} warm_ms={warm_ms} calibrated={calibrated} {residency}",
+            readers.len(),
+            warm.0,
+            warm.1,
+        );
+    }
+    assert_eq!(warm, first_pass);
+    assert!(
+        warm_ms < MAX_WARM_SCAN_MS,
+        "warm scan exceeded {MAX_WARM_SCAN_MS} ms: {warm_ms} ms"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sample_corpus_pages(
+    probes: &[payload_page_probe::PayloadPageProbe],
+) -> std::io::Result<Option<payload_page_probe::PageResidency>> {
+    let mut total = payload_page_probe::PageResidency::default();
+    for probe in probes {
+        let Some(sample) = probe.sample()? else {
+            return Ok(None);
+        };
+        total.resident += sample.resident;
+        total.total += sample.total;
+    }
+    Ok(Some(total))
 }

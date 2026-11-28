@@ -1,8 +1,16 @@
 //! T0 unit tests for canonical settled segments layout, manifests, live-tail
 //! records, aligned sealing, `.staging/` recovery, pinned snapshots, and LRU cache.
 
-use std::{fs, io, num::NonZeroU64, path::Path, sync::Arc};
+use std::{
+    fs, io,
+    num::NonZeroU64,
+    path::Path,
+    sync::Arc,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
 
+use parking_lot::{Condvar, Mutex};
 use sha2::{Digest as _, Sha256};
 use tempfile::{NamedTempFile, TempDir};
 use zinder_core::{
@@ -2948,36 +2956,376 @@ fn settled_corpus_admission_reports_exact_bytes_and_warns_only_below_budget() ->
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[path = "../../../tests/common/payload_page_probe.rs"]
+mod payload_page_probe;
+
+const SCAN_STREAMS: usize = 4;
+const SCAN_ROUNDS: usize = 3;
+const SCAN_ROUND_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct ScanRound {
+    elapsed: std::time::Duration,
+    matches_baseline: bool,
+    #[cfg(target_os = "linux")]
+    discard_hints: Vec<std::ops::Range<usize>>,
+}
+
+type ScanRoundResult = Result<ScanRound, Box<dyn std::error::Error + Send + Sync>>;
+type ScanWorkerResult = Result<Vec<ScanRound>, Box<dyn std::error::Error + Send + Sync>>;
+
 #[test]
 fn constrained_and_unbounded_readers_serve_concurrent_settled_ranges() -> TestResult {
     let dir = TempDir::new()?;
     let entry = seal_dense_scan_segment(dir.path())?;
-    let file =
-        std::fs::File::open(SettledSegmentFilePaths::for_entry(dir.path(), &entry)?.shielded)?;
-    let budget = NonZeroU64::new(1024 * 1024);
-    assert!(file.metadata()?.len() > 4 * 1024 * 1024);
+    let path = SettledSegmentFilePaths::for_entry(dir.path(), &entry)?.shielded;
+    let meta = fs::metadata(&path)?;
+    assert!(meta.len() > 4 * 1024 * 1024);
     let range = BlockHeightRange::inclusive(entry.start_height, entry.end_block.height);
     let entries = std::slice::from_ref(&entry);
-    let baseline = SettledSegmentReaderCache::with_corpus_budget(dir.path(), entries, None)?
-        .get_or_open_shielded(&entry)?
-        .read_default_range(range, HeightOrder::Ascending)?;
-    for budget in [budget, None] {
+    let baseline_reader = SettledSegmentReaderCache::with_corpus_budget(dir.path(), entries, None)?
+        .get_or_open_shielded(&entry)?;
+    let baseline = Arc::new(baseline_reader.read_default_range(range, HeightOrder::Ascending)?);
+    #[cfg(target_os = "linux")]
+    let (probe, inode) = {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let probe = payload_page_probe::PayloadPageProbe::open(
+            &path,
+            SHIELDED_HEADER_LEN,
+            baseline_reader.index().index_offset(),
+        )?;
+        (probe, meta.ino().to_string())
+    };
+
+    for budget in [NonZeroU64::new(1024 * 1024), None] {
         #[cfg(target_os = "linux")]
-        {
-            file.sync_all()?;
-            rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)?;
-        }
+        let calibration = {
+            probe.evict()?;
+            probe.sample()?
+        };
+        #[cfg(target_os = "linux")]
+        let mut residency = Vec::with_capacity(SCAN_ROUNDS);
+
         let cache = SettledSegmentReaderCache::with_corpus_budget(dir.path(), entries, budget)?;
-        assert_singleflight_module(4, || {
-            let reader = cache.get_or_open_shielded(&entry)?;
-            let blocks = reader.read_default_range(range, HeightOrder::Ascending)?;
-            assert_eq!(blocks.len(), baseline.len());
-            for (block, expected) in blocks.iter().zip(&baseline) {
-                assert_eq!(block.payload(), expected.payload());
-            }
-            Ok(reader)
-        })?;
+        let scan_cache = Arc::clone(&cache);
+        let entry = entry.clone();
+        let baseline = Arc::clone(&baseline);
+        #[cfg(target_os = "linux")]
+        let inode = inode.clone();
+        let streams = run_concurrent_scan_rounds(
+            SCAN_ROUND_TIMEOUT,
+            move || {
+                #[cfg(target_os = "linux")]
+                let capture = zinder_testkit::LogCapture::install_for_target("zinder::store");
+                let start = Instant::now();
+                let reader = scan_cache.get_or_open_shielded(&entry)?;
+                let blocks = reader.read_default_range(range, HeightOrder::Ascending)?;
+                Ok(ScanRound {
+                    elapsed: start.elapsed(),
+                    matches_baseline: blocks.len() == baseline.len()
+                        && blocks
+                            .iter()
+                            .zip(baseline.iter())
+                            .all(|(block, expected)| block.payload() == expected.payload()),
+                    #[cfg(target_os = "linux")]
+                    discard_hints: shielded_scan_hints(&capture, &inode)?,
+                })
+            },
+            || {
+                #[cfg(target_os = "linux")]
+                residency.push(probe.sample());
+            },
+        )?;
         assert_eq!(cache.open_count(SettledSegmentKind::Shielded), 1);
+        for (tid, rounds) in streams.iter().enumerate() {
+            assert_eq!(rounds.len(), SCAN_ROUNDS, "stream {tid} did not finish");
+            for (round, stats) in rounds.iter().enumerate() {
+                assert!(
+                    stats.matches_baseline,
+                    "stream {tid} round {round} payloads differ"
+                );
+                assert!(
+                    stats.elapsed < SCAN_ROUND_TIMEOUT,
+                    "stream {tid} round {round} exceeded the progress budget: {:?}",
+                    stats.elapsed
+                );
+            }
+        }
+        #[cfg(target_os = "linux")]
+        assert_concurrent_scan_residency(&probe, calibration, &streams, residency, budget)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ScanAbort {
+    Worker(usize),
+    Timeout(usize),
+    Coordinator,
+}
+
+#[derive(Default)]
+struct ScanRoundState {
+    round: usize,
+    finished: usize,
+    aborted: Option<ScanAbort>,
+}
+
+#[derive(Default)]
+struct ScanRendezvous {
+    state: Mutex<ScanRoundState>,
+    changed: Condvar,
+}
+
+impl ScanRendezvous {
+    fn start_and_wait(&self, round: usize, timeout: Duration) -> Result<(), ScanAbort> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock();
+        state.round = round;
+        state.finished = 0;
+        self.changed.notify_all();
+        loop {
+            if let Some(reason) = state.aborted {
+                return Err(reason);
+            }
+            if state.finished == SCAN_STREAMS {
+                return Ok(());
+            }
+            if self.changed.wait_until(&mut state, deadline).timed_out()
+                && state.finished < SCAN_STREAMS
+                && state.aborted.is_none()
+            {
+                let reason = ScanAbort::Timeout(round);
+                state.aborted = Some(reason);
+                drop(state);
+                self.changed.notify_all();
+                return Err(reason);
+            }
+        }
+    }
+
+    fn wait_for_start(&self, round: usize) -> bool {
+        let mut state = self.state.lock();
+        while state.round < round && state.aborted.is_none() {
+            self.changed.wait(&mut state);
+        }
+        state.aborted.is_none()
+    }
+
+    fn finish(&self) {
+        self.state.lock().finished += 1;
+        self.changed.notify_all();
+    }
+}
+
+struct AbortOnDrop<'a> {
+    rendezvous: &'a ScanRendezvous,
+    reason: Option<ScanAbort>,
+}
+
+impl Drop for AbortOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(reason) = self.reason {
+            self.rendezvous.state.lock().aborted.get_or_insert(reason);
+            self.rendezvous.changed.notify_all();
+        }
+    }
+}
+
+fn run_concurrent_scan_rounds(
+    round_timeout: Duration,
+    scan: impl Fn() -> ScanRoundResult + Send + Sync + 'static,
+    mut after_round: impl FnMut(),
+) -> Result<Vec<Vec<ScanRound>>, Box<dyn std::error::Error>> {
+    let rendezvous = Arc::new(ScanRendezvous::default());
+    let scan = Arc::new(scan);
+    let mut coordinator = AbortOnDrop {
+        rendezvous: &rendezvous,
+        reason: Some(ScanAbort::Coordinator),
+    };
+    let mut workers: Vec<_> = (0..SCAN_STREAMS)
+        .map(|id| {
+            let rendezvous = Arc::clone(&rendezvous);
+            let scan = Arc::clone(&scan);
+            thread::spawn(move || {
+                let mut abort = AbortOnDrop {
+                    rendezvous: &rendezvous,
+                    reason: Some(ScanAbort::Worker(id)),
+                };
+                let mut rounds = Vec::with_capacity(SCAN_ROUNDS);
+                for round in 1..=SCAN_ROUNDS {
+                    if !rendezvous.wait_for_start(round) {
+                        break;
+                    }
+                    rounds.push(scan()?);
+                    rendezvous.finish();
+                }
+                abort.reason = None;
+                Ok(rounds)
+            })
+        })
+        .collect();
+
+    for round in 1..=SCAN_ROUNDS {
+        match rendezvous.start_and_wait(round, round_timeout) {
+            Ok(()) => after_round(),
+            Err(ScanAbort::Worker(id)) => {
+                join_scan_worker(workers.swap_remove(id))?;
+                return Err("scan worker exited before finishing its round".into());
+            }
+            // Dropping the join handles lets the coordinator return even if a
+            // worker is still blocked in a synchronous read.
+            Err(ScanAbort::Timeout(round)) => {
+                return Err(format!("scan round {round} timed out after {round_timeout:?}").into());
+            }
+            Err(ScanAbort::Coordinator) => return Err("scan coordinator aborted".into()),
+        }
+    }
+    coordinator.reason = None;
+    workers.into_iter().map(join_scan_worker).collect()
+}
+
+fn join_scan_worker(
+    worker: JoinHandle<ScanWorkerResult>,
+) -> Result<Vec<ScanRound>, Box<dyn std::error::Error>> {
+    worker
+        .join()
+        .map_err(|_| "scan worker panicked")?
+        .map_err(|error| error as Box<dyn std::error::Error>)
+}
+
+#[test]
+fn concurrent_scan_rounds_abort_cleanly_when_a_worker_panics() -> TestResult {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let first_scan = AtomicBool::new(true);
+    let started = Instant::now();
+    let outcome = run_concurrent_scan_rounds(
+        SCAN_ROUND_TIMEOUT,
+        move || {
+            if first_scan.swap(false, Ordering::Relaxed) {
+                std::panic::resume_unwind(Box::new("injected scan panic"));
+            }
+            Ok(ScanRound {
+                elapsed: Duration::ZERO,
+                matches_baseline: true,
+                #[cfg(target_os = "linux")]
+                discard_hints: Vec::new(),
+            })
+        },
+        || {},
+    );
+    let error = outcome.err().ok_or("scan worker panic was lost")?;
+    assert_eq!(error.to_string(), "scan worker panicked");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    Ok(())
+}
+
+#[test]
+fn concurrent_scan_rounds_report_timeout_while_workers_are_blocked() -> TestResult {
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    let started = Instant::now();
+    let outcome = run_concurrent_scan_rounds(
+        Duration::from_millis(100),
+        move || {
+            released.lock().recv_timeout(Duration::from_secs(3))?;
+            Err("blocked scan unexpectedly released".into())
+        },
+        || {},
+    );
+    drop(release);
+    let error = outcome.err().ok_or("blocked scan did not time out")?;
+    assert_eq!(error.to_string(), "scan round 1 timed out after 100ms");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn shielded_scan_hints(
+    capture: &zinder_testkit::LogCapture,
+    inode: &str,
+) -> Result<Vec<std::ops::Range<usize>>, Box<dyn std::error::Error + Send + Sync>> {
+    capture
+        .events()
+        .iter()
+        .filter(|event| {
+            event.field("event") == Some("settled_scan_discard_pages")
+                && event.field("inode") == Some(inode)
+        })
+        .map(|event| {
+            let offset = event
+                .field("offset")
+                .ok_or("missing discard offset")?
+                .parse::<usize>()?;
+            let len = event
+                .field("len")
+                .ok_or("missing discard length")?
+                .parse::<usize>()?;
+            Ok(offset..offset + len)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn assert_concurrent_scan_residency(
+    probe: &payload_page_probe::PayloadPageProbe,
+    calibration: Option<payload_page_probe::PageResidency>,
+    streams: &[Vec<ScanRound>],
+    residency: Vec<io::Result<Option<payload_page_probe::PageResidency>>>,
+    budget: Option<NonZeroU64>,
+) -> TestResult {
+    let calibrated = calibration.is_some_and(payload_page_probe::PageResidency::confirms_eviction);
+    for (round, sample) in residency.into_iter().enumerate() {
+        let sample = sample?;
+        let elapsed_us: Vec<_> = streams
+            .iter()
+            .map(|s| s[round].elapsed.as_micros())
+            .collect();
+        let mut hints: Vec<_> = streams
+            .iter()
+            .flat_map(|s| s[round].discard_hints.iter())
+            .collect();
+        #[allow(
+            clippy::print_stderr,
+            reason = "reports measured scan progress and page residency"
+        )]
+        {
+            eprintln!(
+                "settled_concurrent_scan budget={budget:?} round={round} calibration={calibration:?} calibrated={calibrated} residency={sample:?} elapsed_us={elapsed_us:?} discard_hints={}",
+                hints.len()
+            );
+        }
+        if budget.is_some() {
+            hints.sort_unstable_by_key(|hint| hint.start);
+            let mut covered = probe.interior.start;
+            for hint in hints {
+                assert!(hint.start >= probe.interior.start && hint.end <= probe.interior.end);
+                assert!(hint.start <= covered, "discard gap before {hint:?}");
+                assert_eq!(hint.start % probe.page_size, 0);
+                assert_eq!(hint.end % probe.page_size, 0);
+                covered = covered.max(hint.end);
+            }
+            assert_eq!(covered, probe.interior.end);
+        } else {
+            assert_eq!(hints, [] as [&std::ops::Range<usize>; 0]);
+        }
+        if calibrated {
+            let measured = sample.ok_or("residency probe stopped working after calibration")?;
+            if let Some(limit) = budget {
+                assert!(
+                    measured.confirms_eviction(),
+                    "constrained scan retained {measured:?}"
+                );
+                assert!(u64::try_from(measured.resident * probe.page_size)? < limit.get());
+            } else {
+                assert!(
+                    measured.mostly_resident(),
+                    "unbounded scan retained {measured:?}"
+                );
+            }
+        }
     }
     Ok(())
 }
