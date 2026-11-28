@@ -1,7 +1,0 @@
-kind: changed
-body: Replace `config-rs` with a type-directed TOML and Serde configuration loader so secret strings preserve exact bytes, invalid scalar coercions fail closed, and mistyped `ZINDER_*` environment variables report typo suggestions.
-time: 2026-11-28T10:21:31Z
-custom:
-  Bump: minor
-  PR: "755"
-  Upgrade: compatible

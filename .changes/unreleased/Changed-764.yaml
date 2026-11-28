@@ -1,7 +1,0 @@
-kind: changed
-body: Encode ZSLVTL01 fee-width header flags (bits 3 and 4) on unsealed live-tail rows and cache validated live-tail compact blocks per READY generation in canonical secondary readers. New releases open existing Schema v2 stores in place; rolling back to a release predating these flags requires restoring a pre-upgrade backup or snapshot, or rebuilding the canonical store and dependent projections in clean paths.
-time: 2026-11-28T11:13:32Z
-custom:
-    Bump: minor
-    Upgrade: canonical-layout
-    PR: "764"

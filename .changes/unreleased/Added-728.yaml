@@ -1,7 +1,0 @@
-kind: added
-body: Run Zinder on Apple Silicon and older x86-64 Linux hosts with verified release archives, or run a private light-wallet stack with the personal-node Compose bundle.
-time: 2026-11-27T23:13:17.298335922Z
-custom:
-    Bump: minor
-    Upgrade: compatible
-    PR: "728"

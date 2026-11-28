@@ -1,7 +1,0 @@
-kind: fixed
-body: Scan settled canonical replay headers sequentially from RocksDB, reconstruct settled replay directly from authenticated supplement chunks without decoding unused compact blocks, and align replay batches to 256 blocks.
-time: 2026-11-28T10:24:19.000000000Z
-custom:
-    Bump: patch
-    Upgrade: compatible
-    PR: "756"

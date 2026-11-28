@@ -1,7 +1,0 @@
-kind: changed
-body: Bound settled-segment page-cache churn under constrained cgroup memory budgets using Linux readahead and drop-behind hints, expose corpus-vs-budget startup warnings and metrics, and amend ADR-0005.
-time: 2026-11-28T10:07:01.131510307Z
-custom:
-    Bump: patch
-    Upgrade: compatible
-    PR: "754"

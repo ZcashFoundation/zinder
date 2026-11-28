@@ -1,7 +1,0 @@
-kind: fixed
-body: Reuse canonical protobuf payloads on unary GetBlock and GetBlockNullifiers responses, cache verified settled supplement Zstd chunks under a shared byte budget, and avoid redundant range-read recounts.
-time: 2026-11-28T10:01:09.590211782Z
-custom:
-    Bump: patch
-    Upgrade: compatible
-    PR: "752"
