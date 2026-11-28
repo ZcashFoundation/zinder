@@ -3,7 +3,7 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, process::Command};
 
 use eyre::{Result, eyre};
 use tempfile::tempdir;
@@ -12,10 +12,61 @@ use zinder_bench::canonical_replay_storage::rocksdb::{
     validate_rocksdb_canonical_replay_storage_with_fresh_open,
 };
 use zinder_bench::fixture::FixtureManifest;
-use zinder_core::CanonicalBlockReplayFormatVersion;
-use zinder_store::RocksDbResourceBudget;
+use zinder_core::{CanonicalBlockReplayFormatVersion, Network};
+use zinder_store::{RawBlobRetention, RocksDbResourceBudget, TreeStateCheckpointSelection};
+use zinder_testkit::{
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, sample_regtest_upgrade_activations,
+};
 
 use crate::common::write_regtest_fixture;
+
+#[test]
+fn rocksdb_store_properties_reports_the_resolved_construction_budget() -> Result<()> {
+    let (fixture_directory, _) = write_regtest_fixture()?;
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::None)
+        .extend_blocks(4);
+    let budget = NonZeroU32::new(256).ok_or_else(|| eyre!("budget must be positive"))?;
+    let baseline = CanonicalBaseline::new(&chain).with_tree_state_checkpoint_selection(
+        TreeStateCheckpointSelection::CommitmentBudget(budget),
+    );
+    let store = CanonicalWriterFixture::publish(&baseline, &sample_regtest_upgrade_activations())?;
+    let scratch = tempdir()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
+        .arg("rocksdb-store-properties")
+        .arg("--fixture")
+        .arg(fixture_directory.path())
+        .arg("--canonical-store")
+        .arg(store.canonical_primary_path())
+        .arg("--secondary-root")
+        .arg(scratch.path().join("secondary"))
+        .args([
+            "--software-revision",
+            "test",
+            "--canonical-io-mode",
+            "buffered",
+        ])
+        .arg("--supported-reorg-depth")
+        .arg(
+            store
+                .canonical_primary()?
+                .reorg_policy()
+                .reorg_window_blocks()
+                .to_string(),
+        )
+        .output()?;
+    eyre::ensure!(
+        output.status.success(),
+        "store properties failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        report["construction_tree_state_checkpoint_policy"],
+        serde_json::json!({"selection": "commitment-budget", "commitment_budget": 256})
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn external_sst_round_trip_publishes_validated_facts_for_a_fresh_reader() -> Result<()> {

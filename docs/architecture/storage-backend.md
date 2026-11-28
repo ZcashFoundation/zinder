@@ -520,6 +520,12 @@ inventory, including zero-row checks on post-publication families (`chain_epoch`
 `chain_event`, `mempool_event`, `displaced_block_facts`) and on
 `live_tail_raw_block` when `raw_blob_policy = "none"`.
 
+The v2 manifest records the construction `tree_state_checkpoint_policy` as
+`cadence-and-tip`, `every-block`, or `commitment-budget` with its resolved
+budget. READY authenticates the original manifest file bytes. Older v2
+manifests without this field open with an unknown policy. Background
+densification can add checkpoint rows without rewriting the manifest.
+
 `CanonicalStoredSet` derives retained block data and its history floor from
 the build plan. Readers specify minimum data and a starting height with
 `CanonicalStoreRequirements` (checked by `CanonicalStoredSet::require`). A richer

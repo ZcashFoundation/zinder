@@ -13,8 +13,8 @@ use super::{
     block_load::{
         CANONICAL_BLOCK_SST_TARGET_LOGICAL_BYTES, CanonicalBlockLoadEvidence,
         CanonicalBlockSstConfig, CanonicalBuildBlock, CanonicalStagedSstEvidence,
-        CanonicalTrustedFreshBlockEvidence, REVERSE_INDEX_SORT_MEMORY_BYTES,
-        TreeStateCheckpointCoverage, canonical_block_families_are_empty,
+        CanonicalTrustedFreshBlockEvidence, ConstructionTreeStateCheckpointPolicy,
+        REVERSE_INDEX_SORT_MEMORY_BYTES, canonical_block_families_are_empty,
         ingest_canonical_block_ssts, validate_source_tip_checkpoint, write_canonical_block_ssts,
     },
     rocksdb::{
@@ -37,7 +37,7 @@ pub struct RocksDbCanonicalBuilder {
     pub(super) resource_budget: RocksDbResourceBudget,
     pub(super) network: Network,
     pub(super) build_plan: CanonicalStoreBuildPlan,
-    pub(super) tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    pub(super) tree_state_checkpoint_policy: ConstructionTreeStateCheckpointPolicy,
     pub(super) construction_activations: Option<NetworkUpgradeActivations>,
     pub(super) canonical_block_evidence: Option<CanonicalBlockLoadEvidence>,
     pub(super) canonical_block_staged_ssts: Option<Vec<CanonicalStagedSstEvidence>>,
@@ -84,7 +84,7 @@ impl RocksDbCanonicalBuilder {
             resource_budget,
             network,
             build_plan,
-            tree_state_checkpoint_coverage: TreeStateCheckpointCoverage::CadenceAndTip,
+            tree_state_checkpoint_policy: ConstructionTreeStateCheckpointPolicy::CadenceAndTip,
             construction_activations: None,
             canonical_block_evidence: None,
             canonical_block_staged_ssts: None,
@@ -163,7 +163,8 @@ impl RocksDbCanonicalBuilder {
         if self.canonical_block_evidence.is_some() {
             return Err(CanonicalStoreError::BlockLoadAlreadyLoaded);
         }
-        self.tree_state_checkpoint_coverage = TreeStateCheckpointCoverage::Selected(selection);
+        self.tree_state_checkpoint_policy =
+            ConstructionTreeStateCheckpointPolicy::from_selection(selection);
         Ok(self)
     }
 
@@ -172,15 +173,15 @@ impl RocksDbCanonicalBuilder {
     #[must_use]
     pub const fn stores_every_block_tree_state_checkpoints(&self) -> bool {
         matches!(
-            self.tree_state_checkpoint_coverage,
-            TreeStateCheckpointCoverage::Selected(TreeStateCheckpointSelection::EveryBlock)
+            self.tree_state_checkpoint_policy,
+            ConstructionTreeStateCheckpointPolicy::EveryBlock
         )
     }
 
     /// Returns the optional selection applied beyond the cadence and build tip.
     #[must_use]
     pub const fn tree_state_checkpoint_selection(&self) -> Option<TreeStateCheckpointSelection> {
-        self.tree_state_checkpoint_coverage.selection()
+        self.tree_state_checkpoint_policy.selection()
     }
 
     /// Bulk-loads every source-derived canonical block family.
@@ -242,7 +243,7 @@ impl RocksDbCanonicalBuilder {
                 options: &sst_options,
                 build_plan: &self.build_plan,
                 network_upgrade_activations,
-                tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
+                tree_state_checkpoint_policy: self.tree_state_checkpoint_policy,
                 sst_target_logical_bytes,
                 reverse_index_sort_memory_bytes,
             },
@@ -737,6 +738,82 @@ mod tests {
             CanonicalStoreError::BlockLoadSequenceInvalid { ref reason }
                 if reason.contains("gap 2 exceeds 1 blocks")
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn construction_manifest_records_the_policy_used_to_load_checkpoints()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use serde_json::json;
+
+        let activations = testnet_activations()?;
+        let tip = BlockHeight::new(3);
+        let budget = NonZeroU32::new(2).ok_or("budget must be positive")?;
+        for (policy, heights, expected_json) in [
+            (
+                ConstructionTreeStateCheckpointPolicy::CadenceAndTip,
+                &[3][..],
+                json!({"selection": "cadence-and-tip"}),
+            ),
+            (
+                ConstructionTreeStateCheckpointPolicy::EveryBlock,
+                &[1, 2, 3][..],
+                json!({"selection": "every-block"}),
+            ),
+            (
+                ConstructionTreeStateCheckpointPolicy::CommitmentBudget(budget),
+                &[2, 3][..],
+                json!({"selection": "commitment-budget", "commitment_budget": 2}),
+            ),
+        ] {
+            let temporary = TempDir::new()?;
+            let path = temporary.path().join("canonical");
+            let mut builder = building_store_through(&path, tip)?;
+            if let Some(selection) = policy.selection() {
+                builder = builder.with_tree_state_checkpoint_selection(selection)?;
+            }
+            let blocks = shielded_chain_with_checkpoints(&activations, tip, heights)?;
+            let source_tip = blocks
+                .last()
+                .and_then(|block| block.as_ref().ok())
+                .and_then(|block| block.tree_state_checkpoint.clone())
+                .ok_or("missing tip checkpoint")?;
+            builder.bulk_load_blocks(&activations, blocks)?;
+            builder.load_subtree_roots(std::iter::empty())?;
+            builder.confirm_source_tip_checkpoint(&source_tip)?;
+            let validated = if policy == ConstructionTreeStateCheckpointPolicy::EveryBlock {
+                builder.prepare_cold_certified_publication()?
+            } else {
+                builder.prepare_trusted_fresh_publication()?
+            };
+            let publication =
+                validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+                    BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                    zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+                ))?;
+            let published = validated.publish_baseline(publication)?;
+            assert_eq!(
+                published.construction_tree_state_checkpoint_policy(),
+                Some(policy)
+            );
+
+            let manifest: serde_json::Value = serde_json::from_slice(&fs::read(
+                path.join("canonical-construction-manifest.v2.json"),
+            )?)?;
+            assert_eq!(manifest["tree_state_checkpoint_policy"], expected_json);
+            let secondary = RocksDbCanonicalSecondary::open_ready(
+                &path,
+                temporary.path().join("secondary"),
+                &activations,
+                crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
+                CanonicalReorgPolicy::new(100)?,
+                RocksDbResourceBudget::for_local_tests(),
+            )?;
+            assert_eq!(
+                secondary.construction_tree_state_checkpoint_policy(),
+                Some(policy)
+            );
+        }
         Ok(())
     }
 
