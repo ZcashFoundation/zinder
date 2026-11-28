@@ -951,7 +951,7 @@ where
         }
         let slice = row?.ok_or_else(|| missing_compact_block_row(height))?;
         let raw_exceeds_budget = state.exceeds_budget(slice.len());
-        let (compact_block, compact_len) =
+        let (compact_block, shielded_len) =
             match LiveTailBlockRecord::decode_compact_block_v1(&slice, height) {
                 Ok(decoded) => decoded,
                 Err(_) if raw_exceeds_budget => return Ok(false),
@@ -962,6 +962,8 @@ where
                 "compact block row has the wrong height",
             ));
         }
+        let compact_len = crate::proto_codec::encoded_compact_block_artifact_len(&compact_block)
+            .max(shielded_len);
         if !state.try_push(compact_block, compact_len) {
             return Ok(false);
         }
