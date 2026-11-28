@@ -2267,7 +2267,7 @@ impl CompactBlockRangeStreamState {
     fn accept_header(&mut self, chain_view: wallet::ChainView) -> Result<(), IndexerError> {
         if self.chain_epoch.is_some() {
             return Err(IndexerError::malformed(
-                "compact_blocks_in_range.header",
+                "stream.header",
                 "stream sent more than one chain-view header",
             ));
         }
@@ -4500,7 +4500,7 @@ mod tests {
             .collect()
     }
 
-    fn is_malformed(decoded: &Result<BlockHeight, IndexerError>, expected_field: &str) -> bool {
+    fn is_malformed<T>(decoded: &Result<T, IndexerError>, expected_field: &str) -> bool {
         matches!(
             decoded,
             Err(IndexerError::MalformedResponse { field, .. }) if *field == expected_field
@@ -4557,7 +4557,26 @@ mod tests {
 
         assert_eq!(decoded.len(), 2, "the stream ends at its first error");
         assert!(matches!(decoded[0], Ok(height) if height == BlockHeight::new(40)));
-        assert!(is_malformed(&decoded[1], "compact_blocks_in_range.header"));
+        assert!(is_malformed(&decoded[1], "stream.header"));
+    }
+
+    #[test]
+    fn compact_nullifier_range_rejects_a_second_header() {
+        use wallet::compact_nullifiers_in_range_chunk::Body;
+
+        let mut state = CompactBlockRangeStreamState::new(
+            EXPECTED_NETWORK,
+            None,
+            BlockHeightRange::inclusive(BlockHeight::new(40), BlockHeight::new(41)),
+        );
+        let header = wallet::CompactNullifiersInRangeChunk {
+            body: Some(Body::Header(synthetic_chain_view(EXPECTED_NETWORK))),
+        };
+        assert!(matches!(state.accept_nullifiers(header.clone()), Ok(None)));
+        assert!(is_malformed(
+            &state.accept_nullifiers(header),
+            "stream.header"
+        ));
     }
 
     #[tokio::test]
