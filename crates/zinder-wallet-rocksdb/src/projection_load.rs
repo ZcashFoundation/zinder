@@ -798,6 +798,16 @@ struct BlockHashStageSink<'options> {
     evidence: WalletProjectionSstEvidence,
 }
 
+struct FinishedBlockHashStage {
+    files: SstFileSet,
+    accumulators: crate::accumulator_hashing::FinishedBranchAccumulators,
+    evidence: WalletProjectionSstEvidence,
+    #[cfg(test)]
+    write_duration: Duration,
+    #[cfg(test)]
+    finish_duration: Duration,
+}
+
 impl<'options> BlockHashStageSink<'options> {
     fn new(config: WalletProjectionLoadConfig<'options>) -> Result<Self, RocksDbWalletError> {
         Ok(Self {
@@ -823,19 +833,22 @@ impl<'options> BlockHashStageSink<'options> {
         )
     }
 
-    fn finish(
-        self,
-    ) -> Result<
-        (
-            SstFileSet,
-            crate::accumulator_hashing::FinishedBranchAccumulators,
-            WalletProjectionSstEvidence,
-        ),
-        RocksDbWalletError,
-    > {
-        let (files, _write_duration) = self.writer.finish()?;
+    fn finish(self) -> Result<FinishedBlockHashStage, RocksDbWalletError> {
+        #[cfg(test)]
+        let finish_started = Instant::now();
+        let (files, write_duration) = self.writer.finish()?;
+        #[cfg(not(test))]
+        let _ = write_duration;
         let accumulators = self.accumulators.finish_branch()?;
-        Ok((files, accumulators, self.evidence))
+        Ok(FinishedBlockHashStage {
+            files,
+            accumulators,
+            evidence: self.evidence,
+            #[cfg(test)]
+            write_duration,
+            #[cfg(test)]
+            finish_duration: finish_started.elapsed(),
+        })
     }
 }
 
@@ -917,6 +930,10 @@ struct CompletedCanonicalScan {
     block_hash_files: SstFileSet,
     block_hash_accumulators: crate::accumulator_hashing::FinishedBranchAccumulators,
     block_hash_evidence: WalletProjectionSstEvidence,
+    #[cfg(test)]
+    block_hash_write_duration: Duration,
+    #[cfg(test)]
+    block_hash_finish_duration: Duration,
 }
 
 #[derive(Default)]
@@ -1214,7 +1231,7 @@ struct CanonicalScanOutcome {
     source_sequence_digest: CanonicalBlockFactsSequenceDigest,
     retained_undo: RetainedUndo,
     counters: ScanCounters,
-    canonical_scan: Duration,
+    scan_started: Instant,
 }
 
 fn finish_canonical_scan(
@@ -1222,8 +1239,11 @@ fn finish_canonical_scan(
     outpoint_sorter: ShardedKeyPrefixSorter<OUTPOINT_EVENT_KEY_BYTES>,
     block_hash_sink: BlockHashStageSink<'_>,
 ) -> Result<CompletedCanonicalScan, RocksDbWalletError> {
-    let (block_hash_files, block_hash_accumulators, block_hash_evidence) =
-        block_hash_sink.finish()?;
+    let block_hash = block_hash_sink.finish()?;
+    // Measure canonical_scan after flushing block_hash_by_height SSTs and
+    // finalizing its branch accumulators so that work does not fall into an
+    // untimed gap before outpoint_sort begins.
+    let canonical_scan = outcome.scan_started.elapsed();
     let phase_started = Instant::now();
     let sorted_outpoints = outpoint_sorter.finish()?;
     let outpoint_sort_evidence = sorted_outpoints.evidence();
@@ -1239,14 +1259,18 @@ fn finish_canonical_scan(
         scanned_transaction_count: outcome.counters.transactions,
         staged_output_count: outcome.counters.staged_outputs,
         staged_spend_count: outcome.counters.staged_spends,
-        canonical_scan: outcome.canonical_scan,
+        canonical_scan,
         outpoint_sort,
         sorted_outpoints,
         outpoint_sort_evidence,
         outpoint_sort_durations,
-        block_hash_files,
-        block_hash_accumulators,
-        block_hash_evidence,
+        block_hash_files: block_hash.files,
+        block_hash_accumulators: block_hash.accumulators,
+        block_hash_evidence: block_hash.evidence,
+        #[cfg(test)]
+        block_hash_write_duration: block_hash.write_duration,
+        #[cfg(test)]
+        block_hash_finish_duration: block_hash.finish_duration,
     })
 }
 
@@ -1301,7 +1325,7 @@ fn scan_canonical_replay_serial(
             source_sequence_digest: sequence_digest.finish(),
             retained_undo,
             counters,
-            canonical_scan: scan_started.elapsed(),
+            scan_started,
         },
         outpoint_sorter,
         block_hash_sink,
@@ -1386,7 +1410,7 @@ fn scan_canonical_replay_parallel(
             source_sequence_digest: final_sequence_digest,
             retained_undo,
             counters,
-            canonical_scan: scan_started.elapsed(),
+            scan_started,
         },
         outpoint_sorter,
         block_hash_sink,
@@ -1958,6 +1982,10 @@ fn finish_projection_ssts_with_plan(
         block_hash_files,
         block_hash_accumulators,
         block_hash_evidence,
+        #[cfg(test)]
+            block_hash_write_duration: _,
+        #[cfg(test)]
+            block_hash_finish_duration: _,
     } = scanned;
 
     let phase_started = Instant::now();
@@ -5547,5 +5575,77 @@ mod tests {
         }
 
         assert_tight_undo_collector_budget_clamp_and_refusal(settled_tip, key_bytes)
+    }
+
+    #[test]
+    fn canonical_scan_duration_includes_block_hash_sst_flush() -> Result<(), Box<dyn Error>> {
+        let temporary = TempDir::new()?;
+        let options = test_column_family_options();
+        let first = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0xc1; 32]));
+        let settled_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xc2; 32]));
+        let config = test_config_with_bounds(
+            temporary.path(),
+            &options,
+            TestByteLimits::default(),
+            first,
+            settled_tip,
+        );
+        let blocks = vec![
+            block_facts(1, [0; 32], [0xc1; 32], Vec::new()),
+            block_facts(2, [0xc1; 32], [0xc2; 32], Vec::new()),
+        ];
+
+        let scanned = scan_canonical_replay_serial(
+            config,
+            canonical_scan(validated_replays(&blocks)?),
+            NonZeroU32::MIN,
+        )?;
+        assert_ne!(scanned.block_hash_files.paths, [] as [PathBuf; 0]);
+        assert!(scanned.block_hash_write_duration <= scanned.canonical_scan);
+        assert!(scanned.block_hash_finish_duration <= scanned.canonical_scan);
+        assert!(scanned.outpoint_sort_durations.initial_run_spill <= scanned.canonical_scan);
+
+        let finish_staging = TempDir::new()?;
+        let finish_config = test_config_with_bounds(
+            finish_staging.path(),
+            &options,
+            TestByteLimits::default(),
+            first,
+            settled_tip,
+        );
+        let mut sink = BlockHashStageSink::new(finish_config)?;
+        for offset in 1..=64_u32 {
+            sink.append_block(BlockId::new(
+                BlockHeight::new(offset),
+                BlockHash::from_bytes([u8::try_from(offset % 251)?; 32]),
+            ))?;
+        }
+        let sorter = ShardedKeyPrefixSorter::<OUTPOINT_EVENT_KEY_BYTES>::new(
+            finish_staging.path(),
+            "wallet-outpoint-events-flush-timing",
+            NonZeroU32::MIN,
+            TEST_SORT_MEMORY_BYTES,
+            TEST_TEMPORARY_FILE_BYTES,
+        )?;
+        let digest = CanonicalBlockFactsSequenceDigestBuilder::new(
+            CanonicalBlockFactsSequenceDigestVersion::V1,
+        )
+        .finish();
+        let scan_started = Instant::now();
+        let completed = finish_canonical_scan(
+            CanonicalScanOutcome {
+                first_block: first,
+                tip: settled_tip,
+                source_sequence_digest: digest,
+                retained_undo: RetainedUndo::new(0, settled_tip, TEST_REORG_UNDO_BYTES),
+                counters: ScanCounters::default(),
+                scan_started,
+            },
+            sorter,
+            sink,
+        )?;
+        assert_ne!(completed.block_hash_files.paths, [] as [PathBuf; 0]);
+        assert!(completed.block_hash_finish_duration <= completed.canonical_scan);
+        Ok(())
     }
 }
