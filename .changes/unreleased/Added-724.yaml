@@ -4,3 +4,4 @@ time: 2026-11-27T22:47:25.964848288Z
 custom:
     Bump: patch
     PR: "724"
+    Upgrade: compatible

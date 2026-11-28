@@ -4,3 +4,4 @@ time: 2026-11-27T23:12:27.025348524Z
 custom:
     Bump: minor
     PR: "727"
+    Upgrade: compatible
