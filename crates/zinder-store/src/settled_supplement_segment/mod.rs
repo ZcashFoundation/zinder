@@ -64,7 +64,10 @@ pub use section::{
 pub use wire_splice::{
     CompactBlockSpliceSelection, reconstruct_compact_block_artifact, splice_compact_block_wire,
 };
-pub(crate) use wire_splice::{reconstruct_compact_block_from_proto, validate_shielded_block_wire};
+pub(crate) use wire_splice::{
+    reconstruct_compact_block_from_proto, validate_and_inspect_shielded_block_wire,
+    validate_shielded_block_wire,
+};
 pub use writer::{SettledSupplementSegmentWriteOptions, SettledSupplementSegmentWriter};
 
 /// Magic header identifying the `ZSTSUP01` settled supplement segment format.

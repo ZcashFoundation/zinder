@@ -21,6 +21,7 @@ mod live_replacement;
 #[cfg(test)]
 mod live_replacement_tests;
 pub(crate) mod live_tail;
+mod live_tail_cache;
 mod mempool_lifecycle;
 #[cfg(test)]
 mod mempool_lifecycle_tests;

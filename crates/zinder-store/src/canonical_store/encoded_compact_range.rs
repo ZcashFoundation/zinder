@@ -22,6 +22,7 @@ use crate::{
 use super::{
     CanonicalStoreError,
     live_tail::{LiveTailBlockRecord, LiveTailShieldedWire, LiveTailSpliceWire},
+    live_tail_cache::LiveTailShieldedCache,
     reader::{
         CanonicalServingRead, bounded_batch_len, missing_compact_block_row,
         require_retained_compact_blocks, retained_compact_block_span,
@@ -221,13 +222,19 @@ pub(super) fn encoded_compact_block_range_up_to(
         return Ok(None);
     }
     require_retained_compact_blocks(store, request.range)?;
-    encoded_compact_block_range_for_context(store.serving_context(), request, cancel)
+    read_encoded_range(
+        store.serving_context(),
+        request,
+        cancel,
+        store.serving_live_tail_cache(),
+    )
 }
 
-fn encoded_compact_block_range_for_context(
+fn read_encoded_range(
     ctx: SegmentStoreContext<'_>,
     request: EncodedCompactBlockRangeRequest,
     cancel: Option<&AtomicBool>,
+    cache: Option<&LiveTailShieldedCache>,
 ) -> Result<Option<EncodedCompactBlockRange>, CanonicalStoreError> {
     check_cancelled(cancel)?;
     if request.range.start > request.range.end {
@@ -235,6 +242,9 @@ fn encoded_compact_block_range_for_context(
     }
 
     let mut acc = RangeAccumulator::new(request);
+    if !request.include_transparent || request.selection.nullifiers_only {
+        acc.live_tail_cache = cache;
+    }
     match request.order {
         HeightOrder::Ascending => stream_ascending(ctx, request, cancel, &mut acc)?,
         HeightOrder::Descending => stream_descending(ctx, request, cancel, &mut acc)?,
@@ -247,7 +257,7 @@ fn stream_ascending(
     ctx: SegmentStoreContext<'_>,
     request: EncodedCompactBlockRangeRequest,
     cancel: Option<&AtomicBool>,
-    acc: &mut RangeAccumulator,
+    acc: &mut RangeAccumulator<'_>,
 ) -> Result<(), CanonicalStoreError> {
     let mut cursor = request.range.start;
     while cursor <= request.range.end && !acc.is_budget_spent() {
@@ -287,7 +297,7 @@ fn stream_descending(
     ctx: SegmentStoreContext<'_>,
     request: EncodedCompactBlockRangeRequest,
     cancel: Option<&AtomicBool>,
-    acc: &mut RangeAccumulator,
+    acc: &mut RangeAccumulator<'_>,
 ) -> Result<(), CanonicalStoreError> {
     let sealed_tip = match ctx.sealed_segments {
         Some(entries) => entries.last().map(|entry| entry.end_block),
@@ -366,7 +376,7 @@ fn read_settled_segment_step(
     ctx: SegmentStoreContext<'_>,
     entry: &SettledSegmentIndexEntry,
     params: SegmentStepParams<'_>,
-    acc: &mut RangeAccumulator,
+    acc: &mut RangeAccumulator<'_>,
 ) -> Result<bool, CanonicalStoreError> {
     let reader = open_shielded_segment_reader(ctx, entry)?;
     let budget = ShieldedRangeByteBudget {
@@ -438,7 +448,7 @@ fn emit_settled_shielded_step(
     reader: &crate::SettledShieldedSegmentReader,
     bounded: &crate::BoundedShieldedRangePlan,
     params: SegmentStepParams<'_>,
-    acc: &mut RangeAccumulator,
+    acc: &mut RangeAccumulator<'_>,
 ) -> Result<(), CanonicalStoreError> {
     let execution = ShieldedPlanExecution {
         order: params.request.order,
@@ -471,7 +481,7 @@ fn emit_settled_spliced_step(
     sup: &crate::SettledSupplementSegmentReader,
     bounded: &crate::BoundedShieldedRangePlan,
     params: SegmentStepParams<'_>,
-    acc: &mut RangeAccumulator,
+    acc: &mut RangeAccumulator<'_>,
 ) -> Result<(), CanonicalStoreError> {
     let asc_execution = ShieldedPlanExecution {
         order: HeightOrder::Ascending,
@@ -540,7 +550,7 @@ fn read_live_tail_span(
     span: BlockHeightRange,
     request: EncodedCompactBlockRangeRequest,
     cancel: Option<&AtomicBool>,
-    acc: &mut RangeAccumulator,
+    acc: &mut RangeAccumulator<'_>,
 ) -> Result<bool, CanonicalStoreError> {
     let mut unread = span.start.value()..=span.end.value();
     let mut next_height = || {
@@ -560,46 +570,108 @@ fn read_live_tail_span(
         if heights.is_empty() {
             return Ok(true);
         }
-        let rows = fetch_live_tail_batch_pinned(ctx.db, &heights, &verified_read_options())?;
-        for (height, maybe_row) in heights.iter().zip(rows) {
+        let cached = acc
+            .live_tail_cache
+            .map_or_else(|| vec![None; heights.len()], |cache| cache.lookup(&heights));
+        let misses = heights
+            .iter()
+            .zip(&cached)
+            .filter_map(|(&height, hit)| hit.is_none().then_some(height))
+            .collect::<Vec<_>>();
+        let multiple_misses = misses.len() > 1;
+        let mut rows = if misses.is_empty() {
+            Vec::new()
+        } else {
+            fetch_live_tail_batch_pinned(ctx.db, &misses, &verified_read_options())?
+        }
+        .into_iter();
+        for (height, hit) in heights.into_iter().zip(cached) {
             check_cancelled(cancel)?;
-            let raw_row = maybe_row?.ok_or_else(|| missing_compact_block_row(*height))?;
-            let stored_row_bytes = raw_row.as_ref().len();
-            if acc.exceeds_live_read_budget(stored_row_bytes) {
-                return Ok(false);
-            }
-            let raw_exceeds_output_budget = acc.exceeds_output_budget(stored_row_bytes);
-            if splice_transparent {
-                let wire =
-                    match LiveTailBlockRecord::decode_splice_wire_v1(raw_row.as_ref(), *height) {
-                        Ok(decoded) => decoded,
-                        Err(_) if raw_exceeds_output_budget => return Ok(false),
-                        Err(error) => return Err(map_settled_segments_read_error(error)),
-                    };
-                if !append_live_tail_spliced_row(&wire, stored_row_bytes, request, acc)? {
-                    return Ok(false);
-                }
+            let appended = if let Some(entry) = hit {
+                append_live_tail_row(
+                    &entry.wire(),
+                    entry.stored_row_bytes,
+                    request,
+                    acc,
+                    Some(&entry.frame),
+                )?
             } else {
-                let wire =
-                    match LiveTailBlockRecord::decode_shielded_wire_v1(raw_row.as_ref(), *height) {
-                        Ok(decoded) => decoded,
-                        Err(_) if raw_exceeds_output_budget => return Ok(false),
-                        Err(error) => return Err(map_settled_segments_read_error(error)),
-                    };
-                if !append_live_tail_row(&wire, stored_row_bytes, request, acc)? {
-                    return Ok(false);
-                }
+                // A missing SST for a speculative key can fail the whole
+                // MultiGet. Retry each height only when its row is needed.
+                let row = match rows.next().transpose() {
+                    Err(error) if multiple_misses && error.is_missing_table_file() => {
+                        fetch_live_tail_batch_pinned(ctx.db, &[height], &verified_read_options())?
+                            .into_iter()
+                            .next()
+                            .transpose()
+                    }
+                    row => row,
+                };
+                let raw_row = row?
+                    .flatten()
+                    .ok_or_else(|| missing_compact_block_row(height))?;
+                append_live_tail_raw_row(
+                    height,
+                    raw_row.as_ref(),
+                    splice_transparent,
+                    request,
+                    acc,
+                )?
+            };
+            if !appended {
+                return Ok(false);
             }
         }
     }
     Ok(false)
 }
 
+fn append_live_tail_raw_row(
+    height: BlockHeight,
+    raw_row: &[u8],
+    splice_transparent: bool,
+    request: EncodedCompactBlockRangeRequest,
+    acc: &mut RangeAccumulator<'_>,
+) -> Result<bool, CanonicalStoreError> {
+    let stored_row_bytes = raw_row.len();
+    if acc.exceeds_live_read_budget(stored_row_bytes) {
+        return Ok(false);
+    }
+    let raw_exceeds_output_budget = acc.exceeds_output_budget(stored_row_bytes);
+    if splice_transparent {
+        let wire = match LiveTailBlockRecord::decode_splice_wire_v1(raw_row, height) {
+            Ok(decoded) => decoded,
+            Err(_) if raw_exceeds_output_budget => return Ok(false),
+            Err(error) => return Err(map_settled_segments_read_error(error)),
+        };
+        return append_live_tail_spliced_row(&wire, stored_row_bytes, request, acc);
+    }
+    let wire = match LiveTailBlockRecord::decode_shielded_wire_v1(raw_row, height) {
+        Ok(decoded) => decoded,
+        Err(_) if raw_exceeds_output_budget => return Ok(false),
+        Err(error) => return Err(map_settled_segments_read_error(error)),
+    };
+    if acc.exceeds_output_budget(wire.shielded_payload.len()) {
+        return Ok(false);
+    }
+    let entry = match acc.live_tail_cache {
+        Some(cache) => cache.admit(&wire, stored_row_bytes)?,
+        None => None,
+    };
+    append_live_tail_row(
+        &wire,
+        stored_row_bytes,
+        request,
+        acc,
+        entry.as_ref().map(|entry| &entry.frame),
+    )
+}
+
 fn append_live_tail_spliced_row(
     wire: &LiveTailSpliceWire<'_>,
     stored_row_bytes: usize,
     request: EncodedCompactBlockRangeRequest,
-    acc: &mut RangeAccumulator,
+    acc: &mut RangeAccumulator<'_>,
 ) -> Result<bool, CanonicalStoreError> {
     if wire.transparent_transactions.is_empty() {
         let shielded = LiveTailShieldedWire {
@@ -610,7 +682,7 @@ fn append_live_tail_spliced_row(
             pool_presence: wire.pool_presence,
             has_unrepresentable_wire_fee: wire.has_unrepresentable_wire_fee,
         };
-        return append_live_tail_row(&shielded, stored_row_bytes, request, acc);
+        return append_live_tail_row(&shielded, stored_row_bytes, request, acc, None);
     }
     if acc.exceeds_output_budget(wire.shielded_payload.len())
         || acc.exceeds_live_read_budget(stored_row_bytes)
@@ -661,7 +733,7 @@ fn project_live_wire_bytes<'a>(
     shielded_payload: &'a [u8],
     wire: &LiveTailSpliceWire<'_>,
     selection: ShieldedProjectionSelection,
-    acc: &mut RangeAccumulator,
+    acc: &mut RangeAccumulator<'_>,
 ) -> Result<ProjectedWire<'a>, CanonicalStoreError> {
     if selection == ShieldedProjectionSelection::DEFAULT_SHIELDED {
         return Ok(ProjectedWire::Borrowed(shielded_payload));
@@ -681,7 +753,8 @@ fn append_live_tail_row(
     wire: &LiveTailShieldedWire<'_>,
     stored_row_bytes: usize,
     request: EncodedCompactBlockRangeRequest,
-    acc: &mut RangeAccumulator,
+    acc: &mut RangeAccumulator<'_>,
+    frame: Option<&EncodedBlock>,
 ) -> Result<bool, CanonicalStoreError> {
     let output_bytes = wire.shielded_payload.len();
     if acc.exceeds_output_budget(output_bytes) || acc.exceeds_live_read_budget(stored_row_bytes) {
@@ -701,8 +774,14 @@ fn append_live_tail_row(
     if let Some(prev) = acc.last_link {
         verify_step_linkage(request.order, prev, link)?;
     }
-    let encoded_payload = project_live_wire(wire, request.selection, acc)?;
-    acc.push_encoded_payload(encoded_payload)?;
+    if let Some(frame) = frame
+        && request.selection == ShieldedProjectionSelection::DEFAULT_SHIELDED
+    {
+        acc.push_encoded_block(frame.clone());
+    } else {
+        let encoded_payload = project_live_wire(wire, request.selection, acc)?;
+        acc.push_encoded_payload(encoded_payload)?;
+    }
     acc.record_live_tail_row(link, output_bytes, stored_row_bytes);
     Ok(!acc.is_budget_spent())
 }
@@ -716,7 +795,7 @@ enum ProjectedWire<'a> {
 fn project_live_wire<'a>(
     wire: &LiveTailShieldedWire<'a>,
     selection: ShieldedProjectionSelection,
-    acc: &mut RangeAccumulator,
+    acc: &mut RangeAccumulator<'_>,
 ) -> Result<ProjectedWire<'a>, CanonicalStoreError> {
     if selection.nullifiers_only && !selection.matches_pool_presence(wire.pool_presence) {
         acc.wire_scratch.clear();
@@ -795,7 +874,8 @@ enum AccumulatorOutput {
     Batcher(EncodedBlockBatcher),
 }
 
-struct RangeAccumulator {
+struct RangeAccumulator<'a> {
+    live_tail_cache: Option<&'a LiveTailShieldedCache>,
     order: HeightOrder,
     max_bytes: usize,
     max_live_read_bytes: usize,
@@ -812,7 +892,7 @@ struct RangeAccumulator {
     tx_scratch: Vec<u8>,
 }
 
-impl RangeAccumulator {
+impl RangeAccumulator<'_> {
     fn new(request: EncodedCompactBlockRangeRequest) -> Self {
         let output = match request.output {
             EncodedCompactBlockOutput::Blocks => AccumulatorOutput::Blocks(Vec::new()),
@@ -821,6 +901,7 @@ impl RangeAccumulator {
             }
         };
         Self {
+            live_tail_cache: None,
             order: request.order,
             max_bytes: request.max_bytes,
             max_live_read_bytes: request
@@ -976,7 +1057,9 @@ impl RangeAccumulator {
     }
 }
 
-fn encoded_block_from_payload(payload: &[u8]) -> Result<EncodedBlock, CanonicalStoreError> {
+pub(super) fn encoded_block_from_payload(
+    payload: &[u8],
+) -> Result<EncodedBlock, CanonicalStoreError> {
     let payload_len =
         u32::try_from(payload.len()).map_err(|_| CanonicalStoreError::ArtifactCorrupt {
             family: ArtifactFamily::CompactBlock,
@@ -986,7 +1069,8 @@ fn encoded_block_from_payload(payload: &[u8]) -> Result<EncodedBlock, CanonicalS
     framed.push(0);
     framed.extend_from_slice(&payload_len.to_be_bytes());
     framed.extend_from_slice(payload);
-    EncodedBlock::from_length_prefixed(Bytes::from(framed)).map_err(|err| {
+    let allocation_len = framed.capacity();
+    EncodedBlock::from_length_prefixed_in(Bytes::from(framed), allocation_len).map_err(|err| {
         CanonicalStoreError::ArtifactCorrupt {
             family: ArtifactFamily::CompactBlock,
             reason: err.to_string(),
@@ -1042,6 +1126,14 @@ mod tests {
     };
 
     type TestOutcome<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn encoded_compact_block_range_for_context(
+        ctx: SegmentStoreContext<'_>,
+        request: EncodedCompactBlockRangeRequest,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<EncodedCompactBlockRange>, CanonicalStoreError> {
+        read_encoded_range(ctx, request, cancel, None)
+    }
 
     fn hash_with_tag(tag: u32) -> BlockHash {
         let mut raw = [0_u8; 32];
@@ -1828,7 +1920,7 @@ mod tests {
         let mut settled_acc = RangeAccumulator::new(shielded_req);
         settled_acc.record_settled_span(link1, link1, 4, 1_024);
         assert_eq!(settled_acc.largest_live_row_bytes, 0);
-        assert_eq!(settled_acc.next_live_tail_batch_len(), 1);
+        assert_eq!(settled_acc.next_live_tail_batch_len(), 16);
     }
 
     fn seed_wide_fee_live_tail_store(dir: &std::path::Path, wide_height: u32) -> TestOutcome<DB> {

@@ -322,8 +322,6 @@ pub(crate) struct ExpectedShieldedBlock<'a> {
 
 const OBSERVED_HASH: u8 = 1 << 0;
 const OBSERVED_PREV_HASH: u8 = 1 << 1;
-const OBSERVED_CHAIN_METADATA: u8 = 1 << 2;
-const OBSERVED_EMPTY_VTX: u8 = 1 << 3;
 
 #[derive(Default)]
 struct ObservedShieldedBlock {
@@ -349,26 +347,6 @@ pub(super) fn validate_shielded_block_wire(
     expected: ExpectedShieldedBlock<'_>,
 ) -> Result<(), SettledShieldedSegmentError> {
     let _observed = scan_and_validate_shielded_block_wire(raw_payload, expected)?;
-    Ok(())
-}
-
-/// Validates a live-tail `CompactBlock` protobuf payload without heap allocation,
-/// enforcing `chain_metadata` presence and non-empty `vtx` transaction entries.
-pub(crate) fn validate_live_tail_shielded_block_wire(
-    raw_payload: &[u8],
-    expected: ExpectedShieldedBlock<'_>,
-) -> Result<(), SettledShieldedSegmentError> {
-    let observed = scan_and_validate_shielded_block_wire(raw_payload, expected)?;
-    if !observed.has_flag(OBSERVED_CHAIN_METADATA) {
-        return Err(SettledShieldedSegmentError::PayloadIntegrity(
-            "live-tail shielded payload is missing chain_metadata".to_owned(),
-        ));
-    }
-    if observed.has_flag(OBSERVED_EMPTY_VTX) {
-        return Err(SettledShieldedSegmentError::PayloadIntegrity(
-            "live-tail DEFAULT_RANGE transaction carries neither Sapling, Orchard, nor Ironwood fields".to_owned(),
-        ));
-    }
     Ok(())
 }
 
@@ -422,15 +400,11 @@ fn scan_and_validate_shielded_block_wire(
                 expect_wire_type(wire_type, WireType::LengthDelimited, "chain_metadata")?;
                 let nested = take_length_delimited(&mut cursor)?;
                 validate_chain_metadata_wire(nested)?;
-                observed.set_flag(OBSERVED_CHAIN_METADATA);
             }
             COMPACT_BLOCK_TAG_VTX => {
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock.vtx")?;
                 let tx_bytes = take_length_delimited(&mut cursor)?;
                 let tx_presence = validate_compact_tx_wire(tx_bytes)?;
-                if tx_presence.is_empty() {
-                    observed.set_flag(OBSERVED_EMPTY_VTX);
-                }
                 observed.pool_presence = observed.pool_presence.union(tx_presence);
             }
             _ => skip_wire_field(wire_type, &mut cursor)?,
