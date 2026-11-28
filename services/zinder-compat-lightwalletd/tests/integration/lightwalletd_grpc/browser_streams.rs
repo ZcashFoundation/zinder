@@ -112,10 +112,16 @@ async fn verify_slot_reuse(fixture: &AcceptanceStore, encoding: &str, end: EndRa
         }
     };
     let refused = server.clone().oneshot(range_request(encoding, 1)?).await?;
-    assert_eq!(
-        Status::from_header_map(refused.headers()).map(|s| s.code()),
-        Some(Code::Unavailable)
-    );
+    let status = Status::from_header_map(refused.headers())
+        .ok_or_else(|| eyre!("missing browser range refusal"))?;
+    assert_eq!(status.code(), Code::Unavailable);
+    let delay_ms = status
+        .metadata()
+        .get("grpc-retry-pushback-ms")
+        .ok_or_else(|| eyre!("missing browser range retry pushback"))?
+        .to_str()?
+        .parse::<i32>()?;
+    assert!((500..=1500).contains(&delay_ms));
 
     gate.add_permits(1);
     let admitted = server.oneshot(range_request(encoding, 1)?).await?;

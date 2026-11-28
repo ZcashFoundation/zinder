@@ -766,6 +766,7 @@ async fn native_dense_range_compression_reduces_wire_bytes() -> eyre::Result<()>
         start_height: 2,
         end_height: 2,
         at_epoch_id: None,
+        pool_types: Vec::new(),
     }
     .encode_to_vec();
     let mut frame = vec![0];
@@ -846,16 +847,18 @@ async fn native_wallet_clients_round_trip_compressed_calls_with_bounded_decoding
     };
     let range_request = wallet::CompactBlocksInRangeRequest {
         start_height: 2,
-        end_height: 2,
+        end_height: 1,
         at_epoch_id: None,
+        pool_types: vec![wallet::CompactPool::Sapling.into()],
     };
     let expected_block = identity.compact_block(block_request).await?.into_inner();
     let expected_range = identity
-        .compact_blocks_in_range(range_request)
+        .compact_blocks_in_range(range_request.clone())
         .await?
         .into_inner()
         .try_collect::<Vec<_>>()
         .await?;
+    assert_eq!(compact_range_heights(&expected_range), [2, 1]);
     for encoding in [CompressionEncoding::Gzip, CompressionEncoding::Zstd] {
         let mut client = identity
             .clone()
@@ -871,7 +874,7 @@ async fn native_wallet_clients_round_trip_compressed_calls_with_bounded_decoding
         );
         assert_eq!(block.into_inner(), expected_block);
         let range = client
-            .compact_blocks_in_range(range_request)
+            .compact_blocks_in_range(range_request.clone())
             .await?
             .into_inner()
             .try_collect::<Vec<_>>()
@@ -887,9 +890,68 @@ async fn native_wallet_clients_round_trip_compressed_calls_with_bounded_decoding
         assert_eq!(refusal.code(), Code::ResourceExhausted);
         assert!(refusal.message().contains("size limit"), "{refusal}");
     }
+    assert_nullifier_range_compression(&mut identity).await?;
     drop(identity);
     shutdown.cancel();
     task.await??;
+    Ok(())
+}
+
+fn compact_range_heights(chunks: &[wallet::CompactBlocksInRangeChunk]) -> Vec<u32> {
+    use wallet::compact_blocks_in_range_chunk::Body;
+
+    chunks
+        .iter()
+        .filter_map(|chunk| match chunk.body.as_ref()? {
+            Body::Header(_) => None,
+            Body::Item(block) => Some(block.height),
+        })
+        .collect()
+}
+
+async fn assert_nullifier_range_compression(
+    identity: &mut wallet::wallet_query_client::WalletQueryClient<tonic::transport::Channel>,
+) -> eyre::Result<()> {
+    use futures_util::TryStreamExt as _;
+    use tonic::codec::CompressionEncoding;
+    use wallet::compact_nullifiers_in_range_chunk::Body;
+
+    let request = wallet::CompactNullifiersInRangeRequest {
+        start_height: 2,
+        end_height: 1,
+        at_epoch_id: None,
+        pool_types: vec![wallet::CompactPool::Sapling.into()],
+    };
+    let expected_range = identity
+        .compact_nullifiers_in_range(request.clone())
+        .await?
+        .into_inner()
+        .try_collect::<Vec<_>>()
+        .await?;
+    let blocks = expected_range
+        .iter()
+        .filter_map(|chunk| match chunk.body.as_ref()? {
+            Body::Header(_) => None,
+            Body::Block(block) => Some(block),
+        });
+    assert_eq!(blocks.map(|block| block.height).collect::<Vec<_>>(), [2, 1]);
+    for encoding in [CompressionEncoding::Gzip, CompressionEncoding::Zstd] {
+        let response = identity
+            .clone()
+            .send_compressed(encoding)
+            .accept_compressed(encoding)
+            .compact_nullifiers_in_range(request.clone())
+            .await?;
+        assert_eq!(
+            response
+                .metadata()
+                .get("grpc-encoding")
+                .and_then(|header| header.to_str().ok()),
+            Some(encoding.to_string().as_str()),
+        );
+        let range = response.into_inner().try_collect::<Vec<_>>().await?;
+        assert_eq!(range, expected_range);
+    }
     Ok(())
 }
 
