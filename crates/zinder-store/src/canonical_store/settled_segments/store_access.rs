@@ -761,10 +761,7 @@ pub(in crate::canonical_store) fn read_replay_step_split(
     {
         return replay_step_from_live_tail_bytes(height, &encoded);
     }
-    Err(CanonicalStoreError::block_replay_sequence(format!(
-        "canonical block replay at height {} is absent",
-        height.value()
-    )))
+    Err(CanonicalStoreError::MissingLiveTailReplay { height })
 }
 
 fn read_compact_block_from_segment(

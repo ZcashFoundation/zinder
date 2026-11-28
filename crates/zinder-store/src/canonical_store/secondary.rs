@@ -6,6 +6,7 @@ use std::{
 };
 
 use rust_rocksdb::{Cache, ColumnFamilyDescriptor, DB, Options};
+use tempfile::TempDir;
 use zinder_core::{
     BlockHeight, BlockHeightRange, CanonicalBlockFacts, CanonicalHistoryBounds, Network,
     NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
@@ -26,7 +27,10 @@ use super::{
         visit_replay_facts_at_heights_with_cache,
     },
     construction_manifest::validate_ready_construction_manifest,
-    event_lifecycle::{canonical_event_history_from_db, canonical_event_retention_floor_from_db},
+    event_lifecycle::{
+        canonical_event_history_from_db, canonical_event_retention_floor_from_db,
+        read_retained_event_from_db,
+    },
     live_commit::event_fence_from_ready,
     mempool_lifecycle::validate_mempool_lifecycle_admission,
     publication::{follow_ready_replay_tail, validate_ready_publication},
@@ -79,7 +83,7 @@ impl CanonicalSecondaryCatchupOutcome {
 /// from the persisted settled checkpoint before returning the new fence.
 pub struct RocksDbCanonicalSecondary {
     pub(super) bounded_open: BoundedRocksDbOpen,
-    primary_path: PathBuf,
+    open_settings: Box<SecondaryOpenSettings>,
     pub(super) expectation: CanonicalStoreAdmissionExpectation,
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     history_predecessor_digest: [u8; 32],
@@ -93,7 +97,19 @@ pub struct RocksDbCanonicalSecondary {
     pub(super) sealed_segments: Vec<SettledSegmentIndexEntry>,
 }
 
+struct SecondaryOpenSettings {
+    primary_path: PathBuf,
+    secondary_path: PathBuf,
+    resources: RocksDbOpenResources,
+    column_families: fn(&Cache, RocksDbResourceBudget) -> Vec<ColumnFamilyDescriptor>,
+    recovery_directory: Option<TempDir>,
+}
+
 impl RocksDbCanonicalSecondary {
+    fn primary_path(&self) -> &Path {
+        &self.open_settings.primary_path
+    }
+
     /// Returns the writer-admitted schedule revision observed at the last
     /// catch-up.
     #[must_use]
@@ -196,7 +212,7 @@ impl RocksDbCanonicalSecondary {
                 primary_path: &primary_path,
                 secondary_path,
             },
-            resources,
+            resources.clone(),
             column_families,
         )
         .map_err(|source| CanonicalStoreError::RocksDbOperation {
@@ -274,7 +290,13 @@ impl RocksDbCanonicalSecondary {
             .transpose()?;
         Ok(Self {
             bounded_open,
-            primary_path,
+            open_settings: Box::new(SecondaryOpenSettings {
+                primary_path,
+                secondary_path: secondary_path.to_path_buf(),
+                resources,
+                column_families,
+                recovery_directory: None,
+            }),
             // An opening table is checked only at open. Catch-ups
             // authenticate the schedule journal and follow each revision the
             // writer admits, so a long-running reader never pins its startup
@@ -295,6 +317,92 @@ impl RocksDbCanonicalSecondary {
             segment_cache,
             sealed_segments,
         })
+    }
+
+    /// Reopens a live follower after an admitted replay height was missing.
+    ///
+    /// The fresh handle must admit READY for the same store and retain the
+    /// previous fence exactly, either as READY or in its event history.
+    /// After verifying any external writer attestation, the caller can retry
+    /// its original replay operation once. Any further error ends that operation.
+    pub fn reopen_after_missing_live_tail(
+        &mut self,
+        height: BlockHeight,
+    ) -> Result<(), CanonicalStoreError> {
+        let before = self.event_fence();
+        if height < self.ready_evidence.first_retained_block.height
+            || height > before.visible_tip().height
+        {
+            return Err(CanonicalStoreError::MissingLiveTailReplay { height });
+        }
+        tracing::warn!(
+            target: "zinder::store",
+            event = "canonical_secondary_live_tail_reopen",
+            missing_height = height.value(),
+            visible_height = before.visible_tip().height.value(),
+            event_sequence = before.chain_event_sequence(),
+            "reopening canonical secondary after an admitted live-tail replay row was missing"
+        );
+        metrics::counter!("zinder_store_canonical_secondary_live_tail_reopens_total").increment(1);
+
+        let directory = tempfile::Builder::new()
+            .prefix("live-tail-recovery-")
+            .tempdir_in(&self.open_settings.secondary_path)
+            .map_err(|source| CanonicalStoreError::PathUnavailable {
+                path: self.open_settings.secondary_path.clone(),
+                source,
+            })?;
+        let mut fresh = Self::open_ready_with_expectation(
+            self.primary_path(),
+            directory.path(),
+            &self.expectation,
+            self.open_settings.resources.clone(),
+            self.open_settings.column_families,
+        )?;
+        self.validate_reopened_fence(&fresh, before)?;
+        fresh
+            .open_settings
+            .secondary_path
+            .clone_from(&self.open_settings.secondary_path);
+        fresh.open_settings.recovery_directory = Some(directory);
+        *self = fresh;
+        Ok(())
+    }
+
+    fn validate_reopened_fence(
+        &self,
+        fresh: &Self,
+        before: CanonicalEventFence,
+    ) -> Result<(), CanonicalStoreError> {
+        if fresh.build_plan != self.build_plan
+            || fresh.cursor_auth_key != self.cursor_auth_key
+            || fresh.ready_evidence.construction_manifest_version
+                != self.ready_evidence.construction_manifest_version
+            || fresh.ready_evidence.construction_manifest_sha256
+                != self.ready_evidence.construction_manifest_sha256
+        {
+            return Err(CanonicalStoreError::admission(
+                self.primary_path(),
+                "canonical store identity changed during secondary reopen",
+            ));
+        }
+        let after = fresh.event_fence();
+        let continuous = if after.chain_event_sequence() > before.chain_event_sequence()
+            && after.chain_epoch_id().value() > before.chain_epoch_id().value()
+        {
+            read_retained_event_from_db(&fresh.bounded_open.db, before.chain_event_sequence())?
+                .resulting_fence()
+                == before
+        } else {
+            fresh.ready_evidence == self.ready_evidence
+        };
+        if !continuous {
+            return Err(CanonicalStoreError::admission(
+                self.primary_path(),
+                "canonical fence regressed or diverged during secondary reopen",
+            ));
+        }
+        Ok(())
     }
 
     /// Publishes this secondary's `RocksDB` cache, ticker, and per-family
@@ -357,7 +465,7 @@ impl RocksDbCanonicalSecondary {
         let db = &self.bounded_open.db;
         let cf = db.cf_handle(family).ok_or_else(|| {
             CanonicalStoreError::admission(
-                &self.primary_path,
+                self.primary_path(),
                 format!("unknown column family {family}"),
             )
         })?;
@@ -408,10 +516,10 @@ impl RocksDbCanonicalSecondary {
                 operation: "canonical secondary catch-up",
                 source,
             })?;
-        validate_exact_column_families(&self.primary_path, &mut self.bounded_open.db.cf_names())?;
+        validate_exact_column_families(self.primary_path(), &mut self.bounded_open.db.cf_names())?;
         let opened_control = validate_open_store_control(
             &self.bounded_open.db,
-            &self.primary_path,
+            self.primary_path(),
             &self.expectation,
         )?;
         validate_mempool_lifecycle_admission(
@@ -421,14 +529,14 @@ impl RocksDbCanonicalSecondary {
         )?;
         let CanonicalStoreBuildState::Ready(ready_evidence) = opened_control.build_state else {
             return Err(CanonicalStoreError::StoreNotReady {
-                path: self.primary_path.clone(),
+                path: self.primary_path().to_path_buf(),
             });
         };
         let ready_changed = ready_evidence != self.ready_evidence;
         self.validate_catch_up_identity(&opened_control, &ready_evidence, ready_changed)?;
         if ready_evidence.visible_event_sequence < self.ready_evidence.visible_event_sequence {
             return Err(CanonicalStoreError::admission(
-                &self.primary_path,
+                self.primary_path(),
                 "canonical event sequence regressed during secondary catch-up",
             ));
         }
@@ -436,7 +544,7 @@ impl RocksDbCanonicalSecondary {
             && ready_changed
         {
             return Err(CanonicalStoreError::admission(
-                &self.primary_path,
+                self.primary_path(),
                 "canonical READY publication changed without advancing its event sequence",
             ));
         }
@@ -469,7 +577,7 @@ impl RocksDbCanonicalSecondary {
             .map(|binding| {
                 CanonicalActivationSchedule::read_bound(
                     &self.bounded_open.db,
-                    &self.primary_path,
+                    self.primary_path(),
                     binding,
                     self.build_plan
                         .network_upgrade_activations_fingerprint()
@@ -491,7 +599,7 @@ impl RocksDbCanonicalSecondary {
         if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
             if first.start_height != ready_evidence.first_retained_block.height {
                 return Err(CanonicalStoreError::admission(
-                    &self.primary_path,
+                    self.primary_path(),
                     format!(
                         "settled segment start {} disagrees with READY first retained height {}",
                         first.start_height.value(),
@@ -501,7 +609,7 @@ impl RocksDbCanonicalSecondary {
             }
             if last.end_block.height > ready_evidence.sequence_checkpoint.through().height {
                 return Err(CanonicalStoreError::admission(
-                    &self.primary_path,
+                    self.primary_path(),
                     format!(
                         "settled segment tip {} exceeds READY settled checkpoint {}",
                         last.end_block.height.value(),
@@ -513,13 +621,13 @@ impl RocksDbCanonicalSecondary {
         if let Some(previous) = self.sealed_segments.last() {
             let Some(current) = entries.last() else {
                 return Err(CanonicalStoreError::admission(
-                    &self.primary_path,
+                    self.primary_path(),
                     "settled segment index disappeared during secondary catch-up",
                 ));
             };
             if current.end_block.height < previous.end_block.height {
                 return Err(CanonicalStoreError::admission(
-                    &self.primary_path,
+                    self.primary_path(),
                     "settled segment tip regressed during secondary catch-up",
                 ));
             }
@@ -527,7 +635,7 @@ impl RocksDbCanonicalSecondary {
                 && (current.end_block.hash != previous.end_block.hash || current != previous)
             {
                 return Err(CanonicalStoreError::admission(
-                    &self.primary_path,
+                    self.primary_path(),
                     "settled segment tip changed at equal height during secondary catch-up",
                 ));
             }
@@ -535,7 +643,7 @@ impl RocksDbCanonicalSecondary {
         if entries.len() < self.sealed_segments.len() || !entries.starts_with(&self.sealed_segments)
         {
             return Err(CanonicalStoreError::admission(
-                &self.primary_path,
+                self.primary_path(),
                 "retained settled segment prefix mutated during secondary catch-up",
             ));
         }
@@ -546,7 +654,7 @@ impl RocksDbCanonicalSecondary {
         for entry in &entries[self.sealed_segments.len()..] {
             if entry.modules != expected_modules {
                 return Err(CanonicalStoreError::admission(
-                    &self.primary_path,
+                    self.primary_path(),
                     format!(
                         "newly settled segment {}-{} modules {:?} do not match admitted modules {:?}",
                         entry.start_height.value(),
@@ -561,7 +669,7 @@ impl RocksDbCanonicalSecondary {
                 Some(&self.segment_cache),
                 entry,
             )
-            .map_err(|err| CanonicalStoreError::admission(&self.primary_path, err.to_string()))?;
+            .map_err(|err| CanonicalStoreError::admission(self.primary_path(), err.to_string()))?;
         }
         Ok(Some(entries))
     }
@@ -580,7 +688,7 @@ impl RocksDbCanonicalSecondary {
     ) -> Result<(), CanonicalStoreError> {
         if opened_control.build_plan != self.build_plan {
             return Err(CanonicalStoreError::admission(
-                &self.primary_path,
+                self.primary_path(),
                 "canonical build identity changed during secondary catch-up",
             ));
         }
@@ -591,13 +699,13 @@ impl RocksDbCanonicalSecondary {
                     != self.ready_evidence.construction_manifest_sha256)
         {
             return Err(CanonicalStoreError::admission(
-                &self.primary_path,
+                self.primary_path(),
                 "canonical construction manifest changed during secondary catch-up",
             ));
         }
         if opened_control.cursor_auth_key != self.cursor_auth_key {
             return Err(CanonicalStoreError::admission(
-                &self.primary_path,
+                self.primary_path(),
                 "canonical cursor authentication key changed during secondary catch-up",
             ));
         }
@@ -643,7 +751,7 @@ impl RocksDbCanonicalSecondary {
     ) -> Result<(), CanonicalStoreError> {
         if self.stored_set != expected {
             return Err(CanonicalStoreError::admission(
-                &self.primary_path,
+                self.primary_path(),
                 format!(
                     "canonical stored set changed from {expected:?} to {:?}",
                     self.stored_set
@@ -713,6 +821,8 @@ impl RocksDbCanonicalSecondary {
     /// row against its canonical predecessor without rescanning the historical
     /// prefix; the caller must compare its resulting source digest and event
     /// cursor with the same secondary fence before publishing derived state.
+    /// A missing live-tail row can fail scan creation or iteration with
+    /// [`CanonicalStoreError::MissingLiveTailReplay`].
     pub fn scan_canonical_replay_range(
         &self,
         range: BlockHeightRange,
@@ -723,8 +833,8 @@ impl RocksDbCanonicalSecondary {
     /// Reads one retained block's canonical facts by height.
     ///
     /// Heights outside the admitted retained range return `None`. A missing row
-    /// inside that range is a canonical replay-sequence error: READY admission
-    /// proves the retained range is contiguous.
+    /// inside that range is an error because READY admission proves the
+    /// retained range is contiguous.
     pub fn block_replay_facts_at(
         &self,
         height: BlockHeight,

@@ -30,23 +30,26 @@ use zinder_runtime::{
     CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
     CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation, OpsHealthcheckArgs, OpsServer,
     OpsServerError, Readiness, ReadinessState, RuntimeService, StartupPhase, StartupPhaseGuard,
-    TracingSubscriberError, cancel_on_terminating_signal, compare_canonical_writer_fences,
-    converge_on_canonical_writer_fence, expected_writer_fence, host_cpu_meets_compiled_baseline,
-    host_cpu_meets_pasta_backend_baseline, install_metrics_recorder, install_tracing_subscriber,
-    spawn_ops_endpoint, writer_attests_network_upgrade_schedule,
+    TracingSubscriberError, cancel_on_terminating_signal, classify_canonical_writer_fence,
+    compare_canonical_writer_fences, converge_on_canonical_writer_fence, expected_writer_fence,
+    host_cpu_meets_compiled_baseline, host_cpu_meets_pasta_backend_baseline,
+    install_metrics_recorder, install_tracing_subscriber, spawn_ops_endpoint,
+    writer_attests_network_upgrade_schedule,
 };
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalReorgPolicy,
-    CanonicalRetainedEvent, CanonicalStoreReadyEvidence, RocksDbCanonicalSecondary,
+    CanonicalRetainedEvent, CanonicalStoreError, CanonicalStoreReadyEvidence,
+    RocksDbCanonicalSecondary,
 };
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
     WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition,
 };
 use zinder_wallet_rocksdb::{
-    RocksDbWalletBuildOptions, RocksDbWalletBuildStore, RocksDbWalletFollowingStore,
-    RocksDbWalletStore, WalletBuildLeaseHeartbeat, WalletBuildLeasePhase,
-    WalletProjectionBuildLeaseExecution, build_wallet_from_canonical_with_lease_and_heartbeat,
+    RocksDbWalletBuildOptions, RocksDbWalletBuildStore, RocksDbWalletError,
+    RocksDbWalletFollowingStore, RocksDbWalletStore, WalletBuildLeaseHeartbeat,
+    WalletBuildLeasePhase, WalletProjectionBuildLeaseExecution,
+    build_wallet_from_canonical_with_lease_and_heartbeat,
 };
 
 use crate::PROJECTOR_SERVICE_NAME;
@@ -878,15 +881,17 @@ async fn run_continuous_wallet_following(
         )
         .await?;
         let resulting_fence = transition.resulting_fence();
-        let reconciled_source = match apply_next_wallet_transition(
+        let reconciled_source = match apply_wallet_transition_with_recovery(
             &mut wallet,
-            &canonical,
+            &mut canonical,
+            &mut canonical_control,
             wallet_source,
             transition,
-            config.reorg_window_blocks,
-            config.follow.max_transition_logical_bytes,
+            config,
             &cancel,
-        ) {
+        )
+        .await
+        {
             Ok(Some(reconciled_source)) => reconciled_source,
             Ok(None) => return Ok(()),
             Err(ProjectorError::WalletTransitionLogicalByteLimit {
@@ -1287,15 +1292,17 @@ async fn bootstrap_resumed_wallet_following(
         )
         .await?;
         let resulting_fence = transition.resulting_fence();
-        let reconciled_source = match apply_next_wallet_transition(
+        let reconciled_source = match apply_wallet_transition_with_recovery(
             &mut wallet,
-            &canonical,
+            &mut canonical,
+            &mut canonical_control,
             wallet_source,
             transition,
-            config.reorg_window_blocks,
-            config.follow.max_transition_logical_bytes,
+            config,
             &cancel,
-        ) {
+        )
+        .await
+        {
             Ok(Some(reconciled_source)) => reconciled_source,
             Ok(None) => return Ok(()),
             Err(ProjectorError::WalletTransitionLogicalByteLimit {
@@ -1464,6 +1471,100 @@ fn raise_wallet_reorg_depth(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the retry reuses the authenticated wallet transition and writer control client"
+)]
+async fn apply_wallet_transition_with_recovery(
+    wallet: &mut RocksDbWalletFollowingStore,
+    canonical: &mut RocksDbCanonicalSecondary,
+    control: &mut CanonicalWriterControlClient,
+    wallet_source: WalletCanonicalSourceIdentity,
+    transition: NextWalletTransition,
+    config: &config::ProjectorConfig,
+    cancel: &CancellationToken,
+) -> Result<Option<WalletCanonicalSourceIdentity>, ProjectorError> {
+    let apply = |wallet: &mut RocksDbWalletFollowingStore,
+                 canonical: &RocksDbCanonicalSecondary| {
+        apply_next_wallet_transition(
+            wallet,
+            canonical,
+            wallet_source,
+            &transition,
+            config.reorg_window_blocks,
+            config.follow.max_transition_logical_bytes,
+            cancel,
+        )
+    };
+    let initial_attempt = apply(wallet, canonical);
+    let Err(
+        ProjectorError::CanonicalStore(CanonicalStoreError::MissingLiveTailReplay { height })
+        | ProjectorError::WalletStore(RocksDbWalletError::CanonicalReplay {
+            source: CanonicalStoreError::MissingLiveTailReplay { height },
+        }),
+    ) = &initial_attempt
+    else {
+        return initial_attempt;
+    };
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
+    canonical.reopen_after_missing_live_tail(*height)?;
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Ok(None),
+        () = tokio::time::sleep(config.fence_convergence_timeout) => {
+            return Err(CanonicalStoreError::AdmissionRefused {
+                path: config.canonical_path.clone(),
+                reason: "writer attestation timed out after reopening the secondary".to_owned(),
+            }.into());
+        }
+        attestation = attest_reopened_secondary(control, canonical) => attestation?,
+    }
+    apply(wallet, canonical)
+}
+
+async fn attest_reopened_secondary(
+    control: &mut CanonicalWriterControlClient,
+    canonical: &RocksDbCanonicalSecondary,
+) -> Result<(), ProjectorError> {
+    let fence = expected_writer_fence(canonical.event_fence());
+    let status = control.writer_status().await?;
+    match classify_canonical_writer_fence(&status, canonical.network(), &fence) {
+        CanonicalFenceRelation::Matches => Ok(()),
+        CanonicalFenceRelation::Diverged(error) => {
+            Err(ProjectorError::CanonicalFenceDiverged(error))
+        }
+        CanonicalFenceRelation::SecondaryBehind(_) => {
+            // WriterStatus proves ordering. A retained event proves the exact
+            // reopened fence when the writer has already moved past it.
+            let cursor = CanonicalEventCursor::at(fence.event_sequence.saturating_sub(1))?;
+            let page = control.event_page(&cursor.as_bytes(), 1).await?;
+            let continues_status = page
+                .writer_fence
+                .as_ref()
+                .zip(status.fence.as_ref())
+                .is_some_and(|(page_fence, status_fence)| {
+                    !matches!(
+                        compare_canonical_writer_fences(page_fence, status_fence),
+                        CanonicalFenceRelation::Diverged(_)
+                    )
+                });
+            if !continues_status
+                || !matches!(
+                    page.events.as_slice(),
+                    [event] if event.resulting_fence.as_ref() == Some(&fence)
+                )
+            {
+                return Err(ProjectorError::CanonicalEventPageInvalid {
+                    reason: "writer did not attest the reopened secondary fence",
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Executes one next retained-event transition.
 ///
 /// Append-only lag progresses one event at a time. Only a run whose
@@ -1477,13 +1578,13 @@ fn apply_next_wallet_transition(
     wallet: &mut RocksDbWalletFollowingStore,
     canonical: &RocksDbCanonicalSecondary,
     wallet_source: WalletCanonicalSourceIdentity,
-    transition: NextWalletTransition,
+    transition: &NextWalletTransition,
     supported_reorg_depth: u32,
     max_logical_bytes: std::num::NonZeroU64,
     cancel: &CancellationToken,
 ) -> Result<Option<WalletCanonicalSourceIdentity>, ProjectorError> {
     let transition_fence = transition.resulting_fence();
-    let resulting_settled_tip = settled_tip_for_transition(canonical, &transition)?;
+    let resulting_settled_tip = settled_tip_for_transition(canonical, transition)?;
     let expected_result =
         wallet_source_identity_from_fence(transition_fence, resulting_settled_tip);
     let transition_result = match transition {
@@ -1493,7 +1594,7 @@ fn apply_next_wallet_transition(
             let replay_rows = canonical.scan_canonical_replay_range(replay_range)?;
             wallet.apply_canonical_event_range_cancellable(
                 wallet_source,
-                event,
+                *event,
                 transition_fence,
                 resulting_settled_tip,
                 max_logical_bytes,
@@ -1517,7 +1618,7 @@ fn apply_next_wallet_transition(
             let replay_rows = canonical.scan_canonical_replay_range(replay_range)?;
             wallet.reconcile_canonical_event_sequence_cancellable(
                 wallet_source,
-                &events,
+                events,
                 transition_fence,
                 resulting_settled_tip,
                 rollback_range,
@@ -2534,19 +2635,10 @@ fn canonical_block_at(
     canonical: &RocksDbCanonicalSecondary,
     height: BlockHeight,
 ) -> Result<BlockId, ProjectorError> {
-    let range = BlockHeightRange::inclusive(height, height);
-    let mut replay = canonical.scan_canonical_replay_range(range)?;
-    let Some(next_replay) = replay.next() else {
-        return Err(ProjectorError::CanonicalCommonAncestorUnavailable);
-    };
-    let replay_row = next_replay?;
-    if replay.next().is_some() {
-        return Err(ProjectorError::CanonicalEventPageInvalid {
-            reason: "single-height canonical replay scan returned multiple rows",
-        });
-    }
-    let header = &replay_row.facts().block_header;
-    Ok(BlockId::new(header.height, header.block_hash))
+    canonical
+        .block_header_at(height)?
+        .map(|header| BlockId::new(header.height, header.block_hash))
+        .ok_or(ProjectorError::CanonicalCommonAncestorUnavailable)
 }
 
 fn reconciliation_ranges(

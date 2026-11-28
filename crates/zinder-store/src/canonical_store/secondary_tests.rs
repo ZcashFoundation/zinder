@@ -42,6 +42,86 @@ use crate::{
 const REORG_WINDOW: u32 = 2;
 
 #[test]
+fn missing_live_tail_replay_recovers_on_a_fresh_secondary() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temporary = TempDir::new()?;
+    let (store, mut secondary, row) = hide_admitted_live_tail_row(temporary.path())?;
+    let height = BlockHeight::new(3);
+    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    store.bounded_open.db.put_cf(
+        &family,
+        zinder_core::wire::encode_height_key_ascending(height),
+        row,
+    )?;
+    drop(family);
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = append_block_five(store, &activations)?;
+    let range = BlockHeightRange::inclusive(height, height);
+    assert!(matches!(
+        secondary.scan_canonical_replay_range(range)?.next(),
+        Some(Err(CanonicalStoreError::MissingLiveTailReplay { height: missing })) if missing == height
+    ));
+
+    secondary.reopen_after_missing_live_tail(height)?;
+    assert_eq!(secondary.event_fence(), store.event_fence());
+    let rows = secondary
+        .scan_canonical_replay_range(range)?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].facts().block_header.height, height);
+    Ok(())
+}
+
+#[test]
+fn missing_live_tail_replay_fails_closed_when_a_reopen_cannot_admit_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let (store, mut secondary, _) = hide_admitted_live_tail_row(temporary.path())?;
+    let height = BlockHeight::new(3);
+    let next = BlockHeight::new(4);
+    let fence = secondary.event_fence();
+    assert!(matches!(
+        secondary.scan_canonical_replay_range(BlockHeightRange::inclusive(next, next)),
+        Err(CanonicalStoreError::MissingLiveTailReplay { height: missing }) if missing == height
+    ));
+    assert!(matches!(
+        secondary.reopen_after_missing_live_tail(height),
+        Err(CanonicalStoreError::MissingLiveTailReplay { height: missing }) if missing == height
+    ));
+    assert_eq!(secondary.event_fence(), fence);
+    assert_eq!(store.event_fence(), fence);
+    Ok(())
+}
+
+fn hide_admitted_live_tail_row(
+    root: &Path,
+) -> Result<(RocksDbCanonicalStore, RocksDbCanonicalSecondary, Vec<u8>), Box<dyn std::error::Error>>
+{
+    let store_path = root.join("canonical");
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let mut secondary = open_adopting_secondary(&store_path, root.join("secondary"))??;
+    let key = zinder_core::wire::encode_height_key_ascending(BlockHeight::new(3));
+    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    let row = store
+        .bounded_open
+        .db
+        .get_cf(&family, key)?
+        .ok_or("fixture needs a live replay row")?;
+    // Simulate the split view deterministically: the secondary still has
+    // the authenticated READY fence when one replay row becomes invisible.
+    store.bounded_open.db.delete_cf(&family, key)?;
+    drop(family);
+    let catchup = secondary.try_catch_up()?;
+    assert_eq!(catchup.after(), catchup.before());
+    Ok((store, secondary, row))
+}
+
+#[test]
 fn second_ready_primary_open_is_refused_while_the_first_owns_the_store()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
