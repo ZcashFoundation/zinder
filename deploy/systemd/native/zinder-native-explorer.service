@@ -19,6 +19,7 @@ ExecStartPost=/bin/sh -c 'while kill -0 "$$MAINPID" 2>/dev/null; do /usr/local/b
 TimeoutStartSec=infinity
 TimeoutStopSec=120
 Restart=on-failure
+RestartMode=direct
 RestartSec=5
 LimitNOFILE=65536
 UMask=0027

@@ -293,7 +293,8 @@ gh release download "$release" --repo ZcashFoundation/zinder \
 On macOS, run the verified `bin/zinder` from the extracted directory.
 ### Install the GNU/Linux archive
 
-Use a systemd host with an archive Zebra or Zakura node reachable from the VM.
+Use a Linux host with systemd 254 or later and an archive Zebra or Zakura node
+reachable from the VM.
 Keep `/var/lib/zinder` on a single local filesystem sized for all primary and
 secondary stores. Stop any existing Zinder deployment that uses the same ports
 or data before starting the native services.
@@ -342,9 +343,10 @@ sudo journalctl -u zinder-native-index.service -u zinder-native-projector.servic
 
 The target starts ingest, then the projector, then WalletQuery and
 lightwalletd compatibility. Each dependent unit waits for its prerequisite's
-`/readyz` to return HTTP 200. The first sync can take hours. While a service
-is syncing, systemd shows it as `activating`. Check progress using
-[Initial sync](initial-sync.md).
+`/readyz` to return HTTP 200. If a service exits before it is ready, systemd
+keeps the dependent units waiting during the automatic retry. The first sync
+can take hours. While a service is syncing, systemd shows it as `activating`.
+Check progress using [Initial sync](initial-sync.md).
 
 ```bash
 systemctl status 'zinder-native-*'
