@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use futures_util::stream;
 use tonic::{Request, Response, Status, Streaming};
@@ -269,8 +272,9 @@ impl Darkside {
             })
             .cloned()
             .collect();
+        let visible = scenario.chain.visible().to_vec();
         drop(scenario);
-        utxos.sort_by_key(|utxo| utxo.height);
+        utxos.sort_unstable_by_key(|utxo| utxo.height);
         let max_entries = request.max_entries as usize;
         if max_entries != 0
             && let Some(first_excluded) = utxos.get(max_entries)
@@ -282,6 +286,35 @@ impl Darkside {
                 return Err(address_utxo_height_limit_exceeded(height, count));
             }
             utxos.truncate(page_len);
+        }
+        for outputs in utxos.chunk_by_mut(|left, right| left.height == right.height) {
+            if outputs.len() == 1 {
+                continue;
+            }
+            let mut transaction_positions = BTreeMap::new();
+            if let Ok(block_index) =
+                visible.binary_search_by_key(&outputs[0].height, |block| block.height)
+            {
+                for (position, tx) in visible[block_index].transactions.iter().enumerate() {
+                    transaction_positions
+                        .entry(tx.txid_bytes())
+                        .or_insert(position);
+                }
+            }
+            // Standalone outputs follow mined transactions and sort by outpoint.
+            let transaction_position = |utxo: &GetAddressUtxosReply| {
+                transaction_positions
+                    .get(utxo.txid.as_slice())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            };
+            outputs.sort_unstable_by(|left, right| {
+                (transaction_position(left), &left.txid, left.index).cmp(&(
+                    transaction_position(right),
+                    &right.txid,
+                    right.index,
+                ))
+            });
         }
         Ok(utxos)
     }

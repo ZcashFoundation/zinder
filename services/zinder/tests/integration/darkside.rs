@@ -291,17 +291,17 @@ async fn darkside_address_utxos_page_only_at_height_boundaries() -> Result<()> {
     stage_blocks(&mut control, 100, 10, 2).await?;
     control.apply_staged(DarksideHeight { height: 101 }).await?;
 
-    let utxo = |height, txid_byte| GetAddressUtxosReply {
+    let utxo = |height, txid_byte, index| GetAddressUtxosReply {
         address: "test-address".to_owned(),
         txid: vec![txid_byte; 32],
+        index,
         height,
         value_zat: 50,
         script: vec![0x51],
-        ..GetAddressUtxosReply::default()
     };
-    let first = utxo(100, 1);
-    let mut next_height = vec![utxo(101, 2), utxo(101, 3)];
-    for output in std::iter::once(&first).chain(&next_height) {
+    let first = utxo(100, 1, 0);
+    let mut next_height = vec![utxo(101, 2, 0), utxo(101, 2, 1)];
+    for output in std::iter::once(&first).chain(next_height.iter().rev()) {
         control.add_address_utxo(output.clone()).await?;
     }
 
@@ -313,7 +313,7 @@ async fn darkside_address_utxos_page_only_at_height_boundaries() -> Result<()> {
     assert_utxo_page(&mut wallet, request(100, 2), std::slice::from_ref(&first)).await?;
     assert_utxo_page(&mut wallet, request(101, 2), &next_height).await?;
 
-    let extra = utxo(101, 4);
+    let extra = utxo(101, 4, 0);
     control.add_address_utxo(extra.clone()).await?;
     next_height.push(extra);
     let unary = wallet
@@ -351,6 +351,49 @@ async fn darkside_address_utxos_page_only_at_height_boundaries() -> Result<()> {
     assert_utxo_page(&mut wallet, request(101, 3), &next_height).await?;
     assert_utxo_page(&mut wallet, request(101, 0), &next_height).await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn darkside_address_utxos_follow_active_block_transaction_order() -> Result<()> {
+    let process = TestProcess::start(&[]).await?;
+    let (mut control, mut wallet) = process.clients().await?;
+    control.reset(metadata(100)).await?;
+    stage_blocks(&mut control, 100, 10, 2).await?;
+    let mut transactions = [broadcast_fixture(0)?, broadcast_fixture(1)?];
+    transactions
+        .sort_unstable_by_key(|(_, id)| std::cmp::Reverse(encode_internal_transaction_id(*id)));
+    let [(first_tx, first_txid), (second_tx, second_txid)] = transactions.map(|(mut tx, id)| {
+        tx.height = 101;
+        (tx, encode_internal_transaction_id(id).to_vec())
+    });
+    control
+        .stage_transactions_stream(tokio_stream::iter([first_tx, second_tx]))
+        .await?;
+    control.apply_staged(DarksideHeight { height: 101 }).await?;
+
+    let utxo = |txid: Vec<u8>, index| GetAddressUtxosReply {
+        address: "test-address".to_owned(),
+        txid,
+        index,
+        height: 101,
+        value_zat: 50,
+        script: vec![0x51],
+    };
+    let expected = [
+        utxo(first_txid.clone(), 0),
+        utxo(first_txid, 1),
+        utxo(second_txid, 0),
+        utxo(vec![0; 32], 0),
+    ];
+    for output in expected.iter().rev() {
+        control.add_address_utxo(output.clone()).await?;
+    }
+    let request = GetAddressUtxosArg {
+        addresses: vec![expected[0].address.clone()],
+        start_height: 101,
+        max_entries: 0,
+    };
+    assert_utxo_page(&mut wallet, request, &expected).await
 }
 
 fn broadcast_fixture(previous_output_index: u32) -> Result<(RawTransaction, TransactionId)> {
