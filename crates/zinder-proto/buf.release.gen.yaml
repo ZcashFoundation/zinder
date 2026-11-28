@@ -1,0 +1,6 @@
+version: v2
+
+plugins:
+  - protoc_builtin: python
+    protoc_path: protoc
+    out: gen/python

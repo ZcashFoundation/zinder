@@ -88,6 +88,161 @@ async fn compact_block_range_serves_visible_blocks_above_settled_tip() -> eyre::
     Ok(())
 }
 
+fn native_range_fixture() -> eyre::Result<ChainFixture> {
+    use zinder_core::{
+        CompactSaplingSpend, CompactTransaction, CompactTransactionData, TransactionId,
+    };
+    use zinder_testkit::FixtureTransactionRows;
+
+    let mut chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let block = chain
+        .block_at(BlockHeight::new(2))
+        .cloned()
+        .ok_or_else(|| eyre!("fixture is missing block 2"))?;
+    let mut transactions = Vec::new();
+    for index in 0_u8..8 {
+        let txid = TransactionId::from_bytes([index + 10; 32]);
+        chain = chain.with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            txid,
+            block.height,
+            block.hash,
+            u32::from(index),
+            b"compact range fixture".as_slice(),
+        ));
+        transactions.push(CompactTransaction {
+            index: u64::from(index),
+            transaction_id: txid,
+            data: CompactTransactionData {
+                sapling_spends: vec![CompactSaplingSpend {
+                    nullifier: [index + 30; 32],
+                }],
+                ..CompactTransactionData::default()
+            },
+        });
+    }
+    Ok(chain.with_compact_block_artifact(CompactBlockArtifact::new(
+        BlockId::new(block.height, block.hash),
+        block.parent_hash,
+        block.block_time_seconds,
+        transactions,
+        CompactChainMetadata {
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        },
+    )?))
+}
+
+async fn assert_native_range_byte_budget(
+    query: &impl WalletQueryApi,
+    range: BlockHeightRange,
+    blocks: &zinder_query::CompactBlockRange,
+) -> eyre::Result<()> {
+    use zinder_store::{HeightOrder, encode_compact_block_artifact};
+
+    let size = blocks
+        .compact_blocks
+        .iter()
+        .map(|block| encode_compact_block_artifact(block).len())
+        .sum::<usize>();
+    for (order, kept) in [
+        (HeightOrder::Ascending, &blocks.compact_blocks[..1]),
+        (HeightOrder::Descending, &blocks.compact_blocks[1..]),
+    ] {
+        assert_eq!(
+            query
+                .compact_blocks_in_range_up_to(range, order, size - 1, None)
+                .await?
+                .compact_blocks,
+            kept,
+        );
+        assert_eq!(
+            query
+                .compact_blocks_in_range_up_to(range, order, size, None)
+                .await?
+                .compact_blocks,
+            blocks.compact_blocks,
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_compact_range_preserves_stream_items_and_message_size_limit() -> eyre::Result<()> {
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Code, transport::Server};
+    use wallet::{wallet_query_client::WalletQueryClient, wallet_query_server::WalletQueryServer};
+    use zinder_query::{WalletEndpointMetadata, WalletQueryGrpcAdapter};
+
+    let chain = native_range_fixture()?;
+    let fixture = WalletServingStoreFixture::from_chain_after_live_append(
+        &chain,
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let (query, _store, _ingest) = crate::common::native_serving_query_from(fixture).await?;
+    let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2));
+    let blocks = query.compact_blocks_in_range(range, None).await?;
+    let header = compact_blocks_in_range_header(blocks.chain_epoch);
+    let items: Vec<_> = blocks
+        .compact_blocks
+        .iter()
+        .map(compact_blocks_in_range_item)
+        .collect();
+    let [settled, live] = items.as_slice() else {
+        return Err(eyre!("expected a settled and a live block"));
+    };
+    assert_native_range_byte_budget(&query, range, &blocks).await?;
+    assert!(header.encoded_len() < live.encoded_len());
+    assert!(settled.encoded_len() < live.encoded_len());
+    let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
+    for max_bytes in [live.encoded_len() - 1, live.encoded_len()] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = Server::builder()
+            .add_service(
+                WalletQueryServer::new(adapter.clone()).max_encoding_message_size(max_bytes),
+            )
+            .serve_with_incoming(TcpListenerStream::new(listener));
+        let task = tokio::spawn(server);
+        let mut client = WalletQueryClient::connect(endpoint).await?;
+        let mut stream = client
+            .compact_blocks_in_range(wallet::CompactBlocksInRangeRequest {
+                start_height: 1,
+                end_height: 2,
+                at_epoch_id: Some(blocks.chain_epoch.id.value()),
+                pool_types: Vec::new(),
+            })
+            .await?
+            .into_inner();
+        if max_bytes == live.encoded_len() {
+            for expected in [&header, settled, live] {
+                assert_eq!(stream.message().await?.as_ref(), Some(expected));
+            }
+            assert!(stream.message().await?.is_none());
+        } else {
+            let mut received = Vec::new();
+            let status = loop {
+                match stream.message().await {
+                    Ok(Some(chunk)) => received.push(chunk),
+                    Ok(None) => return Err(eyre!("oversized compact block was accepted")),
+                    Err(status) => break status,
+                }
+            };
+            assert_eq!(status.code(), Code::OutOfRange);
+            // An encoding error can discard frames that tonic had buffered.
+            assert!(received.len() <= 2);
+            assert!(
+                received
+                    .iter()
+                    .eq([&header, settled].into_iter().take(received.len()))
+            );
+        }
+        task.abort();
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn tree_state_at_serves_visible_height_above_settled_tip_under_epoch_pin() -> eyre::Result<()>
 {

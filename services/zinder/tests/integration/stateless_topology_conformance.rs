@@ -51,6 +51,7 @@ use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreRequirements, RawBlobRetention, RocksDbCanonicalSecondary,
     RocksDbResourceBudget,
 };
+use zinder_testkit::grpc_web::{decode_grpc_web_message, encode_grpc_web_frame};
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
     IngestControlFixture, open_test_materialized_view_store_for_canonical,
@@ -338,67 +339,6 @@ async fn spawn_replica_stack(
     })
 }
 
-pub(super) fn encode_grpc_web_frame(payload: &[u8]) -> eyre::Result<Vec<u8>> {
-    let length = u32::try_from(payload.len())?;
-    let mut framed = Vec::with_capacity(5 + payload.len());
-    framed.push(0);
-    framed.extend_from_slice(&length.to_be_bytes());
-    framed.extend_from_slice(payload);
-    Ok(framed)
-}
-
-fn decode_first_grpc_web_message<M: prost::Message + Default>(bytes: &[u8]) -> eyre::Result<M> {
-    ensure!(bytes.len() >= 5, "grpc-web response truncated");
-    ensure!(bytes[0] == 0, "expected gRPC data frame header 0");
-    let frame_len = usize::try_from(u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]))?;
-    let payload_end = 5 + frame_len;
-    ensure!(
-        bytes.len() >= payload_end,
-        "grpc-web frame extends past body"
-    );
-    let trailer_bytes = &bytes[payload_end..];
-    ensure!(
-        trailer_bytes.len() >= 5,
-        "grpc-web response missing trailers frame"
-    );
-    ensure!(
-        trailer_bytes[0] == 0x80,
-        "expected uncompressed grpc-web trailers frame header 0x80, got {:#x}",
-        trailer_bytes[0]
-    );
-    let trailer_len = usize::try_from(u32::from_be_bytes([
-        trailer_bytes[1],
-        trailer_bytes[2],
-        trailer_bytes[3],
-        trailer_bytes[4],
-    ]))?;
-    let trailer_end = 5 + trailer_len;
-    ensure!(
-        trailer_bytes.len() == trailer_end,
-        "expected single complete final grpc-web trailers frame (len={}, got {})",
-        trailer_end,
-        trailer_bytes.len()
-    );
-    let trailer_text = std::str::from_utf8(&trailer_bytes[5..trailer_end])?;
-    let mut grpc_status = None;
-    for raw_line in trailer_text.split("\r\n") {
-        if raw_line.is_empty() {
-            continue;
-        }
-        let (header_name, header_val) = raw_line
-            .split_once(':')
-            .ok_or_else(|| eyre!("malformed grpc-web trailer line: {raw_line:?}"))?;
-        if header_name.trim().eq_ignore_ascii_case("grpc-status") {
-            grpc_status = Some(header_val.trim().to_owned());
-        }
-    }
-    ensure!(
-        grpc_status.as_deref() == Some("0"),
-        "expected trailing grpc-status: 0, got {grpc_status:?} in {trailer_text:?}"
-    );
-    Ok(M::decode(&bytes[5..payload_end])?)
-}
-
 async fn query_http2_and_grpc_web(addr: SocketAddr) -> eyre::Result<(u64, Vec<u8>)> {
     let mut client = CompactTxStreamerClient::connect(format!("http://{addr}")).await?;
     let lightd_info = client
@@ -432,7 +372,7 @@ async fn query_http2_and_grpc_web(addr: SocketAddr) -> eyre::Result<(u64, Vec<u8
         .send()
         .await?;
     ensure!(bin_reply.status().is_success());
-    let bin_tip: lightwalletd::BlockId = decode_first_grpc_web_message(&bin_reply.bytes().await?)?;
+    let bin_tip: lightwalletd::BlockId = decode_grpc_web_message(&bin_reply.bytes().await?)?;
     ensure!(bin_tip.height == tip.height && bin_tip.hash == tip.hash);
 
     let encoded_req = base64::engine::general_purpose::STANDARD.encode(&request_bytes);
@@ -452,7 +392,7 @@ async fn query_http2_and_grpc_web(addr: SocketAddr) -> eyre::Result<(u64, Vec<u8
     for quartet in encoded_body.chunks(4) {
         base64::engine::general_purpose::STANDARD.decode_vec(quartet, &mut raw_text_bytes)?;
     }
-    let text_tip: lightwalletd::BlockId = decode_first_grpc_web_message(&raw_text_bytes)?;
+    let text_tip: lightwalletd::BlockId = decode_grpc_web_message(&raw_text_bytes)?;
     ensure!(text_tip.height == tip.height && text_tip.hash == tip.hash);
     Ok((tip.height, tip.hash))
 }

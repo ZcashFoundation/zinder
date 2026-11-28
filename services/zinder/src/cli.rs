@@ -41,6 +41,39 @@ pub enum Command {
     Config(ConfigArgs),
     /// Probe the operational `/healthz` or `/readyz` HTTP endpoint.
     Healthcheck(HealthcheckArgs),
+    /// Run standalone developer test tools.
+    #[command(subcommand)]
+    Dev(DevCommand),
+}
+
+/// Developer tools isolated from the indexing and serving runtimes.
+#[derive(Debug, Subcommand)]
+pub enum DevCommand {
+    /// Run a scriptable in-memory wallet test server.
+    Darkside(DarksideArgs),
+}
+
+/// Options for `zinder dev darkside`.
+#[derive(Debug, Args)]
+pub struct DarksideArgs {
+    /// Test listener address. Specify port zero to allocate a free port.
+    #[arg(long, default_value = "127.0.0.1:9067")]
+    pub listen_addr: SocketAddr,
+    /// Allow an unauthenticated test listener on a non-loopback address.
+    #[arg(long)]
+    pub allow_non_loopback: bool,
+    /// Maximum server lifetime in seconds.
+    #[arg(long, default_value = "1800")]
+    pub timeout_secs: NonZeroU32,
+    /// Browser origin to allow for gRPC-Web, such as `http://127.0.0.1:5173`.
+    #[arg(long)]
+    pub grpc_web_origin: Option<String>,
+    /// Allow URL-based staging from this HTTP(S) fixture origin.
+    #[arg(long)]
+    pub fixture_origin: Option<String>,
+    /// Reject valid broadcasts to exercise wallet send failure handling.
+    #[arg(long)]
+    pub reject_broadcasts: bool,
 }
 
 /// Coordinated deployment preset for `zinder serve`, `zinder index`, and `zinder config`.

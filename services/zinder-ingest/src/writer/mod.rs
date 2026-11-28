@@ -527,6 +527,7 @@ where
         visible_tip_height = published_fence.visible_tip().height.value(),
         chain_epoch = published_fence.chain_epoch_id().value(),
         chain_event_sequence = published_fence.chain_event_sequence(),
+        construction_tree_state_checkpoint_policy = ?store.construction_tree_state_checkpoint_policy(),
         "published and cold-reopened the canonical baseline"
     );
     Ok(store)

@@ -463,7 +463,7 @@ impl LiveTailBlockRecord {
     }
 
     /// Authenticates a `V1` record and reconstructs only its [`CompactBlockArtifact`] and
-    /// canonical compact-wire budget length.
+    /// raw shielded payload length.
     pub(crate) fn decode_compact_block_v1(
         bytes: &[u8],
         expected_height: BlockHeight,
@@ -506,10 +506,7 @@ impl LiveTailBlockRecord {
                 &empty_sup,
             )?,
         };
-        let compact_wire_budget_len =
-            crate::proto_codec::encoded_compact_block_artifact_len(&compact_block)
-                .max(shielded_payload.len());
-        Ok((compact_block, compact_wire_budget_len))
+        Ok((compact_block, shielded_payload.len()))
     }
 
     /// Authenticates a `V1` record and borrows its raw shielded `CompactBlock` protobuf
@@ -2825,10 +2822,10 @@ mod tests {
             },
         )?;
         assert!(shielded_len > 0);
-        let (decoded_compact, budget_len) =
+        let (decoded_compact, decoded_shielded_len) =
             LiveTailBlockRecord::decode_compact_block_v1(&encoded_full, height)?;
         assert_eq!(decoded_compact, compact);
-        assert!(budget_len >= shielded_len);
+        assert_eq!(decoded_shielded_len, shielded_len);
         let decoded_facts = LiveTailBlockRecord::decode_canonical_facts_v1(&encoded_full, height)?;
         assert_eq!(decoded_facts, Some(facts));
 
