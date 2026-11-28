@@ -15,7 +15,6 @@ publish.workspace = true
 axum.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
-config.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
 http.workspace = true

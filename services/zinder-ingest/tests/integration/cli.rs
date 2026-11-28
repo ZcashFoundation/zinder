@@ -961,7 +961,7 @@ fn wallet_serving_allows_default_none_retention_and_rejects_legacy_transactions(
         },
         &[],
         &[],
-        "does not have variant constructor transactions",
+        "unknown variant `transactions`, expected `none` or `all`",
     )
 }
 
@@ -1019,9 +1019,11 @@ fn assert_profile_print_and_conflict(
         !legacy_transactions.status.success(),
         "{legacy_transactions:?}"
     );
+    let legacy_stderr = String::from_utf8(legacy_transactions.stderr)?;
     assert!(
-        String::from_utf8(legacy_transactions.stderr)?
-            .contains("does not have variant constructor transactions")
+        legacy_stderr.contains("ZINDER_STORAGE__RAW_BLOB_POLICY")
+            && legacy_stderr.contains("expected `none` or `all`"),
+        "{legacy_stderr}"
     );
     Ok(())
 }
@@ -1583,7 +1585,8 @@ fn assert_single_volume_legacy_transactions_fails_closed(
     assert!(!rejected.status.success(), "{rejected:?}");
     let stderr = String::from_utf8(rejected.stderr)?;
     assert!(
-        stderr.contains("does not have variant constructor transactions"),
+        stderr.contains("ZINDER_STORAGE__RAW_BLOB_POLICY")
+            && stderr.contains("expected `none` or `all`"),
         "{stderr}"
     );
     Ok(())
