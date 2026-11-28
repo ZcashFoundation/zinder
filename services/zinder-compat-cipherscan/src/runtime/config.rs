@@ -2,17 +2,16 @@
 
 use std::{net::SocketAddr, path::PathBuf};
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
-    BearerToken, BearerTokenConnectError, BearerTokenError, ConfigError, ConfigLoader,
-    InvalidZinderGrpcEndpoint, NetworkSection, NetworkToml, OpsSection, OpsServerError, OpsToml,
-    RuntimeService, SecuritySection, SecurityToml, guard_optional_serving_bind, guard_serving_bind,
-    parse_socket_addr, require_field, resolve_allow_public_bind, resolve_ops_listen_addr,
-    resolve_optional_bearer_token, validate_zinder_grpc_endpoint,
+    BearerToken, BearerTokenConnectError, BearerTokenError, CipherscanSection, ConfigError,
+    ConfigLoader, DEFAULT_ALLOW_PUBLIC_BIND, InvalidZinderGrpcEndpoint, NetworkSection, OpsSection,
+    OpsServerError, RedactedUrl, RuntimeService, SecretInput, SecuritySection, ZinderConfig,
+    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, resolve_allow_public_bind,
+    resolve_ops_listen_addr, resolve_optional_bearer_token, validate_optional_path,
+    validate_zinder_grpc_endpoint,
 };
-use zinder_source::redact_endpoint_url;
 
 use crate::CipherscanMarketPriceEndpoints;
 
@@ -132,24 +131,7 @@ pub fn load_cipherscan_config_with_env<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    let raw: CipherscanRawConfig = ConfigLoader::new()
-        .with_default("cipherscan.listen_addr", DEFAULT_LISTEN_ADDR)?
-        .with_default(
-            "cipherscan.explorer_query_endpoint",
-            DEFAULT_EXPLORER_QUERY_ENDPOINT,
-        )?
-        .with_default(
-            "cipherscan.wallet_query_endpoint",
-            DEFAULT_WALLET_QUERY_ENDPOINT,
-        )?
-        .with_default(
-            "cipherscan.current_price_endpoint",
-            DEFAULT_CURRENT_PRICE_ENDPOINT,
-        )?
-        .with_default(
-            "cipherscan.historical_price_endpoint_template",
-            DEFAULT_HISTORICAL_PRICE_ENDPOINT_TEMPLATE,
-        )?
+    let raw: ZinderConfig = ConfigLoader::new()
         .with_ops_section(RuntimeService::CompatCipherscan)?
         .with_security_section()?
         .with_file(config_path)
@@ -181,138 +163,75 @@ where
         )?
         .with_override_path_if("cipherscan.bearer_token_path", overrides.bearer_token_path)?
         .load()?;
-    resolve_cipherscan_config(raw)
+    resolve_cipherscan_config_from_raw(raw)
 }
 
 /// Renders a resolved Cipherscan configuration as redacted TOML for `--print-config`.
 pub fn cipherscan_config_toml(config: &CipherscanConfig) -> Result<String, CipherscanConfigError> {
-    toml::to_string(&CipherscanConfigToml::from_resolved(config))
-        .map_err(|source| ConfigError::Render { source }.into())
+    let toml_config = ZinderConfig {
+        network: NetworkSection::from_network(config.network),
+        ops: OpsSection::from_resolved(config.ops_listen_addr),
+        observability: config.observability.clone(),
+        security: SecuritySection::from_resolved(config.allow_public_bind),
+        cipherscan: CipherscanSection {
+            listen_addr: Some(config.listen_addr.to_string()),
+            explorer_query_endpoint: Some(RedactedUrl::from_redacted_display(
+                &config.explorer_query_endpoint,
+            )),
+            wallet_query_endpoint: Some(RedactedUrl::from_redacted_display(
+                &config.wallet_query_endpoint,
+            )),
+            current_price_endpoint: Some(RedactedUrl::from_redacted_display(
+                config.market_price_endpoints.current.as_str(),
+            )),
+            historical_price_endpoint_template: Some(RedactedUrl::from_redacted_display(
+                &config.market_price_endpoints.historical_template,
+            )),
+            bearer_token_path: config.bearer_token_path.clone(),
+            bearer_token: (config.bearer_token.is_some() && config.bearer_token_path.is_none())
+                .then(SecretInput::redacted_placeholder),
+        },
+        ..ZinderConfig::default()
+    };
+    toml::to_string(&toml_config).map_err(|source| ConfigError::Render { source }.into())
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct CipherscanRawConfig {
-    network: NetworkSection,
-    cipherscan: CipherscanSection,
-    ops: OpsSection,
-    observability: zinder_runtime::ObservabilityConfig,
-    security: SecuritySection,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct CipherscanSection {
-    listen_addr: Option<String>,
-    explorer_query_endpoint: Option<String>,
-    wallet_query_endpoint: Option<String>,
-    current_price_endpoint: Option<String>,
-    historical_price_endpoint_template: Option<String>,
-    bearer_token_path: Option<PathBuf>,
-    bearer_token: Option<String>,
-}
-
-impl std::fmt::Debug for CipherscanSection {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CipherscanSection")
-            .field("listen_addr", &self.listen_addr)
-            .field("explorer_query_endpoint", &self.explorer_query_endpoint)
-            .field("wallet_query_endpoint", &self.wallet_query_endpoint)
-            .field("current_price_endpoint", &self.current_price_endpoint)
-            .field(
-                "historical_price_endpoint_template",
-                &self.historical_price_endpoint_template,
-            )
-            .field("bearer_token_path", &self.bearer_token_path)
-            .field(
-                "bearer_token",
-                &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .finish()
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct CipherscanConfigToml {
-    network: NetworkToml,
-    ops: OpsToml,
-    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
-    observability: zinder_runtime::ObservabilityConfig,
-    security: SecurityToml,
-    cipherscan: CipherscanToml,
-}
-
-#[derive(Debug, Serialize)]
-struct CipherscanToml {
-    listen_addr: String,
-    explorer_query_endpoint: String,
-    wallet_query_endpoint: String,
-    current_price_endpoint: String,
-    historical_price_endpoint_template: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bearer_token_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bearer_token: Option<&'static str>,
-}
-
-impl CipherscanConfigToml {
-    fn from_resolved(config: &CipherscanConfig) -> Self {
-        Self {
-            network: NetworkToml::from_network(config.network),
-            ops: OpsToml::from_resolved(config.ops_listen_addr),
-            observability: config.observability.clone(),
-            security: SecurityToml::from_resolved(config.allow_public_bind),
-            cipherscan: CipherscanToml {
-                listen_addr: config.listen_addr.to_string(),
-                explorer_query_endpoint: redact_endpoint_url(&config.explorer_query_endpoint)
-                    .into_owned(),
-                wallet_query_endpoint: redact_endpoint_url(&config.wallet_query_endpoint)
-                    .into_owned(),
-                current_price_endpoint: redact_endpoint_url(
-                    config.market_price_endpoints.current.as_str(),
-                )
-                .into_owned(),
-                historical_price_endpoint_template: redact_endpoint_url(
-                    &config.market_price_endpoints.historical_template,
-                )
-                .into_owned(),
-                bearer_token_path: config
-                    .bearer_token_path
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
-                bearer_token: (config.bearer_token.is_some() && config.bearer_token_path.is_none())
-                    .then_some("[REDACTED]"),
-            },
-        }
-    }
-}
-
-fn resolve_cipherscan_config(
-    raw: CipherscanRawConfig,
+/// Validates and resolves an already-deserialized unified [`ZinderConfig`] for
+/// `zinder-compat-cipherscan`.
+pub fn resolve_cipherscan_config_from_raw(
+    raw: ZinderConfig,
 ) -> Result<CipherscanConfig, CipherscanConfigError> {
     let network = raw.network.resolve()?;
-    let listen_addr_text = require_field(raw.cipherscan.listen_addr, "cipherscan.listen_addr")?;
+    let listen_addr_text = raw
+        .cipherscan
+        .listen_addr
+        .unwrap_or_else(|| DEFAULT_LISTEN_ADDR.to_owned());
     let listen_addr = parse_socket_addr("cipherscan.listen_addr", &listen_addr_text)?;
     let ops_listen_addr = resolve_ops_listen_addr(raw.ops)?;
-    let allow_public_bind = resolve_allow_public_bind(raw.security)?;
+    let allow_public_bind = resolve_allow_public_bind(SecuritySection {
+        allow_public_bind: Some(
+            raw.security
+                .allow_public_bind
+                .unwrap_or(DEFAULT_ALLOW_PUBLIC_BIND),
+        ),
+    })?;
     guard_serving_bind("cipherscan.listen_addr", listen_addr, allow_public_bind)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
 
-    let explorer_query_endpoint = require_field(
-        raw.cipherscan.explorer_query_endpoint,
-        "cipherscan.explorer_query_endpoint",
-    )?;
+    let explorer_query_endpoint = raw.cipherscan.explorer_query_endpoint.map_or_else(
+        || DEFAULT_EXPLORER_QUERY_ENDPOINT.to_owned(),
+        RedactedUrl::into_inner,
+    );
     validate_zinder_grpc_endpoint(&explorer_query_endpoint)?;
-    let wallet_query_endpoint = require_field(
-        raw.cipherscan.wallet_query_endpoint,
-        "cipherscan.wallet_query_endpoint",
-    )?;
+    let wallet_query_endpoint = raw.cipherscan.wallet_query_endpoint.map_or_else(
+        || DEFAULT_WALLET_QUERY_ENDPOINT.to_owned(),
+        RedactedUrl::into_inner,
+    );
     validate_zinder_grpc_endpoint(&wallet_query_endpoint)?;
-    let current_price_endpoint_text = require_field(
-        raw.cipherscan.current_price_endpoint,
-        "cipherscan.current_price_endpoint",
-    )?;
+    let current_price_endpoint_text = raw.cipherscan.current_price_endpoint.map_or_else(
+        || DEFAULT_CURRENT_PRICE_ENDPOINT.to_owned(),
+        RedactedUrl::into_inner,
+    );
     let current_price_endpoint = reqwest::Url::parse(&current_price_endpoint_text)
         .map_err(|source| CipherscanConfigError::InvalidCurrentPriceEndpoint(source.to_string()))?;
     if !matches!(current_price_endpoint.scheme(), "http" | "https") {
@@ -320,18 +239,27 @@ fn resolve_cipherscan_config(
             "scheme must be http or https".to_owned(),
         ));
     }
-    let historical_price_endpoint_template = require_field(
-        raw.cipherscan.historical_price_endpoint_template,
-        "cipherscan.historical_price_endpoint_template",
-    )?;
+    let historical_price_endpoint_template = raw
+        .cipherscan
+        .historical_price_endpoint_template
+        .map_or_else(
+            || DEFAULT_HISTORICAL_PRICE_ENDPOINT_TEMPLATE.to_owned(),
+            RedactedUrl::into_inner,
+        );
     let market_price_endpoints = CipherscanMarketPriceEndpoints::new(
         current_price_endpoint,
         historical_price_endpoint_template,
     )?;
-    let bearer_token_path = raw.cipherscan.bearer_token_path;
+    let bearer_token_path = validate_optional_path(
+        raw.cipherscan.bearer_token_path,
+        "cipherscan.bearer_token_path",
+    )?;
     let bearer_token = resolve_optional_bearer_token(
         bearer_token_path.as_deref(),
-        raw.cipherscan.bearer_token.as_deref(),
+        raw.cipherscan
+            .bearer_token
+            .as_ref()
+            .map(SecretInput::expose_secret),
         "cipherscan.bearer_token_path",
         "cipherscan.bearer_token",
     )?;

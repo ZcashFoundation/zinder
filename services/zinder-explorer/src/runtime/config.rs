@@ -5,19 +5,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, BrowserOrigins, ClientAddressSource, ConfigError, ConfigLoader,
-    NetworkSection, NetworkToml, OpsSection, OpsServerError, OpsToml, ResolvedSecondaryStorage,
-    RuntimeService, SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
-    derive_canonical_path, derive_explorer_secondary_path, guard_optional_serving_bind,
-    guard_serving_bind, parse_socket_addr, require_field, resolve_allow_public_bind,
+    DEFAULT_ALLOW_PUBLIC_BIND, ExplorerSection, NetworkSection, OpsSection, OpsServerError,
+    RedactedUrl, ResolvedSecondaryStorage, RuntimeService, SecretInput, SecuritySection,
+    StorageSection, Toggle, ZinderConfig, derive_canonical_path, derive_explorer_secondary_path,
+    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, resolve_allow_public_bind,
     resolve_ops_listen_addr, resolve_optional_bearer_token, resolve_secondary_storage,
-    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir,
+    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir, validate_optional_path,
 };
-use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget, redact_endpoint_url};
+use zinder_source::NodeTarget;
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9068";
 
@@ -131,8 +130,7 @@ pub fn load_explorer_config_with_env<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    let raw: ExplorerRawConfig = ConfigLoader::new()
-        .with_default("explorer.listen_addr", DEFAULT_LISTEN_ADDR)?
+    let raw: ZinderConfig = ConfigLoader::new()
         .with_ops_section(RuntimeService::Explorer)?
         .with_security_section()?
         .with_file(config_path)
@@ -154,114 +152,43 @@ where
             overrides.wallet_query_endpoint,
         )?
         .load()?;
-    resolve_explorer_config(raw)
+    resolve_explorer_config_from_raw(raw)
 }
 
 /// Renders a resolved explorer configuration as TOML for `--print-config`.
 pub fn explorer_config_toml(config: &ExplorerConfig) -> Result<String, ExplorerConfigError> {
-    let toml_text = toml::to_string(&ExplorerConfigToml::from_resolved(config))
-        .map_err(|source| ConfigError::Render { source })?;
+    let toml_config = ZinderConfig {
+        network: NetworkSection::from_network(config.network),
+        ops: OpsSection::from_resolved(config.ops_listen_addr),
+        observability: config.observability.clone(),
+        security: SecuritySection::from_resolved(config.allow_public_bind),
+        storage: StorageSection::from_secondary(&config.storage),
+        explorer: ExplorerSection {
+            listen_addr: Some(config.listen_addr.to_string()),
+            browser_origins: config.browser_origins.clone(),
+            bearer_token_path: config.bearer_token_path.clone(),
+            bearer_token: (config.bearer_token.is_some() && config.bearer_token_path.is_none())
+                .then(SecretInput::redacted_placeholder),
+            wallet_query_endpoint: Toggle::from_resolved_defaulted_on(
+                config
+                    .wallet_query_endpoint
+                    .as_deref()
+                    .map(RedactedUrl::from_redacted_display),
+            ),
+            trust_proxy_client_address: Some(
+                config.client_address_source.trust_proxy_client_address(),
+            ),
+        },
+        ..ZinderConfig::default()
+    };
+    let toml_text =
+        toml::to_string(&toml_config).map_err(|source| ConfigError::Render { source })?;
     Ok(toml_text)
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ExplorerRawConfig {
-    network: NetworkSection,
-    storage: SecondaryStorageSection,
-    explorer: ExplorerSection,
-    ops: OpsSection,
-    observability: zinder_runtime::ObservabilityConfig,
-    node: NodeSection,
-    node_fallbacks: NodeFallbackSections,
-    security: SecuritySection,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ExplorerSection {
-    listen_addr: Option<String>,
-    browser_origins: BrowserOrigins,
-    bearer_token_path: Option<PathBuf>,
-    bearer_token: Option<String>,
-    wallet_query_endpoint: Option<String>,
-    trust_proxy_client_address: Option<bool>,
-}
-
-impl std::fmt::Debug for ExplorerSection {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ExplorerSection")
-            .field("listen_addr", &self.listen_addr)
-            .field("browser_origins", &self.browser_origins)
-            .field("bearer_token_path", &self.bearer_token_path)
-            .field(
-                "bearer_token",
-                &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("wallet_query_endpoint", &self.wallet_query_endpoint)
-            .field(
-                "trust_proxy_client_address",
-                &self.trust_proxy_client_address,
-            )
-            .finish()
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ExplorerConfigToml {
-    network: NetworkToml,
-    ops: OpsToml,
-    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
-    observability: zinder_runtime::ObservabilityConfig,
-    security: SecurityToml,
-    storage: SecondaryStorageToml,
-    explorer: ExplorerToml,
-}
-
-#[derive(Debug, Serialize)]
-struct ExplorerToml {
-    listen_addr: String,
-    browser_origins: BrowserOrigins,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bearer_token_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bearer_token: Option<&'static str>,
-    wallet_query_endpoint: String,
-    trust_proxy_client_address: bool,
-}
-
-impl ExplorerConfigToml {
-    fn from_resolved(config: &ExplorerConfig) -> Self {
-        Self {
-            network: NetworkToml::from_network(config.network),
-            ops: OpsToml::from_resolved(config.ops_listen_addr),
-            observability: config.observability.clone(),
-            security: SecurityToml::from_resolved(config.allow_public_bind),
-            storage: SecondaryStorageToml::from_resolved(&config.storage),
-            explorer: ExplorerToml {
-                listen_addr: config.listen_addr.to_string(),
-                browser_origins: config.browser_origins.clone(),
-                bearer_token_path: config
-                    .bearer_token_path
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
-                bearer_token: (config.bearer_token.is_some() && config.bearer_token_path.is_none())
-                    .then_some("[REDACTED]"),
-                wallet_query_endpoint: config
-                    .wallet_query_endpoint
-                    .as_deref()
-                    .map_or_default(|endpoint| redact_endpoint_url(endpoint).into_owned()),
-                trust_proxy_client_address: config
-                    .client_address_source
-                    .trust_proxy_client_address(),
-            },
-        }
-    }
-}
-
-fn resolve_explorer_config(
-    mut raw: ExplorerRawConfig,
+/// Validates and resolves an already-deserialized unified [`ZinderConfig`] for `zinder-explorer`.
+pub fn resolve_explorer_config_from_raw(
+    mut raw: ZinderConfig,
 ) -> Result<ExplorerConfig, ExplorerConfigError> {
     let network = raw.network.resolve()?;
     raw.storage.data_dir = validate_optional_data_dir(raw.storage.data_dir)?;
@@ -277,31 +204,48 @@ fn resolve_explorer_config(
         )
     });
     let storage = resolve_secondary_storage(raw.storage)?;
-    let listen_addr_text = require_field(raw.explorer.listen_addr, "explorer.listen_addr")?;
+    let listen_addr_text = raw
+        .explorer
+        .listen_addr
+        .unwrap_or_else(|| DEFAULT_LISTEN_ADDR.to_owned());
     let listen_addr = parse_socket_addr("explorer.listen_addr", &listen_addr_text)?;
-    let bearer_token_path = raw.explorer.bearer_token_path;
+    let bearer_token_path =
+        validate_optional_path(raw.explorer.bearer_token_path, "explorer.bearer_token_path")?;
     if raw.explorer.browser_origins.allows_any_origin()
         && (bearer_token_path.is_some() || raw.explorer.bearer_token.is_some())
     {
         return Err(ConfigError::invalid(
             "explorer.browser_origins requires specific origins when an Explorer bearer token is configured",
-        ).into());
+        )
+        .into());
     }
     let bearer_token = resolve_optional_bearer_token(
         bearer_token_path.as_deref(),
-        raw.explorer.bearer_token.as_deref(),
+        raw.explorer
+            .bearer_token
+            .as_ref()
+            .map(SecretInput::expose_secret),
         "explorer.bearer_token_path",
         "explorer.bearer_token",
     )?;
     let ops_listen_addr = resolve_ops_listen_addr(raw.ops)?;
-    let allow_public_bind = resolve_allow_public_bind(raw.security)?;
+    let allow_public_bind = resolve_allow_public_bind(SecuritySection {
+        allow_public_bind: Some(
+            raw.security
+                .allow_public_bind
+                .unwrap_or(DEFAULT_ALLOW_PUBLIC_BIND),
+        ),
+    })?;
     guard_serving_bind("explorer.listen_addr", listen_addr, allow_public_bind)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
-    let wallet_query_endpoint = raw
-        .explorer
-        .wallet_query_endpoint
-        .filter(|endpoint| !endpoint.is_empty());
-    let node = NodeTarget::resolve_optional(network, raw.node)?;
+    let wallet_query_endpoint = match raw.explorer.wallet_query_endpoint {
+        Toggle::Defaulted | Toggle::Disabled => None,
+        Toggle::Enabled(endpoint) => Some(endpoint.into_inner()),
+    };
+    let node = (!raw.node.is_empty())
+        .then_some(raw.node)
+        .map(|section| NodeTarget::resolve(network, section))
+        .transpose()?;
     // The shared node list is validated as every runtime validates it, but the
     // upstream-observation probe reads only `[node]`.
     let node_fallbacks = NodeTarget::resolve_fallbacks(network, raw.node_fallbacks)?;

@@ -1,0 +1,7 @@
+kind: changed
+body: Unify all runtimes and the `zinder` supervisor onto one strict 18-section `ZinderConfig` schema, reject empty values and `[REDACTED]` placeholders in favor of `"none"`, unify canonical paths on `storage.path` and `storage.secondary_path`, and supervise child roles in memory.
+time: 2026-11-28T10:35:23Z
+custom:
+  Bump: major
+  PR: "758"
+  Upgrade: compatible

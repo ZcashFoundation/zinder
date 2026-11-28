@@ -218,8 +218,15 @@ fn env_csv_and_toml_arrays_deserialize_sequences() -> Result<()> {
     let from_env = load_toy_env(("ZINDER_TYPED__TAGS", "alpha, beta , gamma"))?;
     assert_eq!(from_env.typed.tags, vec!["alpha", "beta", "gamma"]);
 
-    let from_empty_env = load_toy_env(("ZINDER_TYPED__TAGS", ""))?;
-    assert_eq!(from_empty_env.typed.tags, Vec::<String>::new());
+    let from_empty_env = load_toy_env(("ZINDER_TYPED__TAGS", ""));
+    assert!(matches!(
+        from_empty_env,
+        Err(ConfigError::InvalidEnvValue {
+            ref original_name,
+            ref key,
+            ..
+        }) if original_name == "ZINDER_TYPED__TAGS" && key == "typed.tags"
+    ));
 
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("tags.toml");
@@ -352,7 +359,7 @@ fn node_type_errors_and_fallback_merges_preserve_provenance_and_precedence() -> 
         fallbacks[0].node_auth,
         NodeAuth::Basic { ref username, .. } if username == "file-user"
     ));
-    let rendered = toml::to_string(&zinder_runtime::NodeToml::from_node_target(&fallbacks[0]))?;
+    let rendered = toml::to_string(&NodeSection::from_resolved(&fallbacks[0]))?;
     assert!(rendered.contains("password = \"[REDACTED]\""), "{rendered}");
     assert!(!rendered.contains("0123456"), "{rendered}");
     Ok(())
@@ -441,5 +448,84 @@ fn section_validation_attributes_failing_leaf_without_blaming_siblings() -> Resu
         ),
         "unexpected outcome for env otlp endpoint: {invalid_endpoint:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn whitespace_only_env_string_is_rejected_while_nonblank_preserves_bytes() -> Result<()> {
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct AnyProbe {
+        typed: std::collections::BTreeMap<String, toml::Value>,
+    }
+
+    let inactive_whitespace = ConfigLoader::new()
+        .with_zinder_env_from_map([
+            (
+                "ZINDER_NETWORK__NAME".to_owned(),
+                "zcash-regtest".to_owned(),
+            ),
+            ("ZINDER_INGEST__SOURCE".to_owned(), "   ".to_owned()),
+        ])?
+        .load::<zinder_runtime::ZinderConfig>();
+    assert!(
+        matches!(
+            inactive_whitespace,
+            Err(ConfigError::InvalidEnvValue {
+                ref original_name,
+                ref key,
+                ..
+            }) if original_name == "ZINDER_INGEST__SOURCE" && key == "ingest.source"
+        ),
+        "expected whitespace-only inactive string to fail closed: {inactive_whitespace:?}"
+    );
+
+    let any_whitespace = ConfigLoader::new()
+        .with_zinder_env_from_map([("ZINDER_TYPED__ANY_FIELD".to_owned(), " \t ".to_owned())])?
+        .load::<AnyProbe>();
+    assert!(matches!(
+        any_whitespace,
+        Err(ConfigError::InvalidEnvValue {
+            ref original_name,
+            ref key,
+            ..
+        }) if original_name == "ZINDER_TYPED__ANY_FIELD" && key == "typed.any_field"
+    ));
+
+    let kept_padded = load_toy_env(("ZINDER_TYPED__SECRET", "  keep-me  "))?;
+    assert_eq!(kept_padded.typed.secret.as_deref(), Some("  keep-me  "));
+    Ok(())
+}
+
+#[test]
+fn blank_scalar_env_error_does_not_recommend_none() -> Result<()> {
+    for env_pair in [
+        ("ZINDER_TYPED__FLAG", ""),
+        ("ZINDER_TYPED__COUNT_U64", ""),
+        ("ZINDER_TYPED__TIMEOUT_SECS", "   "),
+    ] {
+        let Err(error) = load_toy_env(env_pair) else {
+            return Err(eyre!(
+                "expected blank env var {} to be rejected",
+                env_pair.0
+            ));
+        };
+        assert!(
+            matches!(error, ConfigError::InvalidEnvValue { .. }),
+            "expected InvalidEnvValue for {}: {error:?}",
+            env_pair.0
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("unset the variable to use the default or supply a valid value"),
+            "missing type-agnostic guidance for {}: {rendered}",
+            env_pair.0
+        );
+        assert!(
+            !rendered.contains("none"),
+            "scalar blank error for {} must not recommend \"none\": {rendered}",
+            env_pair.0
+        );
+    }
     Ok(())
 }

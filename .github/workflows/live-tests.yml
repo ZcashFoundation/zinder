@@ -266,22 +266,21 @@ jobs:
       - name: Run T3 live tests against regtest
         env:
           ZINDER_NODE__INDEXER_GRPC_ADDR: ${{ matrix.indexer_grpc_addr }}
-          ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH: ${{ env.INDEXER_TLS_CA_CERT_PATH }}
-          ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH: ${{ env.INDEXER_TLS_CLIENT_CERT_PATH }}
-          ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH: ${{ env.INDEXER_TLS_CLIENT_KEY_PATH }}
         # Exclude the hosted-network checkpoint tracer, mainnet-only cases,
         # the activation test above, and the node restart test below.
         # Regtest runs deep_chain and latency within the CI budget.
         run: |
+          if [[ -n "${INDEXER_TLS_CA_CERT_PATH:-}" ]]; then
+            export ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH="${INDEXER_TLS_CA_CERT_PATH}"
+            export ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH="${INDEXER_TLS_CLIENT_CERT_PATH}"
+            export ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH="${INDEXER_TLS_CLIENT_KEY_PATH}"
+          fi
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
             -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(canonical_blocks_load_requested_range_from_fixed_checkpoint) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
 
       - name: Run the node restart test against regtest
         env:
           ZINDER_NODE__INDEXER_GRPC_ADDR: ${{ matrix.indexer_grpc_addr }}
-          ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH: ${{ env.INDEXER_TLS_CA_CERT_PATH }}
-          ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH: ${{ env.INDEXER_TLS_CLIENT_CERT_PATH }}
-          ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH: ${{ env.INDEXER_TLS_CLIENT_KEY_PATH }}
           ZINDER_TEST_INDEXER_CONTAINER_NAME: ${{ matrix.container }}
         # This test restarts the node container, so it runs alone after every
         # other live test has finished. A nextest group only serializes its own
@@ -290,6 +289,11 @@ jobs:
         # most every 5 seconds, so the step waits past the last mined block
         # before the restart.
         run: |
+          if [[ -n "${INDEXER_TLS_CA_CERT_PATH:-}" ]]; then
+            export ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH="${INDEXER_TLS_CA_CERT_PATH}"
+            export ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH="${INDEXER_TLS_CLIENT_CERT_PATH}"
+            export ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH="${INDEXER_TLS_CLIENT_KEY_PATH}"
+          fi
           sleep 6
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
             -E 'test(streaming_source_recovers_after_zebra_indexer_restart)'
@@ -320,12 +324,21 @@ jobs:
           ZINDER_TEST_LIVE: "1"
           ZINDER_NETWORK: zcash-testnet
           ZINDER_NODE__JSON_RPC_ADDR: ${{ secrets.NODE_TESTNET_JSON_RPC_ADDR }}
-          ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_TESTNET_AUTH_METHOD }}
-          ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_TESTNET_AUTH_USERNAME }}
-          ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_TESTNET_AUTH_PASSWORD }}
+          NODE_AUTH_METHOD: ${{ secrets.NODE_TESTNET_AUTH_METHOD }}
+          NODE_AUTH_USERNAME: ${{ secrets.NODE_TESTNET_AUTH_USERNAME }}
+          NODE_AUTH_PASSWORD: ${{ secrets.NODE_TESTNET_AUTH_PASSWORD }}
         # Filter out tests scoped to other networks. The checkpoint tracer,
         # deep_chain, and latency are outside the weekly lane's budget.
         run: |
+          if [[ -n "${NODE_AUTH_METHOD:-}" ]]; then
+            export ZINDER_NODE__AUTH__METHOD="${NODE_AUTH_METHOD}"
+          fi
+          if [[ -n "${NODE_AUTH_USERNAME:-}" ]]; then
+            export ZINDER_NODE__AUTH__USERNAME="${NODE_AUTH_USERNAME}"
+          fi
+          if [[ -n "${NODE_AUTH_PASSWORD:-}" ]]; then
+            export ZINDER_NODE__AUTH__PASSWORD="${NODE_AUTH_PASSWORD}"
+          fi
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
             -E 'test(/^live::/) and not test(fetch_chain_checkpoint_at_tip_reflects_supported_tree_sizes) and not test(mainnet) and not test(canonical_blocks_load_requested_range_from_fixed_checkpoint) and not test(deep_chain) and not test(latency)'
 
@@ -353,13 +366,22 @@ jobs:
           ZINDER_TEST_LIVE: "1"
           ZINDER_NETWORK: zcash-mainnet
           ZINDER_NODE__JSON_RPC_ADDR: ${{ secrets.NODE_MAINNET_JSON_RPC_ADDR }}
-          ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_MAINNET_AUTH_METHOD }}
-          ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_MAINNET_AUTH_USERNAME }}
-          ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_MAINNET_AUTH_PASSWORD }}
+          NODE_AUTH_METHOD: ${{ secrets.NODE_MAINNET_AUTH_METHOD }}
+          NODE_AUTH_USERNAME: ${{ secrets.NODE_MAINNET_AUTH_USERNAME }}
+          NODE_AUTH_PASSWORD: ${{ secrets.NODE_MAINNET_AUTH_PASSWORD }}
         # Mainnet runs only tests that explicitly opt in via
         # require_live_for(&[Network::ZcashMainnet]) or require_live_mainnet().
         # Keep this allowlist explicit because live test names avoid network
         # names unless the behavior itself is network-specific.
         run: |
+          if [[ -n "${NODE_AUTH_METHOD:-}" ]]; then
+            export ZINDER_NODE__AUTH__METHOD="${NODE_AUTH_METHOD}"
+          fi
+          if [[ -n "${NODE_AUTH_USERNAME:-}" ]]; then
+            export ZINDER_NODE__AUTH__USERNAME="${NODE_AUTH_USERNAME}"
+          fi
+          if [[ -n "${NODE_AUTH_PASSWORD:-}" ]]; then
+            export ZINDER_NODE__AUTH__PASSWORD="${NODE_AUTH_PASSWORD}"
+          fi
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
             -E 'test(mainnet) or test(canonical_blocks_load_requested_range_from_fixed_checkpoint) or test(upgrade_activations_keep_advertised_order) or test(latest_completed_subtree_roots_derive_from_their_completing_blocks)'

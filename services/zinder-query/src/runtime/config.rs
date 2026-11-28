@@ -7,22 +7,20 @@ use std::{
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
-    BearerToken, BearerTokenError, BrowserOrigins, CanonicalSecondaryStorageSection,
-    CanonicalSecondaryStorageToml, ClientAddressSource, ConfigError, ConfigLoader,
-    DeploymentProfile, DeploymentSection, DeploymentToml, GrpcProxyProtocol, GrpcRangeAdmission,
-    IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml, NodeFallbacksToml,
-    NodeToml, OpsSection, OpsServerError, OpsToml, ResolvedCanonicalSecondaryStorage,
-    ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
-    RuntimeService, SecuritySection, SecurityToml, derive_canonical_path,
-    derive_canonical_secondary_path, derive_wallet_path, derive_wallet_secondary_path,
-    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
-    resolve_allow_public_bind, resolve_canonical_secondary_storage, resolve_ingest_control_reader,
-    resolve_ops_listen_addr, resolve_wallet_projection_reader_rocksdb_budget,
-    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir,
+    BearerToken, BearerTokenError, BrowserOrigins, ClientAddressSource, ConfigError, ConfigLoader,
+    DEFAULT_ALLOW_PUBLIC_BIND, DeploymentProfile, DeploymentSection, GrpcProxyProtocol,
+    GrpcRangeAdmission, IngestControlSection, NetworkSection, OpsSection, OpsServerError,
+    QuerySection, RedactedCidrs, ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader,
+    RuntimeService, SecuritySection, StorageSection, WalletSection, ZinderConfig,
+    derive_canonical_path, derive_canonical_secondary_path, derive_wallet_path,
+    derive_wallet_secondary_path, guard_optional_serving_bind, guard_serving_bind,
+    parse_socket_addr, require_field, resolve_allow_public_bind,
+    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
+    resolve_wallet_projection_reader_rocksdb_budget, section_defaults::DEFAULT_DATA_DIR,
+    validate_optional_data_dir, validate_optional_path,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 use zinder_store::{
@@ -188,12 +186,7 @@ pub fn load_query_config_with_env<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    let raw_config: QueryRawConfig = ConfigLoader::new()
-        .with_default("query.listen_addr", "127.0.0.1:9102")?
-        .with_default(
-            "query.reorg_window_blocks",
-            zinder_store::DEFAULT_REORG_WINDOW_BLOCKS,
-        )?
+    let raw_config: ZinderConfig = ConfigLoader::new()
         .with_ops_section(RuntimeService::Query)?
         .with_security_section()?
         .with_file(config_path)
@@ -221,59 +214,71 @@ where
         .with_override_if("query.reorg_window_blocks", overrides.reorg_window_blocks)?
         .load()?;
 
-    resolve_query_config(raw_config)
+    resolve_query_config_from_raw(raw_config)
 }
 
 /// Renders a resolved native query configuration as redacted TOML for `--print-config`.
 pub fn query_config_toml(config: &QueryConfig) -> Result<String, QueryConfigError> {
-    toml::to_string(&QueryConfigToml::from_query_config(config))
-        .map_err(|source| ConfigError::Render { source }.into())
+    let mut storage = StorageSection::from_canonical_secondary(&config.storage);
+    if config.profile.is_some() {
+        storage.raw_blob_policy = None;
+    }
+    let toml_config = ZinderConfig {
+        deployment: DeploymentSection::from_resolved(config.profile),
+        network: NetworkSection::from_network(config.network),
+        ops: OpsSection::from_resolved(config.ops_listen_addr),
+        observability: config.observability.clone(),
+        security: SecuritySection::from_resolved(config.allow_public_bind),
+        storage,
+        wallet: WalletSection::from_resolved_reader(
+            config.wallet_primary_path.clone(),
+            config.wallet_secondary_root.clone(),
+            config.wallet_rocksdb_budget,
+        ),
+        ingest_control: IngestControlSection::from_reader(&ResolvedIngestControlReader {
+            addr: config.ingest_control_addr.clone(),
+            bearer_token_path: config.ingest_control_bearer_token_path.clone(),
+            bearer_token: config.ingest_control_bearer_token.clone(),
+        }),
+        query: QuerySection {
+            listen_addr: Some(config.listen_addr.to_string()),
+            browser_origins: config.browser_origins.clone(),
+            reorg_window_blocks: Some(config.canonical_reorg_policy.reorg_window_blocks()),
+            pair_convergence_attempts: Some(config.pair_convergence_attempts.get()),
+            epoch_pin_retention_seconds: Some(config.epoch_pin_retention.seconds()),
+            tree_state_replay_wait_ms: Some(
+                u64::try_from(config.tree_state_replay_wait.as_millis()).unwrap_or(u64::MAX),
+            ),
+            tree_state_replay_waiters_per_slot: Some(
+                config.tree_state_replay_waiters_per_slot.get(),
+            ),
+            forwarded_read_max_concurrent: Some(config.forwarded_reads.max_concurrent().get()),
+            forwarded_read_wait_ms: Some(
+                u64::try_from(config.forwarded_reads.wait().as_millis()).unwrap_or(u64::MAX),
+            ),
+            forwarded_read_waiters_per_slot: Some(config.forwarded_reads.waiters_per_slot().get()),
+            forwarded_transaction_cache_bytes: Some(
+                config.forwarded_reads.transaction_cache_bytes(),
+            ),
+            trust_proxy_client_address: Some(
+                config.client_address_source.trust_proxy_client_address(),
+            ),
+            proxy_protocol_trusted_cidrs: RedactedCidrs::from_resolved(
+                config.proxy_protocol.is_enabled(),
+            ),
+            range_admission: config.range_admission,
+        },
+        node: config
+            .node
+            .as_ref()
+            .map_or_default(NodeSection::from_resolved),
+        node_fallbacks: NodeFallbackSections::from_resolved(&config.node_fallbacks),
+        ..ZinderConfig::default()
+    };
+    toml::to_string(&toml_config).map_err(|source| ConfigError::Render { source }.into())
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct QueryRawConfig {
-    deployment: DeploymentSection,
-    network: NetworkSection,
-    ops: OpsSection,
-    observability: zinder_runtime::ObservabilityConfig,
-    storage: CanonicalSecondaryStorageSection,
-    wallet: WalletSection,
-    ingest_control: IngestControlSection,
-    query: QuerySection,
-    node: Option<NodeSection>,
-    node_fallbacks: NodeFallbackSections,
-    security: SecuritySection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct QuerySection {
-    listen_addr: Option<String>,
-    browser_origins: BrowserOrigins,
-    reorg_window_blocks: Option<u32>,
-    pair_convergence_attempts: Option<u8>,
-    epoch_pin_retention_seconds: Option<u64>,
-    tree_state_replay_wait_ms: Option<u64>,
-    tree_state_replay_waiters_per_slot: Option<u32>,
-    forwarded_read_max_concurrent: Option<u32>,
-    forwarded_read_wait_ms: Option<u64>,
-    forwarded_read_waiters_per_slot: Option<u32>,
-    forwarded_transaction_cache_bytes: Option<u64>,
-    trust_proxy_client_address: Option<bool>,
-    proxy_protocol_trusted_cidrs: Option<String>,
-    range_admission: GrpcRangeAdmission,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct WalletSection {
-    path: Option<PathBuf>,
-    secondary_path: Option<PathBuf>,
-    rocksdb: RocksDbResourceBudgetSection,
-}
-
-fn apply_deployment_profile(config: &mut QueryRawConfig) -> Result<(), ConfigError> {
+fn apply_deployment_profile(config: &mut ZinderConfig) -> Result<(), ConfigError> {
     let profile = config.deployment.profile;
     if let Some(profile) = profile {
         if profile == DeploymentProfile::LightWallet {
@@ -290,7 +295,7 @@ fn apply_deployment_profile(config: &mut QueryRawConfig) -> Result<(), ConfigErr
             profile,
             DeploymentProfile::Wallet | DeploymentProfile::Explorer
         ) && config.storage.full_blocks != Some(true)
-            && config.node.is_none()
+            && config.node.is_empty()
         {
             return Err(ConfigError::invalid(format!(
                 "the {} profile requires [node] for verified mined transaction bytes",
@@ -301,8 +306,11 @@ fn apply_deployment_profile(config: &mut QueryRawConfig) -> Result<(), ConfigErr
     Ok(())
 }
 
-fn derive_query_storage_paths(config: &mut QueryRawConfig) -> Result<(), ConfigError> {
+fn derive_query_storage_paths(config: &mut ZinderConfig) -> Result<(), ConfigError> {
     config.storage.data_dir = validate_optional_data_dir(config.storage.data_dir.take())?;
+    config.wallet.path = validate_optional_path(config.wallet.path.take(), "wallet.path")?;
+    config.wallet.secondary_path =
+        validate_optional_path(config.wallet.secondary_path.take(), "wallet.secondary_path")?;
     let all_paths_unset = config.storage.path.is_none()
         && config.storage.secondary_path.is_none()
         && config.wallet.path.is_none()
@@ -333,11 +341,54 @@ fn derive_query_storage_paths(config: &mut QueryRawConfig) -> Result<(), ConfigE
     Ok(())
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the field resolution and startup validation order are easier to audit together"
-)]
-fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, QueryConfigError> {
+struct QueryListenersAndProxy {
+    listen_addr: SocketAddr,
+    ops_listen_addr: Option<SocketAddr>,
+    allow_public_bind: bool,
+    client_address_source: ClientAddressSource,
+    proxy_protocol: GrpcProxyProtocol,
+}
+
+fn resolve_query_listeners(
+    query: &QuerySection,
+    ops: OpsSection,
+    security: SecuritySection,
+) -> Result<QueryListenersAndProxy, QueryConfigError> {
+    let listen_addr_text = query
+        .listen_addr
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:9102".to_owned());
+    let listen_addr = parse_socket_addr("query.listen_addr", &listen_addr_text)?;
+    let ops_listen_addr = resolve_ops_listen_addr(ops)?;
+    let allow_public_bind = resolve_allow_public_bind(SecuritySection {
+        allow_public_bind: Some(
+            security
+                .allow_public_bind
+                .unwrap_or(DEFAULT_ALLOW_PUBLIC_BIND),
+        ),
+    })?;
+    guard_serving_bind("query.listen_addr", listen_addr, allow_public_bind)?;
+    guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
+    let client_address_source = ClientAddressSource::from_trust_proxy_client_address(
+        query.trust_proxy_client_address.unwrap_or(false),
+    );
+    let proxy_protocol = GrpcProxyProtocol::resolve(
+        query.proxy_protocol_trusted_cidrs.as_deref(),
+        client_address_source,
+    )?;
+    Ok(QueryListenersAndProxy {
+        listen_addr,
+        ops_listen_addr,
+        allow_public_bind,
+        client_address_source,
+        proxy_protocol,
+    })
+}
+
+/// Validates and resolves an already-deserialized unified [`ZinderConfig`] for `zinder-query`.
+pub fn resolve_query_config_from_raw(
+    mut config: ZinderConfig,
+) -> Result<QueryConfig, QueryConfigError> {
     apply_deployment_profile(&mut config)?;
     derive_query_storage_paths(&mut config)?;
     let network = config.network.resolve()?;
@@ -353,23 +404,14 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         &wallet_primary_path,
         &wallet_secondary_root,
     )?;
-    let ResolvedIngestControlReader {
-        addr: ingest_control_addr,
-        bearer_token_path: ingest_control_bearer_token_path,
-        bearer_token: ingest_control_bearer_token,
-    } = resolve_ingest_control_reader(config.ingest_control)?;
-    let listen_addr = parse_socket_addr(
-        "query.listen_addr",
-        &require_field(config.query.listen_addr, "query.listen_addr")?,
+    let ingest_control = resolve_ingest_control_reader(config.ingest_control)?;
+    let listeners = resolve_query_listeners(&config.query, config.ops, config.security)?;
+    let canonical_reorg_policy = CanonicalReorgPolicy::new(
+        config
+            .query
+            .reorg_window_blocks
+            .unwrap_or(zinder_store::DEFAULT_REORG_WINDOW_BLOCKS),
     )?;
-    let ops_listen_addr = resolve_ops_listen_addr(config.ops)?;
-    let allow_public_bind = resolve_allow_public_bind(config.security)?;
-    guard_serving_bind("query.listen_addr", listen_addr, allow_public_bind)?;
-    guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
-    let canonical_reorg_policy = CanonicalReorgPolicy::new(require_field(
-        config.query.reorg_window_blocks,
-        "query.reorg_window_blocks",
-    )?)?;
     let forwarded_reads = ForwardedReadConfig::resolve(
         config.query.forwarded_read_max_concurrent,
         config.query.forwarded_read_wait_ms,
@@ -379,14 +421,6 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
     .map_err(|error| ConfigError::invalid(format!("query.{error}")))?;
     let (node, node_fallbacks) = resolve_query_nodes(network, config.node, config.node_fallbacks)?;
 
-    let client_address_source = ClientAddressSource::from_trust_proxy_client_address(
-        config.query.trust_proxy_client_address.unwrap_or(false),
-    );
-    let proxy_protocol = GrpcProxyProtocol::resolve(
-        config.query.proxy_protocol_trusted_cidrs.as_deref(),
-        client_address_source,
-    )?;
-
     Ok(QueryConfig {
         profile: config.deployment.profile,
         network,
@@ -394,16 +428,16 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         wallet_primary_path,
         wallet_secondary_root,
         wallet_rocksdb_budget,
-        ingest_control_addr,
-        ingest_control_bearer_token_path,
-        ingest_control_bearer_token,
-        listen_addr,
+        ingest_control_addr: ingest_control.addr,
+        ingest_control_bearer_token_path: ingest_control.bearer_token_path,
+        ingest_control_bearer_token: ingest_control.bearer_token,
+        listen_addr: listeners.listen_addr,
         browser_origins: config.query.browser_origins,
-        ops_listen_addr,
+        ops_listen_addr: listeners.ops_listen_addr,
         observability: config.observability,
-        allow_public_bind,
-        client_address_source,
-        proxy_protocol,
+        allow_public_bind: listeners.allow_public_bind,
+        client_address_source: listeners.client_address_source,
+        proxy_protocol: listeners.proxy_protocol,
         range_admission: config.query.range_admission,
         canonical_reorg_policy,
         pair_convergence_attempts: require_pair_convergence_attempts(
@@ -424,10 +458,11 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
 
 fn resolve_query_nodes(
     network: Network,
-    node: Option<NodeSection>,
+    node: NodeSection,
     fallbacks: NodeFallbackSections,
 ) -> Result<(Option<NodeTarget>, Vec<NodeTarget>), ConfigError> {
-    let node = node
+    let node = (!node.is_empty())
+        .then_some(node)
         .map(|section| NodeTarget::resolve(network, section))
         .transpose()
         .map_err(ConfigError::from)?;
@@ -550,98 +585,4 @@ fn normalized_storage_path_identity(path: &Path) -> Result<PathBuf, ConfigError>
         }
     }
     Ok(normalized)
-}
-
-#[derive(Serialize)]
-struct QueryConfigToml {
-    #[serde(skip_serializing_if = "DeploymentToml::is_empty")]
-    deployment: DeploymentToml,
-    network: NetworkToml,
-    ops: OpsToml,
-    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
-    observability: zinder_runtime::ObservabilityConfig,
-    security: SecurityToml,
-    storage: CanonicalSecondaryStorageToml,
-    wallet: WalletToml,
-    ingest_control: IngestControlReaderToml,
-    query: QueryToml,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    node: Option<NodeToml>,
-    #[serde(skip_serializing_if = "NodeFallbacksToml::is_empty")]
-    node_fallbacks: NodeFallbacksToml,
-}
-
-impl QueryConfigToml {
-    fn from_query_config(config: &QueryConfig) -> Self {
-        let mut storage = CanonicalSecondaryStorageToml::from_resolved(&config.storage);
-        if config.profile.is_some() {
-            storage.raw_blob_policy = None;
-        }
-        Self {
-            network: NetworkToml::from_network(config.network),
-            ops: OpsToml::from_resolved(config.ops_listen_addr),
-            observability: config.observability.clone(),
-            security: SecurityToml::from_resolved(config.allow_public_bind),
-            deployment: DeploymentToml::from_resolved(config.profile),
-            storage,
-            wallet: WalletToml {
-                path: config.wallet_primary_path.clone(),
-                secondary_path: config.wallet_secondary_root.clone(),
-                rocksdb: RocksDbResourceBudgetToml::from_resolved(config.wallet_rocksdb_budget),
-            },
-            ingest_control: IngestControlReaderToml::from_reader(&ResolvedIngestControlReader {
-                addr: config.ingest_control_addr.clone(),
-                bearer_token_path: config.ingest_control_bearer_token_path.clone(),
-                bearer_token: config.ingest_control_bearer_token.clone(),
-            }),
-            query: QueryToml {
-                listen_addr: config.listen_addr.to_string(),
-                browser_origins: config.browser_origins.clone(),
-                reorg_window_blocks: config.canonical_reorg_policy.reorg_window_blocks(),
-                pair_convergence_attempts: config.pair_convergence_attempts.get(),
-                epoch_pin_retention_seconds: config.epoch_pin_retention.seconds(),
-                tree_state_replay_wait_ms: u64::try_from(config.tree_state_replay_wait.as_millis())
-                    .unwrap_or(u64::MAX),
-                tree_state_replay_waiters_per_slot: config.tree_state_replay_waiters_per_slot.get(),
-                forwarded_read_max_concurrent: config.forwarded_reads.max_concurrent().get(),
-                forwarded_read_wait_ms: u64::try_from(config.forwarded_reads.wait().as_millis())
-                    .unwrap_or(u64::MAX),
-                forwarded_read_waiters_per_slot: config.forwarded_reads.waiters_per_slot().get(),
-                forwarded_transaction_cache_bytes: config.forwarded_reads.transaction_cache_bytes(),
-                trust_proxy_client_address: config
-                    .client_address_source
-                    .trust_proxy_client_address(),
-                proxy_protocol_trusted_cidrs: config.proxy_protocol.redacted_cidrs(),
-                range_admission: config.range_admission,
-            },
-            node: config.node.as_ref().map(NodeToml::from_node_target),
-            node_fallbacks: NodeFallbacksToml::from_node_targets(&config.node_fallbacks),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct QueryToml {
-    listen_addr: String,
-    browser_origins: BrowserOrigins,
-    reorg_window_blocks: u32,
-    pair_convergence_attempts: u8,
-    epoch_pin_retention_seconds: u64,
-    tree_state_replay_wait_ms: u64,
-    tree_state_replay_waiters_per_slot: u32,
-    forwarded_read_max_concurrent: u32,
-    forwarded_read_wait_ms: u64,
-    forwarded_read_waiters_per_slot: u32,
-    forwarded_transaction_cache_bytes: u64,
-    trust_proxy_client_address: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    proxy_protocol_trusted_cidrs: Option<&'static str>,
-    range_admission: GrpcRangeAdmission,
-}
-
-#[derive(Serialize)]
-struct WalletToml {
-    path: PathBuf,
-    secondary_path: PathBuf,
-    rocksdb: RocksDbResourceBudgetToml,
 }

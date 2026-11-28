@@ -9,14 +9,17 @@
 //! `ZINDER_TEST_CRASH_POINT`) are stripped here so test-only acknowledgements
 //! cannot leak into a production binary's config.
 //!
-//! Secret hygiene is handled at emit time rather than at load time. Secrets
-//! pass through this loader unchanged; redaction happens in
-//! [`NodeAuthToml::from_node_auth`] and [`NodeIndexerTlsToml::from_node_indexer_tls`]
-//! (used by `--print-config`), in the `[REDACTED]` placeholders for inline bearer
-//! tokens, and in the manual `Debug` impls on [`zinder_source::NodeAuth`],
-//! [`zinder_source::IndexerTlsMaterial`], and [`crate::auth::BearerToken`].
+//! Secret hygiene is handled by redacting wrapper types
+//! ([`SecretInput`], [`RedactedUrl`], [`RedactedCidrs`], [`zinder_source::SecretNodeInput`])
+//! and by [`NodeSection::from_resolved`](zinder_source::NodeSection::from_resolved) /
+//! [`NodeFallbackSections::from_resolved`](zinder_source::NodeFallbackSections::from_resolved),
+//! together with the manual `Debug` impls on [`zinder_source::NodeAuth`],
+//! [`zinder_source::IndexerTlsMaterial`], [`crate::auth::BearerToken`], and
+//! [`ObservabilityConfig`](crate::ObservabilityConfig).
 
 mod deserializer;
+mod primitives;
+mod schema;
 mod tree;
 
 use std::{
@@ -31,13 +34,16 @@ use zinder_core::{
     Network,
     wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name},
 };
-use zinder_source::{
-    IndexerTlsMaterial, NodeAuth, NodeConfigError, NodeHealthConfig, NodeIndexerTls, NodeTarget,
-    redact_endpoint_url,
-};
+use zinder_source::NodeConfigError;
 
-pub use self::tree::ConfigValue;
 use self::tree::{ConfigTree, PrimitiveValue};
+pub use self::{
+    primitives::{
+        DISABLED_SENTINEL, REDACTED_PLACEHOLDER, RedactedCidrs, RedactedUrl, SecretInput, Toggle,
+    },
+    schema::{ZinderConfig, discover_schema_leaf_paths},
+    tree::ConfigValue,
+};
 use crate::auth::{BearerToken, BearerTokenError};
 use crate::sections::{
     DEFAULT_ALLOW_PUBLIC_BIND, RuntimeService, defaults::default_ops_listen_addr,
@@ -45,75 +51,6 @@ use crate::sections::{
 
 const ENV_PREFIX: &str = "ZINDER_";
 const TEST_ENV_PREFIXES: &[&str] = &["ZINDER_TEST_"];
-
-const fn sibling_sections_for_service(service: RuntimeService) -> &'static [&'static str] {
-    match service {
-        RuntimeService::Ingest => &[
-            "projector",
-            "query",
-            "compat",
-            "explorer",
-            "cipherscan",
-            "projector_control",
-            "wallet",
-        ],
-        RuntimeService::Projector => &[
-            "ingest",
-            "query",
-            "compat",
-            "explorer",
-            "cipherscan",
-            "retention",
-            "node",
-            "node_fallbacks",
-        ],
-        RuntimeService::Query => &[
-            "ingest",
-            "projector",
-            "compat",
-            "explorer",
-            "cipherscan",
-            "projector_control",
-            "retention",
-        ],
-        RuntimeService::CompatLightwalletd => &[
-            "ingest",
-            "projector",
-            "query",
-            "explorer",
-            "cipherscan",
-            "projector_control",
-            "retention",
-        ],
-        RuntimeService::Explorer => &[
-            "deployment",
-            "ingest",
-            "projector",
-            "query",
-            "compat",
-            "cipherscan",
-            "ingest_control",
-            "projector_control",
-            "wallet",
-            "retention",
-        ],
-        RuntimeService::CompatCipherscan => &[
-            "deployment",
-            "storage",
-            "node",
-            "node_fallbacks",
-            "ingest",
-            "projector",
-            "query",
-            "compat",
-            "explorer",
-            "ingest_control",
-            "projector_control",
-            "wallet",
-            "retention",
-        ],
-    }
-}
 
 /// Error returned while resolving Zinder service configuration from defaults,
 /// file, environment, and CLI overrides.
@@ -309,85 +246,6 @@ fn is_positive_position_segment(segment: &str) -> bool {
         && segment.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn config_path_matches_doc_pattern(config_path: &str, pattern: &str) -> bool {
-    let mut path_segments = config_path.split('.');
-    let mut pattern_segments = pattern.split('.');
-    loop {
-        match (path_segments.next(), pattern_segments.next()) {
-            (None, None) => return true,
-            (Some(actual), Some("<N>")) => {
-                if !is_positive_position_segment(actual) {
-                    return false;
-                }
-            }
-            (Some(actual), Some(expected)) => {
-                if actual != expected {
-                    return false;
-                }
-            }
-            (None, Some(_)) | (Some(_), None) => return false,
-        }
-    }
-}
-
-fn is_known_zinder_leaf_path(config_path: &str) -> bool {
-    crate::env_var_docs::ENVIRONMENT_VARIABLES
-        .iter()
-        .any(|doc| config_path_matches_doc_pattern(config_path, doc.toml_path))
-}
-
-fn is_unconsumed_shared_path(service: RuntimeService, config_path: &str) -> bool {
-    match service {
-        RuntimeService::Ingest => matches!(
-            config_path,
-            "storage.canonical_path"
-                | "storage.canonical_secondary_path"
-                | "storage.secondary_path"
-                | "storage.initial_catchup_timeout_ms"
-                | "storage.secondary_catchup_interval_ms"
-                | "storage.secondary_replica_lag_threshold_chain_epochs"
-                | "storage.serving_pair_staleness_ceiling_ms"
-        ),
-        RuntimeService::Projector => {
-            matches!(
-                config_path,
-                "storage.path"
-                    | "storage.secondary_path"
-                    | "storage.initial_catchup_timeout_ms"
-                    | "storage.secondary_catchup_interval_ms"
-                    | "storage.secondary_replica_lag_threshold_chain_epochs"
-                    | "storage.serving_pair_staleness_ceiling_ms"
-                    | "wallet.secondary_path"
-            ) || config_path.starts_with("storage.materialized_views.")
-        }
-        RuntimeService::Query | RuntimeService::CompatLightwalletd => {
-            matches!(
-                config_path,
-                "storage.canonical_path" | "storage.canonical_secondary_path"
-            ) || config_path.starts_with("storage.materialized_views.")
-        }
-        RuntimeService::Explorer => matches!(
-            config_path,
-            "storage.canonical_path"
-                | "storage.canonical_secondary_path"
-                | "storage.raw_blob_policy"
-                | "storage.serving_pair_staleness_ceiling_ms"
-        ),
-        RuntimeService::CompatCipherscan => false,
-    }
-}
-
-pub(crate) fn is_unconsumed_known_path_for_service(
-    service: RuntimeService,
-    config_path: &str,
-) -> bool {
-    if !is_known_zinder_leaf_path(config_path) {
-        return false;
-    }
-    sibling_sections_for_service(service).contains(&top_level_segment(config_path))
-        || is_unconsumed_shared_path(service, config_path)
-}
-
 fn edit_distance(left: &str, right: &str) -> usize {
     let right_chars: Vec<char> = right.chars().collect();
     let mut previous_row: Vec<usize> = (0..=right_chars.len()).collect();
@@ -478,6 +336,29 @@ fn path_to_config_string(path: PathBuf, field: &'static str) -> Result<String, C
         .map_err(|_| ConfigError::NonUnicodePath { field })
 }
 
+/// Rejects empty/whitespace paths and the literal `[REDACTED]` placeholder.
+pub fn validate_optional_path(
+    path: Option<PathBuf>,
+    field: &'static str,
+) -> Result<Option<PathBuf>, ConfigError> {
+    match path {
+        Some(candidate) => {
+            let lossy = candidate.as_os_str().to_string_lossy();
+            let trimmed = lossy.trim();
+            if trimmed.is_empty() {
+                return Err(ConfigError::invalid(format!("{field} must not be empty")));
+            }
+            if trimmed == REDACTED_PLACEHOLDER {
+                return Err(ConfigError::invalid(format!(
+                    "{field} must not be `{REDACTED_PLACEHOLDER}`"
+                )));
+            }
+            Ok(Some(candidate))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Converts a [`Duration`] to whole milliseconds as `u64`.
 ///
 /// Saturates at [`u64::MAX`] for durations that exceed the representable
@@ -531,15 +412,31 @@ pub fn resolve_optional_bearer_token(
     }
 }
 
-/// Raw `[network]` config section shared by every Zinder service binary.
-#[derive(Clone, Debug, Default, Deserialize)]
+/// Raw and serializable `[network]` config section shared by every Zinder
+/// service binary.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkSection {
     /// Network name: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
 
 impl NetworkSection {
+    /// Reports whether `network.name` is unset.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.name.is_none()
+    }
+
+    /// Builds a `[network]` section from a resolved [`Network`].
+    #[must_use]
+    pub fn from_network(network: Network) -> Self {
+        Self {
+            name: Some(encode_zinder_native_chain_name(network).to_owned()),
+        }
+    }
+
     /// Resolves the configured [`Network`] or returns
     /// [`ConfigError::MissingField`] / [`ConfigError::Invalid`].
     pub fn resolve(self) -> Result<Network, ConfigError> {
@@ -569,7 +466,6 @@ pub struct ConfigLoader {
     defaults: Vec<(String, PrimitiveValue)>,
     sources: Vec<LoaderSource>,
     overrides: Vec<(String, PrimitiveValue)>,
-    service: Option<RuntimeService>,
 }
 
 impl ConfigLoader {
@@ -579,15 +475,7 @@ impl ConfigLoader {
             defaults: Vec::new(),
             sources: Vec::new(),
             overrides: Vec::new(),
-            service: None,
         }
-    }
-
-    /// Configures known-sibling-section tolerance for `service` without
-    /// altering `[ops]` defaults.
-    pub fn with_service_sibling_tolerance(mut self, service: RuntimeService) -> Self {
-        self.service = Some(service);
-        self
     }
 
     /// Records a default for `key`. Defaults sit at the lowest precedence
@@ -636,16 +524,14 @@ impl ConfigLoader {
     }
 
     /// Wires the shared `[ops]` section with the per-service default
-    /// operational listen address, and enables known-sibling-section tolerance
-    /// for `service`.
+    /// operational listen address.
     ///
     /// Every service binary calls this exactly once so the on-by-default
     /// policy applies uniformly: a binary started without any TOML or env
     /// override binds the loopback default for its service. Operators opt
-    /// out by setting `ops.listen_addr = ""` (or
-    /// `ZINDER_OPS__LISTEN_ADDR=` to the empty string).
-    pub fn with_ops_section(mut self, service: RuntimeService) -> Result<Self, ConfigError> {
-        self.service = Some(service);
+    /// out by setting `ops.listen_addr = "none"` (or
+    /// `ZINDER_OPS__LISTEN_ADDR=none`).
+    pub fn with_ops_section(self, service: RuntimeService) -> Result<Self, ConfigError> {
         self.with_default("ops.listen_addr", default_ops_listen_addr(service))
     }
 
@@ -715,8 +601,8 @@ impl ConfigLoader {
         }
         for source in self.sources {
             match source {
-                LoaderSource::File(path) => tree.merge_toml_file(&path, self.service)?,
-                LoaderSource::Env(entries) => tree.merge_env_entries(entries, self.service)?,
+                LoaderSource::File(path) => tree.merge_toml_file(&path)?,
+                LoaderSource::Env(entries) => tree.merge_env_entries(entries)?,
             }
         }
         for (key, override_primitive) in self.overrides {
@@ -726,312 +612,19 @@ impl ConfigLoader {
     }
 }
 
-pub(crate) fn prune_toml_table(
-    table: &mut toml::Table,
-    prefix: &str,
-    service: RuntimeService,
-) -> Result<bool, ConfigError> {
-    let keys: Vec<String> = table.keys().cloned().collect();
-    let mut removed_any = false;
-    for key in keys {
-        let field_path = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
-        };
-        if matches!(table.get(&key), Some(toml::Value::Table(_))) {
-            let should_remove_empty =
-                if let Some(toml::Value::Table(subtable)) = table.get_mut(&key) {
-                    let child_removed = prune_toml_table(subtable, &field_path, service)?;
-                    subtable.is_empty()
-                        && (child_removed
-                            || sibling_sections_for_service(service).contains(&field_path.as_str()))
-                } else {
-                    false
-                };
-            if should_remove_empty {
-                let _removed = table.remove(&key);
-                removed_any = true;
-            }
-            continue;
-        }
-        if is_unconsumed_known_path_for_service(service, &field_path) {
-            let _removed = table.remove(&key);
-            removed_any = true;
-        } else if sibling_sections_for_service(service).contains(&top_level_segment(&field_path)) {
-            let suffix = if prefix.is_empty() {
-                String::new()
-            } else {
-                format!(" for key `{prefix}`")
-            };
-            return Err(ConfigError::Deserialize {
-                path: Some(field_path),
-                reason: format!("unknown field `{key}`{suffix}"),
-            });
-        }
-    }
-    Ok(removed_any)
-}
-
 impl Default for ConfigLoader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Redacted TOML projection of `[network]` for `--print-config`.
-#[derive(Debug, Serialize)]
-pub struct NetworkToml {
-    /// Network name in canonical form (e.g. `zcash-mainnet`).
-    pub name: &'static str,
-}
-
-impl NetworkToml {
-    /// Builds a [`NetworkToml`] from a resolved [`Network`].
-    #[must_use]
-    pub const fn from_network(network: Network) -> Self {
-        Self {
-            name: encode_zinder_native_chain_name(network),
-        }
-    }
-}
-
-/// Redacted TOML projection of `[node.auth]` for `--print-config`.
-#[derive(Debug, Serialize)]
-pub struct NodeAuthToml {
-    /// Auth method: `none`, `basic`, or `cookie`.
-    pub method: &'static str,
-    /// Basic-auth username, when present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
-    /// Basic-auth password placeholder. Always `[REDACTED]` when set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub password: Option<&'static str>,
-    /// Cookie-auth path placeholder. Always `[REDACTED]` when set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<&'static str>,
-}
-
-impl NodeAuthToml {
-    /// Builds a redacted [`NodeAuthToml`] from a resolved [`NodeAuth`].
-    ///
-    /// Both cookie sources (file path and inline credentials) redact to
-    /// `[REDACTED]` so an operator inspecting `--print-config` cannot tell
-    /// the credential apart from the path. Distinguishing them is not
-    /// useful for debugging and risks leaking metadata about how the secret
-    /// was injected.
-    #[must_use]
-    pub fn from_node_auth(auth: &NodeAuth) -> Self {
-        match auth {
-            NodeAuth::None => Self {
-                method: "none",
-                username: None,
-                password: None,
-                path: None,
-            },
-            NodeAuth::Basic { username, .. } => Self {
-                method: "basic",
-                username: Some(username.clone()),
-                password: Some("[REDACTED]"),
-                path: None,
-            },
-            NodeAuth::Cookie(_) => Self {
-                method: "cookie",
-                username: None,
-                password: None,
-                path: Some("[REDACTED]"),
-            },
-        }
-    }
-}
-
-/// TOML projection of `[node.health]` for `--print-config`.
-#[derive(Debug, Serialize)]
-pub struct NodeHealthToml {
-    /// URL of the upstream node's readiness endpoint, with credentials
-    /// redacted.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub addr: Option<String>,
-    /// Upstream-health probe cadence in milliseconds.
-    pub poll_interval_ms: u64,
-    /// Verification-progress floor used by the JSON-RPC fallback.
-    pub verification_progress_floor: f64,
-    /// Estimated-height gap floor, in blocks, used by the JSON-RPC fallback.
-    pub estimated_gap_floor_blocks: u32,
-}
-
-impl NodeHealthToml {
-    /// Builds a [`NodeHealthToml`] from a resolved [`NodeHealthConfig`].
-    #[must_use]
-    pub fn from_node_health_config(health: &NodeHealthConfig) -> Self {
-        Self {
-            addr: health
-                .addr
-                .as_deref()
-                .map(|addr| redact_endpoint_url(addr).into_owned()),
-            poll_interval_ms: duration_as_millis_u64(health.poll_interval),
-            verification_progress_floor: health.verification_progress_floor,
-            estimated_gap_floor_blocks: health.estimated_gap_floor_blocks,
-        }
-    }
-}
-
-/// TOML projection of `[node.indexer_tls]` for `--print-config`.
-///
-/// File paths are rendered directly; inline PEM values are redacted to
-/// `[REDACTED]` so secret material is never emitted.
-#[derive(Debug, Serialize)]
-pub struct NodeIndexerTlsToml {
-    /// PEM CA bundle path, when configured from a file.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ca_cert_path: Option<String>,
-    /// Redacted placeholder when an inline PEM CA bundle is configured.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ca_cert_pem: Option<&'static str>,
-    /// PEM client certificate chain path, when configured from a file.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_cert_path: Option<String>,
-    /// Redacted placeholder when an inline PEM client certificate is configured.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_cert_pem: Option<&'static str>,
-    /// PEM client private key path, when configured from a file.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_key_path: Option<String>,
-    /// Redacted placeholder when an inline PEM client private key is configured.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_key_pem: Option<&'static str>,
-    /// Name verified against the indexer certificate, when set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub server_name: Option<String>,
-}
-
-impl NodeIndexerTlsToml {
-    /// Builds a [`NodeIndexerTlsToml`] from resolved [`NodeIndexerTls`].
-    #[must_use]
-    pub fn from_node_indexer_tls(tls: &NodeIndexerTls) -> Self {
-        let (ca_cert_path, ca_cert_pem) = split_tls_material_toml(tls.ca_cert.as_ref());
-        let (client_cert_path, client_cert_pem) =
-            split_tls_material_toml(tls.client_identity.as_ref().map(|identity| &identity.cert));
-        let (client_key_path, client_key_pem) =
-            split_tls_material_toml(tls.client_identity.as_ref().map(|identity| &identity.key));
-        Self {
-            ca_cert_path,
-            ca_cert_pem,
-            client_cert_path,
-            client_cert_pem,
-            client_key_path,
-            client_key_pem,
-            server_name: tls.server_name.clone(),
-        }
-    }
-}
-
-fn split_tls_material_toml(
-    material: Option<&IndexerTlsMaterial>,
-) -> (Option<String>, Option<&'static str>) {
-    match material {
-        Some(IndexerTlsMaterial::File(path)) => (Some(path.display().to_string()), None),
-        Some(IndexerTlsMaterial::Inline(_)) => (None, Some("[REDACTED]")),
-        None => (None, None),
-    }
-}
-
-/// Redacted TOML projection of `[node]` for `--print-config`.
-#[derive(Debug, Serialize)]
-pub struct NodeToml {
-    /// Node JSON-RPC base URL, with credentials redacted.
-    pub json_rpc_addr: String,
-    /// Optional Zebra indexer gRPC endpoint URL, with credentials redacted.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub indexer_grpc_addr: Option<String>,
-    /// Per-RPC request timeout in seconds.
-    pub request_timeout_secs: u64,
-    /// Maximum JSON-RPC response body size accepted from the node.
-    pub max_response_bytes: u64,
-    /// Per-broadcast timeout in seconds, applied only to `sendrawtransaction`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub broadcast_timeout_secs: Option<u64>,
-    /// Most JSON-RPC calls the process has in flight to the node at once.
-    pub max_concurrent_requests: u32,
-    /// Optional upstream-health probe subsection.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub health: Option<NodeHealthToml>,
-    /// Optional indexer TLS subsection.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub indexer_tls: Option<NodeIndexerTlsToml>,
-    /// Auth subsection.
-    pub auth: NodeAuthToml,
-}
-
-impl NodeToml {
-    /// Builds a redacted [`NodeToml`] from a resolved [`NodeTarget`].
-    #[must_use]
-    pub fn from_node_target(target: &NodeTarget) -> Self {
-        Self {
-            json_rpc_addr: redact_endpoint_url(&target.json_rpc_addr).into_owned(),
-            indexer_grpc_addr: target
-                .indexer_grpc_addr
-                .as_deref()
-                .map(|addr| redact_endpoint_url(addr).into_owned()),
-            request_timeout_secs: target.request_timeout.as_secs(),
-            max_response_bytes: target.max_response_bytes.get(),
-            broadcast_timeout_secs: target.broadcast_timeout.map(|d| d.as_secs()),
-            max_concurrent_requests: target.max_concurrent_requests.get(),
-            health: target
-                .health
-                .as_ref()
-                .map(NodeHealthToml::from_node_health_config),
-            indexer_tls: target
-                .indexer_tls
-                .as_ref()
-                .map(NodeIndexerTlsToml::from_node_indexer_tls),
-            auth: NodeAuthToml::from_node_auth(&target.node_auth),
-        }
-    }
-}
-
-/// Redacted TOML projection of the `[node_fallbacks.N]` tables for
-/// `--print-config`, rendered in position order.
-#[derive(Debug, Default)]
-pub struct NodeFallbacksToml {
-    positions: Vec<NodeToml>,
-}
-
-impl NodeFallbacksToml {
-    /// Builds the projection of resolved fallback targets, the first at
-    /// position 1.
-    #[must_use]
-    pub fn from_node_targets(targets: &[NodeTarget]) -> Self {
-        Self {
-            positions: targets.iter().map(NodeToml::from_node_target).collect(),
-        }
-    }
-
-    /// Returns whether no fallback is configured, so callers can omit the
-    /// section.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.positions.is_empty()
-    }
-}
-
-impl Serialize for NodeFallbacksToml {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.collect_map(
-            (1_usize..)
-                .zip(&self.positions)
-                .map(|(position, node)| (position.to_string(), node)),
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zinder_source::{NodeFallbackSections, NodeSection};
+    use zinder_source::{
+        IndexerTlsMaterial, NodeAuth, NodeFallbackSections, NodeHealthConfig, NodeIndexerTls,
+        NodeSection, NodeTarget,
+    };
 
     #[test]
     fn suggests_double_underscore_and_normalized_known_vars() {
@@ -1095,7 +688,7 @@ mod tests {
             42,
         )));
 
-        let rendered = toml::to_string(&NodeToml::from_node_target(&target))?;
+        let rendered = toml::to_string(&NodeSection::from_resolved(&target))?;
 
         assert_eq!(
             rendered,
@@ -1105,14 +698,14 @@ mod tests {
                 "max_response_bytes = 1\n",
                 "max_concurrent_requests = 64\n",
                 "\n",
+                "[auth]\n",
+                "method = \"none\"\n",
+                "\n",
                 "[health]\n",
                 "addr = \"http://127.0.0.1:18233/ready\"\n",
                 "poll_interval_ms = 1250\n",
                 "verification_progress_floor = 0.875\n",
                 "estimated_gap_floor_blocks = 42\n",
-                "\n",
-                "[auth]\n",
-                "method = \"none\"\n",
             )
         );
         Ok(())
@@ -1138,7 +731,7 @@ mod tests {
                 .with_server_name("zakura.internal"),
         ));
 
-        let rendered = toml::to_string(&NodeToml::from_node_target(&target))?;
+        let rendered = toml::to_string(&NodeSection::from_resolved(&target))?;
 
         assert_eq!(
             rendered,
@@ -1188,7 +781,12 @@ mod tests {
             ])?
             .load()?;
         assert_eq!(
-            loaded.node.indexer_tls.ca_cert_pem.as_deref(),
+            loaded
+                .node
+                .indexer_tls
+                .ca_cert_pem
+                .as_ref()
+                .map(zinder_source::SecretNodeInput::expose_secret),
             Some("ca-secret-material\nline-two")
         );
         let target = NodeTarget::new(
@@ -1205,7 +803,7 @@ mod tests {
                 .with_client_identity_pem("client-cert-secret", "client-key-secret"),
         ));
 
-        let rendered = toml::to_string(&NodeToml::from_node_target(&target))
+        let rendered = toml::to_string(&NodeSection::from_resolved(&target))
             .map_err(|source| ConfigError::Render { source })?;
         for secret in [
             "ca-secret-material",
@@ -1272,26 +870,23 @@ mod tests {
     }
 
     #[test]
-    fn config_loader_tolerates_sibling_sections_while_rejecting_unknown_fields()
+    fn unified_schema_accepts_all_sections_and_rejects_typos_and_empty_env()
     -> Result<(), ConfigError> {
-        #[derive(Debug, Default, Deserialize)]
-        #[serde(default, deny_unknown_fields)]
-        struct ProbeConfig {
-            network: NetworkSection,
-            ops: crate::sections::OpsSection,
-        }
-
         let dir = tempfile::tempdir().map_err(|err| ConfigError::invalid(err.to_string()))?;
-        let toml_path = dir.path().join("shared.toml");
+        let toml_path = dir.path().join("unified.toml");
         std::fs::write(
             &toml_path,
-            "[network]\nname = \"zcash-regtest\"\n[ingest]\nsource = \"zebra-json-rpc\"\n[explorer]\nlisten_addr = \"127.0.0.1:9068\"\n",
+            concat!(
+                "[network]\nname = \"zcash-regtest\"\n",
+                "[ingest]\nsource = \"zebra-json-rpc\"\n",
+                "[explorer]\nlisten_addr = \"127.0.0.1:9068\"\nwallet_query_endpoint = \"none\"\n",
+            ),
         )
         .map_err(|err| ConfigError::invalid(err.to_string()))?;
 
-        let loaded: ProbeConfig = ConfigLoader::new()
+        let loaded: ZinderConfig = ConfigLoader::new()
             .with_ops_section(RuntimeService::CompatCipherscan)?
-            .with_file(Some(toml_path.clone()))
+            .with_file(Some(toml_path))
             .with_zinder_env_from_map([
                 (
                     "ZINDER_QUERY__LISTEN_ADDR".to_owned(),
@@ -1305,12 +900,45 @@ mod tests {
             ])?
             .load()?;
         assert_eq!(loaded.network.name.as_deref(), Some("zcash-regtest"));
+        assert_eq!(
+            loaded.ops.listen_addr,
+            Toggle::Enabled(
+                "127.0.0.1:9108"
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|err| ConfigError::invalid(err.to_string()))?
+            )
+        );
+        assert!(loaded.explorer.wallet_query_endpoint.is_disabled());
+
+        let disabled_ops: ZinderConfig = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Ingest)?
+            .with_zinder_env_from_map([("ZINDER_OPS__LISTEN_ADDR".to_owned(), "none".to_owned())])?
+            .load()?;
+        assert!(disabled_ops.ops.listen_addr.is_disabled());
+        Ok(())
+    }
+
+    #[test]
+    fn unified_schema_rejects_typos_and_empty_env() -> Result<(), ConfigError> {
+        let dir = tempfile::tempdir().map_err(|err| ConfigError::invalid(err.to_string()))?;
+        let toml_path = dir.path().join("unified.toml");
+        std::fs::write(&toml_path, "[network]\nname = \"zcash-regtest\"\n")
+            .map_err(|err| ConfigError::invalid(err.to_string()))?;
+
+        let empty_ops = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Ingest)?
+            .with_zinder_env_from_map([("ZINDER_OPS__LISTEN_ADDR".to_owned(), String::new())])?
+            .load::<ZinderConfig>();
+        assert!(matches!(
+            empty_ops,
+            Err(ConfigError::InvalidEnvValue { .. })
+        ));
 
         let typo = ConfigLoader::new()
             .with_ops_section(RuntimeService::CompatCipherscan)?
             .with_file(Some(toml_path))
             .with_zinder_env_from_map([("ZINDER_INJEST__SOURCE".to_owned(), "x".to_owned())])?
-            .load::<ProbeConfig>();
+            .load::<ZinderConfig>();
         assert!(matches!(
             typo,
             Err(ConfigError::RejectedEnvVar {
@@ -1320,26 +948,14 @@ mod tests {
             }) if original_name == "ZINDER_INJEST__SOURCE"
                 && suggested_name.as_deref() == Some("ZINDER_INGEST__SOURCE")
         ));
-        Ok(())
-    }
 
-    #[test]
-    fn nested_sibling_typos_fail_closed_for_env_and_toml() -> Result<(), ConfigError> {
-        #[derive(Debug, Default, Deserialize)]
-        #[serde(default, deny_unknown_fields)]
-        struct ProbeConfig {
-            network: NetworkSection,
-            ops: crate::sections::OpsSection,
-        }
-
-        let dir = tempfile::tempdir().map_err(|err| ConfigError::invalid(err.to_string()))?;
         let nested_env_typo = ConfigLoader::new()
             .with_ops_section(RuntimeService::Ingest)?
             .with_zinder_env_from_map([(
                 "ZINDER_QUERY__LISTEN_ADRR".to_owned(),
                 "127.0.0.1:9102".to_owned(),
             )])?
-            .load::<ProbeConfig>();
+            .load::<ZinderConfig>();
         assert!(matches!(
             nested_env_typo,
             Err(ConfigError::RejectedEnvVar {
@@ -1359,156 +975,25 @@ mod tests {
         let nested_toml_typo = ConfigLoader::new()
             .with_ops_section(RuntimeService::Ingest)?
             .with_file(Some(nested_toml_typo_path))
-            .load::<ProbeConfig>();
+            .load::<ZinderConfig>();
         assert!(nested_toml_typo.is_err());
-        Ok(())
-    }
-
-    #[derive(Debug, Default, Deserialize)]
-    #[serde(default, deny_unknown_fields)]
-    struct SharedIngestStorageProbe {
-        data_dir: Option<PathBuf>,
-        path: Option<PathBuf>,
-        raw_blob_policy: Option<String>,
-        full_blocks: Option<bool>,
-        canonical: crate::sections::StorageRoleSection,
-        materialized_views: crate::sections::StorageRoleSection,
-    }
-
-    #[derive(Debug, Default, Deserialize)]
-    #[serde(default, deny_unknown_fields)]
-    struct SharedProjectorStorageProbe {
-        data_dir: Option<PathBuf>,
-        canonical_path: Option<PathBuf>,
-        canonical_secondary_path: Option<PathBuf>,
-        canonical: crate::sections::StorageRoleSection,
-    }
-
-    #[derive(Debug, Default, Deserialize)]
-    #[serde(default, deny_unknown_fields)]
-    struct SharedQueryProbeConfig {
-        network: NetworkSection,
-        ops: crate::sections::OpsSection,
-        storage: crate::sections::CanonicalSecondaryStorageSection,
-        wallet: toml::Table,
-        query: toml::Table,
-    }
-
-    #[derive(Debug, Default, Deserialize)]
-    #[serde(default, deny_unknown_fields)]
-    struct SharedProjectorProbeConfig {
-        network: NetworkSection,
-        ops: crate::sections::OpsSection,
-        storage: SharedProjectorStorageProbe,
-        wallet: toml::Table,
-    }
-
-    #[derive(Debug, Default, Deserialize)]
-    #[serde(default, deny_unknown_fields)]
-    struct SharedIngestProbeConfig {
-        network: NetworkSection,
-        ops: crate::sections::OpsSection,
-        storage: SharedIngestStorageProbe,
-    }
-
-    #[test]
-    fn shared_sections_tolerate_unconsumed_fields_across_services() -> Result<(), ConfigError> {
-        let dir = tempfile::tempdir().map_err(|err| ConfigError::invalid(err.to_string()))?;
-        let shared_toml_path = dir.path().join("all_services_shared.toml");
-        std::fs::write(
-            &shared_toml_path,
-            concat!(
-                "[network]\nname = \"zcash-regtest\"\n",
-                "[storage]\n",
-                "data_dir = \"/var/lib/zinder\"\n",
-                "path = \"/var/lib/zinder/canonical\"\n",
-                "canonical_path = \"/var/lib/zinder/canonical\"\n",
-                "secondary_path = \"/var/lib/zinder/sec\"\n",
-                "canonical_secondary_path = \"/var/lib/zinder/psec\"\n",
-                "materialized_views.rocksdb.block_cache_bytes = 67108864\n",
-                "[wallet]\n",
-                "path = \"/var/lib/zinder/wallet\"\n",
-                "secondary_path = \"/var/lib/zinder/wsec\"\n",
-                "[query]\nlisten_addr = \"127.0.0.1:9102\"\n",
-            ),
-        )
-        .map_err(|err| ConfigError::invalid(err.to_string()))?;
-
-        let shared_env = [
-            (
-                "ZINDER_STORAGE__CANONICAL_PATH".to_owned(),
-                "/env/canonical".to_owned(),
-            ),
-            (
-                "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES".to_owned(),
-                "128".to_owned(),
-            ),
-            (
-                "ZINDER_WALLET__SECONDARY_PATH".to_owned(),
-                "/env/wsec".to_owned(),
-            ),
-        ];
-        let loaded_query: SharedQueryProbeConfig = ConfigLoader::new()
-            .with_ops_section(RuntimeService::Query)?
-            .with_file(Some(shared_toml_path.clone()))
-            .with_zinder_env_from_map(shared_env.clone())?
-            .load()?;
-        assert_eq!(loaded_query.network.name.as_deref(), Some("zcash-regtest"));
-
-        let loaded_projector: SharedProjectorProbeConfig = ConfigLoader::new()
-            .with_ops_section(RuntimeService::Projector)?
-            .with_file(Some(shared_toml_path.clone()))
-            .with_zinder_env_from_map(shared_env.clone())?
-            .load()?;
-        assert_eq!(
-            loaded_projector.network.name.as_deref(),
-            Some("zcash-regtest")
-        );
-
-        let loaded_ingest: SharedIngestProbeConfig = ConfigLoader::new()
-            .with_ops_section(RuntimeService::Ingest)?
-            .with_file(Some(shared_toml_path))
-            .with_zinder_env_from_map(shared_env)?
-            .load()?;
-        assert_eq!(loaded_ingest.network.name.as_deref(), Some("zcash-regtest"));
-        Ok(())
-    }
-
-    #[test]
-    fn shared_sections_reject_misspelled_fields() -> Result<(), ConfigError> {
-        #[derive(Debug, Default, Deserialize)]
-        #[serde(default, deny_unknown_fields)]
-        struct SharedProbeConfig {
-            network: NetworkSection,
-            ops: crate::sections::OpsSection,
-            storage: crate::sections::CanonicalSecondaryStorageSection,
-        }
 
         let shared_typo = ConfigLoader::new()
             .with_ops_section(RuntimeService::Query)?
             .with_zinder_env_from_map([(
-                "ZINDER_STORAGE__CANONICL_PATH".to_owned(),
+                "ZINDER_WALLET__SECONDRY_PATH".to_owned(),
                 "/typo".to_owned(),
             )])?
-            .load::<SharedProbeConfig>();
+            .load::<ZinderConfig>();
         assert!(matches!(
             shared_typo,
             Err(ConfigError::RejectedEnvVar {
                 ref original_name,
                 ref suggested_name,
                 ..
-            }) if original_name == "ZINDER_STORAGE__CANONICL_PATH"
-                && suggested_name.as_deref() == Some("ZINDER_STORAGE__CANONICAL_PATH")
+            }) if original_name == "ZINDER_WALLET__SECONDRY_PATH"
+                && suggested_name.as_deref() == Some("ZINDER_WALLET__SECONDARY_PATH")
         ));
-
-        let wallet_typo = ConfigLoader::new()
-            .with_ops_section(RuntimeService::Ingest)?
-            .with_zinder_env_from_map([(
-                "ZINDER_WALLET__SECONDRY_PATH".to_owned(),
-                "/typo".to_owned(),
-            )])?
-            .load::<SharedProbeConfig>();
-        assert!(wallet_typo.is_err());
         Ok(())
     }
 
@@ -1517,7 +1002,7 @@ mod tests {
     -> Result<(), toml::ser::Error> {
         #[derive(Serialize)]
         struct Rendered {
-            node_fallbacks: NodeFallbacksToml,
+            node_fallbacks: NodeFallbackSections,
         }
         let fallback = |address: &str| {
             NodeTarget::new(
@@ -1533,7 +1018,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let rendered = toml::to_string(&Rendered {
-            node_fallbacks: NodeFallbacksToml::from_node_targets(&targets),
+            node_fallbacks: NodeFallbackSections::from_resolved(&targets),
         })?;
 
         let second = rendered.find("[node_fallbacks.2]");
@@ -1551,8 +1036,8 @@ mod tests {
     fn endpoint_urls_render_with_their_credentials_redacted() -> Result<(), toml::ser::Error> {
         #[derive(Serialize)]
         struct Rendered {
-            node: NodeToml,
-            node_fallbacks: NodeFallbacksToml,
+            node: NodeSection,
+            node_fallbacks: NodeFallbackSections,
         }
         let target = NodeTarget::new(
             Network::ZcashRegtest,
@@ -1572,8 +1057,8 @@ mod tests {
         )));
 
         let rendered = toml::to_string(&Rendered {
-            node: NodeToml::from_node_target(&target),
-            node_fallbacks: NodeFallbacksToml::from_node_targets(std::slice::from_ref(&target)),
+            node: NodeSection::from_resolved(&target),
+            node_fallbacks: NodeFallbackSections::from_resolved(std::slice::from_ref(&target)),
         })?;
 
         assert!(!rendered.contains("secret"), "{rendered}");
@@ -1648,7 +1133,7 @@ mod tests {
             std::num::NonZeroU64::MIN,
         );
 
-        let rendered = toml::to_string(&NodeToml::from_node_target(&target))?;
+        let rendered = toml::to_string(&NodeSection::from_resolved(&target))?;
 
         assert_eq!(
             rendered,

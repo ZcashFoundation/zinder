@@ -7,11 +7,7 @@ use std::{
 
 use serde::de::DeserializeOwned;
 
-use super::{
-    ConfigError, RuntimeService, collect_zinder_env_entries, deserializer::deserialize_tree,
-    is_unconsumed_known_path_for_service, prune_toml_table, sibling_sections_for_service,
-    suggest_env_var, top_level_segment,
-};
+use super::{ConfigError, collect_zinder_env_entries, deserializer::deserialize_tree};
 
 #[derive(Clone, Debug)]
 pub(crate) enum PrimitiveValue {
@@ -254,23 +250,16 @@ impl ConfigTree {
         insert_segments(root_map, &segments, leaf, dotted_key)
     }
 
-    pub(crate) fn merge_toml_file(
-        &mut self,
-        path: &Path,
-        service: Option<RuntimeService>,
-    ) -> Result<(), ConfigError> {
+    pub(crate) fn merge_toml_file(&mut self, path: &Path) -> Result<(), ConfigError> {
         let raw_toml = std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
             path: path.to_path_buf(),
             source,
         })?;
-        let mut parsed =
+        let parsed =
             toml::from_str::<toml::Table>(&raw_toml).map_err(|source| ConfigError::ParseToml {
                 path: path.to_path_buf(),
                 source: Box::new(source),
             })?;
-        if let Some(runtime_service) = service {
-            let _pruned = prune_toml_table(&mut parsed, "", runtime_service)?;
-        }
         let ConfigNode::Table(ref mut root_map) = self.root else {
             return Err(ConfigError::invalid("configuration root must be a table"));
         };
@@ -280,7 +269,6 @@ impl ConfigTree {
     pub(crate) fn merge_env_entries(
         &mut self,
         env_iter: impl IntoIterator<Item = (String, String)>,
-        service: Option<RuntimeService>,
     ) -> Result<(), ConfigError> {
         let entries = collect_zinder_env_entries(env_iter);
         let mut seen_paths: HashMap<String, String> = HashMap::new();
@@ -298,9 +286,6 @@ impl ConfigTree {
                 )));
             }
             seen_paths.insert(config_key.clone(), original_name.clone());
-            if should_skip_sibling_env(service, &original_name, &config_key)? {
-                continue;
-            }
             let segment_refs: Vec<&str> = segments.iter().map(String::as_str).collect();
             let leaf = ConfigNode::Env {
                 origin: EnvOrigin {
@@ -313,28 +298,6 @@ impl ConfigTree {
         }
         Ok(())
     }
-}
-
-fn should_skip_sibling_env(
-    service: Option<RuntimeService>,
-    original_name: &str,
-    config_key: &str,
-) -> Result<bool, ConfigError> {
-    let Some(runtime_service) = service else {
-        return Ok(false);
-    };
-    if is_unconsumed_known_path_for_service(runtime_service, config_key) {
-        return Ok(true);
-    }
-    if sibling_sections_for_service(runtime_service).contains(&top_level_segment(config_key)) {
-        return Err(ConfigError::RejectedEnvVar {
-            original_name: original_name.to_owned(),
-            suggested_name: suggest_env_var(original_name, config_key),
-            rejected_key: config_key.to_owned(),
-            detail: None,
-        });
-    }
-    Ok(false)
 }
 
 fn parse_env_segments(

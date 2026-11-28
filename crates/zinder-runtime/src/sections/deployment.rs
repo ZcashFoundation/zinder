@@ -145,24 +145,17 @@ pub fn resolve_manual_raw_blob_retention(
     }
 }
 
-/// Raw `[deployment]` config section.
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+/// Raw and serializable `[deployment]` config section.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeploymentSection {
     /// Named deployment profile. Unset keeps the runtime's own settings.
-    pub profile: Option<DeploymentProfile>,
-}
-
-/// Redacted TOML projection of the resolved `[deployment]` section.
-#[derive(Clone, Copy, Debug, Serialize)]
-pub struct DeploymentToml {
-    /// Selected deployment profile, omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<DeploymentProfile>,
 }
 
-impl DeploymentToml {
-    /// Builds a section from the selected profile.
+impl DeploymentSection {
+    /// Builds a `[deployment]` section projection from the selected profile.
     #[must_use]
     pub const fn from_resolved(profile: Option<DeploymentProfile>) -> Self {
         Self { profile }

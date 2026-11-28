@@ -152,7 +152,7 @@ fn browser_origins_read_the_file_and_honor_environment_overrides() -> eyre::Resu
             &["http://[::1]:5173", "https://wallet.example"],
         ),
         (Some("*"), &["*"][..]),
-        (Some(""), &[][..]),
+        (Some("none"), &[][..]),
     ] {
         let mut command = zinder_compat_command();
         command
@@ -185,6 +185,7 @@ fn browser_origins_reject_invalid_or_ambiguous_configuration_without_echoing_cre
         )?,
     )?;
     for invalid in [
+        "",
         "null",
         "file:///wallet",
         "https://wallet.example/path",

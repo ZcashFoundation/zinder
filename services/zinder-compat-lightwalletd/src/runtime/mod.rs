@@ -39,6 +39,7 @@ pub use compact_block_serving::CompactBlockServingError;
 pub use config::{
     CompatServing, LightwalletdConfig, LightwalletdConfigError, LightwalletdConfigOverrides,
     lightwalletd_config_toml, load_lightwalletd_config, load_lightwalletd_config_with_env,
+    resolve_lightwalletd_config_from_raw,
 };
 use supervision::{CompactBlocksServingTasks, WalletServingTasks};
 

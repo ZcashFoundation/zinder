@@ -117,8 +117,8 @@ fn write_projector_config(
     let config = json!({
         "network": { "name": "zcash-regtest" },
         "storage": {
-            "canonical_path": primary,
-            "canonical_secondary_path": root.join("secondary"),
+            "path": primary,
+            "secondary_path": root.join("secondary"),
         },
         "wallet": { "path": root.join("wallet") },
         "projector": {
@@ -132,7 +132,7 @@ fn write_projector_config(
             "bearer_token_path": token,
             "checkpoint_staging_root": root.join("staging"),
         },
-        "ops": { "listen_addr": "" },
+        "ops": { "listen_addr": "none" },
     });
     fs::write(root.join("projector.toml"), toml::to_string(&config)?)?;
     Ok(())
