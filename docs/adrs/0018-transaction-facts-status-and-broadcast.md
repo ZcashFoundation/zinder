@@ -61,18 +61,19 @@ matched substrings of node messages broke whenever the wording changed.
    runtime forwards the node's error code and message for every rejection and
    reports queued as code `-25`. It invents no Zinder-specific codes.
 
-8. **Mined locations carry the byte commitment.** The canonical
-   transaction index stores the SHA-256 commitment to the exact serialized
-   transaction bytes alongside the block position (`transaction_location`, 72 bytes per entry). This lets a reader obtain
-   the commitment in one index lookup under every raw-blob retention policy (`none` or `all`).
-   Lean wallet serving uses this commitment to validate mined transaction bytes
-   fetched from the primary node against the captured canonical epoch. The
-   node verifies against the captured schedule and tip on a cache miss and
-   must report the indexed block. The reader admits at most 32 concurrent
-   fetches and caches up to 64 MiB of verified bytes by transaction ID and
-   digest. Missing commitments and mismatched bytes fail with `DATA_LOSS`.
-   A node outage can prevent a cold byte read while local address lookups
-   and verified cache hits can continue.
+8. **Mined locations carry the byte commitment.** The canonical transaction
+   index stores the SHA-256 commitment to the exact serialized transaction
+   bytes alongside the block position (`transaction_location`, 72 bytes per
+   entry). This lets a reader obtain the commitment in one index lookup under
+   every raw-blob retention policy (`none` or `all`). Lean wallet serving uses
+   this commitment to validate mined transaction bytes fetched from the
+   primary node against the captured canonical epoch. The node verifies
+   against the captured schedule and tip on a cache miss and must report the
+   indexed block. The reader admits at most 32 concurrent fetches and caches
+   up to 64 MiB of verified bytes by transaction ID and digest. Missing
+   commitments and mismatched bytes fail with `DATA_LOSS`. A node outage can
+   prevent a cold byte read while local address lookups and verified cache
+   hits can continue.
 
    [Storage backend](../architecture/storage-backend.md#canonical-store)
    defines the 72-byte row value.
@@ -103,8 +104,13 @@ with their retry rules are in
 
 ## Evidence
 
-- Decision 9: Judgment. The store can prove a transaction is mined even when the source lacks its body. Reopen if a consumer cannot distinguish a pruned body from proven absence using the typed status.
-- Decision 10: Judgment. Validator endpoints preserve the admitted authority for chain and broadcast decisions. [ADR-0006](0006-node-source-boundary.md#evidence) decision 10 gives the reopening condition.
+- Decision 9: Judgment. The store can prove a transaction is mined even when
+  the source lacks its body. Reopen if a consumer cannot distinguish a pruned
+  body from proven absence using the typed status.
+- Decision 10: Judgment. Validator endpoints preserve the admitted authority
+  for chain and broadcast decisions.
+  [ADR-0006](0006-node-source-boundary.md#evidence) decision 10 gives the
+  reopening condition.
 
 ## Consequences
 
@@ -125,7 +131,6 @@ with their retry rules are in
 
 ## Alternatives rejected
 
-- **Treat pruned history as absence or fetch it from P2P peers.** A missing body proves nothing about chain membership, and peer responses cannot replace admitted validator evidence. See [#709](https://github.com/ZcashFoundation/zinder/issues/709).
 - **Parse raw bytes at read time.** Each reader would own its own parser and
   its own bugs.
 - **Fill missing facts from the node at read time.** The answer would mix
@@ -137,10 +142,15 @@ with their retry rules are in
   older client's behavior unchanged.
 - **Treat queued as a rejection reason.** Every caller would have to inspect
   the reason to learn the transaction is still in flight.
+- **Treat pruned history as absence or fetch it from P2P peers.** A missing
+  body proves nothing about chain membership, and peer responses cannot
+  replace admitted validator evidence. See
+  [#709](https://github.com/ZcashFoundation/zinder/issues/709).
 
 ## Revision history
 
 - 2026-11-28. Decisions 9 and 10 define pruned-history errors and reaffirm validator authority for byte forwarding and broadcast.
+
 - 2026-11-27. Updated decision 8 to reflect Canonical Schema v2 (`none` or `all` raw-blob retention on `transaction_location`).
 
 - 2026-11-24. Mined byte reads can use the verified primary node and a bounded cache.

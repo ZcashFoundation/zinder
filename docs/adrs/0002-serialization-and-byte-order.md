@@ -52,7 +52,7 @@ Hashes add a second problem. A Zcash 32-byte hash exists in two byte orders. The
 ## Revision history
 
 - 2026-11-27. Reconciled decision 3 and evidence for Canonical Schema v2 (`ZSHRNG02`, `ZSTSUP01`, and `ZSLVTL01`), retiring the separate derived signed projection copy while keeping direct wire streaming.
+- 2026-11-23. Decision 3 separates canonical storage formats from the adapter's derived, signed projection of settled history, and records the reader CPU it saves.
 - 2026-11-20. Decision 3 assigns pool selection to the compatibility adapter, including narrowed nullifier requests from wallets. [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#getblockrange-and-getblockrangenullifiers).
 - 2026-11-20. Decision 3 records which transactions unary nullifier requests retain. Decision 6 records the RPC-order hash in `GetTreeState` requests. [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#gettreestate-and-getlatesttreestate).
 - 2026-11-20. Decision 3 specifies when writers check header identity and what readers validate.
-- 2026-11-23. Decision 3 separates canonical storage formats from the adapter's derived, signed projection of settled history, and records the reader CPU it saves.

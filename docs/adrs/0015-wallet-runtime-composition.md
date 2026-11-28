@@ -30,57 +30,26 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 12. **The unified `zinder` supervisor coordinates roles without collapsing boundaries.** `zinder serve` and `zinder index` launch their preset's split role subprocesses with per-role filtered configs and private loopback control tokens, keeping each runtime's capability isolation and fail-fast exit behavior intact while exposing aggregated health and readiness. The wallet RPC and its advertised capabilities stay split by role, and readers verify canonical `READY` store admission directly before binding.
 13. **The wallet listener and its consumer size HTTP/2 windows for WAN round trips.** `PublicGrpcServer` raises each stream's send buffer from hyper's ~400 KiB default to 1 MiB, h2's per-stream backpressure threshold, so a block-range stream can fill a 100-200 ms bandwidth-delay product; the send-stall timeout still bounds how long a stalled stream keeps that buffer. `zinder-client`'s `RemoteChainIndex` raises its receive windows from hyper's 2 MiB stream, 5 MiB connection, and 16 KiB frame defaults to 4 MiB stream, 16 MiB connection, and a 64 KiB max frame; it omits h2's adaptive window, because in tonic 0.14.9 and hyper 1.12.0 that setting resets both initial windows back to 65,535 bytes and would discard the fixed sizes. How the listener keys each client for the receive limit, including a bare IP a load balancer names, is in [ADR-0007](0007-node-failure-recovery-and-transport-policy.md) Decision 10.
 
-14. **Wide ranges have orthogonal discovery and stateless SDK resumption.**
-    Revision 16 already advertises `wallet.read.compact_block_range_v3` for
-    descending ranges and pool selection ([#734](https://github.com/ZcashFoundation/zinder/pull/734)).
-    The ratified wide-range semantics in [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md)
-    decision 8 ship at `CONTRACT_REVISION = 17` and advertise
-    `wallet.read.wide_compact_block_range_v1`. Protocol range caps are
-    revision-bound constants exported by `zinder-proto` and shared by
-    `zinder-query` and `zinder-client`. `WalletServerInfo` has no
-    `max_compact_block_range_blocks` field.
+14. **Wide ranges have orthogonal discovery and stateless SDK resumption.** Revision 16 already advertises `wallet.read.compact_block_range_v3` for descending ranges and pool selection ([#734](https://github.com/ZcashFoundation/zinder/pull/734)). The ratified wide-range semantics in [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 8 ship at `CONTRACT_REVISION = 17` and advertise `wallet.read.wide_compact_block_range_v1`. Protocol range caps are revision-bound constants exported by `zinder-proto` and shared by `zinder-query` and `zinder-client`. `WalletServerInfo` has no `max_compact_block_range_blocks` field.
 
-    The ratified `zinder-client` `sync_compact_blocks` stream owns request
-    chunking, retries, and `RefreshChainEpoch` recovery across settled
-    prefixes. It uses the wide capability when available and falls back to
-    requests of at most 1,000 blocks. The wallet caller persists durable
-    scan progress, such as the last scanned height or its own cursor. On
-    an unsettled suffix reorg or hash fence mismatch, the stream returns
-    control to the wallet. The wallet keeps its settled progress and
-    reconciles the affected suffix against a fresh view before resuming.
-    The SDK resumes from caller-supplied progress with no durable SDK
-    state or server-side resume session. Document that remote `snapshot()`
-    uses `VisibleTipBlock` to establish its epoch. Keep
-    `ChainIndex::block_header_by_selector`, whose capability is already
-    `AlwaysOn` ([#668](https://github.com/ZcashFoundation/zinder/pull/668)).
-    [#636](https://github.com/ZcashFoundation/zinder/issues/636) and
-    [#571](https://github.com/ZcashFoundation/zinder/issues/571) track
-    implementation.
+    The ratified `zinder-client` `sync_compact_blocks` stream owns request chunking, retries, and `RefreshChainEpoch` recovery across settled prefixes. It uses the wide capability when available and falls back to requests of at most 1,000 blocks. The wallet caller persists durable scan progress, such as the last scanned height or its own cursor. On an unsettled suffix reorg or hash fence mismatch, the stream returns control to the wallet. The wallet keeps its settled progress and reconciles the affected suffix against a fresh view before resuming. The SDK resumes from caller-supplied progress with no durable SDK state or server-side resume session. Document that remote `snapshot()` uses `VisibleTipBlock` to establish its epoch. Keep `ChainIndex::block_header_by_selector`, whose capability is already `AlwaysOn` ([#668](https://github.com/ZcashFoundation/zinder/pull/668)). [#636](https://github.com/ZcashFoundation/zinder/issues/636) and [#571](https://github.com/ZcashFoundation/zinder/issues/571) track implementation.
 
-15. **Pruned following keeps transaction-byte discovery honest.** The
-    ratified [#713](https://github.com/ZcashFoundation/zinder/issues/713)
-    policy advertises `wallet.read.transaction_bytes_v1` only when the
-    admitted store records `raw_blob_policy = "all"` (`--full-blocks`)
-    or the installed verified byte source has at least one admitted
-    upstream validator in `Archive` mode. A lean reader backed solely by
-    pruned validators withholds the capability. Historical body failures
-    follow [ADR-0018](0018-transaction-facts-status-and-broadcast.md) decision 9.
+15. **Pruned following keeps transaction-byte discovery honest.** The ratified [#713](https://github.com/ZcashFoundation/zinder/issues/713) policy advertises `wallet.read.transaction_bytes_v1` only when the admitted store records `raw_blob_policy = "all"` (`--full-blocks`) or the installed verified byte source has at least one admitted upstream validator in `Archive` mode. A lean reader backed solely by pruned validators withholds the capability. Historical body failures follow [ADR-0018](0018-transaction-facts-status-and-broadcast.md) decision 9.
 
 [Wallet data plane](../architecture/wallet-data-plane.md) describes pinning and pair publication. [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md) lists the block-range outcomes.
 
 ## Evidence
 
-- Decision 14, revision and capability: External constraint. Revision 16 already assigns `wallet.read.compact_block_range_v3` to range direction and pool selection. [ADR-0013](0013-chain-event-streams.md) decision 6 requires a revision bump for changed semantics.
-- Decision 14, shared constants and SDK resumption: Judgment. One revision-bound cap lets the SDK select a request path from advertised support. The SDK can retry immutable settled blocks across epochs. The wallet alone knows which suffix changes it durably applied. Reopen if independent deployment limits become necessary or a settled retry cannot resume from caller-owned progress without gaps.
-- Decision 15: Judgment. An admitted archive source or local full retention is evidence of historical coverage, while a pruned-only source can drop bodies after admission. Reopen if a source can prove equivalent full byte coverage without either condition.
 - Decision 1, deployment profiles and serving settings are not capability evidence: judgment. The rejected alternative on capability profiles records the reason.
 - Decision 4, ingest-control admission: judgment. Checking the service before storage admission refuses an endpoint with the wrong identity, network, or contract before it can supply writer evidence.
 - Decision 7, observation-gated retention: judgment backed by unit tests. A burst with no observed pair, and a burst with only tip polling between blocks, publish every block with no `retention_window` generation wait. A burst whose pairs a request observed still waits for the full window. Deterministic tests cover a capture before and after a publication, an explicit pin, and a same-epoch republication, and a concurrent test checks that a pair a capture returns still answers its epoch after a racing publication. A tip read that recovers from a deleted table file keeps its replacement unobserved.
 - Decision 13, the HTTP/2 window sizes: judgment. A wire-level unit test asserts the client's opening `SETTINGS` frame advertises `SETTINGS_INITIAL_WINDOW_SIZE` of 4 MiB and `SETTINGS_MAX_FRAME_SIZE` of 64 KiB, and that its connection `WINDOW_UPDATE` raises the connection window to 16 MiB. Post-change WAN throughput has not yet been re-measured.
+- Decision 14, revision and capability: External constraint. Revision 16 already assigns `wallet.read.compact_block_range_v3` to range direction and pool selection. [ADR-0013](0013-chain-event-streams.md) decision 6 requires a revision bump for changed semantics.
+- Decision 14, shared constants and SDK resumption: Judgment. One revision-bound cap lets the SDK select a request path from advertised support. The SDK can retry immutable settled blocks across epochs. The wallet alone knows which suffix changes it durably applied. Reopen if independent deployment limits become necessary or a settled retry cannot resume from caller-owned progress without gaps.
+- Decision 15: Judgment. An admitted archive source or local full retention is evidence of historical coverage, while a pruned-only source can drop bodies after admission. Reopen if a source can prove equivalent full byte coverage without either condition.
 
 ## Consequences
 
-- A wallet can resume a wide scan without a server session. Revision 16 consumers and servers continue to use their existing bounded range contract.
 - Operators choose a deployment profile, retention, and endpoints, and none of them is a capability claim. Invalid capability claims cannot be constructed.
 - A misconfigured node endpoint is still advertised. Every broadcast through it fails with the retryable `NODE_UNAVAILABLE`, and the operator sees a degraded dependency instead of a missing capability.
 - A client that read `ServerInfo` early never loses a capability later.
@@ -89,11 +58,10 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 - The publisher coalesces updates while retained pairs and slow reads occupy the four generation slots. A longer retention window can extend the delay before another generation is available. A burst of blocks that no request observes does not wait on the retention window.
 - A block-range stream can end early during a reorg in the unsettled suffix. The client requests again from the height it needs. An `OK` stream is one chain as read, not a promise that the chain is still best.
 - A new capability needs a registry entry, an implementation, evidence derivation, positive and negative tests, and a production consumer flow.
+- A wallet can resume a wide scan without a server session. Revision 16 consumers and servers continue to use their existing bounded range contract.
 
 ## Alternatives rejected
 
-- **A range-limit field in `WalletServerInfo`.** A per-host limit makes interoperability depend on configuration where the contract only needs a revision-bound limit and a capability.
-- **Advertise transaction bytes from any configured validator.** A lean reader backed only by pruned nodes cannot promise historical bodies.
 - **Capability profiles, or per-capability booleans.** A name or flag that declares capabilities keeps a shadow model that can disagree with the composed service. A deployment profile avoids this because capabilities still derive from the composition it selects.
 - **Derive support from the registry alone.** The registry cannot prove that storage retained an artifact or that a provider was wired.
 - **A generic capability-provider framework.** There is one composition root, so it adds indirection without removing any evidence binding.
@@ -108,22 +76,22 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 - **Hold one pair for a whole block-range stream, or pin each chunk.** The client sets the pace, so no retention window covers it. The hash link, not a pin, proves continuity.
 - **Send the new branch after a reorg below the stream position.** One `OK` stream would no longer be one chain.
 - **Compatibility aliases for removed names.** Zinder's native consumers move with it, and aliases keep obsolete names available for new code.
+- **A range-limit field in `WalletServerInfo`.** A per-host limit makes interoperability depend on configuration where the contract only needs a revision-bound limit and a capability.
+- **Advertise transaction bytes from any configured validator.** A lean reader backed only by pruned nodes cannot promise historical bodies.
 
 ## Revision history
 
 - 2026-11-28. Decisions 14 and 15 specify wide-range discovery, SDK recovery, and wallet-owned progress, and gate historical transaction-byte discovery on coverage.
+- 2026-11-27. Decisions 11 and 12 retire `history-publisher` and the external signed `ZSHRNG01` catalog; `zinder-compat-lightwalletd` streams directly from canonical `ZSHRNG02` settled segments and `live_tail_block`.
+- 2026-11-27. Decisions 7 and 8 allow native query to configure the pin window within the fixed generation limit.
 - 2026-11-24. Decision 1 adds the verified mined-transaction byte source as capability evidence.
-
-- 2026-11-21. Added the trust and ownership boundary for pre-encoded settled lightwalletd history.
-- 2026-11-21. Bound the compact segment index and the optional kernel measurement to the signed catalog.
-- 2026-11-21. Specified trusted bootstrap and automatic catalog adoption for the single-host wallet Compose deployment.
+- 2026-11-24. Decision 7 retains a replaced pair only when a request observed it, so unobserved bursts and tip polling no longer wait on the retention window.
+- 2026-11-24. Decision 13 sizes the wallet listener's and consumer's HTTP/2 windows for WAN bandwidth-delay products, recorded as judgment backed by the client `SETTINGS`/`WINDOW_UPDATE` wire test; post-change WAN throughput has not yet been re-measured.
+- 2026-11-24. Decision 11 covers both default projections and the signed body digest.
 - 2026-11-23. Decision 1 separates deployment profiles, which select a composition, from capability evidence.
 - 2026-11-23. Decision 11 links the current signed settled-history section.
 - 2026-11-23. Evidence records what decision 1 rests on.
 - 2026-11-23. Decision 4 specifies which readers admit ingest control and how they use its channels.
-- 2026-11-24. Decision 7 retains a replaced pair only when a request observed it, so unobserved bursts and tip polling no longer wait on the retention window.
-- 2026-11-24. Decision 13 sizes the wallet listener's and consumer's HTTP/2 windows for WAN bandwidth-delay products, recorded as judgment backed by the client `SETTINGS`/`WINDOW_UPDATE` wire test; post-change WAN throughput has not yet been re-measured.
-- 2026-11-27. Decisions 11 and 12 retire `history-publisher` and the external signed `ZSHRNG01` catalog; `zinder-compat-lightwalletd` streams directly from canonical `ZSHRNG02` settled segments and `live_tail_block`.
-- 2026-11-24. Decision 11 covers both default projections and the signed body digest.
-
-- 2026-11-27. Decisions 7 and 8 allow native query to configure the pin window within the fixed generation limit.
+- 2026-11-21. Added the trust and ownership boundary for pre-encoded settled lightwalletd history.
+- 2026-11-21. Bound the compact segment index and the optional kernel measurement to the signed catalog.
+- 2026-11-21. Specified trusted bootstrap and automatic catalog adoption for the single-host wallet Compose deployment.

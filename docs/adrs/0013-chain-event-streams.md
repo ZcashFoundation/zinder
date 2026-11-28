@@ -23,11 +23,7 @@ Some changes revise what an existing RPC means without changing its name or fiel
 5. **A mempool snapshot names its stream position.** `MempoolSnapshotResponse.events_resume_cursor` is a `MempoolEvents` cursor captured atomically with the snapshot contents, and every page of one walk repeats it. Subscribing after it is at-least-once: events already in the snapshot may arrive again, and none is lost. When no event existed yet, the cursor is empty and the consumer subscribes with `earliest_retained`. The snapshot's chain epoch is a separate value that fences the canonical tip. It is never a mempool position.
 6. **In-place semantic changes raise `contract_revision`.** `ops.ServerInfo.contract_revision` increases whenever an existing RPC changes meaning while its name and fields survive. Consumers require a minimum revision and refuse an older server. The server serves exactly one revision, so this is not a negotiation.
 
-7. **Mobile wake-ups are level-triggered companion work.** The ratified
-   `zinder-client` example in [Use cases](../use-cases.md#mobile-wallet-wake-ups)
-   opens `ChainEvents` at `live_tail` on every connection. Its public tip signal
-   prompts wallets to run their own sync. Durable replay remains a separate
-   consumer contract under decision 2.
+7. **Mobile wake-ups are level-triggered companion work.** The ratified `zinder-client` example in [Use cases](../use-cases.md#mobile-wallet-wake-ups) opens `ChainEvents` at `live_tail` on every connection. Its public tip signal prompts wallets to run their own sync. Durable replay remains a separate consumer contract under decision 2.
 
 [Chain events](../architecture/chain-events.md) owns the envelope, cursor, and resume contract. [ADR-0002](0002-serialization-and-byte-order.md) records the cursor encoding.
 
@@ -55,11 +51,6 @@ Some changes revise what an existing RPC means without changing its name or fiel
 ## Revision history
 
 - 2026-11-28. Decision 7 records the external mobile wake-up companion and its live-only subscription.
-- 2026-11-20. Contract revision 10 makes a synthesized reorg a complete resume
-  position and requires increasing epoch IDs and monotonic settlement across
-  delivered chain events.
-- 2026-11-20. Contract revision 12 projects settled-tip advances onto the
-  Settled family. Initial gRPC metadata identifies a Settled subscription so
-  clients can validate its ranges when the family comes from an opaque cursor.
-- 2026-11-20. Contract revision 13 requires a writer to withdraw a stale live
-  mempool tail and to honor the wallet’s mempool stream opening budget.
+- 2026-11-20. Contract revision 10 makes a synthesized reorg a complete resume position and requires increasing epoch IDs and monotonic settlement across delivered chain events.
+- 2026-11-20. Contract revision 12 projects settled-tip advances onto the Settled family. Initial gRPC metadata identifies a Settled subscription so clients can validate its ranges when the family comes from an opaque cursor.
+- 2026-11-20. Contract revision 13 requires a writer to withdraw a stale live mempool tail and to honor the wallet’s mempool stream opening budget.

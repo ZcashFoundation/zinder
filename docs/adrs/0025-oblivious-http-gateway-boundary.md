@@ -50,16 +50,17 @@ Gateway implementation and deployment qualification are pending.
 
 ## Evidence
 
-- Decisions 1 and 4: External constraint. RFC 9458 defines the
-  relay/gateway trust boundary and permits a time-windowed `enc` register
-  for replay protection. RFC 9180 defines the HPKE algorithms and RFC 9292
-  defines the message encoding. [RFC 9458 §6.5.1](https://www.rfc-editor.org/rfc/rfc9458.html#section-6.5.1),
-  [RFC 9180](https://www.rfc-editor.org/rfc/rfc9180.html),
-  [RFC 9292](https://www.rfc-editor.org/rfc/rfc9292.html).
 - Decision 1, placement and suite selection: Judgment. Keeping private
   keys at the edge limits where they are held. Reopen if an independent
   relay and a supported wallet cannot interoperate through the gateway
   using these suites.
+- Decisions 1 and 4: External constraint. RFC 9458 defines the
+  relay/gateway trust boundary and permits a time-windowed `enc` register
+  for replay protection. RFC 9180 defines the HPKE algorithms and RFC 9292
+  defines the message encoding.
+  [RFC 9458 §6.5.1](https://www.rfc-editor.org/rfc/rfc9458.html#section-6.5.1),
+  [RFC 9180](https://www.rfc-editor.org/rfc/rfc9180.html),
+  [RFC 9292](https://www.rfc-editor.org/rfc/rfc9292.html).
 - Decisions 2 and 3: Judgment. The times and size limits bound stale-key
   acceptance and work per call. Sustained rotation failures or a required
   unary wallet flow that cannot fit within the caps would reopen the

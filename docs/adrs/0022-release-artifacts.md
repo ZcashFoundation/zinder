@@ -32,9 +32,10 @@ the release claiming precision it does not have for native libraries.
    the Rust target, release platform, CPU baseline, extra CPU features, and
    platform-specific system library requirements.
 2. **An archive holds the single unified `zinder` executable.** It contains
-   `bin/zinder` (`serve`, `index`, `run <role>`, `snapshot`, `backup`, `config`,
-   and `healthcheck`, covering ingest, projector, query, lightwalletd
-   compatibility, Explorer, and Cipherscan adapter), plus build metadata, the license, a README, and checksums.
+   `bin/zinder` (`serve`, `index`, `run <role>`, `snapshot`, `backup`,
+   `config`, and `healthcheck`, covering ingest, projector, query,
+   lightwalletd compatibility, Explorer, and Cipherscan adapter), plus build
+   metadata, the license, a README, and checksums.
    `deploy/release-images.json` lists the single OCI image (`zinder`).
    Benchmark (`zinder-bench`) and code-generation binaries are excluded.
 3. **Builds are deterministic and proven by reproduction.** The build pins
@@ -43,9 +44,10 @@ the release claiming precision it does not have for native libraries.
    build machine's CPU. Each platform is built twice in separate jobs without
    caches. Their binary and archive hashes must match before anyone is asked
    to approve the release.
-4. **The single image reuses the proven binary.** `ghcr.io/zcashfoundation/zinder`
-   copies `bin/zinder` from the compared archive instead of compiling again,
-   and the image binary matches its archive binary byte for byte.
+4. **The single image reuses the proven binary.**
+   `ghcr.io/zcashfoundation/zinder` copies `bin/zinder` from the compared
+   archive instead of compiling again, and the image binary matches its
+   archive binary byte for byte.
 5. **System libraries stay dynamic.** RocksDB and its compression libraries
    are linked statically. On Linux, the release checker rejects GNU libc and
    `libstdc++` symbols newer than `GLIBC_2.34` and `GLIBCXX_3.4.30`, and CI
@@ -66,10 +68,11 @@ the release claiming precision it does not have for native libraries.
 8. **Published releases are immutable.** The workflow fails if the published
    GitHub Release is not immutable, and the stable `latest` image tag moves
    only after every artifact passes verification.
-9. **The release image holds only `bin/zinder`.** `ghcr.io/zcashfoundation/zinder`
-   runs on a digest-pinned `gcr.io/distroless/cc-debian12:nonroot` base (`USER
-   10001:10001`, `ENTRYPOINT ["/usr/local/bin/zinder"]`, default `CMD ["serve"]`)
-   with no shell, package manager, HTTP client, or wrapper scripts. Its built-in
+9. **The release image holds only `bin/zinder`.**
+   `ghcr.io/zcashfoundation/zinder` runs on a digest-pinned
+   `gcr.io/distroless/cc-debian12:nonroot` base (`USER 10001:10001`,
+   `ENTRYPOINT ["/usr/local/bin/zinder"]`, default `CMD ["serve"]`) with no
+   shell, package manager, HTTP client, or wrapper scripts. Its built-in
    `zinder healthcheck` probes `/healthz` or `/readyz`. Because UID/GID 10001
    matches the Zebra and Zakura images, Zinder reads the node's mode-0600 RPC
    cookie directly without root privilege dropping.
@@ -102,18 +105,26 @@ The release procedure and how operators verify a download are in
 
 ## Evidence
 
-- Decision 10: Judgment. The versioned wire contract gives wrappers a shared compatibility baseline. Waiting for `sync_compact_blocks` gives them a common recovery contract. Reopen if a committed consumer demonstrates a distribution requirement the pinned contract cannot meet.
-- Decision 11: Judgment. One MSRV keeps one supported Rust dependency graph. A concrete Rust-source consumer that needs a lower version and CI coverage of the split graph would reopen it.
+- Decision 10: Judgment. The versioned wire contract gives wrappers a shared
+  compatibility baseline. Waiting for `sync_compact_blocks` gives them a
+  common recovery contract. Reopen if a committed consumer demonstrates a
+  distribution requirement the pinned contract cannot meet.
+- Decision 11: Judgment. One MSRV keeps one supported Rust dependency graph. A
+  concrete Rust-source consumer that needs a lower version and CI coverage of
+  the split graph would reopen it.
 
 ## Consequences
 
-- Operators run any preset (`light-wallet`, `wallet`, `explorer`) or individual role from the single `bin/zinder` binary without extracting a container image.
+- Operators run any preset (`light-wallet`, `wallet`, `explorer`) or
+  individual role from the single `bin/zinder` binary without extracting a
+  container image.
 - x86 hosts without AVX2 or ADX can use the baseline GNU/Linux archive.
   The AMD64 OCI image continues to use the optimized x86-64-v3 archive.
 - The personal-node Compose manifest is a release asset covered by the signed
   `SHA256SUMS`. It pins both images by digest. The Zinder image digest comes
-  from the verified multi-platform release index. See [Deploying Zinder](../runbooks/deploying.md#personal-node-compose)
-  for sizing and operating instructions.
+  from the verified multi-platform release index. See [Deploying
+  Zinder](../runbooks/deploying.md#personal-node-compose) for sizing and
+  operating instructions.
 - A binary that fails to build, reproduce, or package stops the whole
   release before any crate, image, or GitHub Release is published.
 - Approval is requested only after the slowest build finishes, so release
@@ -129,17 +140,14 @@ The release procedure and how operators verify a download are in
 - Musl builds are not produced. They would be a separate product, not an
   alias for these archives.
 - An operator cannot open a shell in a runtime container. Inspection runs the
-  binary itself or attaches a separate toolbox container, as
-  [Deploying on a VM](../runbooks/deploying-on-a-vm.md#inspect-a-runtime-container)
-  shows.
+  binary itself or attaches a separate toolbox container, as [Deploying on a
+  VM](../runbooks/deploying-on-a-vm.md#inspect-a-runtime-container) shows.
 - The reference Compose deployment requires the node to run as UID 10001,
   because its `state-init` service gives the stores to that UID on every
   start.
 
 ## Alternatives rejected
 
-- **Ship platform wrappers before the wire contract and sync API stabilize.** Each wrapper would establish a separate integration contract to maintain.
-- **Lower the SDK MSRV for binary consumers.** SwiftPM, Maven Central, and npm consumers install packaged artifacts without compiling Rust.
 - **Container images only.** Operators who supervise native processes would
   have to extract binaries from images themselves.
 - **One build per platform.** Nothing would detect a build that depends on
@@ -150,10 +158,17 @@ The release procedure and how operators verify a download are in
   which workflow and commit produced the bytes.
 - **Guessing native package identities in the SBOM.** An inventory with
   invented versions is worse than one that states its limit.
-- **Separate Debian images with shell entrypoint scripts.** Shipping Debian wrappers beside distroless runtime images duplicated maintenance and added unnecessary packages (`zinder serve` now supervises roles natively in the unified distroless image).
+- **Separate Debian images with shell entrypoint scripts.** Shipping Debian
+  wrappers beside distroless runtime images duplicated maintenance and added
+  unnecessary packages (`zinder serve` now supervises roles natively in the
+  unified distroless image).
 - **A sidecar that relaxes the node cookie's mode.** It must run beside every
   node, and mode 0644 makes the cookie readable by every UID that mounts the
   volume.
+- **Ship platform wrappers before the wire contract and sync API stabilize.**
+  Each wrapper would establish a separate integration contract to maintain.
+- **Lower the SDK MSRV for binary consumers.** SwiftPM, Maven Central, and npm
+  consumers install packaged artifacts without compiling Rust.
 
 ## Revision history
 

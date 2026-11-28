@@ -24,75 +24,33 @@ Several optional fields, such as a fee that needs resolved inputs or a raw trans
 7. **The background pass fills settled checkpoint coverage.** Wallet-serving construction stores the selected checkpoints through its build tip by default, as [ADR-0009](0009-ingest-lifecycle-and-construction.md) describes, so the pass mostly confirms coverage there. Explorer and `explicit` construction store a checkpoint every 100 blocks and at the build tip. The default background selection is `every-block`. With the `commitment-budget` selection, the background pass stores a checkpoint each time 1,024 note commitments have accumulated by default. Choose this policy before densifying to save space. Changing it later preserves every existing row. Once the writer follows the tip, the background pass checks whether each settled 100-block stride meets the selected coverage. Under `every-block`, it checks checkpoint heights. Under `commitment-budget`, it also checks stored tree sizes across gaps. A stride that meets the selection skips replay and checkpoint-content comparison. For a stride that needs more checkpoints, the pass replays from its first stored checkpoint and writes missing rows only if the replay reproduces every existing checkpoint byte for byte, including the ending cadence checkpoint. Replay remains the answer for a height the pass has not reached on a sparse store and, under `commitment-budget`, for heights between budgeted checkpoints.
 8. **The compatibility adapter streams canonical `ZSHRNG02` settled segments and `live_tail_block` wire payloads directly, with canonical storage owning coverage and chain identity.** Non-transparent `GetBlockRange` and `GetBlockRangeNullifiers` selections read canonical `ZSHRNG02` settled segments and the `live_tail_block` column family (`ZSLVTL01`) directly — streaming pre-encoded default payloads zero-copy and projecting other non-transparent pool subsets on the fly over the authenticated slab or live-tail frame. Each settled segment carries an explicit artifact schema version so pre-v7 (52-byte ciphertext prefix) and future ZIP-231 full-ciphertext formats coexist without rewriting settled history. `GetBlockRange` selections that include `TRANSPARENT` read canonical storage ([Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#canonical-settled-segments-and-live-tail-wire-streaming)).
 
-9. **Settled segment downloads are an optional native client path.** Under
-   [#697](https://github.com/ZcashFoundation/zinder/issues/697), a wallet can
-   fetch immutable `ZSHRNG02` objects with HTTPS `Range` requests. This work
-   depends on [#384](https://github.com/ZcashFoundation/zinder/issues/384)
-   for a frozen, cold-certified settled Schema v2 format
-   ([ADR-0023](0023-deployment-profiles.md#schema-v2-qualification-gates))
-   and on [#478](https://github.com/ZcashFoundation/zinder/issues/478)
-   for the shared HTTPS segment pool and signed catalog
-   ([ADR-0024](0024-verified-edge-snapshot-bootstrap.md#shared-https-settled-segment-pool)).
-   It is independent of the M3 PostgreSQL read-through cache
-   ([#678](https://github.com/ZcashFoundation/zinder/issues/678)).
+9. **Settled segment downloads are an optional native client path.** Under [#697](https://github.com/ZcashFoundation/zinder/issues/697), a wallet can fetch immutable `ZSHRNG02` objects with HTTPS `Range` requests. This work depends on [#384](https://github.com/ZcashFoundation/zinder/issues/384) for a frozen, cold-certified settled Schema v2 format ([ADR-0023](0023-deployment-profiles.md#decision) decision 10) and on [#478](https://github.com/ZcashFoundation/zinder/issues/478) for the shared HTTPS segment pool and signed catalog ([ADR-0024](0024-verified-edge-snapshot-bootstrap.md#shared-https-settled-segment-pool)). It is independent of the M3 PostgreSQL read-through cache ([#678](https://github.com/ZcashFoundation/zinder/issues/678)).
 
-   TLS-authenticated Zinder `WalletQuery` gRPC responses anchor the expected
-   whole-segment SHA-256 digest, byte length, and `index_sha256` pin for each
-   `ZSHRNG02` segment. These are the trusted inputs for partial `Range`
-   verification under [ADR-0024](0024-verified-edge-snapshot-bootstrap.md#shared-https-settled-segment-pool).
-   Wallets need no publisher signing key. Extract sans-I/O `ZSHRNG02`
-   verification from `zinder-store` into code that consumers can use without
-   linking `rust-rocksdb`. This download path is ratified and pending
-   implementation.
+   TLS-authenticated Zinder `WalletQuery` gRPC responses anchor the expected SHA-256 digest of the bytes preceding the trailer, byte length, and `index_sha256` pin for each `ZSHRNG02` segment. These are the trusted inputs for partial `Range` verification under [ADR-0024](0024-verified-edge-snapshot-bootstrap.md#shared-https-settled-segment-pool). Wallets need no publisher signing key. Extract sans-I/O `ZSHRNG02` verification from `zinder-store` into code that consumers can use without linking `rust-rocksdb`. This download path is ratified and pending implementation.
 
-10. **Shifted ephemeral keys are optional, independently verified hints.**
-    The future `epk-shift` contract is an explicit native `WalletQuery`
-    opt-in. The default response, `ZSHRNG02` Slab 0, minimal `light-wallet`
-    footprint, and vendored lightwalletd proto stay unchanged. An optional,
-    rebuildable `ZSHSHF01` sidecar or cache stores hints outside `ZSHRNG02`.
-    `SEGMENT_FLAG_RESERVED_SHIFTED_EPK` remains reserved in the base format.
+10. **Shifted ephemeral keys are optional, independently verified hints.** The future `epk-shift` contract is an explicit native `WalletQuery` opt-in. The default response, `ZSHRNG02` Slab 0, minimal `light-wallet` footprint, and vendored lightwalletd proto stay unchanged. An optional, rebuildable `ZSHSHF01` sidecar or cache stores hints outside `ZSHRNG02`. `SEGMENT_FLAG_RESERVED_SHIFTED_EPK` remains reserved in the base format.
 
-    Production implementation and advertisement are deferred until a
-    committed wallet consumer demonstrates a net end-to-end mobile gain and
-    qualifies independent client verification. The client must batch-check
-    `sum r_i ([2^k] epk_i - hint_i) == O` with independent random coefficients
-    and recover safely from failures, or use a safe fallback that guarantees
-    zero silently missed payments under adversarial hints. An unverifiable
-    hint cannot determine which notes the wallet skips.
-    [#696](https://github.com/ZcashFoundation/zinder/issues/696).
+    Production implementation and advertisement are deferred until a committed wallet consumer demonstrates a net end-to-end mobile gain and qualifies independent client verification. The client must batch-check `sum r_i ([2^k] epk_i - hint_i) == O` with independent random coefficients and recover safely from failures, or use a safe fallback that guarantees zero silently missed payments under adversarial hints. An unverifiable hint cannot determine which notes the wallet skips. [#696](https://github.com/ZcashFoundation/zinder/issues/696).
 
-11. **Consensus headers and FlyClient proofs use opt-in native extensions.**
-    The optional stored-set module in [ADR-0023](0023-deployment-profiles.md)
-    supplies full consensus headers and [ZIP 221](https://zips.z.cash/zip-0221)
-    inclusion proofs. After the [G1 format freeze](0023-deployment-profiles.md#schema-v2-qualification-gates),
-    ship additive optional consensus-header bytes on
-    `WalletQuery.BlockHeaderBySelector` and a native inclusion-proof RPC,
-    with separate capability discovery. `CompactBlock.header` stays empty
-    in the default compact payload. Compatibility can adopt
-    `GetBlockInclusionProof` once
-    [zcash/lightwallet-protocol#21](https://github.com/zcash/lightwallet-protocol/pull/21)
-    merges upstream. These extensions are ratified for future implementation.
-    [#705](https://github.com/ZcashFoundation/zinder/issues/705).
+11. **Consensus headers and FlyClient proofs use opt-in native extensions.** The optional stored-set module in [ADR-0023](0023-deployment-profiles.md) supplies full consensus headers and [ZIP 221](https://zips.z.cash/zip-0221) inclusion proofs. After the [G1 format freeze](0023-deployment-profiles.md#decision) in ADR-0023 decision 10, ship additive optional consensus-header bytes on `WalletQuery.BlockHeaderBySelector` and a native inclusion-proof RPC, with separate capability discovery. `CompactBlock.header` stays empty in the default compact payload. Compatibility can adopt `GetBlockInclusionProof` once [zcash/lightwallet-protocol#21](https://github.com/zcash/lightwallet-protocol/pull/21) merges upstream. These extensions are ratified for future implementation. [#705](https://github.com/ZcashFoundation/zinder/issues/705).
 
 [Wallet data plane](../architecture/wallet-data-plane.md) describes what each method returns. [Capabilities](../reference/capabilities.md) lists the capability strings.
 
 ## Evidence
 
+- Decision 2, the scope of epoch binding: judgment, as [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 1 records.
 - Decision 2, wide compact ranges: Judgment. [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md#evidence) decision 8 gives the invariant and reopening condition.
+- Decision 4, stored facts govern native answers: judgment. Locally indexed facts preserve epoch-pinned reads and typed absence even when the node supplies verified transaction bytes ([ADR-0018](0018-transaction-facts-status-and-broadcast.md)).
 - Decision 6, transaction bytes: Judgment. [ADR-0015](0015-wallet-runtime-composition.md#evidence) decision 15 gives the admission evidence and reopening condition.
+- Decision 8: measured. Sending stored wire bytes cut warm range-read CPU per block by 71 to 74 percent against converting canonical rows; [ADR-0002](0002-serialization-and-byte-order.md#evidence) gives the figures and the receipt. The storage cost is in the consequences.
 - Decision 9: Judgment. Zinder authenticates the length and digest pins so the wallet can verify partial content from a separate HTTPS origin without a publisher trust store or storage-engine dependency. A partial range that cannot be safely verified with those pins would reopen the trust boundary.
 - Decision 10, wrong hints: Measured. In a four-payment fixture, one unrelated but well-formed point hid one payment in the shifted-key scan. [#389](https://github.com/ZcashFoundation/zinder/pull/389).
 - Decision 10, opt-in and rollout: Judgment. Reopen the implementation gate when a committed consumer demonstrates safe receipt recovery under malicious hints and a net end-to-end mobile win.
 - Decision 11, consensus and compatibility: External constraint. ZIP 221 specifies the consensus history tree, and the compatibility RPC follows the upstream protocol.
 - Decision 11, native rollout: Judgment. Separate discovery lets native wallets adopt full headers and proofs together once the stored format is stable. Reopen if independent verification shows the native extensions cannot bind the proof to the requested view.
-- Decision 8: measured. Sending stored wire bytes cut warm range-read CPU per block by 71 to 74 percent against converting canonical rows; [ADR-0002](0002-serialization-and-byte-order.md#evidence) gives the figures and the receipt. The storage cost is in the consequences.
-- Decision 2, the scope of epoch binding: judgment, as [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 1 records.
-- Decision 4, stored facts govern native answers: judgment. Locally indexed facts preserve epoch-pinned reads and typed absence even when the node supplies verified transaction bytes ([ADR-0018](0018-transaction-facts-status-and-broadcast.md)).
 
 ## Consequences
 
-- A wallet that opts into segment downloads verifies the bytes before using them. Ordinary compact-block RPCs remain available to clients without the download path.
-- Header and proof coverage requires the optional stored set, and shifted-key hints require a separate consumer opt-in.
 - Compatibility work has one general target instead of per-app exceptions.
 - Light-wallet serving requires complete history at admission. Native query and full-wallet compatibility can admit checkpointed stores and refuse individual requests that need unavailable history.
 - A wallet-serving reader keeps serving tree state, blocks, and transparent reads while the node is down ([ADR-0016](0016-wallet-serving-readiness.md)). A light-wallet reader keeps serving tree state and blocks, and only its calls that need the forwarding node fail. [Readiness](../reference/readiness.md#during-a-node-outage) lists the behavior per method.
@@ -106,11 +64,11 @@ Several optional fields, such as a fee that needs resolved inputs or a raw trans
 - Rebuilding a canonical store applies the current construction settings. Changing the settings while reopening a published store preserves its existing coverage.
 - Adding an optional field touches the proto, the capability registry and its tests, and the handler that fills it, in one change.
 - Consumers branch on field presence and on `ServerInfo` capabilities, never on sentinel values.
+- A wallet that opts into segment downloads verifies the bytes before using them. Ordinary compact-block RPCs remain available to clients without the download path.
+- Header and proof coverage requires the optional stored set, and shifted-key hints require a separate consumer opt-in.
 
 ## Alternatives rejected
 
-- **Reuse the snapshot signing key in every wallet.** Wallets already authenticate their Zinder endpoint and can take the expected digest from it without a second trust distribution channel.
-- **Add shifted keys or full consensus headers to the default compact payload.** Every scanner would pay extra bytes, and unverified shifted keys can lose receipts.
 - **Fall back to the node for missing artifacts.** It blurs the source of truth, makes readiness lie, and turns query runtimes into partial node proxies. Repair tools may use the node to rebuild artifacts. Public reads may not. The light-wallet composition's node-backed methods are not a fallback: the composition declares which methods use the node, it decides from the admitted store's retention rather than from a miss, and readiness reports the node as their dependency.
 - **A per-wallet coverage profile.** It recreates the app-specific design this decision avoids.
 - **Bounded history for light-wallet serving.** This composition serves from height one and needs the local chain's history to verify forwarded answers.
@@ -122,6 +80,8 @@ Several optional fields, such as a fee that needs resolved inputs or a raw trans
 - **Exit ingest when the background verification finds a damaged row.** The writer does not read the damaged history and can still commit. An exit would leave an orchestrator restarting a process that finds the same row on each start, while parking readiness keeps ingest up to report the damage to its readers.
 - **Refuse `CanonicalControl.WriterStatus` while the store is damaged.** Readers would see only an unreachable writer: they would keep serving until their staleness ceiling passed and then report `writer_status_unavailable`, the projector would fail its convergence, and a supervisor could not tell damage from an outage. A typed field in the status lets readers refuse at once with a cause that names the damage, and lets the projector and supervisors treat it as a park.
 - **Sentinel values for absent fields.** A consumer cannot tell "unresolved" from a real zero fee or balance.
+- **Reuse the snapshot signing key in every wallet.** Wallets already authenticate their Zinder endpoint and can take the expected digest from it without a second trust distribution channel.
+- **Add shifted keys or full consensus headers to the default compact payload.** Every scanner would pay extra bytes, and unverified shifted keys can lose receipts.
 
 ## Revision history
 
@@ -131,8 +91,8 @@ Several optional fields, such as a fee that needs resolved inputs or a raw trans
 - 2026-11-24. Decision 8 notes per-segment artifact schema versioning for pre-v7 and ZIP-231 coexistence.
 - 2026-11-24. Decision 8 covers non-transparent range and nullifier wire serving over canonical shielded payloads below Ironwood activation.
 - 2026-11-24. Decision 4 allows verified mined transaction bytes in lean wallet serving.
-- 2026-11-21. Decision 7 distinguishes the default background backfill from opt-in dense checkpoint writes during construction.
 - 2026-11-23. Decision 8 assigns the signed settled-history projection to the compatibility adapter and coverage and chain identity to canonical storage, and the consequences record the second copy of settled compact blocks it costs.
 - 2026-11-23. Decision 7 and its consequences follow the wallet-serving dense construction default and its measured Mainnet READY time and disk growth.
 - 2026-11-23. The record covers the native data plane. Decisions 2 and 4 confine node-backed reads to the light-wallet lightwalletd composition, which ADR-0003 governs. Native `WalletQuery` forwards no indexed read. Decision 2 includes light-wallet subtree streams, and the consequences distinguish checkpointed admission from light-wallet's complete-history requirement.
 - 2026-11-23. Evidence records what decisions 2 and 4 rest on.
+- 2026-11-21. Decision 7 distinguishes the default background backfill from opt-in dense checkpoint writes during construction.

@@ -67,10 +67,10 @@ The Explorer and the Cipherscan adapter already keep serving through upstream ou
 
 ## Revision history
 
-- 2026-11-20. Bound how long a caught-up mempool stream can wait for a replacement generation.
-- 2026-11-20. Decision 9 ties the node-outage budget to ingest’s current wait reason.
 - 2026-11-23. The consequences state that READY does not imply tree-state checkpoint coverage, with its measured restore cost and the signals that show densification progress.
 - 2026-11-23. Decision 1 adds light-wallet admission on an attested canonical generation. Decision 3 separates an unreachable node from a node that refuses a request, and the consequences state the light-wallet node-outage behavior.
 - 2026-11-23. Decision 3 says an admitted request attempts the node independently of probes and names its other errors. The light-wallet outage consequence separates the forwarding node from ingest and links the per-method readiness reference.
 - 2026-11-23. Evidence records what decisions 1 and 3 rest on for light-wallet serving.
 - 2026-11-23. Decision 2 ties gate closure to decision 5's attestation bound. Decision 8 scopes the stale-tip check to the tip calls.
+- 2026-11-20. Bound how long a caught-up mempool stream can wait for a replacement generation.
+- 2026-11-20. Decision 9 ties the node-outage budget to ingest’s current wait reason.

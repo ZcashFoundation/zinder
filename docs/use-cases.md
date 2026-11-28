@@ -11,6 +11,7 @@ In every pattern, Zinder serves public chain data from your configured node. Key
 | Light wallet | `CompactTxStreamer` on `zinder-compat-lightwalletd` | Yes | Existing lightwalletd client with no protocol changes |
 | Browser wallet | gRPC-Web on `zinder-compat-lightwalletd` | Optional (CORS origins) | Browser SDK (e.g., WebZjs) over the same HTTPS endpoint |
 | Native wallet or backend | `WalletQuery` on `zinder-query`, or `zinder-client` | Yes | Multi-call epoch-pinned reads, typed retries, capability checks |
+| Mobile wallet wake-up | `zinder-client` companion over `ChainEvents` | Planned | Coalesced public tip wake-ups for the wallet operator's push gateway |
 | Payment or deposit tracker | `ChainEvents` + transparent queries on `zinder-query` | Yes | Resumable reorg-aware cursor + outpoint spend checks |
 | Faucet or transaction sender | `BroadcastTransaction` + `Transaction` on `zinder-query` | Yes | Typed broadcast verdicts with multi-node failover |
 | Block explorer | `ExplorerQuery` on `zinder-explorer` (plus optional `zinder-compat-cipherscan`) | Optional (`--preset explorer`) | Displaced-block queries from canonical store; `BlockDetail`, block production, `BlockTransactions`, search, fee/pool/address views, and mempool with materialized views and `WalletQuery` |
@@ -43,21 +44,9 @@ A server-side wallet pairs `zinder-client` with a wallet library such as `librus
 
 ## Mobile wallet wake-ups
 
-The ratified silent wake-up design is a stateless `zinder-client` companion
-example outside `bin/zinder`. The bridge holds no device push tokens or
-viewing keys. It subscribes to `ChainEvents` with `live_tail` on every
-connection, without persisting or replaying cursors. Each webhook is a
-level-triggered signal to sync to the current tip. See
-[ADR-0013](adrs/0013-chain-event-streams.md) and
-[#698](https://github.com/ZcashFoundation/zinder/issues/698).
+The ratified silent wake-up design is a stateless `zinder-client` companion example outside `bin/zinder`. The bridge holds no device push tokens or viewing keys. It subscribes to `ChainEvents` with `live_tail` on every connection, without persisting or replaying cursors. Each webhook is a level-triggered signal to sync to the current tip. See [ADR-0013](adrs/0013-chain-event-streams.md) and [#698](https://github.com/ZcashFoundation/zinder/issues/698).
 
-The bridge coalesces tip changes for 20–30 minutes by default, within
-Apple's guidance of about two to three background pushes per hour. It
-sends only public `(network, chain_epoch_id, visible_tip, settled_tip_height)`
-facts to the wallet operator's push gateway and signs the payload and
-timestamp with HMAC-SHA256. The operator's gateway manages device tokens
-and push delivery. Wallets jitter reconnects before syncing from their
-last durable state. [APNs background updates](https://developer.apple.com/documentation/usernotifications/pushing-background-updates-to-your-app).
+The bridge coalesces tip changes for 20–30 minutes by default, within Apple's guidance of about two to three background pushes per hour. It sends only public `(network, chain_epoch_id, visible_tip, settled_tip_height)` facts to the wallet operator's push gateway and signs the payload and timestamp with HMAC-SHA256. The operator's gateway manages device tokens and push delivery. Wallets jitter reconnects before syncing from their last durable state. [APNs background updates](https://developer.apple.com/documentation/usernotifications/pushing-background-updates-to-your-app).
 
 ## Payment and deposit tracking
 
