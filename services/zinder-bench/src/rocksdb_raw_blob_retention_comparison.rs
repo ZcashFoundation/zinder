@@ -13,7 +13,7 @@ use zinder_bench::{
     BenchError,
     canonical_fixture_replay::{
         CanonicalFixtureRocksDbReplayConfig, CanonicalFixtureRocksDbReplayOutcome,
-        replay_canonical_fixture_into_rocksdb,
+        TreeStateCheckpointCoverage, replay_canonical_fixture_into_rocksdb,
     },
     fixture::FixtureManifest,
     report::{
@@ -23,29 +23,29 @@ use zinder_bench::{
 use zinder_core::{BlockId, ChainTipMetadata};
 use zinder_ingest::CanonicalPipelineLimits;
 use zinder_store::{
-    CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreReadyEvidence,
     CanonicalSubtreeRootLoadCoverage, RawBlobRetention, RocksDbCanonicalSecondary,
     RocksDbResourceBudget,
 };
 
 const REPORT_CONTRACT_IDENTITY: &str = "rocksdb-raw-blob-retention-comparison";
-const REPORT_FORMAT_VERSION: u16 = 2;
+const REPORT_FORMAT_VERSION: u16 = 1;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
 
-/// CLI contract for one authenticated `transactions` versus `all` comparison.
+/// CLI contract for one authenticated `none` versus `all` comparison.
 #[derive(Args)]
 pub(crate) struct RocksDbRawBlobRetentionComparisonArgs {
     /// Directory containing the fixture manifest, segments, and replay plan.
     #[arg(long)]
     fixture: PathBuf,
-    /// Fresh canonical destination for the `transactions` arm.
-    #[arg(long = "transactions-canonical-store")]
-    transactions_canonical_store: PathBuf,
-    /// Fresh local secondary metadata destination for the `transactions` arm.
-    #[arg(long = "transactions-secondary-root")]
-    transactions_secondary_root: PathBuf,
+    /// Fresh canonical destination for the `none` arm.
+    #[arg(long = "none-canonical-store")]
+    none_canonical_store: PathBuf,
+    /// Fresh local secondary metadata destination for the `none` arm.
+    #[arg(long = "none-secondary-root")]
+    none_secondary_root: PathBuf,
     /// Fresh canonical destination for the `all` arm.
     #[arg(long = "all-canonical-store")]
     all_canonical_store: PathBuf,
@@ -82,6 +82,12 @@ pub(crate) struct RocksDbRawBlobRetentionComparisonArgs {
     /// Aggregate canonical preparation memory watermark.
     #[arg(long = "block-prepare-memory-watermark-bytes")]
     block_prepare_memory_watermark_bytes: Option<u64>,
+    /// Tree-state checkpoint coverage persisted during canonical construction.
+    #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Commitment threshold for commitment-budget coverage. Defaults to the ingest threshold.
+    #[arg(long)]
+    tree_state_commitment_budget: Option<NonZeroU32>,
     /// Write the JSON report to this fresh path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -99,7 +105,7 @@ pub(crate) struct RocksDbRawBlobRetentionComparisonReport {
     contract_identity: &'static str,
     report_format_version: u16,
     arm_execution_order: [RawBlobRetention; 2],
-    transactions: RawBlobRetentionArmReport,
+    none: RawBlobRetentionArmReport,
     all: RawBlobRetentionArmReport,
 }
 
@@ -112,6 +118,7 @@ struct RawBlobRetentionArmReport {
     secondary_root_path: String,
     effective_limits: EffectiveLimits,
     logical_replay_identity: LogicalReplayIdentity,
+    storage_layout_evidence: StorageLayoutEvidence,
     raw_blob_counts: RawBlobCounts,
     ready_identity: ReadyIdentity,
     physical_canonical_bytes: u64,
@@ -123,10 +130,11 @@ struct RawBlobRetentionArmReport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 struct EffectiveLimits {
-    workload: &'static str,
     request_timeout_seconds: u64,
     supported_reorg_depth: u32,
     source_segment_delay_millis: u64,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    tree_state_commitment_budget: Option<NonZeroU32>,
     derived_for_cpu_limit_cores: u32,
     derived_for_memory_limit_bytes: u64,
     pipeline: PipelineLimitSummary,
@@ -167,18 +175,13 @@ struct LogicalReplayIdentity {
     transaction_count: u64,
     block_header_count: u64,
     block_hash_index_count: u64,
-    block_replay_count: u64,
-    compact_block_count: u64,
     transaction_location_count: u64,
     tree_state_checkpoint_count: u64,
-    block_final_note_commitment_roots_count: u64,
     block_header_logical_bytes: u64,
     block_hash_index_logical_bytes: u64,
-    block_replay_logical_bytes: u64,
-    compact_block_logical_bytes: u64,
+    logical_replay_bytes: u64,
     transaction_location_logical_bytes: u64,
     tree_state_checkpoint_logical_bytes: u64,
-    block_final_note_commitment_roots_logical_bytes: u64,
     replay_format_version: u32,
     block_digest_version: u16,
     sequence_digest_version: u16,
@@ -196,11 +199,20 @@ struct LogicalReplayIdentity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct StorageLayoutEvidence {
+    settled_segment_index_count: u64,
+    live_tail_block_count: u64,
+    settled_segment_index_logical_bytes: u64,
+    live_tail_block_logical_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 struct RawBlobCounts {
     transaction_blob_count: u64,
     block_blob_count: u64,
     transaction_blob_logical_bytes: u64,
     block_blob_logical_bytes: u64,
+    live_tail_raw_block_logical_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -261,8 +273,8 @@ struct ChainTipTreeSizes {
 
 struct ValidatedComparisonArgs {
     fixture: PathBuf,
-    transactions_canonical_store: PathBuf,
-    transactions_secondary_root: PathBuf,
+    none_canonical_store: PathBuf,
+    none_secondary_root: PathBuf,
     all_canonical_store: PathBuf,
     all_secondary_root: PathBuf,
     request_timeout: Duration,
@@ -273,13 +285,15 @@ struct ValidatedComparisonArgs {
     supported_reorg_depth: u32,
     source_segment_delay: Duration,
     source_segment_delay_millis: u64,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    tree_state_commitment_budget: Option<NonZeroU32>,
     report: Option<PathBuf>,
 }
 
 struct FreshComparisonPaths {
     fixture: PathBuf,
-    transactions_canonical_store: PathBuf,
-    transactions_secondary_root: PathBuf,
+    none_canonical_store: PathBuf,
+    none_secondary_root: PathBuf,
     all_canonical_store: PathBuf,
     all_secondary_root: PathBuf,
     report: Option<PathBuf>,
@@ -300,12 +314,12 @@ pub(crate) async fn run_rocksdb_raw_blob_retention_comparison(
     let validated = args.validate()?;
     let manifest = FixtureManifest::read(&validated.fixture)?;
     let activations = manifest.activations_typed()?;
-    let transactions = run_retention_arm(
+    let none = run_retention_arm(
         &validated,
         &activations,
-        RawBlobRetention::Transactions,
-        &validated.transactions_canonical_store,
-        &validated.transactions_secondary_root,
+        RawBlobRetention::None,
+        &validated.none_canonical_store,
+        &validated.none_secondary_root,
     )
     .await?;
     let all = run_retention_arm(
@@ -316,14 +330,14 @@ pub(crate) async fn run_rocksdb_raw_blob_retention_comparison(
         &validated.all_secondary_root,
     )
     .await?;
-    require_comparable_arms(&transactions, &all)?;
+    require_comparable_arms(&none, &all)?;
 
     Ok(RocksDbRawBlobRetentionComparisonOutput {
         report: RocksDbRawBlobRetentionComparisonReport {
             contract_identity: REPORT_CONTRACT_IDENTITY,
             report_format_version: REPORT_FORMAT_VERSION,
-            arm_execution_order: [RawBlobRetention::Transactions, RawBlobRetention::All],
-            transactions,
+            arm_execution_order: [RawBlobRetention::None, RawBlobRetention::All],
+            none,
             all,
         },
         report_path: validated.report,
@@ -347,6 +361,8 @@ async fn run_retention_arm(
         raw_blob_retention,
         supported_reorg_depth: validated.supported_reorg_depth,
         source_segment_delay: validated.source_segment_delay,
+        tree_state_checkpoint_coverage: validated.tree_state_checkpoint_coverage,
+        tree_state_commitment_budget: validated.tree_state_commitment_budget,
     })
     .await?;
     let authenticated_replay_lifecycle_seconds = replay_started.elapsed().as_secs_f64();
@@ -358,8 +374,7 @@ async fn run_retention_arm(
         canonical_store_path,
         secondary_root_path,
         activations,
-        CanonicalStoreWorkload::Wallet,
-        raw_blob_retention,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(raw_blob_retention),
         CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
         validated.reader_resource_budget,
     )?;
@@ -377,8 +392,9 @@ async fn run_retention_arm(
         replay_plan_digest_sha256: outcome.replay_plan_digest_sha256.clone(),
         canonical_store_path: canonical_store_path.to_string_lossy().into_owned(),
         secondary_root_path: secondary_root_path.to_string_lossy().into_owned(),
-        effective_limits: EffectiveLimits::from_validated(validated),
+        effective_limits: EffectiveLimits::from_validated(validated, &outcome),
         logical_replay_identity: LogicalReplayIdentity::from_outcome(&outcome),
+        storage_layout_evidence: StorageLayoutEvidence::from_outcome(&outcome),
         raw_blob_counts: RawBlobCounts::from_outcome(&outcome),
         ready_identity: ReadyIdentity::from(outcome.reopened_ready_evidence),
         physical_canonical_bytes,
@@ -398,8 +414,8 @@ impl RocksDbRawBlobRetentionComparisonArgs {
         let limits = self.validate_limits()?;
         Ok(ValidatedComparisonArgs {
             fixture: paths.fixture,
-            transactions_canonical_store: paths.transactions_canonical_store,
-            transactions_secondary_root: paths.transactions_secondary_root,
+            none_canonical_store: paths.none_canonical_store,
+            none_secondary_root: paths.none_secondary_root,
             all_canonical_store: paths.all_canonical_store,
             all_secondary_root: paths.all_secondary_root,
             request_timeout: Duration::from_secs(limits.request_timeout_seconds.get()),
@@ -410,6 +426,12 @@ impl RocksDbRawBlobRetentionComparisonArgs {
             supported_reorg_depth: limits.supported_reorg_depth.get(),
             source_segment_delay: Duration::from_millis(self.source_segment_delay_millis),
             source_segment_delay_millis: self.source_segment_delay_millis,
+            tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
+            tree_state_commitment_budget: TreeStateCheckpointCoverage::from_selection(
+                self.tree_state_checkpoint_coverage
+                    .resolve(self.tree_state_commitment_budget)?,
+            )?
+            .1,
             report: paths.report,
         })
     }
@@ -417,28 +439,18 @@ impl RocksDbRawBlobRetentionComparisonArgs {
     fn validate_paths(&self) -> Result<FreshComparisonPaths, BenchError> {
         let fixture = fs::canonicalize(&self.fixture)
             .map_err(|source| BenchError::io(&self.fixture, source))?;
-        let transactions_canonical_store = resolve_fresh_path(
-            "--transactions-canonical-store",
-            &self.transactions_canonical_store,
-        )?;
-        let transactions_secondary_root = resolve_fresh_path(
-            "--transactions-secondary-root",
-            &self.transactions_secondary_root,
-        )?;
+        let none_canonical_store =
+            resolve_fresh_path("--none-canonical-store", &self.none_canonical_store)?;
+        let none_secondary_root =
+            resolve_fresh_path("--none-secondary-root", &self.none_secondary_root)?;
         let all_canonical_store =
             resolve_fresh_path("--all-canonical-store", &self.all_canonical_store)?;
         let all_secondary_root =
             resolve_fresh_path("--all-secondary-root", &self.all_secondary_root)?;
         let mut scoped_paths = vec![
             ("--fixture", fixture.as_path()),
-            (
-                "--transactions-canonical-store",
-                transactions_canonical_store.as_path(),
-            ),
-            (
-                "--transactions-secondary-root",
-                transactions_secondary_root.as_path(),
-            ),
+            ("--none-canonical-store", none_canonical_store.as_path()),
+            ("--none-secondary-root", none_secondary_root.as_path()),
             ("--all-canonical-store", all_canonical_store.as_path()),
             ("--all-secondary-root", all_secondary_root.as_path()),
         ];
@@ -453,8 +465,8 @@ impl RocksDbRawBlobRetentionComparisonArgs {
         require_pairwise_disjoint(&scoped_paths)?;
         Ok(FreshComparisonPaths {
             fixture,
-            transactions_canonical_store,
-            transactions_secondary_root,
+            none_canonical_store,
+            none_secondary_root,
             all_canonical_store,
             all_secondary_root,
             report,
@@ -539,12 +551,16 @@ impl RocksDbRawBlobRetentionComparisonArgs {
 }
 
 impl EffectiveLimits {
-    fn from_validated(validated: &ValidatedComparisonArgs) -> Self {
+    fn from_validated(
+        validated: &ValidatedComparisonArgs,
+        outcome: &CanonicalFixtureRocksDbReplayOutcome,
+    ) -> Self {
         Self {
-            workload: CanonicalStoreWorkload::Wallet.as_str(),
             request_timeout_seconds: validated.request_timeout_seconds,
             supported_reorg_depth: validated.supported_reorg_depth,
             source_segment_delay_millis: validated.source_segment_delay_millis,
+            tree_state_checkpoint_coverage: outcome.tree_state_checkpoint_coverage,
+            tree_state_commitment_budget: outcome.tree_state_commitment_budget,
             derived_for_cpu_limit_cores: CANONICAL_FIXTURE_REPLAY_PROFILE_CPU_CORES,
             derived_for_memory_limit_bytes: CANONICAL_FIXTURE_REPLAY_PROFILE_MEMORY_BYTES,
             pipeline: PipelineLimitSummary::from(validated.pipeline_limits),
@@ -603,19 +619,13 @@ impl LogicalReplayIdentity {
             transaction_count: load.transaction_count,
             block_header_count: load.block_header_count,
             block_hash_index_count: load.block_hash_index_count,
-            block_replay_count: load.block_replay_count,
-            compact_block_count: load.compact_block_count,
             transaction_location_count: load.transaction_location_count,
             tree_state_checkpoint_count: load.tree_state_checkpoint_count,
-            block_final_note_commitment_roots_count: load.block_final_note_commitment_roots_count,
             block_header_logical_bytes: load.block_header_logical_bytes,
             block_hash_index_logical_bytes: load.block_hash_index_logical_bytes,
-            block_replay_logical_bytes: load.block_replay_logical_bytes,
-            compact_block_logical_bytes: load.compact_block_logical_bytes,
+            logical_replay_bytes: load.logical_replay_bytes,
             transaction_location_logical_bytes: load.transaction_location_logical_bytes,
             tree_state_checkpoint_logical_bytes: load.tree_state_checkpoint_logical_bytes,
-            block_final_note_commitment_roots_logical_bytes: load
-                .block_final_note_commitment_roots_logical_bytes,
             replay_format_version: load.replay_format_version.value(),
             block_digest_version: load.block_digest_version.value(),
             sequence_digest_version: load.sequence_digest_version.value(),
@@ -634,6 +644,18 @@ impl LogicalReplayIdentity {
     }
 }
 
+impl StorageLayoutEvidence {
+    fn from_outcome(outcome: &CanonicalFixtureRocksDbReplayOutcome) -> Self {
+        let load = outcome.block_load_evidence;
+        Self {
+            settled_segment_index_count: load.settled_segment_index_count,
+            live_tail_block_count: load.live_tail_block_count,
+            settled_segment_index_logical_bytes: load.settled_segment_index_logical_bytes,
+            live_tail_block_logical_bytes: load.live_tail_block_logical_bytes,
+        }
+    }
+}
+
 impl RawBlobCounts {
     fn from_outcome(outcome: &CanonicalFixtureRocksDbReplayOutcome) -> Self {
         let load = outcome.block_load_evidence;
@@ -642,6 +664,7 @@ impl RawBlobCounts {
             block_blob_count: load.block_blob_count,
             transaction_blob_logical_bytes: load.transaction_blob_logical_bytes,
             block_blob_logical_bytes: load.block_blob_logical_bytes,
+            live_tail_raw_block_logical_bytes: load.live_tail_raw_block_logical_bytes,
         }
     }
 }
@@ -741,6 +764,14 @@ fn require_arm_replay_evidence(
             "{raw_blob_retention} full-scan block count differs from its loaded block count"
         )));
     }
+    if outcome.block_load_evidence.logical_replay_bytes == 0
+        || (outcome.block_load_evidence.live_tail_block_count == 0
+            && outcome.block_load_evidence.settled_segment_index_count == 0)
+    {
+        return Err(BenchError::report_format(format!(
+            "{raw_blob_retention} replay recorded zero canonical replay coverage"
+        )));
+    }
     require_retention_blob_counts(
         raw_blob_retention,
         outcome.block_load_evidence.block_count,
@@ -757,20 +788,15 @@ fn require_retention_blob_counts(
     transaction_blob_count: u64,
     block_blob_count: u64,
 ) -> Result<(), BenchError> {
-    if transaction_blob_count != transaction_count {
+    let (expected_transaction_blob_count, expected_block_blob_count) = match raw_blob_retention {
+        RawBlobRetention::None => (0, 0),
+        RawBlobRetention::All => (transaction_count, block_count),
+    };
+    if transaction_blob_count != expected_transaction_blob_count {
         return Err(BenchError::report_format(format!(
-            "{raw_blob_retention} retained {transaction_blob_count} transaction blobs for {transaction_count} transactions"
+            "{raw_blob_retention} retained {transaction_blob_count} transaction blobs; expected {expected_transaction_blob_count}"
         )));
     }
-    let expected_block_blob_count = match raw_blob_retention {
-        RawBlobRetention::Transactions => 0,
-        RawBlobRetention::All => block_count,
-        RawBlobRetention::None => {
-            return Err(BenchError::report_format(
-                "raw-blob retention comparison does not admit a none arm",
-            ));
-        }
-    };
     if block_blob_count != expected_block_blob_count {
         return Err(BenchError::report_format(format!(
             "{raw_blob_retention} retained {block_blob_count} block blobs; expected {expected_block_blob_count}"
@@ -780,43 +806,47 @@ fn require_retention_blob_counts(
 }
 
 fn require_comparable_arms(
-    transactions: &RawBlobRetentionArmReport,
+    none: &RawBlobRetentionArmReport,
     all: &RawBlobRetentionArmReport,
 ) -> Result<(), BenchError> {
-    if transactions.raw_blob_retention != RawBlobRetention::Transactions
+    if none.raw_blob_retention != RawBlobRetention::None
         || all.raw_blob_retention != RawBlobRetention::All
     {
         return Err(BenchError::report_format(
             "raw-blob retention comparison arms have unexpected retention identities",
         ));
     }
-    if transactions.fixture_manifest_digest_sha256 != all.fixture_manifest_digest_sha256 {
+    if none.fixture_manifest_digest_sha256 != all.fixture_manifest_digest_sha256 {
         return Err(BenchError::report_format(
             "raw-blob retention arms admitted different fixture manifest identities",
         ));
     }
-    if transactions.replay_plan_digest_sha256 != all.replay_plan_digest_sha256 {
+    if none.replay_plan_digest_sha256 != all.replay_plan_digest_sha256 {
         return Err(BenchError::report_format(
             "raw-blob retention arms admitted different replay plan identities",
         ));
     }
-    if transactions.effective_limits != all.effective_limits {
+    if none.effective_limits != all.effective_limits {
         return Err(BenchError::report_format(
             "raw-blob retention arms used different effective limits",
         ));
     }
-    if transactions.logical_replay_identity != all.logical_replay_identity {
+    if none.logical_replay_identity != all.logical_replay_identity {
         return Err(BenchError::report_format(
             "raw-blob retention arms produced different logical replay identities",
         ));
     }
-    if transactions.raw_blob_counts.transaction_blob_count
-        != all.raw_blob_counts.transaction_blob_count
-        || transactions.raw_blob_counts.transaction_blob_logical_bytes
-            != all.raw_blob_counts.transaction_blob_logical_bytes
+    if none.raw_blob_counts.transaction_blob_count != 0
+        || none.raw_blob_counts.transaction_blob_logical_bytes != 0
+        || none.raw_blob_counts.block_blob_count != 0
+        || none.raw_blob_counts.block_blob_logical_bytes != 0
+        || none.raw_blob_counts.live_tail_raw_block_logical_bytes != 0
+        || all.raw_blob_counts.transaction_blob_count
+            != all.logical_replay_identity.transaction_count
+        || all.raw_blob_counts.block_blob_count != all.logical_replay_identity.block_count
     {
         return Err(BenchError::report_format(
-            "raw-blob retention arms produced different transaction-blob evidence",
+            "raw-blob retention arms produced unexpected raw-blob counts",
         ));
     }
     Ok(())
@@ -921,14 +951,10 @@ mod tests {
             "test".to_owned(),
             "--fixture".to_owned(),
             root.join("fixture").to_string_lossy().into_owned(),
-            "--transactions-canonical-store".to_owned(),
-            root.join("transactions-canonical")
-                .to_string_lossy()
-                .into_owned(),
-            "--transactions-secondary-root".to_owned(),
-            root.join("transactions-secondary")
-                .to_string_lossy()
-                .into_owned(),
+            "--none-canonical-store".to_owned(),
+            root.join("none-canonical").to_string_lossy().into_owned(),
+            "--none-secondary-root".to_owned(),
+            root.join("none-secondary").to_string_lossy().into_owned(),
             "--all-canonical-store".to_owned(),
             root.join("all-canonical").to_string_lossy().into_owned(),
             "--all-secondary-root".to_owned(),
@@ -952,10 +978,23 @@ mod tests {
             validated.supported_reorg_depth,
             zinder_store::DEFAULT_REORG_WINDOW_BLOCKS
         );
-        assert!(!validated.transactions_canonical_store.exists());
-        assert!(!validated.transactions_secondary_root.exists());
+        assert_eq!(
+            validated.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::CadenceAndTip
+        );
+        assert!(!validated.none_canonical_store.exists());
+        assert!(!validated.none_secondary_root.exists());
         assert!(!validated.all_canonical_store.exists());
         assert!(!validated.all_secondary_root.exists());
+
+        let dense = TestCli::try_parse_from(arguments(
+            root.path(),
+            &["--tree-state-checkpoint-coverage", "every-block"],
+        ))?;
+        assert_eq!(
+            dense.comparison.validate()?.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::EveryBlock
+        );
         Ok(())
     }
 
@@ -982,7 +1021,7 @@ mod tests {
         let root = tempdir()?;
         let fixture = root.path().join("fixture");
         fs::create_dir(&fixture)?;
-        let nested_output = fixture.join("transactions-canonical");
+        let nested_output = fixture.join("none-canonical");
         let mut arguments = arguments(root.path(), &[]);
         arguments[4] = nested_output.to_string_lossy().into_owned();
         let cli = TestCli::try_parse_from(arguments)?;
@@ -994,17 +1033,18 @@ mod tests {
             .ok_or("fixture overlap must be rejected")?;
 
         assert!(error.to_string().contains("--fixture"));
-        assert!(error.to_string().contains("--transactions-canonical-store"));
+        assert!(error.to_string().contains("--none-canonical-store"));
         Ok(())
     }
 
     #[test]
     fn retention_blob_counts_enforce_each_arm_contract() -> Result<(), Box<dyn Error>> {
-        require_retention_blob_counts(RawBlobRetention::Transactions, 5, 9, 9, 0)?;
+        require_retention_blob_counts(RawBlobRetention::None, 5, 9, 0, 0)?;
         require_retention_blob_counts(RawBlobRetention::All, 5, 9, 9, 5)?;
-        assert!(require_retention_blob_counts(RawBlobRetention::Transactions, 5, 9, 8, 0).is_err());
+        assert!(require_retention_blob_counts(RawBlobRetention::None, 5, 9, 9, 0).is_err());
+        assert!(require_retention_blob_counts(RawBlobRetention::None, 5, 9, 0, 5).is_err());
         assert!(require_retention_blob_counts(RawBlobRetention::All, 5, 9, 9, 0).is_err());
-        assert!(require_retention_blob_counts(RawBlobRetention::None, 5, 9, 0, 0).is_err());
+        assert!(require_retention_blob_counts(RawBlobRetention::All, 5, 9, 8, 5).is_err());
         Ok(())
     }
 
@@ -1022,6 +1062,187 @@ mod tests {
             REPORT_CONTRACT_IDENTITY,
             "rocksdb-raw-blob-retention-comparison"
         );
-        assert_eq!(REPORT_FORMAT_VERSION, 2);
+        assert_eq!(REPORT_FORMAT_VERSION, 1);
+    }
+
+    fn sample_block_id(height: u32) -> super::BlockIdSummary {
+        super::BlockIdSummary {
+            height,
+            hash_hex: format!("{height:064x}"),
+        }
+    }
+
+    fn sample_limits() -> super::EffectiveLimits {
+        let budget = super::RocksDbResourceBudgetSummary {
+            block_cache_bytes: 1_024,
+            max_wal_bytes: 1_024,
+            max_open_files: 64,
+            write_buffer_bytes: 1_024,
+            max_write_buffer_count: 2,
+            max_background_jobs: 1,
+            memtable_budget_bytes: 2_048,
+            statistics_level: "except-detailed-timers",
+        };
+        super::EffectiveLimits {
+            request_timeout_seconds: 30,
+            supported_reorg_depth: 2,
+            source_segment_delay_millis: 0,
+            tree_state_checkpoint_coverage: super::TreeStateCheckpointCoverage::CadenceAndTip,
+            tree_state_commitment_budget: None,
+            derived_for_cpu_limit_cores: 4,
+            derived_for_memory_limit_bytes: 1_048_576,
+            pipeline: super::PipelineLimitSummary {
+                max_response_bytes: 64,
+                source_segment_target_response_bytes: 32,
+                source_segment_max_blocks: 16,
+                source_fetch_max_in_flight_requests: 2,
+                source_fetch_max_in_flight_bytes: 64,
+                block_prepare_concurrency: 2,
+                block_prepare_memory_watermark_bytes: 64,
+            },
+            canonical_writer_rocksdb: budget,
+            canonical_reader_rocksdb: budget,
+        }
+    }
+
+    fn sample_logical_identity(block_count: u64) -> super::LogicalReplayIdentity {
+        let tip = sample_block_id(5);
+        let ready = super::ReadyLogicalIdentity {
+            first_retained_block: sample_block_id(1),
+            visible_tip: tip.clone(),
+            visible_epoch_id: 1,
+            visible_event_sequence: 1,
+            visible_block_count: block_count,
+            block_digest_version: 1,
+            replay_format_version: 1,
+            sequence_digest_version: 1,
+            visible_sequence_digest_sha256: "aa".repeat(32),
+            visible_logical_replay_bytes: 512,
+            sequence_checkpoint: super::SequenceCheckpointSummary {
+                through: tip.clone(),
+                retained_block_count: block_count,
+                sequence_digest_version: 1,
+                sequence_digest_block_count: block_count,
+                sequence_digest_sha256: "bb".repeat(32),
+                logical_replay_bytes: 512,
+            },
+            construction_manifest_version: 1,
+        };
+        super::LogicalReplayIdentity {
+            first_retained_block: sample_block_id(1),
+            first_parent_hash_hex: "00".repeat(32),
+            visible_tip: tip.clone(),
+            visible_tip_tree_sizes: super::ChainTipTreeSizes {
+                sapling: 10,
+                orchard: 20,
+                ironwood: 30,
+            },
+            block_count,
+            transaction_count: 10,
+            block_header_count: block_count,
+            block_hash_index_count: block_count,
+            transaction_location_count: 10,
+            tree_state_checkpoint_count: 1,
+            block_header_logical_bytes: 200,
+            block_hash_index_logical_bytes: 100,
+            logical_replay_bytes: 512,
+            transaction_location_logical_bytes: 300,
+            tree_state_checkpoint_logical_bytes: 64,
+            replay_format_version: 1,
+            block_digest_version: 1,
+            sequence_digest_version: 1,
+            sequence_digest_sha256: "cc".repeat(32),
+            subtree_root_count: 1,
+            subtree_root_logical_bytes: 64,
+            subtree_root_coverage: super::CanonicalSubtreeRootLoadCoverage::CompletePrefix,
+            subtree_root_sequence_digest_version: 1,
+            subtree_root_sequence_digest_sha256: "dd".repeat(32),
+            source_tip_checkpoint_authenticated: true,
+            settled_tip: sample_block_id(4),
+            event_fence: super::EventFenceSummary {
+                chain_epoch_id: 1,
+                chain_event_sequence: 1,
+                visible_tip: tip,
+                sequence_digest_version: 1,
+                sequence_digest_block_count: block_count,
+                sequence_digest_sha256: "ee".repeat(32),
+            },
+            full_scan_block_count: block_count,
+            ready,
+        }
+    }
+
+    fn sample_arm(
+        retention: RawBlobRetention,
+        block_count: u64,
+        layout: super::StorageLayoutEvidence,
+    ) -> super::RawBlobRetentionArmReport {
+        let logical = sample_logical_identity(block_count);
+        let ready_logical = logical.ready.clone();
+        let retain_blobs = retention == RawBlobRetention::All;
+        super::RawBlobRetentionArmReport {
+            raw_blob_retention: retention,
+            fixture_manifest_digest_sha256: "11".repeat(32),
+            replay_plan_digest_sha256: "22".repeat(32),
+            canonical_store_path: "/tmp/store".to_owned(),
+            secondary_root_path: "/tmp/sec".to_owned(),
+            effective_limits: sample_limits(),
+            logical_replay_identity: logical,
+            storage_layout_evidence: layout,
+            raw_blob_counts: super::RawBlobCounts {
+                transaction_blob_count: if retain_blobs { 10 } else { 0 },
+                block_blob_count: if retain_blobs { block_count } else { 0 },
+                transaction_blob_logical_bytes: if retain_blobs { 400 } else { 0 },
+                block_blob_logical_bytes: if retain_blobs { 800 } else { 0 },
+                live_tail_raw_block_logical_bytes: if retain_blobs { 512 } else { 0 },
+            },
+            ready_identity: super::ReadyIdentity {
+                logical: ready_logical,
+                construction_manifest_version: 1,
+                construction_manifest_sha256: "33".repeat(32),
+            },
+            physical_canonical_bytes: 2_048,
+            authenticated_replay_lifecycle_seconds: 1.0,
+            authenticated_replay_lifecycle_blocks_per_second: Some(5.0),
+            secondary_open_ready_and_initial_catch_up_seconds: 0.1,
+            secondary_ready_matches_reopened_primary: true,
+        }
+    }
+
+    #[test]
+    fn require_comparable_arms_allows_different_storage_layout_split_boundaries() {
+        let none_arm = sample_arm(
+            RawBlobRetention::None,
+            5,
+            super::StorageLayoutEvidence {
+                settled_segment_index_count: 1,
+                live_tail_block_count: 1,
+                settled_segment_index_logical_bytes: 320,
+                live_tail_block_logical_bytes: 256,
+            },
+        );
+        let all_arm = sample_arm(
+            RawBlobRetention::All,
+            5,
+            super::StorageLayoutEvidence {
+                settled_segment_index_count: 2,
+                live_tail_block_count: 1,
+                settled_segment_index_logical_bytes: 640,
+                live_tail_block_logical_bytes: 256,
+            },
+        );
+        assert!(super::require_comparable_arms(&none_arm, &all_arm).is_ok());
+
+        let mismatch_arm = sample_arm(
+            RawBlobRetention::All,
+            6,
+            super::StorageLayoutEvidence {
+                settled_segment_index_count: 2,
+                live_tail_block_count: 2,
+                settled_segment_index_logical_bytes: 640,
+                live_tail_block_logical_bytes: 256,
+            },
+        );
+        assert!(super::require_comparable_arms(&none_arm, &mismatch_arm).is_err());
     }
 }

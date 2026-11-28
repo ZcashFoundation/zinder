@@ -11,12 +11,10 @@
 //! found within one pass over it.
 //!
 //! Verification reads through a [`RocksDbTreeStateVerifier`], a canonical
-//! secondary whose checkpoint family has no block cache, so every read takes
-//! its blocks from the table file and checks their checksums. A block that an
-//! earlier read cached cannot hide damage done to the file since. A block
-//! that fails that check is damage, reported like a row that fails a row
-//! check. A table file the primary has since deleted is not damage: it is an
-//! ordinary store error that clears once the secondary catches up.
+//! secondary that bypasses the block cache for checkpoints and block headers.
+//! Each read of a data block from their table files rechecks its checksum.
+//! A checksum failure is reported as damage. If the primary has deleted a
+//! table file, the secondary retries after catching up.
 
 use std::{num::NonZeroU32, path::Path};
 
@@ -29,24 +27,23 @@ use zinder_core::{
 
 use super::{
     CanonicalReorgPolicy, CanonicalSecondaryCatchupOutcome, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
+    CanonicalStoreReadyEvidence, RocksDbCanonicalSecondary,
     block_load::{decode_tree_state_checkpoint, encode_block_position},
     frontier_presence_mismatch,
     publication::column_family,
     reader::{CanonicalServingRead, decode_block_header},
     rocksdb::{
-        BLOCK_HEADER_COLUMN_FAMILY, CanonicalStoreAdmissionExpectation,
+        BLOCK_HEADER_COLUMN_FAMILY, CanonicalStoreAdmissionExpectation, StoredDataAdmission,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY, canonical_verification_column_family_descriptors,
     },
+    stored_set::CANONICAL_DATA_COLUMN_FAMILIES,
 };
-use crate::{RawBlobRetention, RocksDbResourceBudget};
+use crate::{RawBlobRetention, RocksDbResourceBudget, StoreRole};
 
 /// A canonical secondary opened to verify stored tree-state checkpoints.
 ///
-/// Its tree-state checkpoint family reads through no block cache, so each
-/// verification reads the checkpoint blocks from their table files and
-/// checks their checksums, whatever an earlier read loaded. It serves no
-/// other read.
+/// It bypasses the block cache for checkpoint and block-header data blocks
+/// so that an earlier read cannot mask damage to either table file.
 pub struct RocksDbTreeStateVerifier {
     pub(super) secondary: RocksDbCanonicalSecondary,
 }
@@ -127,12 +124,13 @@ pub struct TreeStateVerificationError {
 }
 
 impl RocksDbTreeStateVerifier {
-    /// Opens one exactly admitted secondary for verification and catches it
+    /// Opens a secondary for verification with minimum data requirements and catches it
     /// up to the primary's current state, as
     /// [`RocksDbCanonicalSecondary::open_ready`] does.
     ///
-    /// `resource_budget` bounds every family but the checkpoint family,
-    /// which reads through no block cache.
+    /// The checkpoint and block-header families keep their indexes in table
+    /// readers. The resource budget's open-file limit bounds the number of
+    /// these readers.
     #[allow(
         clippy::too_many_arguments,
         reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
@@ -141,7 +139,6 @@ impl RocksDbTreeStateVerifier {
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
         expected_network_upgrade_activations: &NetworkUpgradeActivations,
-        expected_workload: CanonicalStoreWorkload,
         expected_raw_blob_retention: RawBlobRetention,
         expected_reorg_policy: CanonicalReorgPolicy,
         resource_budget: RocksDbResourceBudget,
@@ -151,14 +148,28 @@ impl RocksDbTreeStateVerifier {
             secondary_path.as_ref(),
             &CanonicalStoreAdmissionExpectation::from_activations(
                 expected_network_upgrade_activations,
-                expected_workload,
-                expected_raw_blob_retention,
+                StoredDataAdmission::Minimum(
+                    super::CanonicalStoreRequirements::for_blob_retention(
+                        expected_raw_blob_retention,
+                    ),
+                ),
                 expected_reorg_policy,
             ),
             resource_budget.into(),
             canonical_verification_column_family_descriptors,
         )
-        .map(|secondary| Self { secondary })
+        .map(|secondary| {
+            secondary.record_settled_corpus_admission(StoreRole::TreeStateVerificationSecondary);
+            Self { secondary }
+        })
+    }
+
+    /// Publishes this verifier's resource gauges independently of replay and serving readers.
+    pub fn record_resource_gauges(&self) {
+        self.secondary.bounded_open.record_resource_gauges(
+            StoreRole::TreeStateVerificationSecondary,
+            &CANONICAL_DATA_COLUMN_FAMILIES,
+        );
     }
 
     /// Catches the secondary up, as
@@ -166,7 +177,8 @@ impl RocksDbTreeStateVerifier {
     pub fn try_catch_up(
         &mut self,
     ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
-        self.secondary.try_catch_up()
+        self.secondary
+            .try_catch_up_for_role(StoreRole::TreeStateVerificationSecondary)
     }
 
     /// Returns the currently admitted READY evidence.

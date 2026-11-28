@@ -3,9 +3,9 @@ name: parity-compat
 # T3 (live) fixed-fence parity diff between Zinder's `zinder-compat-lightwalletd`
 # and the pinned upstream `electriccoinco/lightwalletd` Go reference, both
 # pointed at the same pinned regtest node. One leg runs against Zebra 7.1.0 and
-# one against Zakura 1.8.6; both legs must pass on a release commit. Mempool
-# parity remains outside this workflow until dedicated ingest-control
-# composition is restored.
+# one against Zakura 1.8.6; both legs must pass on a release commit. Each
+# leg also compares the qualification build with ordinary wallet serving,
+# including a signed spend and a node outage under both retention policies.
 #
 # Test sources: services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs
 
@@ -17,25 +17,36 @@ on:
     # Keep this list identical in live-tests.yml and parity-compat.yml. It
     # covers every crate the live and parity tests exercise, the workspace
     # manifest and lockfile that pin the consensus cohort, the node
-    # configurations, the mining and indexer TLS scripts, the CI tool installer
-    # and its lock (which pins cargo-nextest), and both workflows.
+    # configurations, the mining and indexer TLS scripts, the CBB report
+    # validator, the CI tool installer and its lock (which pins cargo-nextest),
+    # the shared Rust setup action, and both workflows.
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".config/nextest.toml"
       - "crates/**"
+      - "services/zinder/**"
       - "services/zinder-bench/**"
+      - "services/zinder-compat-cipherscan/**"
       - "services/zinder-compat-lightwalletd/**"
       - "services/zinder-explorer/**"
       - "services/zinder-ingest/**"
+      - "services/zinder-projector/**"
       - "services/zinder-query/**"
+      - "deploy/systemd/**"
       - "deploy/zakura/**"
       - "deploy/zebra/**"
+      - "scripts/build-release-binary-archive.sh"
+      - "scripts/release-binary-platform.sh"
+      - "scripts/test-native-systemd-regtest.sh"
       - "scripts/mine-live-regtest.sh"
+      - "scripts/test-light-wallet-qualification.sh"
       - "scripts/generate-live-indexer-tls.sh"
+      - "scripts/validate-cbb-interop-report.sh"
       - "scripts/install-ci-tool.sh"
       - ".github/ci-tools.lock"
+      - ".github/actions/setup-rust/**"
       - ".github/workflows/live-tests.yml"
       - ".github/workflows/parity-compat.yml"
 
@@ -50,6 +61,8 @@ concurrency:
 # keep this block identical to the other Rust workflows.
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   PROTOC: /does/not/exist
   # The reference must parse the version-6 (NU6.3 and later) transactions that
   # every block from height 6 carries on the shared Regtest schedule in
@@ -64,8 +77,64 @@ env:
   REGTEST_NODE_RPC_URL: http://127.0.0.1:39232
 
 jobs:
+  # Compiles once for both node legs: the release binaries, the compat
+  # acceptance tests as a nextest archive, and the pinned CBB client.
+  build-parity:
+    name: build parity binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # This job builds the release profile as well as the test profile, so it
+      # keeps its own cache, saved only from the default branch.
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: parity
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+          tools: cargo-nextest
+
+      - name: Build Zinder binaries
+        run: cargo build --locked --release -p zinder-ingest -p zinder-compat-lightwalletd -p zinder-bench
+
+      - name: Archive the live test client
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/parity-binaries"
+          cargo nextest archive --locked -p zinder-compat-lightwalletd --test acceptance \
+            --archive-file "$RUNNER_TEMP/parity-binaries/compat-acceptance.tar.zst" --zstd-level 1
+          cp target/release/zinder-ingest target/release/zinder-compat-lightwalletd \
+            target/release/zinder-bench "$RUNNER_TEMP/parity-binaries/"
+
+      # CBB generates its bindings at build time. Zinder uses checked-in bindings.
+      - name: Install protoc for the CBB client
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "36.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the pinned CBB client
+        run: |
+          PROTOC="$(command -v protoc)" cargo install --locked \
+            --git https://github.com/dismad/cbb \
+            --rev a5a0899bac764cb330a442e777027a503a310197 \
+            --root "$RUNNER_TEMP/cbb"
+          cp "$RUNNER_TEMP/cbb/bin/cbb" "$RUNNER_TEMP/parity-binaries/"
+
+      - name: Upload parity binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: parity-binaries
+          path: ${{ runner.temp }}/parity-binaries/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
   parity-regtest:
     name: parity diff (regtest, ${{ matrix.node }})
+    needs: build-parity
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -76,28 +145,29 @@ jobs:
             container: zebra-regtest
           - node: zakura
             container: zakura-regtest
+    # The legs install no toolchain. They call `cargo-nextest nextest` on the
+    # archive, so rustup never reads rust-toolchain.toml.
+    env:
+      NEXTEST_ARCHIVE_FILE: ${{ github.workspace }}/target/release/compat-acceptance.tar.zst
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
-
-      # This job builds the release profile as well as the test profile, so it
-      # keeps its own cache. Only the Zebra leg saves it, and only from the
-      # default branch (the scheduled nightly run).
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: parity
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.node == 'zebra' }}
-
       - name: Install cargo-nextest
         run: scripts/install-ci-tool.sh cargo-nextest
 
-      - name: Build Zinder binaries
-        run: cargo build --locked --release -p zinder-ingest -p zinder-compat-lightwalletd -p zinder-bench
+      # Artifacts drop the executable bit, so restore it after the download.
+      - name: Download parity binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: parity-binaries
+          path: target/release
+
+      - name: Install parity binaries
+        run: |
+          chmod +x target/release/zinder-ingest target/release/zinder-compat-lightwalletd \
+            target/release/zinder-bench target/release/cbb
 
       # Zebra runs as a step rather than a service container because its
       # Regtest activation heights and funding streams come from a mounted
@@ -179,12 +249,18 @@ jobs:
             --rpchost 127.0.0.1 --rpcport 39232 --rpcuser zebra --rpcpassword zebra \
             --no-tls-very-insecure \
             --data-dir /tmp/lwd --log-file /dev/stdout
+          reference_ready=""
           for _ in $(seq 1 60); do
-            if docker logs lightwalletd-reference 2>&1 | grep -q "Waiting for block: $((tip + 1))"; then
+            if docker logs lightwalletd-reference 2>&1 | grep -F "Waiting for block: $((tip + 1))" >/dev/null; then
+              reference_ready=yes
               break
             fi
             sleep 2
           done
+          if [ -z "${reference_ready}" ]; then
+            echo "::error::Reference lightwalletd did not reach the Regtest fence at height ${tip}"
+            exit 1
+          fi
 
       - name: Build fixed-fence Zinder stores and start compat
         env:
@@ -250,7 +326,8 @@ jobs:
             exit 1
           fi
 
-          ZINDER_STORAGE__RAW_BLOB_POLICY=all \
+          # The mined Regtest timestamps predate the outage by years.
+          ZINDER_COMPAT__STALE_TIP_LIMIT_MS=0 ZINDER_STORAGE__RAW_BLOB_POLICY=all \
             ./target/release/zinder-compat-lightwalletd --network zcash-regtest \
             --canonical-primary-path .tmp/parity-store \
             --canonical-secondary-root .tmp/parity-secondary-compat-canonical \
@@ -276,6 +353,26 @@ jobs:
             exit 1
           fi
 
+      - name: Run CBB interoperability smoke
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$((PARITY_REGTEST_TIP - 1))" > .tmp/cbb-tree-heights.txt
+          cbb=target/release/cbb
+          "$cbb" \
+            --endpoint zinder=http://127.0.0.1:9087 \
+            --endpoint reference=http://127.0.0.1:9088 \
+            --concurrency 1 --warmup 0 --steps 1 --chunk 3 --start-height "$((PARITY_REGTEST_TIP - 2))" \
+            --tree-every 0 --timeout 30 --json-out .tmp/cbb-range.json
+          scripts/validate-cbb-interop-report.sh .tmp/cbb-range.json GetBlockRange zinder reference
+          # The pinned CBB checks response height in tree-file mode.
+          "$cbb" \
+            --endpoint zinder=http://127.0.0.1:9087 \
+            --endpoint reference=http://127.0.0.1:9088 \
+            --tree-heights-file .tmp/cbb-tree-heights.txt \
+            --concurrency 1 --warmup 0 --steps 1 --timeout 30 \
+            --json-out .tmp/cbb-tree.json
+          scripts/validate-cbb-interop-report.sh .tmp/cbb-tree.json GetTreeState zinder reference
+
       - name: Run parity diff
         env:
           ZINDER_TEST_LIVE: "1"
@@ -288,14 +385,28 @@ jobs:
           ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR: http://127.0.0.1:9088
           ZINDER_TEST_PARITY_TRANSPARENT_ADDRESS: ${{ env.PARITY_TRANSPARENT_ADDRESS }}
         run: |
-          cargo nextest run --locked -p zinder-compat-lightwalletd --profile=ci-live --run-ignored=all \
+          mkdir -p "$RUNNER_TEMP/nextest-extracted"
+          cargo-nextest nextest run --archive-file "$NEXTEST_ARCHIVE_FILE" \
+            --extract-to "$RUNNER_TEMP/nextest-extracted" --workspace-remap "$GITHUB_WORKSPACE" \
+            --profile=ci-live --run-ignored=all \
             -E 'test(/^live::parity_against_lightwalletd::/) and not test(/mempool/)'
+
+      - name: Compare light-wallet qualification with wallet serving
+        env:
+          ZINDER_NODE__JSON_RPC_ADDR: ${{ env.REGTEST_NODE_RPC_URL }}
+          ZINDER_NODE__AUTH__METHOD: basic
+          ZINDER_NODE__AUTH__USERNAME: zebra
+          ZINDER_NODE__AUTH__PASSWORD: zebra
+          REGTEST_CONTAINER: ${{ matrix.container }}
+        run: scripts/test-light-wallet-qualification.sh target/release "$REGTEST_CONTAINER" http://127.0.0.1:9087
 
       - name: Dump pipeline logs on failure
         if: failure()
         run: |
           echo "=== ingest.log ==="; tail -n 50 .tmp/ingest.log || true
           echo "=== compat.log ==="; tail -n 50 .tmp/compat.log || true
+          echo "=== cbb-range.json ==="; cat .tmp/cbb-range.json || true
+          echo "=== cbb-tree.json ==="; cat .tmp/cbb-tree.json || true
           echo "=== lightwalletd-reference ==="; docker logs lightwalletd-reference 2>&1 | tail -n 50 || true
           echo "=== ${{ matrix.container }} ==="; docker logs ${{ matrix.container }} 2>&1 | tail -n 50 || true
 

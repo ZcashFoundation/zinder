@@ -27,26 +27,78 @@ const DEFAULT_MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_MEMPOOL_EVENT_RETENTION_MAX_EVENTS_PER_STEP: u32 = 1_024;
 const DEFAULT_MEMPOOL_EVENT_RETENTION_MAX_ENCODED_BYTES_PER_STEP: u64 = 16_000_000;
 
-/// Raw `[retention]` config section.
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+/// Raw and serializable `[retention]` config section.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RetentionSection {
     /// Chain-event retention window in hours. `0` disables eviction.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub chain_event_retention_hours: Option<u64>,
     /// Chain-event retention sweep cadence in milliseconds. Must be > 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub chain_event_retention_check_interval_ms: Option<u64>,
     /// Cursor-at-risk warning lead time in hours.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor_at_risk_warning_hours: Option<u64>,
     /// Mined-mempool retention window in minutes. `0` disables retention.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mempool_mined_retention_minutes: Option<u64>,
     /// Invalidated-mempool retention window in hours. `0` disables retention.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mempool_invalidated_retention_hours: Option<u64>,
     /// Mempool-event retention sweep cadence in milliseconds. Must be > 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mempool_event_retention_check_interval_ms: Option<u64>,
     /// Maximum event rows examined by one mempool-retention step. Must be > 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mempool_event_retention_max_events_per_step: Option<u32>,
     /// Target maximum encoded bytes examined by one mempool-retention step. Must be > 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mempool_event_retention_max_encoded_bytes_per_step: Option<u64>,
+}
+
+impl RetentionSection {
+    /// Returns whether every `[retention]` field is unset.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.chain_event_retention_hours.is_none()
+            && self.chain_event_retention_check_interval_ms.is_none()
+            && self.cursor_at_risk_warning_hours.is_none()
+            && self.mempool_mined_retention_minutes.is_none()
+            && self.mempool_invalidated_retention_hours.is_none()
+            && self.mempool_event_retention_check_interval_ms.is_none()
+            && self.mempool_event_retention_max_events_per_step.is_none()
+            && self
+                .mempool_event_retention_max_encoded_bytes_per_step
+                .is_none()
+    }
+
+    /// Builds a [`RetentionSection`] projection from a [`ResolvedRetention`].
+    #[must_use]
+    pub const fn from_resolved(retention: ResolvedRetention) -> Self {
+        Self {
+            chain_event_retention_hours: Some(retention.chain_event_retention_hours),
+            chain_event_retention_check_interval_ms: Some(
+                retention.chain_event_retention_check_interval_ms,
+            ),
+            cursor_at_risk_warning_hours: Some(retention.cursor_at_risk_warning_hours),
+            mempool_mined_retention_minutes: Some(retention.mempool_mined_retention_minutes),
+            mempool_invalidated_retention_hours: Some(
+                retention.mempool_invalidated_retention_hours,
+            ),
+            mempool_event_retention_check_interval_ms: Some(
+                retention.mempool_event_retention_check_interval_ms,
+            ),
+            mempool_event_retention_max_events_per_step: Some(
+                retention.mempool_event_retention_max_events_per_step.get(),
+            ),
+            mempool_event_retention_max_encoded_bytes_per_step: Some(
+                retention
+                    .mempool_event_retention_max_encoded_bytes_per_step
+                    .get(),
+            ),
+        }
+    }
 }
 
 /// Fully resolved retention configuration with all defaults applied.
@@ -120,50 +172,6 @@ impl ResolvedRetention {
             self.mempool_event_retention_max_events_per_step,
             self.mempool_event_retention_max_encoded_bytes_per_step,
         )
-    }
-}
-
-/// Redacted TOML projection of the `[retention]` section.
-#[derive(Debug, Serialize)]
-pub struct RetentionToml {
-    /// Chain-event retention window in hours.
-    pub chain_event_retention_hours: u64,
-    /// Chain-event retention sweep cadence in milliseconds.
-    pub chain_event_retention_check_interval_ms: u64,
-    /// Cursor-at-risk warning lead time in hours.
-    pub cursor_at_risk_warning_hours: u64,
-    /// Mined-mempool retention window in minutes.
-    pub mempool_mined_retention_minutes: u64,
-    /// Invalidated-mempool retention window in hours.
-    pub mempool_invalidated_retention_hours: u64,
-    /// Mempool-event retention sweep cadence in milliseconds.
-    pub mempool_event_retention_check_interval_ms: u64,
-    /// Maximum event rows examined by one mempool-retention step.
-    pub mempool_event_retention_max_events_per_step: u32,
-    /// Target maximum encoded bytes examined by one mempool-retention step.
-    pub mempool_event_retention_max_encoded_bytes_per_step: u64,
-}
-
-impl RetentionToml {
-    /// Builds a [`RetentionToml`] from a [`ResolvedRetention`].
-    #[must_use]
-    pub const fn from_resolved(retention: ResolvedRetention) -> Self {
-        Self {
-            chain_event_retention_hours: retention.chain_event_retention_hours,
-            chain_event_retention_check_interval_ms: retention
-                .chain_event_retention_check_interval_ms,
-            cursor_at_risk_warning_hours: retention.cursor_at_risk_warning_hours,
-            mempool_mined_retention_minutes: retention.mempool_mined_retention_minutes,
-            mempool_invalidated_retention_hours: retention.mempool_invalidated_retention_hours,
-            mempool_event_retention_check_interval_ms: retention
-                .mempool_event_retention_check_interval_ms,
-            mempool_event_retention_max_events_per_step: retention
-                .mempool_event_retention_max_events_per_step
-                .get(),
-            mempool_event_retention_max_encoded_bytes_per_step: retention
-                .mempool_event_retention_max_encoded_bytes_per_step
-                .get(),
-        }
     }
 }
 

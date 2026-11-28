@@ -36,14 +36,17 @@ expect_rejected_because() {
 }
 
 bash "$validator" \
+  --deployment-class production \
+  --target zinder
+bash "$validator" \
   --deployment-class canary \
-  --target zinder-canonical-runtime
+  --target zinder
 bash "$validator" \
   --deployment-class diagnostic \
-  --target zinder-canonical-runtime
+  --target zinder
 
 expect_rejected \
-  "the single-volume wallet-serving target as production" \
+  "the retired single-volume wallet-serving target as production" \
   --deployment-class production \
   --target zinder-wallet-serving
 expect_rejected \
@@ -51,7 +54,7 @@ expect_rejected \
   --deployment-class production \
   --target zinder-single-container
 expect_rejected \
-  "the ingest-only canonical-runtime target as production" \
+  "the retired ingest-only canonical-runtime target as production" \
   --deployment-class production \
   --target zinder-canonical-runtime
 
@@ -69,38 +72,121 @@ bash "$validator" \
   --release-images-catalog "$release_images_catalog"
 bash "$validator" \
   --prometheus-config "$repository_root/deploy/observability/prometheus.yml"
+bash "$validator" \
+  --kubernetes-manifest "$repository_root/deploy/kubernetes/statefulset.yaml"
 
-if grep -Eq 'zinder-[a-z-]+:latest' "$repository_root/deploy/docker-compose.yml"; then
-  fail "the deployment Compose file defaults a Zinder runtime to latest"
+if grep -Eq 'zinder[^[:space:]]*:latest' \
+  "$repository_root/deploy/docker-compose.yml" \
+  "$repository_root/deploy/kubernetes/statefulset.yaml"; then
+  fail "the deployment Compose file or Kubernetes manifest defaults Zinder to :latest"
 fi
 
-deployment_env_names=(mainnet testnet regtest zakura-mainnet zakura-testnet)
+personal_compose="$repository_root/deploy/personal/compose.yaml"
+personal_compose_env=(
+  env -u DEPLOY_IMAGE -u DEPLOY_VERSION -u DEPLOY_SERVE_MEMORY_LIMIT
+  -u ZINDER_DEPLOYMENT__PROFILE -u ZINDER_NETWORK__NAME
+  -u ZEBRA_NETWORK__NETWORK -u ZINDER_NODE__JSON_RPC_ADDR
+)
+"${personal_compose_env[@]}" DEPLOY_VERSION=v0.27.0 \
+  docker compose --env-file /dev/null -f "$personal_compose" config --format json \
+  | jq -e '
+    .services.zinder.command == ["serve"]
+    and .services.zinder.environment.ZINDER_DEPLOYMENT__PROFILE == "light-wallet"
+    and .services.zinder.environment.ZINDER_COMPAT__LISTEN_ADDR == "[::]:9067"
+    and .services.zinder.environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9108"
+    and (.services.zinder.mem_limit | tonumber) == 8589934592
+    and .services.zinder.stop_grace_period == "30s"
+    and .services.zinder.image == "ghcr.io/zcashfoundation/zinder:v0.27.0"
+    and .services.zinder.environment.ZINDER_NETWORK__NAME == "zcash-mainnet"
+    and .services.zinder.environment.ZINDER_NODE__JSON_RPC_ADDR == "http://zebra:8232"
+    and .services.zebra.environment.ZEBRA_NETWORK__NETWORK == "Mainnet"
+    and .services.zinder.environment.ZINDER_NODE__AUTH__METHOD == "cookie"
+    and .services.zebra.environment.ZEBRA_RPC__ENABLE_COOKIE_AUTH == "true"
+    and (.services.zebra.ports // []) == []
+    and (.services.zinder.ports | map([.host_ip, .target]) | sort) == [
+      ["127.0.0.1", 9067], ["127.0.0.1", 9108]
+    ]
+    and ([.services.zinder.volumes[] | select(.read_only != true) | .target] == ["/var/lib/zinder"])
+    and any(.services.zinder.volumes[]; .source == "zebra-auth" and .read_only == true)
+  ' >/dev/null || fail "personal Compose changed its default configuration"
 
-env_file_value() {
-  sed -n "s/^$2=//p" "$repository_root/deploy/.env.$1"
+"${personal_compose_env[@]}" DEPLOY_SERVE_MEMORY_LIMIT=4g DEPLOY_IMAGE=zinder:local DEPLOY_VERSION=local \
+  ZINDER_DEPLOYMENT__PROFILE=wallet \
+  ZINDER_NETWORK__NAME=zcash-testnet ZEBRA_NETWORK__NETWORK=Testnet \
+  ZINDER_NODE__JSON_RPC_ADDR=http://zebra:18232 \
+  docker compose --env-file /dev/null -f "$personal_compose" config --format json \
+  | jq -e '
+    (.services.zinder.mem_limit | tonumber) == 4294967296
+    and .services.zinder.image == "zinder:local"
+    and .services.zinder.environment.ZINDER_DEPLOYMENT__PROFILE == "wallet"
+    and .services.zinder.environment.ZINDER_NETWORK__NAME == "zcash-testnet"
+    and .services.zinder.environment.ZINDER_NODE__JSON_RPC_ADDR == "http://zebra:18232"
+    and .services.zebra.environment.ZEBRA_NETWORK__NETWORK == "Testnet"
+  ' >/dev/null || fail "personal Compose did not apply supported overrides"
+
+zinder_image_digest="sha256:$(printf '%064d' 1)"
+release_compose="$temporary_directory/zinder-personal-compose.yaml"
+"${personal_compose_env[@]}" "$repository_root/scripts/render-personal-compose.sh" \
+  "$zinder_image_digest" > "$release_compose"
+"${personal_compose_env[@]}" DEPLOY_IMAGE=zinder:local \
+  docker compose --env-file /dev/null -f "$release_compose" config --format json \
+  | jq -e --arg digest "$zinder_image_digest" '
+    .services.zinder.image == ("ghcr.io/zcashfoundation/zinder@" + $digest)
+    and (.services.zebra.image | test("@sha256:[0-9a-f]{64}$"))
+  ' >/dev/null || fail "personal Compose release did not pin both image digests"
+if "$repository_root/scripts/render-personal-compose.sh" latest >/dev/null 2>&1; then
+  fail "personal Compose release accepted an image tag"
+fi
+
+deployment_profile_names=(mainnet testnet regtest zakura-mainnet zakura-testnet)
+
+profile_deploy_value() {
+  sed -n "s/^$2=//p" "$repository_root/deploy/profiles/$1/deploy.env"
+}
+
+profile_zinder_value() {
+  sed -n "s/^$2=//p" "$repository_root/deploy/profiles/$1/zinder.env"
 }
 
 if grep -Eiq 'JSON_RPC_ADDR:?-|INDEXER_GRPC_ADDR:?-[^}]|//(zebra|zakura)\b|z3-|:1?8232\b|:8230\b|:8155\b' \
-  "$repository_root/deploy/docker-compose.yml" \
-  "$repository_root/deploy/docker-compose.explorer.yml" \
-  "$repository_root"/deploy/config/{ingest,projector,query,compat-lightwalletd,explorer}.toml; then
-  fail "the deployment Compose topology or its configs default to a node"
+  "$repository_root/deploy/docker-compose.yml"; then
+  fail "the deployment Compose topology defaults to a hardcoded node"
 fi
 
-for deployment_env in "${deployment_env_names[@]}"; do
-  grep -Fqx 'ZINDER_NODE__INDEXER_GRPC_ADDR=' \
-    "$repository_root/deploy/.env.$deployment_env" \
-    || fail "the $deployment_env env file enables streaming mempool by default"
-  projector_owner="$(env_file_value "$deployment_env" ZINDER_PROJECTOR_BUILD_OWNER_HEX)"
-  [[ "$projector_owner" =~ ^[0-9a-f]{32}$ && "$projector_owner" =~ [a-f] ]] \
-    || fail "the $deployment_env projector owner is not a config-safe 32-character hex string"
+for profile_name in "${deployment_profile_names[@]}"; do
+  deploy_file="$repository_root/deploy/profiles/$profile_name/deploy.env"
+  zinder_file="$repository_root/deploy/profiles/$profile_name/zinder.env"
+  [[ -r "$deploy_file" && -r "$zinder_file" ]] \
+    || fail "missing deploy/profiles/$profile_name/{deploy.env,zinder.env}"
+  if grep -Ev '^[[:space:]]*(#.*)?$' "$deploy_file" | grep -qvE '^DEPLOY_[A-Z0-9_]+=.+$'; then
+    fail "$deploy_file must contain only non-empty DEPLOY_* variables"
+  fi
+  if grep -Ev '^[[:space:]]*(#.*)?$' "$zinder_file" | grep -qvE '^ZINDER_[A-Z0-9_]+=.+$'; then
+    fail "$zinder_file must contain only non-empty ZINDER_* variables"
+  fi
 done
+
+[[ "$(profile_zinder_value regtest ZINDER_NODE__AUTH__METHOD)" == "none" ]] \
+  || fail "regtest zinder.env must set ZINDER_NODE__AUTH__METHOD=none"
+if grep -Eq '^ZINDER_NODE__AUTH__PATH=' "$repository_root/deploy/profiles/regtest/zinder.env"; then
+  fail "regtest zinder.env must omit ZINDER_NODE__AUTH__PATH"
+fi
+
 for zakura_network in mainnet testnet; do
-  for shared_name in ZINDER_DEPLOY_NETWORK ZINDER_NETWORK__NAME ZINDER_PROJECTOR_BUILD_OWNER_HEX \
-    ZINDER_INGEST_OPS_HOST_PORT ZINDER_QUERY_HOST_PORT ZINDER_COMPAT_HOST_PORT; do
-    [[ "$(env_file_value "zakura-$zakura_network" "$shared_name")" \
-      == "$(env_file_value "$zakura_network" "$shared_name")" ]] \
-      || fail "the zakura-$zakura_network env file does not share $shared_name with the $zakura_network deployment"
+  for shared_name in DEPLOY_NETWORK \
+    DEPLOY_INDEX_OPS_HOST_PORT DEPLOY_SERVE_OPS_HOST_PORT \
+    DEPLOY_QUERY_HOST_PORT DEPLOY_COMPAT_HOST_PORT \
+    DEPLOY_EXPLORER_HOST_PORT DEPLOY_CIPHERSCAN_HOST_PORT \
+    DEPLOY_PROMETHEUS_HOST_PORT DEPLOY_GRAFANA_HOST_PORT \
+    DEPLOY_INDEX_MEMORY_LIMIT DEPLOY_SERVE_MEMORY_LIMIT; do
+    [[ "$(profile_deploy_value "zakura-$zakura_network" "$shared_name")" \
+      == "$(profile_deploy_value "$zakura_network" "$shared_name")" ]] \
+      || fail "the zakura-$zakura_network deploy.env does not share $shared_name with the $zakura_network deployment"
+  done
+  for shared_runtime in ZINDER_DEPLOYMENT__PROFILE ZINDER_NETWORK__NAME; do
+    [[ "$(profile_zinder_value "zakura-$zakura_network" "$shared_runtime")" \
+      == "$(profile_zinder_value "$zakura_network" "$shared_runtime")" ]] \
+      || fail "the zakura-$zakura_network zinder.env does not share $shared_runtime with the $zakura_network deployment"
   done
 done
 
@@ -109,240 +195,330 @@ control_secrets="$temporary_directory/control-secrets"
 mkdir -p "$control_secrets"
 printf 'test-ingest-token\n' > "$control_secrets/ingest.token"
 printf 'test-checkpoint-token\n' > "$control_secrets/checkpoint.token"
-ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_GRAFANA_ADMIN_PASSWORD="test-grafana-password" \
 docker compose \
-  --env-file "$repository_root/deploy/.env.testnet" \
+  --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
   -f "$repository_root/deploy/docker-compose.yml" \
   --profile observability \
   config --format json > "$resolved_compose"
 bash "$validator" --compose-contract "$resolved_compose"
 
-indexer_tls_directory="$temporary_directory/indexer-tls"
-mkdir -p "$indexer_tls_directory"
-resolve_indexer_tls_compose() {
-  ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
-    --env-file "$repository_root/deploy/.env.testnet" \
-    -f "$repository_root/deploy/docker-compose.yml" \
-    -f "$repository_root/deploy/docker-compose.indexer-tls.yml" \
-    config "$@"
-}
-resolved_indexer_tls_compose="$temporary_directory/resolved-indexer-tls-compose.json"
-ZINDER_INDEXER_TLS_DIR="$indexer_tls_directory" \
-ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura:8230 \
-ZINDER_NODE__INDEXER_TLS__SERVER_NAME=zakura.internal \
-  resolve_indexer_tls_compose --format json > "$resolved_indexer_tls_compose"
-bash "$validator" --compose-contract "$resolved_indexer_tls_compose"
-jq -e --arg tls_directory "$indexer_tls_directory" '
-  .services["zinder-ingest"].environment as $ingest_environment
-  | $ingest_environment.ZINDER_NODE__INDEXER_GRPC_ADDR == "https://zakura:8230"
-  and $ingest_environment.ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH
-    == "/var/run/zinder-indexer-tls/ca.pem"
-  and $ingest_environment.ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH
-    == "/var/run/zinder-indexer-tls/client.pem"
-  and $ingest_environment.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH
-    == "/var/run/zinder-indexer-tls/client-key.pem"
-  and $ingest_environment.ZINDER_NODE__INDEXER_TLS__SERVER_NAME == "zakura.internal"
-  and (.services["zinder-ingest"].volumes
-    | any(.source == $tls_directory
-      and .target == "/var/run/zinder-indexer-tls"
-      and .read_only == true))
-  and ([.services | to_entries[] | select(.key != "zinder-ingest") | .value]
-    | all(
-      ((.environment // {}) | keys | all(startswith("ZINDER_NODE__INDEXER_TLS__") | not))
-      and ((.volumes // []) | all(.target != "/var/run/zinder-indexer-tls"))
-    ))
-' "$resolved_indexer_tls_compose" >/dev/null \
-  || fail "the indexer TLS overlay does not give its material to ingest alone"
-if ZINDER_INDEXER_TLS_DIR="$indexer_tls_directory" ZINDER_NODE__INDEXER_GRPC_ADDR='' \
-  resolve_indexer_tls_compose -q >/dev/null 2>&1; then
-  fail "the indexer TLS overlay resolved without an indexer URL"
-fi
-if ZINDER_INDEXER_TLS_DIR='' ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura:8230 \
-  resolve_indexer_tls_compose -q >/dev/null 2>&1; then
-  fail "the indexer TLS overlay resolved without ZINDER_INDEXER_TLS_DIR"
-fi
-
-resolve_node_fallback_compose() {
-  ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
-    --env-file "$repository_root/deploy/.env.testnet" \
-    -f "$repository_root/deploy/docker-compose.yml" \
-    -f "$repository_root/deploy/docker-compose.node-fallback.yml" \
-    config "$@"
-}
-resolved_node_fallback_compose="$temporary_directory/resolved-node-fallback-compose.json"
-ZINDER_FALLBACK_SOURCE_NETWORK_NAME=zakura-testnet \
-ZINDER_FALLBACK_SOURCE_COOKIE_VOLUME_NAME=zakura-testnet-cookie \
-ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://zakura:18232 \
-ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR=http://zakura:18230 \
-  resolve_node_fallback_compose --format json > "$resolved_node_fallback_compose"
-bash "$validator" --compose-contract "$resolved_node_fallback_compose"
 jq -e '
-  .services["zinder-ingest"].environment as $ingest_environment
-  | $ingest_environment.ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR == "http://zakura:18232"
-  and $ingest_environment.ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR == "http://zakura:18230"
-  and $ingest_environment.ZINDER_NODE_FALLBACKS__1__AUTH__PATH
-    == "/var/run/auth-fallback/.cookie"
-  and (.services["zinder-ingest"].networks | has("node-fallback"))
-  and (.networks["node-fallback"].name == "zakura-testnet")
-  and (.volumes["node-fallback-cookie"].name == "zakura-testnet-cookie")
-  and ([.services["zinder-query", "zinder-compat-lightwalletd"]]
-    | all(.environment.ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR == "http://zakura:18232"
-      and (.volumes | any(.target == "/var/run/auth-fallback" and .read_only == true))))
-  and ((.services["zinder-projector"].environment // {})
-    | keys | all(startswith("ZINDER_NODE_FALLBACKS__") | not))
-' "$resolved_node_fallback_compose" >/dev/null \
-  || fail "the node fallback overlay does not give the fallback endpoint to the node-reading runtimes"
-if ZINDER_FALLBACK_SOURCE_COOKIE_VOLUME_NAME=zakura-testnet-cookie \
-  ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://zakura:18232 \
-  resolve_node_fallback_compose -q >/dev/null 2>&1; then
-  fail "the node fallback overlay resolved without the fallback node's network"
+  .services as $services
+  | $services["zinder-index"].command == ["index"]
+  and $services["zinder-serve"].command == ["serve", "--readers-only"]
+  and $services["zinder-index"].environment.ZINDER_DEPLOYMENT__PROFILE == "wallet"
+  and $services["zinder-serve"].environment.ZINDER_DEPLOYMENT__PROFILE == "wallet"
+  and $services["zinder-grafana"].environment.GF_SECURITY_ADMIN_PASSWORD == "test-grafana-password"
+  and (($services["zinder-index"].environment // {}) | has("ZINDER_NODE__INDEXER_GRPC_ADDR") | not)
+  and (($services["zinder-serve"].environment // {}) | has("ZINDER_NODE__INDEXER_GRPC_ADDR") | not)
+  and (($services["zinder-index"].environment // {}) | keys | all((startswith("DEPLOY_") | not) and . != "ZINDER_PRESET"))
+  and (($services["zinder-serve"].environment // {}) | keys | all((startswith("DEPLOY_") | not) and . != "ZINDER_PRESET"))
+  and ($services | has("zinder-history-publisher") | not)
+  and (($services["zinder-serve"].environment // {})
+    | keys | all(startswith("ZINDER_COMPAT__SHIELDED_HISTORY__") | not))
+' "$resolved_compose" >/dev/null \
+  || fail "the default Compose topology does not resolve pure runtime env_file isolation and canonical serving"
+
+custom_zinder_env="$temporary_directory/custom-zinder.env"
+cat > "$custom_zinder_env" <<'EOF'
+ZINDER_DEPLOYMENT__PROFILE=explorer
+ZINDER_NETWORK__NAME=zcash-testnet
+ZINDER_NODE__JSON_RPC_ADDR=http://zakura:18232
+ZINDER_NODE__AUTH__METHOD=cookie
+ZINDER_NODE__AUTH__PATH=/var/run/auth/.cookie
+ZINDER_COMPAT__BROWSER_ORIGINS=https://wallet.example
+ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=true
+ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true
+ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=true
+EOF
+custom_index_env="$temporary_directory/custom-index.env"
+cat > "$custom_index_env" <<'EOF'
+ZINDER_INGEST__SOURCE=zebra-indexer-grpc
+ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura:8230
+ZINDER_NODE__INDEXER_TLS__SERVER_NAME=zakura.internal
+ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM=CA-PEM
+ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM=CLIENT-CERT-PEM
+ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM=CLIENT-KEY-PEM
+EOF
+
+explorer_preset_compose="$temporary_directory/explorer-preset-compose.json"
+DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_ZINDER_ENV="$custom_zinder_env" \
+DEPLOY_INDEX_ENV="$custom_index_env" \
+docker compose \
+  --env-file "$repository_root/deploy/profiles/zakura-testnet/deploy.env" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  config --format json > "$explorer_preset_compose"
+bash "$validator" --compose-contract "$explorer_preset_compose"
+jq -e '
+  .services as $services
+  | $services["zinder-index"].command == ["index"]
+  and $services["zinder-serve"].command == ["serve", "--readers-only"]
+  and $services["zinder-index"].environment.ZINDER_DEPLOYMENT__PROFILE == "explorer"
+  and $services["zinder-serve"].environment.ZINDER_DEPLOYMENT__PROFILE == "explorer"
+  and $services["zinder-index"].environment.ZINDER_COMPAT__BROWSER_ORIGINS == "https://wallet.example"
+  and $services["zinder-serve"].environment.ZINDER_COMPAT__BROWSER_ORIGINS == "https://wallet.example"
+  and $services["zinder-serve"].environment.ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS == "true"
+  and $services["zinder-serve"].environment.ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS == "true"
+  and $services["zinder-serve"].environment.ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS == "true"
+  and $services["zinder-index"].environment.ZINDER_INGEST__SOURCE == "zebra-indexer-grpc"
+  and $services["zinder-index"].environment.ZINDER_NODE__INDEXER_GRPC_ADDR == "https://zakura:8230"
+  and $services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__SERVER_NAME == "zakura.internal"
+  and $services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM == "CA-PEM"
+  and $services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM == "CLIENT-CERT-PEM"
+  and $services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM == "CLIENT-KEY-PEM"
+  and (($services["zinder-serve"].environment // {}) | has("ZINDER_INGEST__SOURCE") | not)
+  and (($services["zinder-serve"].environment // {}) | has("ZINDER_NODE__INDEXER_GRPC_ADDR") | not)
+  and (($services["zinder-serve"].environment // {}) | keys | all(startswith("ZINDER_NODE__INDEXER_TLS__") | not))
+' "$explorer_preset_compose" >/dev/null \
+  || fail "Compose env_file did not forward arbitrary ZINDER_* overrides or isolate writer-only DEPLOY_INDEX_ENV secrets"
+
+if DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+  DEPLOY_INDEX_ENV="$temporary_directory/missing-index.env" \
+  docker compose \
+    --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
+    -f "$repository_root/deploy/docker-compose.yml" \
+    config >/dev/null 2>&1; then
+  fail "docker compose accepted a missing explicit DEPLOY_INDEX_ENV file"
 fi
 
-resolved_explorer_compose="$temporary_directory/resolved-explorer-compose.json"
-ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
-docker compose \
-  --env-file "$repository_root/deploy/.env.testnet" \
-  -f "$repository_root/deploy/docker-compose.yml" \
-  -f "$repository_root/deploy/docker-compose.explorer.yml" \
-  config --format json > "$resolved_explorer_compose"
-jq -e '
-  .services["zinder-explorer"].build.target == "zinder-explorer"
-  and .services["zinder-explorer"].command == ["--config", "/etc/zinder/config.toml"]
-  and .services["zinder-explorer"].network_mode == "service:zinder-ingest"
-  and .services["zinder-ingest"].ulimits.nofile.soft == 65536
-  and .services["zinder-ingest"].ulimits.nofile.hard == 65536
-  and .services["zinder-explorer"].ulimits.nofile.soft == 65536
-  and .services["zinder-explorer"].ulimits.nofile.hard == 65536
-  and .services["zinder-explorer"].depends_on["zinder-ingest"].condition == "service_started"
-  and .services["zinder-explorer"].depends_on["zinder-query"].condition == "service_healthy"
-  and .services["zinder-explorer"].healthcheck.test == [
-    "CMD",
-    "zinder-explorer",
-    "healthcheck"
-  ]
-  and .services["zinder-explorer"].environment.ZINDER_EXPLORER__LISTEN_ADDR == "[::]:9068"
-  and .services["zinder-explorer"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9069"
-  and (.services["zinder-ingest"].networks.node.aliases | index("zinder-testnet-explorer")) != null
-  and (.services["zinder-ingest"].ports | any(.target == 9068 and .published == "19068"))
-  and (.services["zinder-ingest"].ports | any(.target == 9069 and .published == "19069"))
-  and (.services["zinder-explorer"].volumes
-    | any(.target == "/etc/zinder/config.toml" and .read_only == true))
-  and (.services["zinder-explorer"].volumes
-    | all(.target != "/var/lib/zinder/checkpoints"))
-  and (.services["zinder-explorer"].volumes
-    | all(.target != "/var/run/zinder-checkpoint/checkpoint.token"))
-' "$resolved_explorer_compose" >/dev/null \
-  || fail "the optional explorer overlay does not preserve its reader-only deployment contract"
+if DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+  DEPLOY_INDEX_ENV="" \
+  docker compose \
+    --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
+    -f "$repository_root/deploy/docker-compose.yml" \
+    config >/dev/null 2>&1; then
+  fail "docker compose accepted an empty explicit DEPLOY_INDEX_ENV value"
+fi
 
-proxy_trust_settings='
-  [
-    .services["zinder-query"].environment.ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS,
-    .services["zinder-compat-lightwalletd"].environment.ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS,
-    .services["zinder-explorer"].environment.ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS
-  ]
-'
-jq -e "$proxy_trust_settings == [\"false\", \"false\", \"false\"]" \
-  "$resolved_explorer_compose" >/dev/null \
-  || fail "a public listener trusts its proxy's client address header by default"
-trusted_proxy_compose="$temporary_directory/trusted-proxy-compose.json"
-ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
-ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=true \
-ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true \
-ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=true \
+light_wallet_zinder_env="$temporary_directory/light-wallet-zinder.env"
+sed 's/^ZINDER_DEPLOYMENT__PROFILE=wallet$/ZINDER_DEPLOYMENT__PROFILE=light-wallet/' \
+  "$repository_root/deploy/profiles/testnet/zinder.env" > "$light_wallet_zinder_env"
+light_wallet_preset_compose="$temporary_directory/light-wallet-preset-compose.json"
+DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_ZINDER_ENV="$light_wallet_zinder_env" \
 docker compose \
-  --env-file "$repository_root/deploy/.env.testnet" \
+  --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
   -f "$repository_root/deploy/docker-compose.yml" \
-  -f "$repository_root/deploy/docker-compose.explorer.yml" \
-  config --format json > "$trusted_proxy_compose"
-jq -e "$proxy_trust_settings == [\"true\", \"true\", \"true\"]" \
-  "$trusted_proxy_compose" >/dev/null \
-  || fail "the Compose topology does not pass trust_proxy_client_address to every public listener"
+  config --format json > "$light_wallet_preset_compose"
+bash "$validator" --compose-contract "$light_wallet_preset_compose"
+jq -e '
+  .services as $services
+  | $services["zinder-index"].command == ["index"]
+  and $services["zinder-serve"].command == ["serve", "--readers-only"]
+  and $services["zinder-index"].environment.ZINDER_DEPLOYMENT__PROFILE == "light-wallet"
+  and $services["zinder-serve"].environment.ZINDER_DEPLOYMENT__PROFILE == "light-wallet"
+' "$light_wallet_preset_compose" >/dev/null \
+  || fail "the Compose topology does not propagate ZINDER_DEPLOYMENT__PROFILE=light-wallet"
+
+tor_compose="$temporary_directory/tor-compose.json"
+DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_ZINDER_ENV="$custom_zinder_env" \
+docker compose \
+  --env-file "$repository_root/deploy/profiles/mainnet/deploy.env" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  -f "$repository_root/deploy/docker-compose.tor.yml" \
+  --profile tor \
+  config --format json > "$tor_compose"
+jq -e '
+  .services as $services
+  | ($services | has("zinder-tor"))
+  and (($services["zinder-index"].ports // []) | length == 0)
+  and $services["zinder-index"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "false"
+  and $services["zinder-index"].environment.ZINDER_OPS__LISTEN_ADDR == "127.0.0.1:9105"
+  and $services["zinder-serve"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "false"
+  and $services["zinder-serve"].environment.ZINDER_OPS__LISTEN_ADDR == "127.0.0.1:9108"
+  and $services["zinder-serve"].environment.ZINDER_COMPAT__LISTEN_ADDR == "127.0.0.1:9067"
+  and $services["zinder-serve"].environment.ZINDER_QUERY__LISTEN_ADDR == "127.0.0.1:9102"
+  and $services["zinder-serve"].environment.ZINDER_EXPLORER__LISTEN_ADDR == "127.0.0.1:9068"
+  and $services["zinder-serve"].environment.ZINDER_CIPHERSCAN__LISTEN_ADDR == "127.0.0.1:9070"
+  and $services["zinder-serve"].environment.ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS == "false"
+  and $services["zinder-serve"].environment.ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS == "false"
+  and $services["zinder-serve"].environment.ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS == "false"
+  and $services["zinder-serve"].environment.ZINDER_COMPAT__PROXY_PROTOCOL_TRUSTED_CIDRS == "none"
+  and $services["zinder-serve"].environment.ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS == "none"
+' "$tor_compose" >/dev/null \
+  || fail "the Compose Tor overlay does not reset ports, bind loopback, untrust proxies, and disable PROXY protocol"
 
 released_compose="$temporary_directory/released-compose.json"
-ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
-ZINDER_VERSION=v9.8.7 \
+DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_VERSION=v9.8.7 \
 docker compose \
-  --env-file "$repository_root/deploy/.env.testnet" \
+  --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
   -f "$repository_root/deploy/docker-compose.yml" \
-  -f "$repository_root/deploy/docker-compose.explorer.yml" \
   config --format json > "$released_compose"
 jq -e '
-  [
-    "zinder-ingest",
-    "zinder-projector",
-    "zinder-query",
-    "zinder-compat-lightwalletd",
-    "zinder-explorer"
-  ]
+  ["zinder-index", "zinder-serve"]
   | all(. as $service
-    | $released[0].services[$service].image == ("ghcr.io/zcashfoundation/" + $service + ":v9.8.7")
-    and $released[0].services[$service].build.target == $service
-    and $source[0].services[$service].image == ("ghcr.io/zcashfoundation/" + $service + ":local"))
-' --slurpfile released "$released_compose" --slurpfile source "$resolved_explorer_compose" \
+    | $released[0].services[$service].image == "ghcr.io/zcashfoundation/zinder:v9.8.7"
+    and $released[0].services[$service].build.target == "zinder"
+    and $source[0].services[$service].image == "ghcr.io/zcashfoundation/zinder:local")
+' --slurpfile released "$released_compose" --slurpfile source "$resolved_compose" \
   -n >/dev/null \
-  || fail "ZINDER_VERSION does not select the published release image for every runtime while keeping its source build"
+  || fail "DEPLOY_VERSION does not select ghcr.io/zcashfoundation/zinder:v9.8.7 while keeping its source build"
 
-for deployment_env in "${deployment_env_names[@]}"; do
-  resolved_env_compose="$temporary_directory/resolved-$deployment_env-compose.json"
-  ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+default_build_compose="$temporary_directory/default-build-compose.json"
+env -u DEPLOY_X86_64_CPU_BASELINE -u DEPLOY_PASTA_ASM \
+  DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
   docker compose \
-    --env-file "$repository_root/deploy/.env.$deployment_env" \
+    --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
+    -f "$repository_root/deploy/docker-compose.yml" \
+    config --format json > "$default_build_compose"
+jq -e '
+  .services as $services
+  | ["zinder-index", "zinder-serve"]
+  | all(. as $service
+    | $services[$service].build.args.ZINDER_X86_64_CPU_BASELINE == "x86-64-v3")
+' "$default_build_compose" >/dev/null \
+  || fail "Compose does not default ZINDER_X86_64_CPU_BASELINE to x86-64-v3"
+
+baseline_compose="$temporary_directory/baseline-compose.json"
+DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+DEPLOY_X86_64_CPU_BASELINE=x86-64 \
+DEPLOY_PASTA_ASM=0 \
+docker compose \
+  --env-file "$repository_root/deploy/profiles/testnet/deploy.env" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  config --format json > "$baseline_compose"
+jq -e '
+  .services as $services
+  | ["zinder-index", "zinder-serve"]
+  | all(. as $service
+    | $services[$service].build.args.ZINDER_X86_64_CPU_BASELINE == "x86-64"
+    and $services[$service].build.args.ZINDER_PASTA_ASM == "0")
+' "$baseline_compose" >/dev/null \
+  || fail "DEPLOY_X86_64_CPU_BASELINE=x86-64 DEPLOY_PASTA_ASM=0 did not override build args"
+
+invalid_compose="$temporary_directory/invalid-compose.json"
+jq '.services["zinder-history-publisher"] = .services["zinder-serve"]' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "a Compose contract declaring retired zinder-history-publisher" \
+  --compose-contract "$invalid_compose"
+
+jq '.services["zinder-serve"].environment.ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY = "/var/lib/zinder-history"' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "a zinder-serve contract configuring retired ZINDER_COMPAT__SHIELDED_HISTORY__" \
+  --compose-contract "$invalid_compose"
+
+jq '.services["zinder-index"].environment.ZINDER_HISTORY_PUBLISHER__DIRECTORY = "/var/lib/zinder-history"' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "a Compose contract configuring retired ZINDER_HISTORY_PUBLISHER__" \
+  --compose-contract "$invalid_compose"
+
+jq '.services["zinder-serve"].volumes += [{type:"bind",source:"/srv/zinder-history/catalog",target:"/var/lib/zinder-history",read_only:true}]' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "a zinder-serve contract mounting retired /var/lib/zinder-history" \
+  --compose-contract "$invalid_compose"
+
+jq '.services["zinder-serve"].volumes += [{type:"bind",source:"/srv/zinder-history/publisher.pub",target:"/run/zinder-history/publisher.pub",read_only:true}]' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "a zinder-serve contract mounting retired /run/zinder-history/publisher.pub" \
+  --compose-contract "$invalid_compose"
+
+jq 'del(.services["zinder-serve"].ulimits.nofile)' "$resolved_compose" > "$invalid_compose"
+expect_rejected "zinder-serve inheriting open-file limits" --compose-contract "$invalid_compose"
+jq '.services["zinder-serve"].ulimits.nofile = {"soft":1024,"hard":524288}' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "zinder-serve using the exhausted Mainnet soft limit" --compose-contract "$invalid_compose"
+jq 'del(.services["zinder-index"].ulimits.nofile)' "$resolved_compose" > "$invalid_compose"
+expect_rejected "zinder-index inheriting open-file limits" --compose-contract "$invalid_compose"
+jq '.services["zinder-index"].ulimits.nofile = {"soft":1024,"hard":524288}' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "zinder-index using the exhausted Mainnet soft limit" --compose-contract "$invalid_compose"
+
+for profile_name in "${deployment_profile_names[@]}"; do
+  resolved_env_compose="$temporary_directory/resolved-$profile_name-compose.json"
+  DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" \
+  docker compose \
+    --env-file "$repository_root/deploy/profiles/$profile_name/deploy.env" \
     -f "$repository_root/deploy/docker-compose.yml" \
     --profile observability \
     config --format json > "$resolved_env_compose"
   bash "$validator" --compose-contract "$resolved_env_compose"
-  resolved_env_explorer_compose="$temporary_directory/resolved-$deployment_env-explorer-compose.json"
-  ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
-  docker compose \
-    --env-file "$repository_root/deploy/.env.$deployment_env" \
-    -f "$repository_root/deploy/docker-compose.yml" \
-    -f "$repository_root/deploy/docker-compose.explorer.yml" \
-    config --format json > "$resolved_env_explorer_compose"
   jq -e \
-    --arg deploy_network "$(env_file_value "$deployment_env" ZINDER_DEPLOY_NETWORK)" \
-    --arg source_network "$(env_file_value "$deployment_env" ZINDER_SOURCE_NETWORK_NAME)" \
-    --arg cookie_volume "$(env_file_value "$deployment_env" ZINDER_SOURCE_COOKIE_VOLUME_NAME)" \
-    --arg json_rpc_addr "$(env_file_value "$deployment_env" ZINDER_NODE__JSON_RPC_ADDR)" '
-    .name == "zinder-\($deploy_network)"
+    --arg deploy_network "$(profile_deploy_value "$profile_name" DEPLOY_NETWORK)" \
+    --arg source_network "$(profile_deploy_value "$profile_name" DEPLOY_NODE_NETWORK)" \
+    --arg cookie_volume "$(profile_deploy_value "$profile_name" DEPLOY_NODE_COOKIE_VOLUME)" \
+    --arg json_rpc_addr "$(profile_zinder_value "$profile_name" ZINDER_NODE__JSON_RPC_ADDR)" \
+    --arg network_name "$(profile_zinder_value "$profile_name" ZINDER_NETWORK__NAME)" '
+    .services as $services
+    | .name == "zinder-\($deploy_network)"
     and .networks.node.external == true
     and .networks.node.name == $source_network
     and .volumes["node-cookie"].external == true
     and .volumes["node-cookie"].name == $cookie_volume
     and .volumes.data.name == "zinder-\($deploy_network)-data"
-    and .services["zinder-ingest"].environment.ZINDER_NODE__INDEXER_GRPC_ADDR == ""
+    and (($services["zinder-index"].environment // {}) | has("ZINDER_NODE__INDEXER_GRPC_ADDR") | not)
+    and (($services["zinder-index"].environment // {}) | keys | all(startswith("ZINDER_NODE__INDEXER_TLS__") | not))
+    and (($services["zinder-index"].environment // {}) | keys | all((startswith("DEPLOY_") | not) and . != "ZINDER_PRESET"))
+    and (($services["zinder-serve"].environment // {}) | keys | all((startswith("DEPLOY_") | not) and . != "ZINDER_PRESET"))
     and $json_rpc_addr != ""
-    and (.services as $services
-      | [
-          "zinder-ingest",
-          "zinder-query",
-          "zinder-compat-lightwalletd",
-          "zinder-explorer"
-        ]
-      | all($services[.].environment.ZINDER_NODE__JSON_RPC_ADDR == $json_rpc_addr))
-    and (.services["zinder-projector"].environment | has("ZINDER_NODE__JSON_RPC_ADDR") | not)
-  ' "$resolved_env_explorer_compose" >/dev/null \
-    || fail "the $deployment_env env file does not resolve to its own node network, cookie volume, and endpoint"
+    and ($services["zinder-index"].environment.ZINDER_NODE__JSON_RPC_ADDR == $json_rpc_addr)
+    and ($services["zinder-serve"].environment.ZINDER_NODE__JSON_RPC_ADDR == $json_rpc_addr)
+    and ($services["zinder-index"].environment.ZINDER_NETWORK__NAME == $network_name)
+    and ($services["zinder-serve"].environment.ZINDER_NETWORK__NAME == $network_name)
+    and ($services["zinder-index"].ulimits.nofile == {"soft":65536,"hard":65536})
+    and ($services["zinder-serve"].ulimits.nofile == {"soft":65536,"hard":65536})
+  ' "$resolved_env_compose" >/dev/null \
+    || fail "the $profile_name profile does not resolve to its expected network, cookie volume, endpoints, and ulimits"
 done
 
-missing_node_env="$temporary_directory/missing-node.env"
-grep -v '^ZINDER_NODE__JSON_RPC_ADDR=' "$repository_root/deploy/.env.testnet" > "$missing_node_env"
-if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
-  --env-file "$missing_node_env" \
+missing_zinder_env="$temporary_directory/missing-zinder-env.deploy.env"
+grep -v '^DEPLOY_ZINDER_ENV=' "$repository_root/deploy/profiles/testnet/deploy.env" > "$missing_zinder_env"
+if DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+  --env-file "$missing_zinder_env" \
   -f "$repository_root/deploy/docker-compose.yml" \
   config -q >/dev/null 2>&1; then
-  fail "the deployment Compose topology resolved without a node JSON-RPC address"
+  fail "the deployment Compose topology resolved without DEPLOY_ZINDER_ENV"
+fi
+missing_zinder_env_target="$temporary_directory/missing-zinder-env-target.deploy.env"
+sed 's|^DEPLOY_ZINDER_ENV=.*|DEPLOY_ZINDER_ENV=./profiles/does-not-exist/zinder.env|' \
+  "$repository_root/deploy/profiles/testnet/deploy.env" > "$missing_zinder_env_target"
+if DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+  --env-file "$missing_zinder_env_target" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  config -q >/dev/null 2>&1; then
+  fail "the deployment Compose topology resolved with a missing DEPLOY_ZINDER_ENV file"
 fi
 missing_deploy_network_env="$temporary_directory/missing-deploy-network.env"
-grep -v '^ZINDER_DEPLOY_NETWORK=' "$repository_root/deploy/.env.testnet" > "$missing_deploy_network_env"
-if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+grep -v '^DEPLOY_NETWORK=' "$repository_root/deploy/profiles/testnet/deploy.env" > "$missing_deploy_network_env"
+if DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
   --env-file "$missing_deploy_network_env" \
   -f "$repository_root/deploy/docker-compose.yml" \
   config -q >/dev/null 2>&1; then
-  fail "docker-compose.yml resolved without ZINDER_DEPLOY_NETWORK"
+  fail "docker-compose.yml resolved without DEPLOY_NETWORK"
+fi
+missing_node_network_env="$temporary_directory/missing-node-network.env"
+grep -v '^DEPLOY_NODE_NETWORK=' "$repository_root/deploy/profiles/testnet/deploy.env" > "$missing_node_network_env"
+if DEPLOY_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+  --env-file "$missing_node_network_env" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  config -q >/dev/null 2>&1; then
+  fail "docker-compose.yml resolved without DEPLOY_NODE_NETWORK"
 fi
 
+# systemd unit must keep active syncs intact on restart and avoid unintended builds.
+systemd_unit="$repository_root/deploy/systemd/zinder.service"
+grep -Fqx 'ExecStart=/usr/bin/docker compose --env-file /etc/zinder/deploy.env -f docker-compose.yml up --no-build' \
+  "$systemd_unit" \
+  || fail "deploy/systemd/zinder.service ExecStart must use /etc/zinder/deploy.env and --no-build"
+grep -Fqx 'ExecStop=/usr/bin/docker compose --env-file /etc/zinder/deploy.env -f docker-compose.yml down' \
+  "$systemd_unit" \
+  || fail "deploy/systemd/zinder.service must preserve ExecStop down with /etc/zinder/deploy.env"
+if grep -Ev '^[[:space:]]*#' "$systemd_unit" | grep -Eq 'ExecStartPre|--remove-orphans'; then
+  fail "deploy/systemd/zinder.service must not run destructive ExecStartPre down --remove-orphans"
+fi
+
+jq 'del(.services["zinder-prometheus"].networks.observability.aliases)' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected \
+  "a Compose contract omitting the prometheus network alias for Grafana" \
+  --compose-contract "$invalid_compose"
+
 missing_state_init_compose="$temporary_directory/missing-state-init-compose.json"
-jq 'del(.services["state-init"]) | del(.services["zinder-ingest"].depends_on["state-init"])' \
+jq 'del(.services["state-init"]) | del(.services["zinder-index"].depends_on["state-init"])' \
   "$resolved_compose" > "$missing_state_init_compose"
 expect_rejected \
   "a Compose contract without root-owned volume initialization" \
@@ -365,8 +541,7 @@ expect_rejected \
 shared_checkpoint_volume_compose="$temporary_directory/shared-checkpoint-volume-compose.json"
 jq '
   (.services["state-init"].volumes[] | select(.target == "/var/lib/zinder") | .source) as $data_source
-  |
-  .services["zinder-ingest"].volumes |= map(
+  | .services["zinder-index"].volumes |= map(
     if .target == "/var/lib/zinder/checkpoints" then
       .source = $data_source
     else . end
@@ -383,152 +558,159 @@ expect_rejected \
   "a Compose contract whose checkpoint-staging volume aliases the data volume" \
   --compose-contract "$aliased_checkpoint_volume_compose"
 
-missing_owner_checkpoint_mount_compose="$temporary_directory/missing-owner-checkpoint-mount-compose.json"
-jq 'del(.services["zinder-projector"].volumes[] | select(.target == "/var/lib/zinder/checkpoints"))' \
-  "$resolved_compose" > "$missing_owner_checkpoint_mount_compose"
-expect_rejected \
-  "a Compose contract missing a projector checkpoint-staging mount" \
-  --compose-contract "$missing_owner_checkpoint_mount_compose"
-
-compat_checkpoint_mount_compose="$temporary_directory/compat-checkpoint-mount-compose.json"
+serve_checkpoint_mount_compose="$temporary_directory/serve-checkpoint-mount-compose.json"
 jq '
-  (.services["zinder-ingest"].volumes[] | select(.target == "/var/lib/zinder/checkpoints")) as $checkpoint_mount
-  |
-  .services["zinder-compat-lightwalletd"].volumes += [
-    $checkpoint_mount
-  ]
-' "$resolved_compose" > "$compat_checkpoint_mount_compose"
+  (.services["zinder-index"].volumes[] | select(.target == "/var/lib/zinder/checkpoints")) as $checkpoint_mount
+  | .services["zinder-serve"].volumes += [$checkpoint_mount]
+' "$resolved_compose" > "$serve_checkpoint_mount_compose"
 expect_rejected \
-  "a Compose contract mounting checkpoint staging into compatibility" \
-  --compose-contract "$compat_checkpoint_mount_compose"
+  "a Compose contract mounting checkpoint staging into zinder-serve" \
+  --compose-contract "$serve_checkpoint_mount_compose"
 
-query_checkpoint_mount_compose="$temporary_directory/query-checkpoint-mount-compose.json"
+serve_checkpoint_secret_compose="$temporary_directory/serve-checkpoint-secret-compose.json"
 jq '
-  (.services["zinder-ingest"].volumes[] | select(.target == "/var/lib/zinder/checkpoints")) as $checkpoint_mount
-  |
-  .services["zinder-query"].volumes += [
-    $checkpoint_mount
-  ]
-' "$resolved_compose" > "$query_checkpoint_mount_compose"
-expect_rejected \
-  "a Compose contract mounting checkpoint staging into native query" \
-  --compose-contract "$query_checkpoint_mount_compose"
-
-query_checkpoint_secret_compose="$temporary_directory/query-checkpoint-secret-compose.json"
-jq '
-  (.services["zinder-ingest"].volumes[] | select(.target == "/var/run/zinder-checkpoint/checkpoint.token")) as $checkpoint_secret
-  |
-  .services["zinder-query"].volumes += [
+  (.services["zinder-index"].volumes[] | select(.target == "/var/run/zinder-checkpoint/checkpoint.token")) as $checkpoint_secret
+  | .services["zinder-serve"].volumes += [
     ($checkpoint_secret | .target = "/var/run/alternate/checkpoint-capability")
   ]
-' "$resolved_compose" > "$query_checkpoint_secret_compose"
+' "$resolved_compose" > "$serve_checkpoint_secret_compose"
 expect_rejected \
-  "a native query contract mounting the checkpoint secret under an alternate target" \
-  --compose-contract "$query_checkpoint_secret_compose"
+  "a zinder-serve contract mounting the checkpoint secret" \
+  --compose-contract "$serve_checkpoint_secret_compose"
 
-swapped_query_config_compose="$temporary_directory/swapped-query-config-compose.json"
-jq '
-  (.services["zinder-compat-lightwalletd"].volumes[] | select(.target == "/etc/zinder/config.toml") | .source) as $compat_config
-  |
-  (.services["zinder-query"].volumes[] | select(.target == "/etc/zinder/config.toml") | .source) = $compat_config
-' "$resolved_compose" > "$swapped_query_config_compose"
+toml_mount_compose="$temporary_directory/toml-mount-compose.json"
+jq '.services["zinder-serve"].volumes += [{type: "bind", source: "/tmp/config.toml", target: "/etc/zinder/config.toml", read_only: true}]' \
+  "$resolved_compose" > "$toml_mount_compose"
 expect_rejected \
-  "a native query contract mounting the compatibility runtime config" \
-  --compose-contract "$swapped_query_config_compose"
-
-overlapping_config_root="$temporary_directory/overlapping/deploy/config"
-mkdir -p "$overlapping_config_root"
-sed 's#/query/#/compat/#g' "$repository_root/deploy/config/query.toml" \
-  > "$overlapping_config_root/query.toml"
-overlapping_reader_paths_compose="$temporary_directory/overlapping-reader-paths-compose.json"
-jq --arg query_config "$overlapping_config_root/query.toml" '
-  (.services["zinder-query"].volumes[] | select(.target == "/etc/zinder/config.toml") | .source) = $query_config
-' "$resolved_compose" > "$overlapping_reader_paths_compose"
-expect_rejected \
-  "native and compatibility readers sharing secondary roots" \
-  --compose-contract "$overlapping_reader_paths_compose"
-
-nested_config_root="$temporary_directory/nested/deploy/config"
-mkdir -p "$nested_config_root"
-sed 's#/var/lib/zinder/query/canonical-secondary#/var/lib/zinder/compat/canonical-secondary/nested#' \
-  "$repository_root/deploy/config/query.toml" > "$nested_config_root/query.toml"
-nested_reader_paths_compose="$temporary_directory/nested-reader-paths-compose.json"
-jq --arg query_config "$nested_config_root/query.toml" '
-  (.services["zinder-query"].volumes[] | select(.target == "/etc/zinder/config.toml") | .source) = $query_config
-' "$resolved_compose" > "$nested_reader_paths_compose"
-expect_rejected \
-  "a native reader secondary nested beneath a compatibility reader root" \
-  --compose-contract "$nested_reader_paths_compose"
+  "a Compose contract mounting /etc/zinder/config.toml" \
+  --compose-contract "$toml_mount_compose"
 
 public_host_compose="$temporary_directory/public-host-compose.json"
-jq '.services["zinder-ingest"].ports[0].host_ip = "0.0.0.0"' \
+jq '.services["zinder-index"].ports[0].host_ip = "0.0.0.0"' \
   "$resolved_compose" > "$public_host_compose"
 expect_rejected \
   "a Compose contract with a public host publication" \
   --compose-contract "$public_host_compose"
 
 duplicate_host_port_compose="$temporary_directory/duplicate-host-port-compose.json"
-jq '.services["zinder-ingest"].ports[1].published = .services["zinder-ingest"].ports[0].published' \
+jq '.services["zinder-index"].ports[1].published = .services["zinder-index"].ports[0].published' \
   "$resolved_compose" > "$duplicate_host_port_compose"
 expect_rejected \
-  "a Compose contract publishing two runtimes on the same host port" \
+  "a Compose contract publishing two ports on the same host port" \
   --compose-contract "$duplicate_host_port_compose"
 
 published_control_compose="$temporary_directory/published-control-compose.json"
-jq '.services["zinder-ingest"].ports += [{"host_ip":"127.0.0.1","target":9100,"published":"9100","protocol":"tcp"}]' \
+jq '.services["zinder-index"].ports += [{"host_ip":"127.0.0.1","target":9100,"published":"9100","protocol":"tcp"}]' \
   "$resolved_compose" > "$published_control_compose"
 expect_rejected \
   "a Compose contract publishing the private control port" \
   --compose-contract "$published_control_compose"
 
-healthz_compose="$temporary_directory/healthz-compose.json"
-jq '.services["zinder-ingest"].healthcheck.test += ["--path", "/healthz"]' \
-  "$resolved_compose" > "$healthz_compose"
+published_projector_control_compose="$temporary_directory/published-projector-control-compose.json"
+jq '.services["zinder-index"].ports += [{"host_ip":"127.0.0.1","target":9101,"published":"9101","protocol":"tcp"}]' \
+  "$resolved_compose" > "$published_projector_control_compose"
 expect_rejected \
-  "a Compose dependency gate using liveness instead of readiness" \
-  --compose-contract "$healthz_compose"
+  "a Compose contract publishing the private projector control port" \
+  --compose-contract "$published_projector_control_compose"
 
-short_ingest_healthcheck_grace_compose="$temporary_directory/short-ingest-healthcheck-grace-compose.json"
-jq '.services["zinder-ingest"].healthcheck.start_period = "1m0s"' \
-  "$resolved_compose" > "$short_ingest_healthcheck_grace_compose"
+missing_projector_control_compose="$temporary_directory/missing-projector-control-compose.json"
+jq 'del(.services["zinder-index"].environment.ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR)' \
+  "$resolved_compose" > "$missing_projector_control_compose"
 expect_rejected \
-  "an ingest readiness gate that expires before the canonical construction hard gate" \
-  --compose-contract "$short_ingest_healthcheck_grace_compose"
+  "a Compose contract disabling zinder-index projector control" \
+  --compose-contract "$missing_projector_control_compose"
 
-short_projector_healthcheck_grace_compose="$temporary_directory/short-projector-healthcheck-grace-compose.json"
-jq '.services["zinder-projector"].healthcheck.start_period = "1m0s"' \
-  "$resolved_compose" > "$short_projector_healthcheck_grace_compose"
+mismatched_projector_token_compose="$temporary_directory/mismatched-projector-token-compose.json"
+jq '.services["zinder-index"].environment.ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH = "/var/run/zinder-control/projector.token"' \
+  "$resolved_compose" > "$mismatched_projector_token_compose"
 expect_rejected \
-  "a projector readiness gate that expires before the wallet construction hard gate" \
-  --compose-contract "$short_projector_healthcheck_grace_compose"
+  "a Compose contract with mismatched projector and canonical checkpoint tokens" \
+  --compose-contract "$mismatched_projector_token_compose"
+
+serve_projector_control_compose="$temporary_directory/serve-projector-control-compose.json"
+jq '.services["zinder-serve"].environment.ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH = "/var/run/zinder-checkpoint/checkpoint.token"' \
+  "$resolved_compose" > "$serve_projector_control_compose"
+expect_rejected \
+  "a Compose contract exposing projector control configuration to zinder-serve" \
+  --compose-contract "$serve_projector_control_compose"
 
 split_namespace_compose="$temporary_directory/split-namespace-compose.json"
-jq '.services["zinder-projector"].network_mode = null' \
+jq '.services["zinder-serve"].network_mode = null' \
   "$resolved_compose" > "$split_namespace_compose"
 expect_rejected \
-  "a Compose contract splitting the projector control namespace" \
+  "a Compose contract splitting zinder-serve from zinder-index network namespace" \
   --compose-contract "$split_namespace_compose"
 
-split_query_namespace_compose="$temporary_directory/split-query-namespace-compose.json"
-jq '.services["zinder-query"].network_mode = null' \
-  "$resolved_compose" > "$split_query_namespace_compose"
-expect_rejected \
-  "a Compose contract splitting the native query control namespace" \
-  --compose-contract "$split_query_namespace_compose"
-
 implicit_security_compose="$temporary_directory/implicit-security-compose.json"
-jq 'del(.services["zinder-compat-lightwalletd"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND)' \
+jq 'del(.services["zinder-serve"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND)' \
   "$resolved_compose" > "$implicit_security_compose"
 expect_rejected \
   "a Compose contract relying on an image-baked public-bind opt-in" \
   --compose-contract "$implicit_security_compose"
 
-implicit_query_security_compose="$temporary_directory/implicit-query-security-compose.json"
-jq 'del(.services["zinder-query"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND)' \
-  "$resolved_compose" > "$implicit_query_security_compose"
+# Reject DEPLOY_* / ZINDER_PRESET leakage, mismatched profiles, hardcoded --preset, or writer secrets on zinder-serve.
+leaked_deploy_env_compose="$temporary_directory/leaked-deploy-env-compose.json"
+jq '.services["zinder-serve"].environment.DEPLOY_NETWORK = "testnet"' \
+  "$resolved_compose" > "$leaked_deploy_env_compose"
 expect_rejected \
-  "a native query contract relying on an image-baked public-bind opt-in" \
-  --compose-contract "$implicit_query_security_compose"
+  "a Compose contract leaking DEPLOY_* orchestration variables into container environment" \
+  --compose-contract "$leaked_deploy_env_compose"
+
+legacy_preset_env_compose="$temporary_directory/legacy-preset-env-compose.json"
+jq '.services["zinder-index"].environment.ZINDER_PRESET = "wallet"' \
+  "$resolved_compose" > "$legacy_preset_env_compose"
+expect_rejected \
+  "a Compose contract setting retired ZINDER_PRESET in container environment" \
+  --compose-contract "$legacy_preset_env_compose"
+
+mismatched_profile_compose="$temporary_directory/mismatched-profile-compose.json"
+jq '.services["zinder-serve"].environment.ZINDER_DEPLOYMENT__PROFILE = "explorer"' \
+  "$resolved_compose" > "$mismatched_profile_compose"
+expect_rejected \
+  "a Compose contract with mismatched zinder-index and zinder-serve ZINDER_DEPLOYMENT__PROFILE" \
+  --compose-contract "$mismatched_profile_compose"
+
+hardcoded_preset_cmd_compose="$temporary_directory/hardcoded-preset-cmd-compose.json"
+jq '.services["zinder-serve"].command = ["serve", "--readers-only", "--preset", "wallet"]' \
+  "$resolved_compose" > "$hardcoded_preset_cmd_compose"
+expect_rejected \
+  "a Compose contract hardcoding --preset on zinder-serve command" \
+  --compose-contract "$hardcoded_preset_cmd_compose"
+
+leaked_tls_env_compose="$temporary_directory/leaked-tls-env-compose.json"
+jq '.services["zinder-serve"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM = "CLIENT-KEY-PEM"' \
+  "$resolved_compose" > "$leaked_tls_env_compose"
+expect_rejected \
+  "a Compose contract forwarding indexer TLS keys to zinder-serve" \
+  --compose-contract "$leaked_tls_env_compose"
+
+leaked_fallback_tls_compose="$temporary_directory/leaked-fallback-tls-compose.json"
+jq '.services["zinder-serve"].environment.ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PEM = "CLIENT-KEY-PEM"' \
+  "$resolved_compose" > "$leaked_fallback_tls_compose"
+expect_rejected \
+  "a Compose contract forwarding fallback indexer TLS keys to zinder-serve" \
+  --compose-contract "$leaked_fallback_tls_compose"
+
+leaked_ingest_source_compose="$temporary_directory/leaked-ingest-source-compose.json"
+jq '.services["zinder-serve"].environment.ZINDER_INGEST__SOURCE = "zebra-indexer-grpc"' \
+  "$resolved_compose" > "$leaked_ingest_source_compose"
+expect_rejected \
+  "a Compose contract forwarding ZINDER_INGEST__SOURCE to zinder-serve" \
+  --compose-contract "$leaked_ingest_source_compose"
+
+missing_cipherscan_port_compose="$temporary_directory/missing-cipherscan-port-compose.json"
+jq '.services["zinder-index"].ports |= map(select(.target != 9070))' \
+  "$resolved_compose" > "$missing_cipherscan_port_compose"
+expect_rejected \
+  "a Compose contract omitting loopback Cipherscan port 9070" \
+  --compose-contract "$missing_cipherscan_port_compose"
+
+missing_cipherscan_listen_compose="$temporary_directory/missing-cipherscan-listen-compose.json"
+jq 'del(.services["zinder-serve"].environment.ZINDER_CIPHERSCAN__LISTEN_ADDR)' \
+  "$resolved_compose" > "$missing_cipherscan_listen_compose"
+expect_rejected \
+  "a Compose contract omitting ZINDER_CIPHERSCAN__LISTEN_ADDR on zinder-serve" \
+  --compose-contract "$missing_cipherscan_listen_compose"
 
 mixed_release_workflow="$temporary_directory/release.yml"
 cp "$repository_root/.github/workflows/release.yml" "$mixed_release_workflow"
@@ -537,16 +719,12 @@ expect_rejected \
   "a release workflow containing the mixed single-container target" \
   --release-workflow "$mixed_release_workflow"
 
-while IFS= read -r omitted_image; do
-  omitted_image_catalog="$temporary_directory/catalog-without-${omitted_image}.json"
-  jq --arg omitted_image "$omitted_image" \
-    'map(select(. != $omitted_image))' \
-    "$release_images_catalog" > "$omitted_image_catalog"
-  expect_rejected \
-    "a release image catalog omitting $omitted_image" \
-    --release-workflow "$repository_root/.github/workflows/release.yml" \
-    --release-images-catalog "$omitted_image_catalog"
-done < <(jq -r '.[]' "$release_images_catalog")
+empty_release_images_catalog="$temporary_directory/empty-catalog.json"
+printf '[]\n' > "$empty_release_images_catalog"
+expect_rejected \
+  "an empty release image catalog" \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --release-images-catalog "$empty_release_images_catalog"
 
 bench_release_images_catalog="$temporary_directory/catalog-with-bench.json"
 jq '. + ["zinder-bench"]' \
@@ -556,29 +734,12 @@ expect_rejected \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --release-images-catalog "$bench_release_images_catalog"
 
-swapped_release_images_catalog="$temporary_directory/catalog-with-bench-for-explorer.json"
-jq 'map(if . == "zinder-explorer" then "zinder-bench" else . end)' \
-  "$release_images_catalog" > "$swapped_release_images_catalog"
+swapped_release_images_catalog="$temporary_directory/catalog-with-bench-only.json"
+printf '["zinder-bench"]\n' > "$swapped_release_images_catalog"
 expect_rejected \
-  "a release image catalog naming the benchmark instead of the Explorer" \
+  "a release image catalog naming zinder-bench instead of zinder" \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --release-images-catalog "$swapped_release_images_catalog"
-
-mixed_release_images_catalog="$temporary_directory/catalog-with-mixed-runtime.json"
-jq '.[0] = "zinder-single-container"' \
-  "$release_images_catalog" > "$mixed_release_images_catalog"
-expect_rejected \
-  "a release image catalog containing the mixed single-container runtime" \
-  --release-workflow "$repository_root/.github/workflows/release.yml" \
-  --release-images-catalog "$mixed_release_images_catalog"
-
-duplicate_release_images_catalog="$temporary_directory/catalog-with-duplicate.json"
-jq '.[3] = .[0]' \
-  "$release_images_catalog" > "$duplicate_release_images_catalog"
-expect_rejected \
-  "a release image catalog containing duplicate runtimes" \
-  --release-workflow "$repository_root/.github/workflows/release.yml" \
-  --release-images-catalog "$duplicate_release_images_catalog"
 
 malformed_release_images_catalog="$temporary_directory/malformed-release-images.json"
 printf '{\n' > "$malformed_release_images_catalog"
@@ -666,7 +827,6 @@ mutate_image_packager() {
 }
 
 unverified_image_binaries_packager="$temporary_directory/unverified-image-binaries-packager.sh"
-# The literal shell variables are the fixture removal target.
 # shellcheck disable=SC2016
 mutate_image_packager "$unverified_image_binaries_packager" \
   sed '/cmp -- "\${binary_root}\/\${binary_name}" "\$image_binary"/d'
@@ -677,7 +837,6 @@ expect_rejected_because \
   --image-packager "$unverified_image_binaries_packager"
 
 modeless_archive_packager="$temporary_directory/modeless-archive-packager.sh"
-# The literal shell variables are the fixture removal target.
 # shellcheck disable=SC2016
 mutate_image_packager "$modeless_archive_packager" \
   sed '/require_archive_binary_mode "\$binary_root\/\$binary_name" "archive binary \$binary_name"/d'
@@ -688,7 +847,6 @@ expect_rejected_because \
   --image-packager "$modeless_archive_packager"
 
 modeless_image_packager="$temporary_directory/modeless-image-packager.sh"
-# The literal shell variables are the fixture removal target.
 # shellcheck disable=SC2016
 mutate_image_packager "$modeless_image_packager" \
   sed '/require_archive_binary_mode "\$image_binary"/d'
@@ -699,7 +857,6 @@ expect_rejected_because \
   --image-packager "$modeless_image_packager"
 
 unchecked_installed_mode_packager="$temporary_directory/unchecked-installed-mode-packager.sh"
-# The literal shell variables are the fixture removal target.
 # shellcheck disable=SC2016
 mutate_image_packager "$unchecked_installed_mode_packager" \
   sed '/\[\[ "\$image_binary_listing" == /d'
@@ -710,7 +867,6 @@ expect_rejected_because \
   --image-packager "$unchecked_installed_mode_packager"
 
 unchecked_healthcheck_packager="$temporary_directory/unchecked-healthcheck-packager.sh"
-# The literal shell variables are the fixture removal target.
 # shellcheck disable=SC2016
 mutate_image_packager "$unchecked_healthcheck_packager" \
   sed '/\[\[ "\$healthcheck_status" -eq 1 \]\]/d'
@@ -720,8 +876,45 @@ expect_rejected_because \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --image-packager "$unchecked_healthcheck_packager"
 
+no_darkside_packager="$temporary_directory/no-darkside-packager.sh"
+mutate_image_packager "$no_darkside_packager" \
+  sed 's/dev darkside --help/help/g'
+expect_rejected_because \
+  "an image packager without a dev darkside help smoke" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$no_darkside_packager"
+
+no_profile_validate_packager="$temporary_directory/no-profile-validate-packager.sh"
+# shellcheck disable=SC2016
+mutate_image_packager "$no_profile_validate_packager" \
+  sed '/--env-file "\$profile_env"/s/config validate$/config validate --help/'
+expect_rejected_because \
+  "an image packager without deployment-profile config validate smoke" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$no_profile_validate_packager"
+
+no_unknown_key_packager="$temporary_directory/no-unknown-key-packager.sh"
+mutate_image_packager "$no_unknown_key_packager" \
+  sed 's/ZINDER_UNKNOWN__SMOKE_KEY=1/ZINDER_NOOP=1/g'
+expect_rejected_because \
+  "an image packager without unknown-key fail-closed smoke" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$no_unknown_key_packager"
+
+unchecked_unknown_key_status_packager="$temporary_directory/unchecked-unknown-key-status-packager.sh"
+# shellcheck disable=SC2016
+mutate_image_packager "$unchecked_unknown_key_status_packager" \
+  sed '/\[\[ "\$unknown_key_status" -eq 1 \]\]/d'
+expect_rejected_because \
+  "an image packager that does not require exit code 1 for unknown config keys" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$unchecked_unknown_key_status_packager"
+
 wall_clock_created_packager="$temporary_directory/wall-clock-created-packager.sh"
-# The literal shell variables are the fixture rewrite target.
 # shellcheck disable=SC2016
 mutate_image_packager "$wall_clock_created_packager" \
   sed 's/date -u -d "@\${source_date_epoch}"/date -u/'
@@ -773,7 +966,6 @@ expect_rejected_because \
   --release-workflow "$ignored_smoke_workflow"
 
 logged_in_reproduction_workflow="$temporary_directory/logged-in-reproduction-release.yml"
-# The literal workflow expressions are the fixture insertion text.
 # shellcheck disable=SC2016
 awk '
   /^  reproduce:/ { in_reproduction = 1 }
@@ -858,7 +1050,6 @@ expect_rejected_because \
   --image-packager "$recompiling_image_packager"
 
 cached_image_packager="$temporary_directory/cached-image-packager.sh"
-# The awk field reference is the fixture insertion program.
 # shellcheck disable=SC2016
 mutate_image_packager "$cached_image_packager" \
   awk '
@@ -878,7 +1069,7 @@ awk '
   /^  images:/ { in_images = 1 }
   /^  binary-archives:/ { in_images = 0 }
   in_images && $0 == "          scripts/package-release-images.sh push \\" {
-    print "          docker buildx build --file deploy/Dockerfile --target zinder-ingest ."
+    print "          docker buildx build --file deploy/Dockerfile --target zinder ."
   }
   { print }
 ' "$repository_root/.github/workflows/release.yml" \
@@ -953,20 +1144,63 @@ expect_rejected_because \
 bench_compile_dockerfile="$temporary_directory/bench-compile.Dockerfile"
 awk '
   { print }
-  $0 == "        --bin zinder-explorer \\" { print "        --bin zinder-bench \\" }
+  $0 == "        --bin zinder \\" { print "        --bin zinder-bench \\" }
 ' "$repository_root/deploy/Dockerfile" > "$bench_compile_dockerfile"
 expect_rejected_because \
   "a Dockerfile whose shared release compile also builds the benchmark" \
-  'release admission rejected: the zinder-binaries stage must compile exactly' \
+  'release admission rejected: the zinder-binaries stage must compile only' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$bench_compile_dockerfile"
 
+unrefreshed_bench_dockerfile="$temporary_directory/unrefreshed-bench.Dockerfile"
+sed '/^FROM zinder-release-source AS zinder-bench-binary$/,/^FROM / {
+  /^    find \. -path \.\/target -prune -o -type f -exec touch {} + \\$/d
+  s/^    && rust_target=/    rust_target=/
+}' "$repository_root/deploy/Dockerfile" > "$unrefreshed_bench_dockerfile"
+cmp -s "$repository_root/deploy/Dockerfile" "$unrefreshed_bench_dockerfile" \
+  && fail "the unrefreshed benchmark fixture did not change the Dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose benchmark build can reuse another tree's workspace crates" \
+  'release admission rejected: every Docker build step that mounts the Cargo' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$unrefreshed_bench_dockerfile"
+
+late_refresh_dockerfile="$temporary_directory/late-refresh.Dockerfile"
+awk '
+  /^FROM zinder-release-source AS zinder-binaries$/ { in_stage = 1 }
+  in_stage && /^    find \. -path \.\/target -prune -o -type f -exec touch \{\} \+ \\$/ { next }
+  in_stage && /^    && rust_target=/ { sub(/^    && /, "    ") }
+  { print }
+  in_stage && $0 == "        --bin zinder \\" {
+    print "    && find . -path ./target -prune -o -type f -exec touch {} + \\"
+    in_stage = 0
+  }
+' "$repository_root/deploy/Dockerfile" > "$late_refresh_dockerfile"
+cmp -s "$repository_root/deploy/Dockerfile" "$late_refresh_dockerfile" \
+  && fail "the late-refresh fixture did not change the Dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose release compile refreshes sources only after cargo runs" \
+  'release admission rejected: every Docker build step that mounts the Cargo' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$late_refresh_dockerfile"
+
+newest_test_binary_dockerfile="$temporary_directory/newest-test-binary.Dockerfile"
+sed 's/ --message-format=json-render-diagnostics / /' \
+  "$repository_root/deploy/Dockerfile" > "$newest_test_binary_dockerfile"
+cmp -s "$repository_root/deploy/Dockerfile" "$newest_test_binary_dockerfile" \
+  && fail "the newest-test-binary fixture did not change the Dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose live-test stage does not read cargo's artifact messages" \
+  'release admission rejected: every Docker build step that mounts the Cargo' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$newest_test_binary_dockerfile"
+
 compiling_image_dockerfile="$temporary_directory/compiling-image.Dockerfile"
-sed 's#^COPY --from=zinder-binaries-selected /zinder-binaries/zinder-query #COPY --from=zinder-binaries /zinder-binaries/zinder-query #' \
+sed 's#^COPY --from=zinder-binaries-selected /zinder-binaries/zinder #COPY --from=zinder-binaries /zinder-binaries/zinder #' \
   "$repository_root/deploy/Dockerfile" > "$compiling_image_dockerfile"
 expect_rejected_because \
-  "a Dockerfile whose query images copy from the compile stage" \
-  'release admission rejected: the zinder-binaries stage must compile exactly' \
+  "a Dockerfile whose release image copies from the compile stage" \
+  'release admission rejected: the zinder-binaries stage must compile only' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$compiling_image_dockerfile"
 
@@ -975,58 +1209,26 @@ sed 's/^FROM scratch AS zinder-archived-binaries$/FROM zinder-binaries AS zinder
   "$repository_root/deploy/Dockerfile" > "$compiling_archive_dockerfile"
 expect_rejected_because \
   "a Dockerfile whose archived-binary source compiles when its context is missing" \
-  'release admission rejected: the zinder-binaries stage must compile exactly' \
+  'release admission rejected: the zinder-binaries stage must compile only' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$compiling_archive_dockerfile"
 
 debian_service_dockerfile="$temporary_directory/debian-service.Dockerfile"
-sed 's/^FROM zinder-service-base AS zinder-query$/FROM zinder-runtime-base AS zinder-query/' \
+sed 's/^FROM zinder-service-base AS zinder$/FROM zinder-runtime-base AS zinder/' \
   "$repository_root/deploy/Dockerfile" > "$debian_service_dockerfile"
 expect_rejected_because \
-  "a Dockerfile whose query image builds on the Debian runtime base" \
-  'release admission rejected: every per-service release image must build on' \
+  "a Dockerfile whose release image builds on the Debian runtime base" \
+  'release admission rejected: the unified zinder release stage must build on' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$debian_service_dockerfile"
 
-shell_less_single_volume_dockerfile="$temporary_directory/shell-less-single-volume.Dockerfile"
-sed 's/^FROM zinder-runtime-base AS zinder-wallet-serving$/FROM zinder-service-base AS zinder-wallet-serving/' \
-  "$repository_root/deploy/Dockerfile" > "$shell_less_single_volume_dockerfile"
-expect_rejected_because \
-  "a Dockerfile whose wallet-serving image has no shell for its entrypoint" \
-  'release admission rejected: every per-service release image must build on' \
-  --release-workflow "$repository_root/.github/workflows/release.yml" \
-  --dockerfile "$shell_less_single_volume_dockerfile"
-
-compat_less_wallet_serving_dockerfile="$temporary_directory/compat-less-wallet-serving.Dockerfile"
-sed '/^FROM zinder-runtime-base AS zinder-wallet-serving$/,/^ENTRYPOINT /{/^COPY --from=zinder-binaries-selected \/zinder-binaries\/zinder-compat-lightwalletd /d}' \
-  "$repository_root/deploy/Dockerfile" > "$compat_less_wallet_serving_dockerfile"
-cmp -s "$repository_root/deploy/Dockerfile" "$compat_less_wallet_serving_dockerfile" \
-  && fail "the fixture did not remove the wallet-serving compatibility binary"
-expect_rejected_because \
-  "a Dockerfile whose wallet-serving image omits the lightwalletd compatibility binary" \
-  'release admission rejected: the zinder-wallet-serving image must carry exactly' \
-  --release-workflow "$repository_root/.github/workflows/release.yml" \
-  --dockerfile "$compat_less_wallet_serving_dockerfile"
-
-closed_compat_port_dockerfile="$temporary_directory/closed-compat-port.Dockerfile"
-sed 's/^EXPOSE 9067 9102 9106 9107$/EXPOSE 9102 9106 9107/' \
-  "$repository_root/deploy/Dockerfile" > "$closed_compat_port_dockerfile"
-cmp -s "$repository_root/deploy/Dockerfile" "$closed_compat_port_dockerfile" \
-  && fail "the fixture did not remove the wallet-serving compatibility port"
-expect_rejected_because \
-  "a Dockerfile whose wallet-serving image does not expose the compatibility port" \
-  'release admission rejected: the zinder-wallet-serving image must carry exactly' \
-  --release-workflow "$repository_root/.github/workflows/release.yml" \
-  --dockerfile "$closed_compat_port_dockerfile"
-
 unpinned_distroless_dockerfile="$temporary_directory/unpinned-distroless.Dockerfile"
-# The variable reference is the literal Dockerfile text being rewritten.
 # shellcheck disable=SC2016
 sed 's#^FROM gcr.io/distroless/cc-debian12:nonroot@\${DISTROLESS_IMAGE_DIGEST} AS zinder-service-base$#FROM gcr.io/distroless/cc-debian12:nonroot AS zinder-service-base#' \
   "$repository_root/deploy/Dockerfile" > "$unpinned_distroless_dockerfile"
 expect_rejected_because \
   "a Dockerfile whose distroless service base is not digest-pinned" \
-  'release admission rejected: every per-service release image must build on' \
+  'release admission rejected: the unified zinder release stage must build on' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$unpinned_distroless_dockerfile"
 
@@ -1034,8 +1236,8 @@ legacy_uid_dockerfile="$temporary_directory/legacy-uid.Dockerfile"
 sed 's/^USER 10001:10001$/USER 1000:1000/' \
   "$repository_root/deploy/Dockerfile" > "$legacy_uid_dockerfile"
 expect_rejected_because \
-  "a Dockerfile whose service images run as UID 1000" \
-  'release admission rejected: every per-service release image must build on' \
+  "a Dockerfile whose release image runs as UID 1000" \
+  'release admission rejected: the unified zinder release stage must build on' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$legacy_uid_dockerfile"
 
@@ -1043,62 +1245,28 @@ legacy_account_dockerfile="$temporary_directory/legacy-account.Dockerfile"
 sed 's/useradd --system --uid 10001 --gid zinder/useradd --system --uid 1000 --gid zinder/' \
   "$repository_root/deploy/Dockerfile" > "$legacy_account_dockerfile"
 expect_rejected_because \
-  "a Dockerfile whose single-volume zinder account is not UID 10001" \
-  'release admission rejected: every per-service release image must build on' \
+  "a Dockerfile whose runtime-base zinder account is not UID 10001" \
+  'release admission rejected: the unified zinder release stage must build on' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$legacy_account_dockerfile"
 
 curl_healthcheck_dockerfile="$temporary_directory/curl-healthcheck.Dockerfile"
-sed 's#^    CMD \["zinder-projector", "--config", "/etc/zinder/config.toml", "healthcheck"\]$#    CMD curl -fsS http://localhost:9110/readyz || exit 1#' \
+sed 's#^    CMD \["/usr/local/bin/zinder", "healthcheck"\]$#    CMD curl -fsS http://localhost:9108/readyz || exit 1#' \
   "$repository_root/deploy/Dockerfile" > "$curl_healthcheck_dockerfile"
 expect_rejected_because \
-  "a Dockerfile whose projector image probes itself with curl" \
-  'release admission rejected: every per-service release image must build on' \
+  "a Dockerfile whose release image probes itself with curl" \
+  'release admission rejected: the unified zinder release stage must build on' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$curl_healthcheck_dockerfile"
-
-configless_healthcheck_dockerfile="$temporary_directory/configless-healthcheck.Dockerfile"
-sed 's#^    CMD \["zinder-query", "--config", "/etc/zinder/config.toml", "healthcheck"\]$#    CMD ["zinder-query", "healthcheck"]#' \
-  "$repository_root/deploy/Dockerfile" > "$configless_healthcheck_dockerfile"
-expect_rejected_because \
-  "a Dockerfile whose query healthcheck ignores the image config file" \
-  'release admission rejected: every per-service release image must build on' \
-  --release-workflow "$repository_root/.github/workflows/release.yml" \
-  --dockerfile "$configless_healthcheck_dockerfile"
-
-listener_env_dockerfile="$temporary_directory/listener-env.Dockerfile"
-awk '
-  { print }
-  $0 == "COPY deploy/config/images/query.toml /etc/zinder/config.toml" {
-    print "ENV ZINDER_OPS__LISTEN_ADDR=[::]:9106"
-  }
-' "$repository_root/deploy/Dockerfile" > "$listener_env_dockerfile"
-expect_rejected_because \
-  "a Dockerfile whose query image sets a listener through the environment" \
-  'release admission rejected: every per-service release image must copy its' \
-  --release-workflow "$repository_root/.github/workflows/release.yml" \
-  --dockerfile "$listener_env_dockerfile"
 
 public_bind_env_dockerfile="$temporary_directory/public-bind-env.Dockerfile"
 sed 's#^USER 10001:10001$#ENV ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true\nUSER 10001:10001#' \
   "$repository_root/deploy/Dockerfile" > "$public_bind_env_dockerfile"
 expect_rejected_because \
   "a Dockerfile whose service base allows public binds through the environment" \
-  'release admission rejected: every per-service release image must copy its' \
+  'release admission rejected: the unified zinder release stage must build on' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$public_bind_env_dockerfile"
-
-unconfigured_cmd_dockerfile="$temporary_directory/unconfigured-cmd.Dockerfile"
-awk '
-  $0 == "ENTRYPOINT [\"zinder-explorer\"]" { explorer = 1 }
-  explorer && $0 == "CMD [\"--config\", \"/etc/zinder/config.toml\"]" { explorer = 0; next }
-  { print }
-' "$repository_root/deploy/Dockerfile" > "$unconfigured_cmd_dockerfile"
-expect_rejected_because \
-  "a Dockerfile whose explorer image does not pass its default config" \
-  'release admission rejected: every per-service release image must copy its' \
-  --release-workflow "$repository_root/.github/workflows/release.yml" \
-  --dockerfile "$unconfigured_cmd_dockerfile"
 
 parallel_publication_workflow="$temporary_directory/parallel-publication-release.yml"
 sed 's/group: release-publication/group: release-${{ github.ref }}/' \
@@ -1170,7 +1338,6 @@ expect_rejected \
   --release-workflow "$protoc_dependent_release_workflow"
 
 static_crate_token_workflow="$temporary_directory/static-crate-token-release.yml"
-# The literal workflow expressions are the credential contract being mutated.
 # shellcheck disable=SC2016
 sed 's/${{ steps.crates-io-auth.outputs.token }}/${{ secrets.CARGO_REGISTRY_TOKEN }}/' \
   "$repository_root/.github/workflows/release.yml" \
@@ -1180,7 +1347,6 @@ expect_rejected \
   --release-workflow "$static_crate_token_workflow"
 
 leaked_oidc_token_workflow="$temporary_directory/leaked-oidc-token-release.yml"
-# The literal workflow expression is the credential contract being duplicated.
 # shellcheck disable=SC2016
 sed '/name: verify public SDK packages/a\    env:\n      CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}' \
   "$repository_root/.github/workflows/release.yml" \
@@ -1330,7 +1496,6 @@ expect_rejected \
   --build-images-workflow "$unverified_build_workflow"
 
 volatile_provenance_build_workflow="$temporary_directory/volatile-provenance-build-images.yml"
-# The literal shell variables are the unsafe fixture replacement targets.
 # shellcheck disable=SC2016
 sed 's/${SMOKE_BUILD_GIT_COMMIT}/${GITHUB_SHA}/' \
   "$repository_root/.github/workflows/build-images.yml" \
@@ -1340,14 +1505,47 @@ expect_rejected \
   --build-images-workflow "$volatile_provenance_build_workflow"
 
 helpless_build_workflow="$temporary_directory/helpless-build-images.yml"
-# The literal shell variable is the unsafe fixture removal target.
 # shellcheck disable=SC2016
-sed '/docker run --rm --entrypoint="\$image_name"/d' \
+sed '/docker run --rm "\${image_name}:\${PR_TAG}" --help/d' \
   "$repository_root/.github/workflows/build-images.yml" \
   > "$helpless_build_workflow"
 expect_rejected \
   "a pull-request image workflow without runtime help smokes" \
   --build-images-workflow "$helpless_build_workflow"
+
+no_darkside_build_workflow="$temporary_directory/no-darkside-build-images.yml"
+sed 's/dev darkside --help/help/g' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$no_darkside_build_workflow"
+expect_rejected \
+  "a pull-request image workflow without dev darkside help smoke" \
+  --build-images-workflow "$no_darkside_build_workflow"
+
+no_profile_validate_build_workflow="$temporary_directory/no-profile-validate-build-images.yml"
+# shellcheck disable=SC2016
+sed '/--env-file "\$profile_env"/s/config validate$/config validate --help/' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$no_profile_validate_build_workflow"
+expect_rejected \
+  "a pull-request image workflow without deployment-profile config validate smoke" \
+  --build-images-workflow "$no_profile_validate_build_workflow"
+
+no_unknown_key_build_workflow="$temporary_directory/no-unknown-key-build-images.yml"
+sed 's/ZINDER_UNKNOWN__SMOKE_KEY=1/ZINDER_NOOP=1/g' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$no_unknown_key_build_workflow"
+expect_rejected \
+  "a pull-request image workflow without unknown-key fail-closed smoke" \
+  --build-images-workflow "$no_unknown_key_build_workflow"
+
+unchecked_unknown_key_status_build_workflow="$temporary_directory/unchecked-unknown-key-status-build-images.yml"
+# shellcheck disable=SC2016
+sed '/\[\[ "\$unknown_key_status" -ne 1 \]\]/d' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$unchecked_unknown_key_status_build_workflow"
+expect_rejected \
+  "a pull-request image workflow that does not require exit code 1 for unknown config keys" \
+  --build-images-workflow "$unchecked_unknown_key_status_build_workflow"
 
 arm64less_build_workflow="$temporary_directory/arm64less-build-images.yml"
 sed '/^[[:space:]]*-[[:space:]]*name: arm64$/,/^[[:space:]]*runner: ubuntu-24.04-arm$/d' \
@@ -1358,7 +1556,6 @@ expect_rejected \
   --build-images-workflow "$arm64less_build_workflow"
 
 platformless_build_workflow="$temporary_directory/platformless-build-images.yml"
-# The literal shell variable is the unsafe fixture removal target.
 # shellcheck disable=SC2016
 sed '/--platform "\$PLATFORM_REF"/d' \
   "$repository_root/.github/workflows/build-images.yml" \
@@ -1367,66 +1564,44 @@ expect_rejected \
   "a pull-request image workflow that ignores its target platform" \
   --build-images-workflow "$platformless_build_workflow"
 
-queryless_prometheus="$temporary_directory/queryless-prometheus.yml"
-sed '/targets: \["zinder-ingest:9106"\]/d' \
+serveless_prometheus="$temporary_directory/serveless-prometheus.yml"
+sed '/targets: \["zinder-index:9108"\]/d' \
   "$repository_root/deploy/observability/prometheus.yml" \
-  > "$queryless_prometheus"
+  > "$serveless_prometheus"
 expect_rejected \
-  "a deploy Prometheus config omitting the native query ops target" \
-  --prometheus-config "$queryless_prometheus"
+  "a deploy Prometheus config omitting the zinder-serve ops target" \
+  --prometheus-config "$serveless_prometheus"
 
-mislabeled_query_prometheus="$temporary_directory/mislabeled-query-prometheus.yml"
-sed '/job_name: "zinder-query"/,/service: "zinder-query"/s/service: "zinder-query"/service: "zinder-compat-lightwalletd"/' \
+mislabeled_serve_prometheus="$temporary_directory/mislabeled-serve-prometheus.yml"
+sed '/job_name: "zinder-serve"/,/service: "zinder-serve"/s/service: "zinder-serve"/service: "zinder-index"/' \
   "$repository_root/deploy/observability/prometheus.yml" \
-  > "$mislabeled_query_prometheus"
+  > "$mislabeled_serve_prometheus"
 expect_rejected \
-  "a deploy Prometheus config mislabeling the native query target" \
-  --prometheus-config "$mislabeled_query_prometheus"
+  "a deploy Prometheus config mislabeling the zinder-serve target" \
+  --prometheus-config "$mislabeled_serve_prometheus"
 
-single_volume_images_catalog="$repository_root/deploy/release-single-volume-images.json"
-while IFS= read -r omitted_image; do
-  omitted_single_volume_catalog="$temporary_directory/single-volume-without-${omitted_image}.json"
-  jq --arg omitted_image "$omitted_image" \
-    'map(select(. != $omitted_image))' \
-    "$single_volume_images_catalog" > "$omitted_single_volume_catalog"
-  expect_rejected \
-    "a single-volume image catalog omitting $omitted_image" \
-    --release-workflow "$repository_root/.github/workflows/release.yml" \
-    --single-volume-images-catalog "$omitted_single_volume_catalog"
-done < <(jq -r '.[]' "$single_volume_images_catalog")
-
-explorer_single_volume_catalog="$temporary_directory/single-volume-with-explorer.json"
-jq '. + ["zinder-explorer"]' \
-  "$single_volume_images_catalog" > "$explorer_single_volume_catalog"
+root_kube_manifest="$temporary_directory/root-statefulset.yaml"
+sed 's/runAsUser: 10001/runAsUser: 0/' \
+  "$repository_root/deploy/kubernetes/statefulset.yaml" \
+  > "$root_kube_manifest"
 expect_rejected \
-  "a single-volume image catalog containing the optional explorer" \
-  --release-workflow "$repository_root/.github/workflows/release.yml" \
-  --single-volume-images-catalog "$explorer_single_volume_catalog"
+  "a Kubernetes StatefulSet manifest running as root" \
+  --kubernetes-manifest "$root_kube_manifest"
 
-newline_single_volume_catalog="$temporary_directory/single-volume-with-newline.json"
-printf '%s\n' '["zinder-canonical-runtime\nzinder-wallet-serving"]' \
-  > "$newline_single_volume_catalog"
+preset_kube_manifest="$temporary_directory/preset-statefulset.yaml"
+awk '{ print; if ($0 ~ /^            - serve$/) { print "            - --preset"; print "            - wallet" } }' \
+  "$repository_root/deploy/kubernetes/statefulset.yaml" \
+  > "$preset_kube_manifest"
 expect_rejected \
-  "a single-volume image catalog with one newline-joined image name" \
-  --release-workflow "$repository_root/.github/workflows/release.yml" \
-  --single-volume-images-catalog "$newline_single_volume_catalog"
+  "a Kubernetes StatefulSet manifest hardcoding --preset" \
+  --kubernetes-manifest "$preset_kube_manifest"
 
-runtime_only_release_workflow="$temporary_directory/runtime-only-release.yml"
-# The literal shell variables are the fixture replacement targets.
-# shellcheck disable=SC2016
-sed 's/jq -c -s '"'"'add'"'"' "\$RELEASE_IMAGES_FILE" "\$RELEASE_SINGLE_VOLUME_IMAGES_FILE"/jq -c . "$RELEASE_IMAGES_FILE"/' \
-  "$repository_root/.github/workflows/release.yml" \
-  > "$runtime_only_release_workflow"
+configmapless_kube_manifest="$temporary_directory/configmapless-statefulset.yaml"
+sed 's/kind: ConfigMap/kind: RemovedConfigMap/' \
+  "$repository_root/deploy/kubernetes/statefulset.yaml" \
+  > "$configmapless_kube_manifest"
 expect_rejected \
-  "a release workflow that does not publish the single-volume images" \
-  --release-workflow "$runtime_only_release_workflow"
-
-single_volumeless_build_workflow="$temporary_directory/single-volumeless-build-images.yml"
-sed '/release-single-volume-images.json)"$/d' \
-  "$repository_root/.github/workflows/build-images.yml" \
-  > "$single_volumeless_build_workflow"
-expect_rejected \
-  "a pull-request image workflow that skips the single-volume images" \
-  --build-images-workflow "$single_volumeless_build_workflow"
+  "a Kubernetes manifest missing the zinder-config ConfigMap" \
+  --kubernetes-manifest "$configmapless_kube_manifest"
 
 echo "deployment admission tests passed"

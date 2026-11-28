@@ -87,6 +87,10 @@ impl Connector {
         }
     }
 
+    pub(super) fn for_wallet(&self) -> Self {
+        self.with_recorder(self.recorder.for_wallet())
+    }
+
     /// Returns the connection in `slot`, opening one first when the slot is
     /// empty, as it is before a wallet's first call and after an error.
     pub(super) async fn reuse_or_connect<'slot>(
@@ -163,12 +167,14 @@ pub(super) struct CallSample {
 /// Every call sample of one run, shared by all simulated wallets.
 #[derive(Default)]
 pub(super) struct CallRecorder {
-    state: Mutex<RecorderState>,
+    state: Arc<Mutex<RecorderState>>,
+    wallet_index: Option<usize>,
 }
 
 #[derive(Default)]
 struct RecorderState {
     calls: BTreeMap<&'static str, CallSamples>,
+    wallet_requests: Vec<BTreeMap<[u8; 32], u64>>,
     tree_state_heights: Vec<u64>,
     tree_state_frontiers: BTreeSet<[u8; 32]>,
 }
@@ -188,6 +194,58 @@ struct CallSamples {
 }
 
 impl CallRecorder {
+    /// Registers the wallet before it starts so a wallet issuing no reads
+    /// still contributes one empty identity to the run.
+    fn for_wallet(&self) -> Arc<Self> {
+        let mut state = self.state.lock();
+        let index = state.wallet_requests.len();
+        state.wallet_requests.push(BTreeMap::new());
+        drop(state);
+        Arc::new(Self {
+            state: Arc::clone(&self.state),
+            wallet_index: Some(index),
+        })
+    }
+
+    fn note_request(&self, method: &'static str, request: &impl prost::Message) {
+        let Some(wallet_index) = self.wallet_index else {
+            return;
+        };
+        let mut hash = Sha256::new();
+        hash.update(method.as_bytes());
+        hash.update([0]);
+        hash.update(request.encode_to_vec());
+        *self.state.lock().wallet_requests[wallet_index]
+            .entry(hash.finalize().into())
+            .or_default() += 1;
+    }
+
+    /// Hashes the sorted wallet digests, retaining identical and empty wallets.
+    pub(super) fn wallet_request_identity_sha256(&self) -> String {
+        let mut wallets: Vec<[u8; 32]> = self
+            .state
+            .lock()
+            .wallet_requests
+            .iter()
+            .map(|requests| {
+                let mut hash = Sha256::new();
+                hash.update(b"zinder-wallet-load-requests-v1\0");
+                for (identity, count) in requests {
+                    hash.update(identity);
+                    hash.update(count.to_be_bytes());
+                }
+                hash.finalize().into()
+            })
+            .collect();
+        wallets.sort_unstable();
+        let mut hash = Sha256::new();
+        hash.update(b"zinder-wallet-load-wallets-v1\0");
+        for wallet in wallets {
+            hash.update(wallet);
+        }
+        hex::encode(hash.finalize())
+    }
+
     pub(super) fn record_call(&self, method: &'static str, sample: CallSample) {
         let mut state = self.state.lock();
         let samples = state.calls.entry(method).or_default();
@@ -369,15 +427,10 @@ pub(crate) struct RpcSummary {
     cancelled_after_messages: u64,
 }
 
-/// Requested tree-state heights against Zinder's construction checkpoints.
+/// Requested tree-state heights and their alignment with the 100-block cadence.
 ///
-/// First-sync construction stores a checkpoint every 100 blocks, so a height
-/// on that stride is a stored checkpoint. Below the first-sync tip, any other
-/// height replays its offset from the stride, `height % 100` blocks. Above
-/// that tip every block has a checkpoint, and a store whose checkpoint pass
-/// has run has one at every settled block, so the offsets are an upper bound
-/// on the replay work. `server_observed`, present when the run read the
-/// server's metrics, is what the server actually did.
+/// Cadence offsets describe the workload. When available, server metrics
+/// report stored and replayed requests and observed replay work.
 #[derive(Debug, Serialize)]
 pub(crate) struct TreeStateHeights {
     requested: u64,
@@ -521,15 +574,17 @@ pub(super) async fn get_tree_state_as(
     limits: &CallLimits,
     height: u64,
 ) -> Result<(), CallFailure> {
+    let request = BlockId {
+        height,
+        hash: Vec::new(),
+    };
     recorder.note_tree_state_height(height);
+    recorder.note_request("GetTreeState", &request);
     let tree_state = unary(
         recorder,
         method,
         limits.unary,
-        client.get_tree_state(BlockId {
-            height,
-            hash: Vec::new(),
-        }),
+        client.get_tree_state(request),
     )
     .await?;
     recorder.note_tree_state_frontier(&tree_state);
@@ -543,11 +598,13 @@ pub(super) async fn get_transaction(
     limits: CallLimits,
     txid: Vec<u8>,
 ) -> Result<(), CallFailure> {
+    let request = transaction_filter(txid);
+    recorder.note_request("GetTransaction", &request);
     unary(
         recorder,
         "GetTransaction",
         limits.unary,
-        client.get_transaction(transaction_filter(txid)),
+        client.get_transaction(request),
     )
     .await
     .map(drop)
@@ -632,19 +689,17 @@ pub(super) async fn read_transaction(
     read: TransactionRead,
     txid: Vec<u8>,
 ) -> Result<(), CallFailure> {
+    let request = transaction_filter(txid);
+    recorder.note_request("GetTransaction", &request);
     let mut pending = PendingCall::new(recorder, read.requested_method());
     if read == TransactionRead::Missing {
         pending.expected_miss = Some(status_label(Code::NotFound));
     }
-    let outcome = await_unary(
-        &mut pending,
-        limits.unary,
-        client.get_transaction(transaction_filter(txid)),
-    )
-    .await
-    .map(|transaction| {
-        pending.method = read.answered_method(TransactionAnswer::of_height(transaction.height));
-    });
+    let outcome = await_unary(&mut pending, limits.unary, client.get_transaction(request))
+        .await
+        .map(|transaction| {
+            pending.method = read.answered_method(TransactionAnswer::of_height(transaction.height));
+        });
     pending.finish(outcome.as_ref().map(drop));
     outcome
 }
@@ -753,7 +808,6 @@ pub(super) async fn get_block_range<Handled: Future<Output = ()>>(
     range: BlockRangeCall,
     mut on_block: impl FnMut(&CompactBlock, u64) -> Handled,
 ) -> Result<(), CallFailure> {
-    let mut pending = PendingCall::new(recorder, "GetBlockRange");
     let request = BlockRange {
         start: Some(BlockId {
             height: range.start,
@@ -765,6 +819,8 @@ pub(super) async fn get_block_range<Handled: Future<Output = ()>>(
         }),
         pool_types: range.pool_types,
     };
+    recorder.note_request("GetBlockRange", &request);
+    let mut pending = PendingCall::new(recorder, "GetBlockRange");
     let stream = async {
         let mut blocks = open_stream(limits, client.get_block_range(request)).await?;
         let mut expected = range.start;
@@ -957,6 +1013,83 @@ mod tests {
         stream_idle: Some(Duration::from_secs(5)),
         stream_total: None,
     };
+
+    #[tokio::test]
+    async fn request_identity_ignores_order_but_detects_changed_txids_and_repeated_attempts()
+    -> Result<(), Box<dyn Error>> {
+        let server = mock_streamer::serve(MockStreamer::new(RangeEnding::Clean)).await?;
+        let original = "e1ba4e42b1aeab83ce0e18d0d9b5e042ef0f75b19c6cb0d669afb34d91a2654b";
+        let changed = "92b4745bcea4af36dc0f491032e82e2cbc3e861b231b618f1aaf85a3604382e0";
+        for (tree_first, txid_byte, expected) in [
+            (true, 0x98, original),
+            (false, 0x98, original),
+            (false, 0x99, changed),
+        ] {
+            let recorder = CallRecorder::default().for_wallet();
+            let connector =
+                Connector::new(&server.url, Arc::clone(&recorder), &TlsOptions::default())?;
+            let mut client = connector
+                .connect()
+                .await
+                .map_err(|failure| failure.detail)?;
+            if tree_first {
+                super::get_tree_state(&recorder, &mut client, &LIMITS, 17)
+                    .await
+                    .map_err(|failure| failure.detail)?;
+            }
+            let range = BlockRangeCall {
+                start: 1,
+                end: 2,
+                pool_types: vec![1, 2],
+            };
+            get_block_range(&recorder, &mut client, &LIMITS, range, |_, _| {
+                std::future::ready(())
+            })
+            .await
+            .map_err(|failure| failure.detail)?;
+            let missing =
+                super::get_transaction(&recorder, client.clone(), LIMITS, vec![txid_byte; 32])
+                    .await;
+            assert_eq!(
+                missing.err().map(|failure| failure.label),
+                Some("not_found")
+            );
+            if !tree_first {
+                super::get_tree_state(&recorder, &mut client, &LIMITS, 17)
+                    .await
+                    .map_err(|failure| failure.detail)?;
+            }
+            assert_eq!(recorder.wallet_request_identity_sha256(), expected);
+            super::get_tree_state(&recorder, &mut client, &LIMITS, 17)
+                .await
+                .map_err(|failure| failure.detail)?;
+            assert_ne!(recorder.wallet_request_identity_sha256(), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_request_identity_distinguishes_the_distribution_of_reads() {
+        let digest = |wallets: &[&[u64]]| {
+            let run = CallRecorder::default();
+            for heights in wallets {
+                let wallet = run.for_wallet();
+                for &height in *heights {
+                    let request = super::BlockId {
+                        height,
+                        hash: Vec::new(),
+                    };
+                    wallet.note_request("GetTreeState", &request);
+                }
+            }
+            run.wallet_request_identity_sha256()
+        };
+        let original = digest(&[&[1, 2], &[3]]);
+        assert_eq!(original, digest(&[&[3], &[2, 1]]));
+        assert_ne!(original, digest(&[&[1, 3], &[2]]));
+        assert_ne!(digest(&[&[1, 2]]), digest(&[&[1, 2], &[1, 2]]));
+        assert_ne!(digest(&[&[1, 2]]), digest(&[&[1, 2], &[]]));
+    }
 
     #[tokio::test]
     async fn a_block_past_the_range_counts_as_received_but_not_handled()

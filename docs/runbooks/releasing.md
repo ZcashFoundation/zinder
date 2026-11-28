@@ -13,15 +13,15 @@ Every first-party crate and service shares one product version, the root
 
 | Artifact | Contents |
 | --- | --- |
-| Runtime images | The five images in `deploy/release-images.json`, for amd64 and arm64 |
-| Single-volume host images | The three images in `deploy/release-single-volume-images.json`, for amd64 and arm64 |
-| Binary archives | One archive per platform (x86-64-v3 and AArch64 GNU/Linux) with the five runtime executables, plus an SPDX 2.3 SBOM for each |
+| Runtime image | The single distroless OCI image in `deploy/release-images.json` (`ghcr.io/zcashfoundation/zinder`), for amd64 and arm64 |
+| Binary archives | One archive per [release platform](../adrs/0022-release-artifacts.md#decision) with the unified `bin/zinder` executable, plus an SPDX 2.3 SBOM for each |
+| Personal-node Compose | `zinder-personal-compose.yaml` |
 | Rust SDK | `zinder-core`, `zinder-proto`, and `zinder-client` on crates.io |
-| API artifacts | `zinder.v1.descriptor.bin` and a `zinder-api-docs` archive with the native `.proto` sources and OpenAPI documents |
+| API artifacts | `zinder.v1.descriptor.bin` and a [standalone protobuf contract archive](../reference/integration-surfaces.md#generate-bindings-from-a-pinned-release) with native and vendored schemas, descriptors, and OpenAPI documents |
 | GitHub Release | All of the above files, `SHA256SUMS`, and its signature `SHA256SUMS.sigstore.json` |
 
 The tag must be `v` followed by the workspace version. A prerelease adds a
-SemVer suffix, such as `v0.18.0-rc.1`. Build metadata (`+...`) is rejected,
+SemVer suffix, such as `v0.28.0-rc.1`. Build metadata (`+...`) is rejected,
 because an OCI image tag cannot carry it.
 
 ## Before you start
@@ -61,14 +61,47 @@ because an OCI image tag cannot carry it.
    ```
 
    The script fails unless the requested version matches the fragments'
-   SemVer impact and every first-party package. For a prerelease, it keeps
-   the fragments, so the next candidate contains the whole release, and it
-   replaces an earlier candidate's section. For a stable version, it removes
-   the prerelease sections and consumes the fragments. Rerunning it for the
-   same version changes nothing.
+   SemVer impact and every first-party package. It also validates every pending
+   fragment's `Upgrade` class, computes the release's highest-precedence class,
+   and writes one `**Upgrade class:**` line with its rollback statement
+   immediately under the version heading in `.changes/v<version>.md` and
+   `CHANGELOG.md`. For a prerelease, it keeps the fragments, so the next
+   candidate contains the whole release, and it replaces an earlier candidate's
+   section. For a stable version, it removes the prerelease sections and
+   consumes the fragments. Rerunning it for the same version changes nothing.
 
 4. Open a pull request with this change and check `No release note required`
    in its template. Merge it to `main` once the required checks pass.
+
+### Upgrade class and rollback contract
+
+Starting at `v0.28.0`, every release section carries one `**Upgrade class:**`
+line derived from its fragments in strict precedence order
+(`compatible < additive-schema < projection-layout < canonical-layout`). This
+declaration replaces ad-hoc per-release store layout notices, and
+`scripts/extract-release-notes.sh` copies it unchanged into the GitHub Release
+notes:
+
+| Class | Rollback statement |
+| --- | --- |
+| `compatible` | Reversible by redeploying the previous release against the same store and schema. |
+| `additive-schema` | Reversible by redeploying the previous release against the same store and schema. |
+| `projection-layout` | Requires a fresh rebuild of the affected projection; release entries below name the affected projection (`wallet`, `explorer`, or `materialized-view`) and rollback steps. |
+| `canonical-layout` | Requires a fresh rebuild of the canonical store and dependent projections; release entries below state the layout changes and rollback steps. |
+
+Single-volume `rocksdb` deployments still restart every runtime on each release,
+regardless of class. Keeping old and new store paths side by side during a
+layout change on `rocksdb` is optional (~2x disk until the old path is removed);
+otherwise, rollback requires restoring a matching backup or snapshot or
+rebuilding from empty in a clean path. Any 7-day superseded-schema retention
+policy applies strictly to future hosted `postgres` (planned M3, not yet
+implemented).
+
+Pull requests that use the exact `- [x] No release note required` waiver count
+as `compatible` and must not alter any persisted store or projection layout. See
+[`.changes/README.md`](../../.changes/README.md) for fragment authoring rules
+and [Deploying on a VM](deploying-on-a-vm.md#upgrade-restart-and-roll-back) for
+operator upgrade and rollback steps.
 
 ## Confirm both node runtimes
 
@@ -112,8 +145,8 @@ approve the release only after all four jobs pass on the tag's commit.
 1. Create and push an annotated tag at the release commit:
 
    ```console
-   git tag -a v0.18.0 -m "v0.18.0" "$release_commit"
-   git push origin v0.18.0
+   git tag -a v0.28.0 -m "v0.28.0" "$release_commit"
+   git push origin v0.28.0
    ```
 
 2. The `release` workflow starts. Before it asks for approval, it runs these
@@ -121,15 +154,19 @@ approve the release only after all four jobs pass on the tag's commit.
 
    - `validate release identity` checks that the tag matches Cargo metadata
      and is reachable from `main`, that `CHANGELOG.md` has a non-empty section
-     for it, and that no published GitHub Release has the tag. A stable tag
-     must have no pending fragments. A prerelease tag must keep them.
+     for it, and that no published GitHub Release has the tag. Starting at
+     `v0.28.0`, `scripts/validate-changelog.sh release` also requires exactly
+     one valid `**Upgrade class:**` line immediately under the version heading.
+     A stable tag must have no pending fragments. A prerelease tag must keep
+     them and match their derived upgrade class in both `CHANGELOG.md` and
+     `.changes/v<version>.md`.
    - `build API release artifacts` and `verify public SDK packages`, which
      also dry-runs the crate publication plan. Missing crate versions are
      expected in that dry run.
    - Per platform, `compile release binaries` and
      `reproduce release binaries` build the archive twice in independent,
-     uncached jobs. The reproduction also packages every image from its
-     archive without pushing, with `scripts/package-release-images.sh
+     uncached jobs. For the two platforms used by the OCI image, the reproduction also packages
+     the image from its archive without pushing, with `scripts/package-release-images.sh
      check`. Each image binary must match its archive binary byte for byte
      and be a root-owned file with mode `0755`. It must run `--version` and
      `--help` as UID 10001, and its `healthcheck` subcommand must exit 1
@@ -141,7 +178,7 @@ approve the release only after all four jobs pass on the tag's commit.
    approve, check that:
 
    - the run belongs to your tag, and its commit is the release commit;
-   - both `compare independent release builds` jobs passed;
+   - all four `compare independent release builds` jobs passed;
    - the `verify public SDK packages` summary shows the plan you expect for
      the three crates; and
    - the four node jobs passed on that commit.
@@ -151,10 +188,10 @@ approve the release only after all four jobs pass on the tag's commit.
    expire, rerun all jobs, which requests a new approval.
 
 4. After approval, the workflow publishes the missing SDK crates and checks
-   them from the registry, packages and pushes the images from the compared
-   binaries, attests and signs them, signs `SHA256SUMS`, and publishes the
-   GitHub Release. For a stable tag only, it then moves the eight `latest`
-   image tags. Prereleases never move `latest`.
+   them from the registry, packages and pushes the unified `zinder` image from
+   the compared archive binary, attests and signs it, signs `SHA256SUMS`, and
+   publishes the GitHub Release. For a stable tag only, it then moves the `latest`
+   image tag. Prereleases never move `latest`.
 
 The workflow publishes one tag at a time and has no manual trigger. For a
 build-only smoke test that publishes nothing, run the `build-images` workflow
@@ -165,34 +202,36 @@ by hand.
 Check out the tag, so the SDK smoke test compiles against that version's API.
 Then verify the Release, the archives, the crates, and each image:
 
-```console
-git switch --detach v0.18.0
-gh release view v0.18.0
-gh release verify v0.18.0
+```bash
+git switch --detach v0.28.0
+gh release view v0.28.0
+gh release verify v0.28.0
 
-gh release download v0.18.0 \
-  --pattern 'zinder-0.18.0-*-unknown-linux-gnu.tar.gz' \
-  --pattern 'zinder-0.18.0-*-unknown-linux-gnu.spdx.json' \
+gh release download v0.28.0 \
+  --pattern 'zinder-0.28.0-*.tar.gz' \
+  --pattern 'zinder-0.28.0-*.spdx.json' \
+  --pattern zinder-personal-compose.yaml \
   --pattern SHA256SUMS \
   --pattern SHA256SUMS.sigstore.json
 sha256sum --ignore-missing --check SHA256SUMS
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
   --certificate-identity \
-    'https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/v0.18.0' \
+    'https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/v0.28.0' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 
-scripts/verify-published-sdk.sh 0.18.0
+scripts/verify-published-sdk.sh 0.28.0
 
-for image in $(jq -r '.[]' deploy/release-images.json deploy/release-single-volume-images.json); do
-  docker buildx imagetools inspect "ghcr.io/zcashfoundation/${image}:v0.18.0"
+for image in $(jq -r '.[]' deploy/release-images.json); do
+  docker buildx imagetools inspect "ghcr.io/zcashfoundation/${image}:v0.28.0"
 done
 ```
 
 Each image must list amd64 and arm64 manifests. Each binary archive contains
-`bin/` with the five runtime executables, `BUILD-INFO.json`, `LICENSE`,
-`README.md`, and its own `SHA256SUMS`.
+`bin/zinder`, `BUILD-INFO.json`, `LICENSE`, `README.md`, and its own `SHA256SUMS`.
+GNU/Linux archives also contain the native units and environment sample under
+`systemd/`.
 
 When a release publishes an image name for the first time, GHCR creates the
 package as private. An organization admin must make it public once. An
@@ -203,26 +242,24 @@ Deployments should pin a verified image digest or archive checksum, not
 
 ### Inspect an image
 
-The five runtime images have no shell, so `docker run ... sh` fails. Inspect
-an image from outside, and run its binary as the entrypoint:
+The distroless `zinder` image has no shell, so `docker run ... sh` fails. Inspect
+the image from outside, and invoke `zinder` commands directly:
 
 ```console
-image=ghcr.io/zcashfoundation/zinder-query:v0.18.0
+image=ghcr.io/zcashfoundation/zinder:v0.28.0
 docker pull "$image"
 docker image inspect "$image" --format '{{.Config.User}}'
 docker image inspect "$image" --format '{{json .Config.Labels}}' | jq
-docker run --rm --entrypoint zinder-query "$image" --version
+docker run --rm "$image" --version
 ```
 
-A runtime image runs as `10001:10001`, and `--version` prints
-`zinder-query 0.18.0`. A single-volume image starts as root, and its
-entrypoint drops every Zinder process to UID 10001.
+The image runs as `10001:10001`, and `--version` prints `zinder 0.28.0`.
 
 Every image carries these OCI labels:
 
 | Label | Value |
 | --- | --- |
-| `org.opencontainers.image.title` | The image name, such as `zinder-query` |
+| `org.opencontainers.image.title` | The image name (`zinder`) |
 | `org.opencontainers.image.description` | One line on what the image runs |
 | `org.opencontainers.image.version` | The release tag |
 | `org.opencontainers.image.revision` | The tag-target commit |
@@ -251,13 +288,16 @@ tags from the same commit.
 | `publish public SDK crates` times out on registry propagation | Rerun the job. It reobserves crates.io and skips verified versions. |
 | A crate version exists but was published from another commit | Stop and investigate. Never yank or replace a version to let the release continue. |
 | Exact and commit image tags do not converge in GHCR | Inspect both tags in GHCR before you retry. Do not bypass the topology check. |
-| Image SBOM evidence reports an unexpected runtime package | Regenerate the SBOM from the exact child digest and compare it with the owning service's manifest. A single-volume image must report exactly the executables its `deploy/Dockerfile` target copies. Do not widen the allowed package set. |
+| Image SBOM evidence reports an unexpected runtime package | Regenerate the SBOM from the exact child digest and compare it with `deploy/release-images.json`. The distroless image must report only `bin/zinder` copied from the archive. Do not widen the allowed package set. |
 | A prerelease published crates or images but no GitHub Release | Leave the tag and artifacts as they are. Merge the fix and publish the next release candidate. |
-| Only `promote stable image tags` failed | Rerun that job. It checks all eight exact manifests before it moves any `latest` tag. |
+| Only `promote stable image tags` failed | Rerun that job. It checks the verified manifests before moving `latest`. |
 
 Never move a release tag or rebuild it from another commit. A published
 GitHub Release is immutable, and the workflow refuses to change it.
 
 To roll a deployment back, follow
-[Deploying on a VM](deploying-on-a-vm.md). Start an older binary only against
-a store whose layout it supports.
+[Deploying on a VM](deploying-on-a-vm.md#upgrade-restart-and-roll-back) and
+check the release's declared `**Upgrade class:**` line. Only `compatible` and
+`additive-schema` releases support redeploying an older binary against the same
+store; layout changes require an optionally retained separate store, a matching
+backup or snapshot restore, or a fresh rebuild in a clean path.

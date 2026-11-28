@@ -16,17 +16,13 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use parking_lot::RwLock;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-use zcash_primitives::transaction::{Authorized, Transaction as ZcashTransaction, TransactionData};
-use zebra_chain::{
-    block::Block as ZebraBlock,
-    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
-    transaction::Transaction as ZebraTransaction,
-};
+use zebra_chain::transaction::Transaction as ZebraTransaction;
 use zinder_core::{
-    BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockHeightRange, BlockId,
-    CanonicalBlockFacts, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontier, CommitmentTreeFrontiers, Network, NetworkUpgradeActivations,
-    ShieldedProtocol, TransactionId, TransparentOutPoint, UnixTimestampMillis,
+    BlockFinalNoteCommitmentRoots, BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFacts,
+    CommitmentTreeAccumulator, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
+    CommitmentTreeFrontiers, ConsensusBranchId, Network, NetworkUpgradeActivation,
+    NetworkUpgradeActivations, ShieldedProtocol, TransactionId, TransparentOutPoint,
+    UnixTimestampMillis,
 };
 use zinder_ingest::{
     CanonicalBlockContextReader, CanonicalConstructionConfig, CanonicalFollowConfig,
@@ -55,26 +51,20 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalStoreError, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_testkit::{
     LogCapture, P2pkhSpendArgs, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
     sample_regtest_upgrade_activations,
 };
 
-use super::fixture_block::{
-    fixture_orchard_source_block, fixture_sapling_source_block, fixture_source_block,
-};
+use super::fixture_block::{fixture_orchard_source_block, fixture_sapling_source_block};
 use super::materialized_view_replay::{
     clear_transparent_address_ranking, transparent_address_ranking, view_rows, view_store,
 };
 use super::tree_state_densification::following_tip_gate;
 
-const SERIALIZED_HEADER_PARENT_OFFSET: usize = 4;
-const SERIALIZED_HEADER_PARENT_END: usize = SERIALIZED_HEADER_PARENT_OFFSET + 32;
-const SERIALIZED_HEADER_TIME_OFFSET: usize = 100;
-const COINBASE_HEIGHT_OPCODE_OFFSET: usize = 1_534;
 const CHAIN_TIP_HEIGHT: u32 = 4;
 const SAPLING_BLOCK_HEIGHT: u32 = 2;
 const SPENDING_BLOCK_HEIGHT: u32 = 3;
@@ -594,6 +584,209 @@ async fn materialized_view_hydration_requires_genesis_complete_history()
     Ok(())
 }
 
+#[tokio::test]
+async fn stored_sparse_and_mixed_checkpoints_hydrate_byte_identical_roots()
+-> Result<(), Box<dyn Error>> {
+    const MIXED_TIP: u32 = 6;
+    let activations = sample_regtest_upgrade_activations();
+    let blocks = shielded_chain_through(MIXED_TIP)?;
+    let expected = independent_final_roots(&blocks, &activations)?;
+    let full_range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(MIXED_TIP));
+
+    // (a) Sparse construction store: only heights 0 and MIXED_TIP have checkpoints.
+    let sparse = CanonicalHarness::publish_chain(blocks.clone(), &activations).await?;
+    assert_roots_match_expected(sparse.secondary(), &activations, full_range, &expected)?;
+
+    // (b) Dense store: every height 1..=MIXED_TIP has a stored checkpoint via live following.
+    let dense = CanonicalHarness::dense_chain(blocks.clone(), &activations).await?;
+    assert_roots_match_expected(dense.secondary(), &activations, full_range, &expected)?;
+
+    // (c) Mixed dense + sparse store: delete checkpoints at heights 3 and 5 so
+    // the range alternates stored (1..=2) -> gap (3..=3) -> stored (4..=4) -> gap (5..=5) -> stored (6..=6).
+    let mut mixed = CanonicalHarness::dense_chain(blocks, &activations).await?;
+    mixed.delete_rows("tree_state_checkpoint", &[3, 5])?;
+    assert_roots_match_expected(mixed.secondary(), &activations, full_range, &expected)?;
+
+    // Multi-page sequential reads across dense/sparse boundaries must match byte-for-byte.
+    for page_bounds in [
+        vec![(1, 2), (3, 4), (5, 6)],
+        vec![(1, 3), (4, 6)],
+        vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)],
+    ] {
+        let mut reader = CanonicalBlockContextReader::new(mixed.secondary(), &activations);
+        let mut collected = HashMap::new();
+        for (start, end) in page_bounds {
+            let page = BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end));
+            collected.extend(reader.read_block_commit_contexts(page)?);
+        }
+        for height in full_range {
+            let context = collected
+                .get(&height)
+                .ok_or_else(|| format!("paged hydration must cover height {}", height.value()))?;
+            assert_eq!(
+                context.final_note_commitment_roots.as_ref(),
+                expected.get(&height)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pre_sapling_activation_boundaries_omit_roots_identically_for_sparse_and_dense_stores()
+-> Result<(), Box<dyn Error>> {
+    let activations = staged_pool_activations()?;
+    let blocks = chain_through(CHAIN_TIP_HEIGHT, 0, &|_| Ok(Vec::new()))?;
+    let expected = independent_final_roots(&blocks, &activations)?;
+    assert_eq!(
+        expected.get(&BlockHeight::new(1)),
+        Some(&BlockFinalNoteCommitmentRoots::unavailable(
+            BlockHeight::new(1),
+            blocks
+                .get(&BlockHeight::new(1))
+                .ok_or("height 1 must exist")?
+                .hash,
+        ))
+    );
+
+    let sparse = CanonicalHarness::publish_chain(blocks.clone(), &activations).await?;
+    let dense = CanonicalHarness::dense_chain(blocks, &activations).await?;
+    for secondary in [sparse.secondary(), dense.secondary()] {
+        let contexts = CanonicalBlockContextReader::new(secondary, &activations)
+            .read_ordered_block_commit_contexts(chain_range())?;
+        assert_eq!(contexts.len(), usize::try_from(CHAIN_TIP_HEIGHT)?);
+        assert_eq!(
+            contexts[0].final_note_commitment_roots, None,
+            "pre-Sapling height 1 must omit final roots"
+        );
+        for context in &contexts[1..] {
+            assert_eq!(
+                context.final_note_commitment_roots.as_ref(),
+                expected.get(&context.height),
+                "post-Sapling height {} must carry exact roots",
+                context.height.value()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn dense_checkpoints_hydrate_final_roots_without_reading_compact_blocks()
+-> Result<(), Box<dyn Error>> {
+    const DENSE_TIP: u32 = 6;
+    let activations = sample_regtest_upgrade_activations();
+    let blocks = shielded_chain_through(DENSE_TIP)?;
+    let expected = independent_final_roots(&blocks, &activations)?;
+    let full_range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(DENSE_TIP));
+
+    // Corrupt compact_block payloads for heights 1..=5 while keeping canonical_facts
+    // and every stored tree_state_checkpoint row (and tip height 6 untouched).
+    let mut dense = CanonicalHarness::dense_chain(blocks.clone(), &activations).await?;
+    dense.corrupt_live_tail_shielded_payload(&[1, 2, 3, 4, 5])?;
+    assert!(
+        dense
+            .secondary()
+            .compact_block_at(BlockHeight::new(2))
+            .is_err(),
+        "corrupt live-tail shielded payload must fail compact block read"
+    );
+    assert!(matches!(
+        dense
+            .secondary()
+            .compact_blocks_in_range(BlockHeightRange::inclusive(
+                BlockHeight::new(1),
+                BlockHeight::new(5)
+            )),
+        Err(CanonicalStoreError::SettledSegment { .. }
+            | CanonicalStoreError::PublicationRefused { .. })
+    ));
+    assert_roots_match_expected(dense.secondary(), &activations, full_range, &expected)?;
+
+    // Mixed case: corrupt live-tail compact payloads only at checkpointed heights (1, 2, 4)
+    // and remove checkpoints at uncheckpointed heights (3, 5). Hydration must
+    // skip compact blocks for 1, 2, 4, 6 and replay only gaps 3..=3 and 5..=5.
+    let mut mixed = CanonicalHarness::dense_chain(blocks, &activations).await?;
+    mixed.corrupt_live_tail_shielded_payload(&[1, 2, 4])?;
+    mixed.delete_rows("tree_state_checkpoint", &[3, 5])?;
+    assert_roots_match_expected(mixed.secondary(), &activations, full_range, &expected)?;
+    Ok(())
+}
+
+fn assert_roots_match_expected(
+    secondary: &RocksDbCanonicalSecondary,
+    activations: &NetworkUpgradeActivations,
+    range: BlockHeightRange,
+    expected: &BTreeMap<BlockHeight, BlockFinalNoteCommitmentRoots>,
+) -> Result<(), Box<dyn Error>> {
+    let mut reader = CanonicalBlockContextReader::new(secondary, activations);
+    let contexts = reader.read_block_commit_contexts(range)?;
+    for height in range {
+        let context = contexts
+            .get(&height)
+            .ok_or_else(|| format!("hydration must cover height {}", height.value()))?;
+        assert_eq!(
+            context.final_note_commitment_roots.as_ref(),
+            expected.get(&height),
+            "roots mismatch at height {}",
+            height.value()
+        );
+    }
+    Ok(())
+}
+
+fn shielded_chain_through(
+    tip_height: u32,
+) -> Result<BTreeMap<BlockHeight, SourceBlock>, Box<dyn Error>> {
+    chain_through(tip_height, 0, &|height| {
+        if height == 5 {
+            return shielded_transactions(&fixture_sapling_source_block()?);
+        }
+        if height == 4 {
+            return shielded_transactions(&fixture_orchard_source_block()?);
+        }
+        Ok(Vec::new())
+    })
+}
+
+fn staged_pool_activations() -> Result<NetworkUpgradeActivations, Box<dyn Error>> {
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        vec![
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x5ba8_1b19),
+                activation_height: BlockHeight::new(1),
+                name: "Overwinter".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x76b8_09bb),
+                activation_height: BlockHeight::new(2),
+                name: "Sapling".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x2bb4_0e60),
+                activation_height: BlockHeight::new(2),
+                name: "Blossom".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0xf5b9_230b),
+                activation_height: BlockHeight::new(2),
+                name: "Heartwood".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0xe9ff_75a6),
+                activation_height: BlockHeight::new(2),
+                name: "Canopy".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0xc2d6_d0b4),
+                activation_height: BlockHeight::new(4),
+                name: "NU5".to_owned(),
+            },
+        ],
+    )?)
+}
+
 /// Two chains that mine the same transparent spend at [`SPENDING_BLOCK_HEIGHT`]
 /// in different blocks; only the replacement extends to a block spending it.
 struct ForkedSpendChains {
@@ -886,7 +1079,7 @@ impl CanonicalHarness {
             &sample_regtest_upgrade_activations(),
             first_block.block_time_seconds.saturating_sub(1),
             block_id(&blocks, CHAIN_TIP_HEIGHT)?,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         )?;
         Self::publish(blocks, build_plan).await
@@ -905,7 +1098,7 @@ impl CanonicalHarness {
                 sapling_only_frontiers()?,
             ),
             block_id(&blocks, CHAIN_TIP_HEIGHT)?,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         )?;
         Self::publish(blocks, build_plan).await
@@ -923,7 +1116,7 @@ impl CanonicalHarness {
             &sample_regtest_upgrade_activations(),
             first_block.block_time_seconds.saturating_sub(1),
             block_id(&blocks, CHAIN_TIP_HEIGHT)?,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         )?;
         Self::publish_settled_at(blocks, build_plan, FORK_PARENT_HEIGHT).await
@@ -941,15 +1134,79 @@ impl CanonicalHarness {
         build_plan: CanonicalStoreBuildPlan,
         settled_height: u32,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::publish_settled_with_activations(
+            blocks,
+            build_plan,
+            settled_height,
+            &sample_regtest_upgrade_activations(),
+        )
+        .await
+    }
+
+    async fn publish_chain(
+        blocks: BTreeMap<BlockHeight, SourceBlock>,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<Self, Box<dyn Error>> {
+        let first_block = blocks
+            .values()
+            .next()
+            .ok_or("the chain must not be empty")?
+            .clone();
+        let tip_height = blocks
+            .keys()
+            .next_back()
+            .copied()
+            .ok_or("the chain must not be empty")?
+            .value();
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            activations,
+            first_block.block_time_seconds.saturating_sub(1),
+            block_id(&blocks, tip_height)?,
+            zinder_store::RawBlobRetention::None,
+            CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
+        )?;
+        Self::publish_settled_with_activations(blocks, build_plan, tip_height, activations).await
+    }
+
+    /// Publishes block 1 and live-follows every subsequent block so every
+    /// height `1..=tip` carries a persisted `tree_state_checkpoint` row.
+    async fn dense_chain(
+        blocks: BTreeMap<BlockHeight, SourceBlock>,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<Self, Box<dyn Error>> {
+        let first = blocks
+            .get(&BlockHeight::new(1))
+            .ok_or("the chain must start at height 1")?
+            .clone();
+        let initial = BTreeMap::from([(BlockHeight::new(1), first)]);
+        let mut harness = Self::publish_chain(initial, activations).await?;
+        harness.follow_to(blocks, activations).await?;
+        Ok(harness)
+    }
+
+    async fn publish_settled_with_activations(
+        blocks: BTreeMap<BlockHeight, SourceBlock>,
+        build_plan: CanonicalStoreBuildPlan,
+        settled_height: u32,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<Self, Box<dyn Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let store = build_canonical_store(&store_path, &blocks, build_plan, settled_height).await?;
+        let store = build_canonical_store_with_activations(
+            &store_path,
+            &blocks,
+            build_plan,
+            settled_height,
+            activations,
+        )
+        .await?;
         let secondary = RocksDbCanonicalSecondary::open_ready(
             &store_path,
             temporary.path().join("canonical-secondary"),
-            &sample_regtest_upgrade_activations(),
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            activations,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                zinder_store::RawBlobRetention::None,
+            ),
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -961,20 +1218,114 @@ impl CanonicalHarness {
         })
     }
 
-    /// Follows the canonical writer onto `blocks`, replacing every height
-    /// where they differ from the published chain, and catches the secondary up.
-    async fn reorg_to(
+    /// Closes the primary, deletes `heights` from `family` directly on disk,
+    /// and reopens the secondary so reads observe the modified column family.
+    fn delete_rows(&mut self, family: &str, heights: &[u32]) -> Result<(), Box<dyn Error>> {
+        let primary_path = self.temporary.path().join("canonical");
+        let activations = self
+            .secondary
+            .network_upgrade_activations()
+            .cloned()
+            .unwrap_or_else(sample_regtest_upgrade_activations);
+        self.store = None;
+        {
+            let options = rust_rocksdb::Options::default();
+            let column_families = rust_rocksdb::DB::list_cf(&options, &primary_path)?;
+            let db = rust_rocksdb::DB::open_cf(&options, &primary_path, &column_families)?;
+            let handle = db
+                .cf_handle(family)
+                .ok_or_else(|| format!("missing column family {family}"))?;
+            for height in heights {
+                db.delete_cf(&handle, height.to_be_bytes())?;
+            }
+            db.flush_cf(&handle)?;
+        }
+        self.reopen_secondary(&primary_path, &activations, family)
+    }
+
+    fn corrupt_live_tail_shielded_payload(
+        &mut self,
+        heights: &[u32],
+    ) -> Result<(), Box<dyn Error>> {
+        use sha2::Digest as _;
+
+        let primary_path = self.temporary.path().join("canonical");
+        let activations = self
+            .secondary
+            .network_upgrade_activations()
+            .cloned()
+            .unwrap_or_else(sample_regtest_upgrade_activations);
+        self.store = None;
+        {
+            let options = rust_rocksdb::Options::default();
+            let column_families = rust_rocksdb::DB::list_cf(&options, &primary_path)?;
+            let db = rust_rocksdb::DB::open_cf(&options, &primary_path, &column_families)?;
+            let handle = db
+                .cf_handle("live_tail_block")
+                .ok_or("missing column family live_tail_block")?;
+            for height in heights {
+                let key = height.to_be_bytes();
+                let encoded = db
+                    .get_cf(&handle, key)?
+                    .ok_or_else(|| format!("missing live_tail_block row {height}"))?;
+                let body = encoded
+                    .get(..encoded.len().saturating_sub(32))
+                    .ok_or("live_tail_block row missing trailer")?;
+                let len_bytes: [u8; 4] = body
+                    .get(85..89)
+                    .ok_or("live_tail_block row missing shielded length")?
+                    .try_into()?;
+                let old_len = usize::try_from(u32::from_be_bytes(len_bytes))?;
+                let suffix = body
+                    .get(89 + old_len..)
+                    .ok_or("live_tail_block shielded payload truncated")?;
+                let mut updated = Vec::with_capacity(body.len() + 32);
+                updated.extend_from_slice(&body[..85]);
+                updated.extend_from_slice(&3_u32.to_be_bytes());
+                updated.extend_from_slice(&[0xff; 3]);
+                updated.extend_from_slice(suffix);
+                let digest = sha2::Sha256::digest(&updated);
+                updated.extend_from_slice(&digest);
+                db.put_cf(&handle, key, updated)?;
+            }
+            db.flush_cf(&handle)?;
+        }
+        self.reopen_secondary(&primary_path, &activations, "corrupt_shielded")
+    }
+
+    fn reopen_secondary(
+        &mut self,
+        primary_path: &Path,
+        activations: &NetworkUpgradeActivations,
+        suffix: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        self.secondary = RocksDbCanonicalSecondary::open_ready(
+            primary_path,
+            self.temporary
+                .path()
+                .join(format!("canonical-secondary-after-{suffix}")),
+            activations,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                zinder_store::RawBlobRetention::None,
+            ),
+            CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        Ok(())
+    }
+
+    async fn follow_to(
         &mut self,
         blocks: BTreeMap<BlockHeight, SourceBlock>,
+        activations: &NetworkUpgradeActivations,
     ) -> Result<(), Box<dyn Error>> {
-        let activations = Arc::new(sample_regtest_upgrade_activations());
         let tip_height = blocks
             .keys()
             .next_back()
             .copied()
-            .ok_or("the replacement chain must not be empty")?;
+            .ok_or("the chain must not be empty")?;
         let source = StaticChainSource {
-            checkpoints: chain_checkpoints(&blocks, &activations)?,
+            checkpoints: chain_checkpoints(&blocks, activations)?,
             blocks: blocks.clone(),
         };
         let store = self
@@ -985,7 +1336,7 @@ impl CanonicalHarness {
         let cancel = CancellationToken::new();
         let follower = CanonicalFollower::new(
             &source,
-            activations,
+            Arc::new(activations.clone()),
             CanonicalFollowConfig {
                 request_timeout: Duration::from_secs(5),
                 poll_interval: Duration::ZERO,
@@ -1006,6 +1357,16 @@ impl CanonicalHarness {
         Ok(())
     }
 
+    /// Follows the canonical writer onto `blocks`, replacing every height
+    /// where they differ from the published chain, and catches the secondary up.
+    async fn reorg_to(
+        &mut self,
+        blocks: BTreeMap<BlockHeight, SourceBlock>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.follow_to(blocks, &sample_regtest_upgrade_activations())
+            .await
+    }
+
     const fn secondary(&self) -> &RocksDbCanonicalSecondary {
         &self.secondary
     }
@@ -1020,8 +1381,9 @@ impl CanonicalHarness {
             self.temporary.path().join("canonical"),
             self.temporary.path().join(secondary_name),
             &sample_regtest_upgrade_activations(),
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                zinder_store::RawBlobRetention::None,
+            ),
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1053,16 +1415,16 @@ impl CanonicalHarness {
     }
 }
 
-async fn build_canonical_store(
+async fn build_canonical_store_with_activations(
     store_path: &Path,
     blocks: &BTreeMap<BlockHeight, SourceBlock>,
     build_plan: CanonicalStoreBuildPlan,
     settled_height: u32,
+    activations: &NetworkUpgradeActivations,
 ) -> Result<RocksDbCanonicalStore, Box<dyn Error>> {
-    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let activations = Arc::new(activations.clone());
     let builder = RocksDbCanonicalBuilder::create_fresh(
         store_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1204,48 +1566,10 @@ fn append_source_block(
     Ok(())
 }
 
-#[derive(Default)]
-pub(super) struct PoolCommitments {
-    pub(super) sapling: Vec<[u8; 32]>,
-    pub(super) orchard: Vec<[u8; 32]>,
-    pub(super) ironwood: Vec<[u8; 32]>,
-}
-
-pub(super) fn pool_commitments(
-    source_block: &SourceBlock,
-) -> Result<PoolCommitments, Box<dyn Error>> {
-    let compact_block = prepare_canonical_block(
-        source_block,
-        &sample_regtest_upgrade_activations(),
-        RawBlobPolicy::Transactions,
-    )?
-    .partial_compact_block;
-    let mut commitments = PoolCommitments::default();
-    for transaction in compact_block.transactions() {
-        commitments.sapling.extend(
-            transaction
-                .data
-                .sapling_outputs
-                .iter()
-                .map(|output| output.commitment),
-        );
-        commitments.orchard.extend(
-            transaction
-                .data
-                .orchard_actions
-                .iter()
-                .map(|action| action.commitment),
-        );
-        commitments.ironwood.extend(
-            transaction
-                .data
-                .ironwood_actions
-                .iter()
-                .map(|action| action.commitment),
-        );
-    }
-    Ok(commitments)
-}
+pub(super) use crate::common::construction_fixture::{
+    chained_source_block, pool_commitments, shielded_transactions,
+    shielded_transactions_with_lock_time,
+};
 
 fn sapling_only_frontiers()
 -> Result<CommitmentTreeFrontiers, zinder_core::CommitmentTreeFrontiersError> {
@@ -1331,103 +1655,10 @@ fn shielded_transactions_at(height: u32) -> Result<Vec<Arc<ZebraTransaction>>, B
     Ok(Vec::new())
 }
 
-/// Lifts a fixture block's note-commitment-bearing transactions into the synthetic chain.
-///
-/// Transparent inputs are dropped: their previous outputs belong to the
-/// fixture's own chain, which the synthetic chain does not contain.
-pub(super) fn shielded_transactions(
-    fixture: &SourceBlock,
-) -> Result<Vec<Arc<ZebraTransaction>>, Box<dyn Error>> {
-    let block: ZebraBlock = fixture
-        .raw_block_bytes
-        .as_slice()
-        .zcash_deserialize_into()?;
-    let transactions = block
-        .transactions
-        .iter()
-        .filter(|transaction| !transaction.is_coinbase() && creates_note_commitments(transaction))
-        .map(|transaction| without_transparent_inputs(transaction).map(Arc::new))
-        .collect::<Result<Vec<_>, _>>()?;
-    if transactions.is_empty() {
-        return Err("fixture must carry a note-commitment-bearing transaction".into());
-    }
-    Ok(transactions)
-}
-
-fn creates_note_commitments(transaction: &ZebraTransaction) -> bool {
-    transaction.sapling_outputs().next().is_some() || transaction.orchard_actions().next().is_some()
-}
-
-fn without_transparent_inputs(
-    transaction: &ZebraTransaction,
-) -> Result<ZebraTransaction, Box<dyn Error>> {
-    let mut bytes = Vec::new();
-    transaction.zcash_serialize(&mut bytes)?;
-    let transaction_data =
-        ZcashTransaction::read(bytes.as_slice(), transaction.consensus_branch_id())?.into_data();
-    if !matches!(
-        transaction_data.version(),
-        zcash_primitives::transaction::TxVersion::V4 | zcash_primitives::transaction::TxVersion::V5
-    ) {
-        return Err("fixture shielded transactions must be v4 or v5".into());
-    }
-
-    let transparent_bundle = transaction_data
-        .transparent_bundle()
-        .cloned()
-        .map(|mut bundle| {
-            bundle.vin.clear();
-            bundle
-        });
-    let rebuilt = TransactionData::<Authorized>::from_parts(
-        transaction_data.version(),
-        transaction_data.consensus_branch_id(),
-        transaction_data.lock_time(),
-        transaction_data.expiry_height(),
-        transparent_bundle,
-        transaction_data.sprout_bundle().cloned(),
-        transaction_data.sapling_bundle().cloned(),
-        transaction_data.orchard_bundle().cloned(),
-    )
-    .freeze()?;
-    let mut rebuilt_bytes = Vec::new();
-    rebuilt.write(&mut rebuilt_bytes)?;
-    ZebraTransaction::zcash_deserialize(rebuilt_bytes.as_slice()).map_err(Into::into)
-}
-
-pub(super) fn chained_source_block(
-    height: BlockHeight,
-    parent_hash: BlockHash,
-    time_nonce: u8,
-    extra_transactions: Vec<Arc<ZebraTransaction>>,
-) -> Result<SourceBlock, Box<dyn Error>> {
-    let fixture = fixture_source_block()?;
-    let mut raw_block_bytes = fixture.raw_block_bytes;
-    raw_block_bytes
-        .get_mut(SERIALIZED_HEADER_PARENT_OFFSET..SERIALIZED_HEADER_PARENT_END)
-        .ok_or("fixture block is too short to carry a parent hash")?
-        .copy_from_slice(&parent_hash.as_bytes());
-    let block_time = raw_block_bytes
-        .get_mut(SERIALIZED_HEADER_TIME_OFFSET)
-        .ok_or("fixture block is too short to carry a block time")?;
-    *block_time = block_time.wrapping_add(time_nonce);
-    let coinbase_height_opcode = raw_block_bytes
-        .get_mut(COINBASE_HEIGHT_OPCODE_OFFSET)
-        .ok_or("fixture block is too short to carry a coinbase height")?;
-    *coinbase_height_opcode = 0x50_u8.saturating_add(u8::try_from(height.value())?);
-    let mut block: ZebraBlock = raw_block_bytes.as_slice().zcash_deserialize_into()?;
-    block.transactions.extend(extra_transactions);
-    let raw_block_bytes = block.zcash_serialize_to_vec()?;
-    Ok(SourceBlock::from_raw_block_bytes(
-        Network::ZcashRegtest,
-        height,
-        raw_block_bytes,
-    )?)
-}
-
 fn spending_transaction(
     spent_outpoint: TransparentOutPoint,
 ) -> Result<ZebraTransaction, Box<dyn Error>> {
+    use zebra_chain::serialization::ZcashDeserialize as _;
     let key = TransparentTestKey::from_seed(&[0x42; 32])?;
     let recipient = key.scratch_recipient_address(1);
     let coinbase_value_zats = SPEND_OUTPUT_VALUE_ZAT.saturating_add(ZIP317_FEE_ONE_IN_ONE_OUT_ZATS);
@@ -1445,7 +1676,7 @@ fn source_block_facts(source_block: &SourceBlock) -> Result<CanonicalBlockFacts,
     Ok(prepare_canonical_block(
         source_block,
         &sample_regtest_upgrade_activations(),
-        RawBlobPolicy::Transactions,
+        RawBlobPolicy::None,
     )?
     .facts)
 }

@@ -1,0 +1,101 @@
+{
+  "contract_identity": "canonical-fixture",
+  "fixture_format_version": 1,
+  "network": "zcash-regtest",
+  "from_height": 603,
+  "to_height": 606,
+  "block_count": 4,
+  "workload_density": {
+    "block_count": 4,
+    "raw_block_bytes": 15837,
+    "transaction_count": 5,
+    "transparent_input_count": 1,
+    "transparent_output_count": 4,
+    "blocks_with_transparent_inputs": 1,
+    "blocks_with_transparent_outputs": 4,
+    "max_raw_block_bytes_per_block": 10944,
+    "max_transactions_per_block": 2,
+    "max_transparent_inputs_per_block": 1,
+    "max_transparent_outputs_per_block": 1
+  },
+  "canonical_artifact_schema_version": 1,
+  "canonical_block_facts_digest_evidence": {
+    "block_digest_version": 1,
+    "sequence_digest_version": 1,
+    "block_count": 4,
+    "sequence_digest_sha256": "87e7d6679cab6b07a4e86e5f4a9db6c9a3fa3f2192532514ef4e9f585c5d8282"
+  },
+  "tip_hash_hex": "7f453a9095109c4d2180970410c6a66efa448b4b8bfd112bfa59da78a87279a3",
+  "network_upgrade_activations": [
+    {
+      "branch_id": 1537743641,
+      "activation_height": 1,
+      "name": "Overwinter"
+    },
+    {
+      "branch_id": 1991772603,
+      "activation_height": 1,
+      "name": "Sapling"
+    },
+    {
+      "branch_id": 733220448,
+      "activation_height": 1,
+      "name": "Blossom"
+    },
+    {
+      "branch_id": 4122551051,
+      "activation_height": 1,
+      "name": "Heartwood"
+    },
+    {
+      "branch_id": 3925833126,
+      "activation_height": 1,
+      "name": "Canopy"
+    },
+    {
+      "branch_id": 3268858036,
+      "activation_height": 2,
+      "name": "NU5"
+    },
+    {
+      "branch_id": 3370586197,
+      "activation_height": 2,
+      "name": "NU6"
+    },
+    {
+      "branch_id": 1307332080,
+      "activation_height": 3,
+      "name": "NU6.1"
+    },
+    {
+      "branch_id": 1412952880,
+      "activation_height": 3,
+      "name": "NU6.2"
+    },
+    {
+      "branch_id": 933566043,
+      "activation_height": 603,
+      "name": "NU6.3"
+    },
+    {
+      "branch_id": 1998129881,
+      "activation_height": 703,
+      "name": "NU7"
+    }
+  ],
+  "segments": [
+    {
+      "index": 0,
+      "from_height": 603,
+      "to_height": 606,
+      "block_count": 4,
+      "file": "segment-000000.bin",
+      "sha256": "3ab36a4256c1c5e69eb249da877009a99876b766ac71a156051cd2866e7c53e9"
+    }
+  ],
+  "subtree_roots": {
+    "sapling": [],
+    "orchard": [],
+    "ironwood": []
+  }
+}

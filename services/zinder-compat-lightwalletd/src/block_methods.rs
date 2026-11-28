@@ -17,28 +17,39 @@
 
 use std::{
     num::NonZeroU32,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
+use prost::Message as _;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio_util::sync::CancellationToken;
 use tonic::{Code, Status};
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, CompactBlockArtifact,
     NetworkUpgradeActivations,
-    wire::{encode_bip70_chain_name, encode_branch_id_hex, encode_internal_block_hash},
+    wire::{
+        WireDecodeError, decode_internal_block_hash, encode_bip70_chain_name, encode_branch_id_hex,
+        encode_internal_block_hash,
+    },
 };
-use zinder_proto::compat::lightwalletd::{self, LIGHTWALLETD_PROTOCOL_VERSION};
-use zinder_store::HeightOrder;
+use zinder_proto::compat::lightwalletd::{self, EncodedBlock, LIGHTWALLETD_PROTOCOL_VERSION};
+use zinder_store::{
+    CompactBlockSpliceSelection, EncodedCompactBlockRange, EncodedCompactBlockRangeRequest,
+    HeightOrder,
+};
 
 use crate::block_range::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES, BlockRangeChunks,
     BlockRangeContinuity, BlockRangeResponse, BlockRangeSink, BlockRangeStage,
-    BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+    BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, RangeBlock,
 };
-use crate::compact_block_messages::CompactBlockShape;
+use crate::compact_block_messages::{CompactBlockShape, ironwood_active_at_or_below};
+use crate::encoded_range::{EncodedFrameRangeRead, EncodedRangeRead};
 use crate::network_tip_estimate::estimated_network_height;
 use crate::node_tip_witness::NodeTipWitness;
 use crate::stale_tip::{StaleTipLimit, TipBlockTime, TipBlockTimeCache, unix_now_seconds};
+use crate::tip_wait::TipWait;
 
 /// The chain view a chunk read answers at.
 pub(crate) enum ChunkView<View> {
@@ -62,6 +73,16 @@ pub(crate) struct ChunkRead<View> {
     pub(crate) max_bytes: usize,
     /// The view the read answers at.
     pub(crate) view: ChunkView<View>,
+    /// Cooperative cancellation signal triggered when the caller drops the response.
+    pub(crate) cancel: CancellationToken,
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 /// Returns whether `read_at` still serves every height of `chunk`.
@@ -79,6 +100,23 @@ pub(crate) struct ChunkReadOutcome<Output> {
     pub(crate) read_duration: Option<Duration>,
     /// What the conversion returned, or why no conversion ran.
     pub(crate) converted: Result<Output, ChunkReadFailure>,
+}
+
+/// Outcome of a canonical encoded-range chunk read.
+pub(crate) enum EncodedChunkReadOutcome<View> {
+    /// The canonical reader returned an encoded slice at `read_at` in `read_duration`.
+    Direct {
+        read_at: ChainEpoch,
+        range: EncodedCompactBlockRange,
+        read_duration: Duration,
+    },
+    /// The canonical reader deferred to [`CompactBlockReads::read_compact_block_chunk`].
+    Fallback(ChunkView<View>),
+    /// The read failed or stopped before reading a slice.
+    Failed {
+        read_duration: Option<Duration>,
+        failure: ChunkReadFailure,
+    },
 }
 
 impl<Output> ChunkReadOutcome<Output> {
@@ -121,6 +159,57 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
     /// Captures the chain view current now, without a storage read.
     fn capture_view(&self) -> impl Future<Output = Result<Self::View, Status>> + Send;
 
+    /// Captures the chain view current now for a probe that exposes no epoch
+    /// and reads nothing again by it, such as a tip check or a staleness
+    /// check.
+    ///
+    /// A mode that serves epoch-bound pairs captures it without keeping the
+    /// pair readable for pins, so a probe never retains a replaced
+    /// generation. A caller must not read by the returned view. The default
+    /// captures the current view.
+    fn capture_ephemeral_view(&self) -> impl Future<Output = Result<Self::View, Status>> + Send {
+        self.capture_view()
+    }
+
+    /// Subscribes to publications of newer views, so a request can wait for
+    /// the visible tip to advance without polling.
+    ///
+    /// The receiver reports a change for every view published after this
+    /// call, so a caller subscribes before it captures the view it compares.
+    /// `None` means the mode publishes no newer views, and no request waits.
+    fn subscribe_publications(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        None
+    }
+
+    /// Reads the visible tip height current now, for a caller that compares
+    /// heights and reads nothing else.
+    ///
+    /// A mode that serves epoch-bound pairs reads it without keeping the pair
+    /// readable for pins. The default captures a view and drops it at once.
+    fn peek_visible_tip_height(&self) -> impl Future<Output = Result<BlockHeight, Status>> + Send {
+        async {
+            let view = self.capture_view().await?;
+            Ok(Self::view_chain_epoch(&view).visible_tip_height)
+        }
+    }
+
+    /// Captures the chain view for one single-shot tip call, such as
+    /// `GetLatestBlock` or `GetLightdInfo`, which expose no epoch and read
+    /// nothing again by it.
+    ///
+    /// A mode that serves epoch-bound pairs captures it without keeping the
+    /// pair readable for pins, and reads the tip's block time with it. The
+    /// default captures the current view and leaves the time to
+    /// [`Self::tip_block_time`].
+    fn capture_tip(&self) -> impl Future<Output = Result<TipCapture<Self::View>, Status>> + Send {
+        async {
+            Ok(TipCapture {
+                view: self.capture_view().await?,
+                block_time_unix_seconds: None,
+            })
+        }
+    }
+
     /// Returns the chain epoch `view` reads.
     fn view_chain_epoch(view: &Self::View) -> ChainEpoch;
 
@@ -142,6 +231,31 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
         view: &Self::View,
         block: RequestedBlock,
     ) -> impl Future<Output = Result<CompactBlockArtifact, Status>> + Send;
+
+    /// Reads one pre-encoded unary compact block directly from canonical
+    /// `ZSHRNG02` + `ZSTSUP01` or `live_tail_block` when supported, or returns
+    /// `Ok(None)` so [`compact_block`] falls back to [`Self::read_compact_block`].
+    fn read_encoded_compact_block(
+        &self,
+        _view: &Self::View,
+        _block: RequestedBlock,
+        _selection: CompactBlockSpliceSelection,
+    ) -> impl Future<Output = Result<Option<EncodedBlock>, Status>> + Send {
+        std::future::ready(Ok(None))
+    }
+
+    /// Streams encoded compact-block wire payloads directly from `ZSHRNG02`
+    /// settled segments and `live_tail_block`, or defers to
+    /// [`Self::read_compact_block_chunk`] when falling back.
+    fn read_encoded_compact_block_chunk(
+        &self,
+        view: ChunkView<Self::View>,
+        request: EncodedCompactBlockRangeRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> impl Future<Output = EncodedChunkReadOutcome<Self::View>> + Send {
+        let _ = (request, cancel);
+        std::future::ready(EncodedChunkReadOutcome::Fallback(view))
+    }
 
     /// Reads the blocks of `read.chunk` that fit `read.max_bytes`, from the
     /// end `read.order` visits first, and runs `convert` on the blocking pool
@@ -173,6 +287,7 @@ pub(crate) struct BlockMethods {
     tip_block_times: TipBlockTimeCache,
     node_tip_witness: NodeTipWitness,
     unix_clock: UnixClock,
+    tip_wait: TipWait,
 }
 
 impl std::fmt::Debug for BlockMethods {
@@ -186,6 +301,7 @@ impl std::fmt::Debug for BlockMethods {
             .field("stale_tip_limit", &self.stale_tip_limit.limit())
             .field("tip_block_times", &self.tip_block_times)
             .field("node_tip_witness", &self.node_tip_witness)
+            .field("tip_wait", &self.tip_wait)
             .finish_non_exhaustive()
     }
 }
@@ -200,12 +316,21 @@ impl Default for BlockMethods {
             tip_block_times: TipBlockTimeCache::default(),
             node_tip_witness: NodeTipWitness::default(),
             unix_clock: Arc::new(unix_now_seconds),
+            tip_wait: TipWait::disabled(),
         }
     }
 }
 
 /// The served tip a tip call answers with, the view it was read at, the times
 /// of its block, and when it was read.
+/// A view captured for one single-shot tip call.
+pub(crate) struct TipCapture<View> {
+    /// The captured view.
+    pub(crate) view: View,
+    /// The Unix time in the tip's header when the capture already read it.
+    pub(crate) block_time_unix_seconds: Option<i64>,
+}
+
 struct ServedTip<View> {
     view: View,
     chain_epoch: ChainEpoch,
@@ -214,6 +339,12 @@ struct ServedTip<View> {
 }
 
 impl BlockMethods {
+    /// Returns the stream and published-read limit these methods admit with.
+    #[cfg(test)]
+    pub(crate) const fn block_range_streams(&self) -> &BlockRangeStreamLimit {
+        &self.block_range_streams
+    }
+
     /// Limits how many block-range streams these methods serve at once,
     /// keeping the admission wait.
     pub(crate) fn with_max_concurrent_block_range_streams(
@@ -236,6 +367,78 @@ impl BlockMethods {
     pub(crate) fn with_node_tip_witness(mut self, node_tip_witness: NodeTipWitness) -> Self {
         self.node_tip_witness = node_tip_witness;
         self
+    }
+
+    /// Sets how long and how far past the visible tip a height-selected read
+    /// waits for its height.
+    pub(crate) fn with_tip_wait(mut self, tip_wait: TipWait) -> Self {
+        self.tip_wait = tip_wait;
+        self
+    }
+
+    /// Returns the configured bounded tip wait.
+    pub(crate) const fn tip_wait(&self) -> &TipWait {
+        &self.tip_wait
+    }
+
+    /// Waits, within the configured tip wait, for the visible tip to reach
+    /// `requested` before the method `method` reads it.
+    ///
+    /// Call it after the request is parsed and before any slot, permit, or
+    /// view is taken. It fails only with the status a tip capture failed with.
+    pub(crate) async fn await_tip<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        method: &'static str,
+        requested: BlockHeight,
+    ) -> Result<(), Status> {
+        self.tip_wait.await_height(reads, method, requested).await
+    }
+
+    /// Runs [`Self::await_tip`] for a `GetBlock` or `GetBlockNullifiers`
+    /// request that selects its block by height, with or without a hash.
+    ///
+    /// A hash-only or malformed selector never waits, so the method answers
+    /// it at once with its own status.
+    pub(crate) async fn await_block_tip<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        method: &'static str,
+        block_id: &lightwalletd::BlockId,
+    ) -> Result<(), Status> {
+        match requested_block(block_id, decode_internal_block_hash) {
+            Ok(RequestedBlock::Height(height)) => self.await_tip(reads, method, height).await,
+            Ok(RequestedBlock::Hash(_)) | Err(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn unary_block<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        method: &'static str,
+        block_id: &lightwalletd::BlockId,
+        shape: CompactBlockShape,
+    ) -> Result<UnaryCompactBlock, Status> {
+        self.await_block_tip(reads, method, block_id).await?;
+        compact_block(reads, block_id, shape).await
+    }
+
+    /// Runs [`Self::await_tip`] for a block-range request at the highest
+    /// height it names, in either order.
+    ///
+    /// A malformed range never waits, so the method answers it at once with
+    /// its own status. The wait runs before the method takes a range-stream
+    /// slot, so waiting requests never hold one.
+    pub(crate) async fn await_range_tip<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        method: &'static str,
+        request: &lightwalletd::BlockRange,
+    ) -> Result<(), Status> {
+        match block_range_from_request(request) {
+            Ok((range, _is_descending)) => self.await_tip(reads, method, range.end).await,
+            Err(_) => Ok(()),
+        }
     }
 
     /// Judges tip ages at the Unix time `unix_clock` reports.
@@ -305,40 +508,50 @@ impl BlockMethods {
     /// [`BlockRangeContinuity`].
     ///
     /// The stream holds a slot of the block-range limit from admission until
-    /// the response is dropped and no chunk read of the stream runs, even
-    /// when the client cancels the call.
+    /// the stream ends, fails, or the response is dropped, and no chunk read
+    /// of the stream runs, even when the client cancels the call.
     pub(crate) async fn block_range<Reads: CompactBlockReads>(
         &self,
         reads: &Reads,
         request: &lightwalletd::BlockRange,
-        shape: CompactBlockShape,
+        select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
     ) -> Result<BlockRangeResponse<Result<lightwalletd::CompactBlock, Status>>, Status> {
-        let (block_range, is_descending) = block_range_from_request(request)?;
-        let stream_slot = self.block_range_streams.open().await?;
-        let view = reads.capture_view().await?;
-        reject_future_block_height(
-            block_range.end,
-            Reads::view_chain_epoch(&view).visible_tip_height,
-        )?;
+        let (range, is_descending) = block_range_from_request(request)?;
+        let slot = self.block_range_streams.open().await?;
         let conversion = ChunkConversion {
-            shape,
+            shape: select(&request.pool_types)?,
             is_descending,
         };
-        let (first_messages, later_chunks) = stream_slot
-            .hold_during(read_first_chunk(
-                reads.clone(),
-                view,
-                BlockRangeChunks::new(block_range, is_descending),
-                conversion,
-            ))
-            .await?;
-        let Some((chunks, continuity)) = later_chunks else {
-            return Ok(stream_slot.hold_for(first_messages));
-        };
-        let reads = reads.clone();
-        Ok(stream_slot.hold_with_reader(first_messages, |sink| {
-            stream_later_chunks(reads, chunks, continuity, conversion, sink)
-        }))
+        stream_range(reads, range, is_descending, slot, conversion).await
+    }
+
+    pub(crate) async fn encoded_block_range<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        request: &lightwalletd::BlockRange,
+        select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
+    ) -> Result<lightwalletd::EncodedBlockRangeStream, Status> {
+        let (range, is_descending) = block_range_from_request(request)?;
+        let shape = select(&request.pool_types)?;
+        let slot = self.block_range_streams.open().await?;
+        let shape = resolve_shielded_shape(reads, shape, range.end).await;
+        let source = EncodedRangeRead::new(shape, is_descending, self.block_range_streams.clone());
+        stream_range(reads, range, is_descending, slot, source).await
+    }
+
+    pub(crate) async fn encoded_block_range_frames<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        request: &lightwalletd::BlockRange,
+        select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
+    ) -> Result<lightwalletd::EncodedBlockFrameStream, Status> {
+        let (range, is_descending) = block_range_from_request(request)?;
+        let shape = select(&request.pool_types)?;
+        let slot = self.block_range_streams.open().await?;
+        let shape = resolve_shielded_shape(reads, shape, range.end).await;
+        let source =
+            EncodedFrameRangeRead::new(shape, is_descending, self.block_range_streams.clone());
+        stream_range(reads, range, is_descending, slot, source).await
     }
 
     /// Captures the current view, reads the times of its tip for the tip call
@@ -349,12 +562,20 @@ impl BlockMethods {
         reads: &Reads,
         method: &'static str,
     ) -> Result<ServedTip<Reads::View>, Status> {
-        let view = reads.capture_view().await?;
+        let TipCapture {
+            view,
+            block_time_unix_seconds,
+        } = reads.capture_tip().await?;
         let chain_epoch = Reads::view_chain_epoch(&view);
         let tip_height = chain_epoch.visible_tip_height;
         let times = self
             .tip_block_times
-            .block_time(chain_epoch.id, tip_height, || reads.tip_block_time(&view))
+            .block_time(chain_epoch.id, tip_height, || async {
+                match block_time_unix_seconds {
+                    Some(block_time) => Ok(block_time),
+                    None => reads.tip_block_time(&view).await,
+                }
+            })
             .await?;
         // Sampled after the header read, which can wait for a blocking
         // thread, so the tip's age is the one it has when the call answers.
@@ -374,25 +595,209 @@ impl BlockMethods {
     }
 }
 
-/// Answers `GetBlock` with the stored block `block_id` names, every pool
-/// kept, read at one captured view.
-pub(crate) async fn compact_block<Reads: CompactBlockReads>(
+fn chunk_budget(limit: Option<&BlockRangeStreamLimit>, max_bytes: usize) -> usize {
+    limit.map_or(max_bytes, |limit| {
+        limit.encoded_range_chunk_budget(max_bytes)
+    })
+}
+
+async fn encoded_range_read_permit(
+    limit: Option<&BlockRangeStreamLimit>,
+) -> Result<Option<OwnedSemaphorePermit>, Status> {
+    match limit {
+        Some(limit) => limit.encoded_range_read_permit().await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Upgrades a pool selection that omits only Ironwood to its default all-pool
+/// zero-copy shape when the current chain schedule proves Ironwood has not
+/// activated at or below `end`.
+///
+/// The caller holds its ordinary stream slot first, so a saturated listener
+/// refuses a request before this reads anything.
+///
+/// Every chunk's highest height is at or below the request's highest height,
+/// so one captured view settles the whole request, but only when that view
+/// reaches the request's highest height: an admitted activation schedule
+/// revision never changes activations at or below the tip it was admitted at,
+/// while a view below the end can still lack an activation the writer admits
+/// before a later chunk's view sees the end. When Ironwood is active at or
+/// below `end`, or when the view or schedule cannot prove equivalence, the
+/// explicit selection stays in place so canonical `ZSHRNG02` streaming
+/// wire-projects the selected pools instead of slicing default frames.
+async fn resolve_shielded_shape<Reads: CompactBlockReads>(
+    reads: &Reads,
+    shape: CompactBlockShape,
+    end: BlockHeight,
+) -> CompactBlockShape {
+    if shape.is_default_shielded_shape() {
+        return shape;
+    }
+    let Some(equivalent) = shape.default_shielded_equivalent() else {
+        return shape;
+    };
+    let Ok(view) = reads.capture_ephemeral_view().await else {
+        return shape;
+    };
+    if Reads::view_chain_epoch(&view).visible_tip_height < end {
+        return shape;
+    }
+    let Ok(activations) = reads.view_activations(&view).await else {
+        return shape;
+    };
+    if ironwood_active_at_or_below(&activations, end) {
+        return shape;
+    }
+    equivalent
+}
+
+async fn first_chunk_view<Reads: CompactBlockReads>(
+    reads: &Reads,
+    end: BlockHeight,
+    encoded_limit: Option<&BlockRangeStreamLimit>,
+) -> Result<(Reads::View, Option<OwnedSemaphorePermit>), Status> {
+    let Some(limit) = encoded_limit else {
+        return Ok((checked_first_view(reads, end).await?, None));
+    };
+    // A request that waits for a permit holds no view, so an unadmitted
+    // request never keeps a generation readable for pins. Its tip check is
+    // ephemeral, and the observed capture happens once the permit is held.
+    let tip_view = reads.capture_ephemeral_view().await?;
+    reject_future_block_height(end, Reads::view_chain_epoch(&tip_view).visible_tip_height)?;
+    drop(tip_view);
+    let permit = match limit.try_encoded_range_read_permit() {
+        Some(permit) => permit,
+        None => limit.encoded_range_read_permit().await?,
+    };
+    Ok((checked_first_view(reads, end).await?, Some(permit)))
+}
+
+async fn checked_first_view<Reads: CompactBlockReads>(
+    reads: &Reads,
+    end: BlockHeight,
+) -> Result<Reads::View, Status> {
+    let view = reads.capture_view().await?;
+    reject_future_block_height(end, Reads::view_chain_epoch(&view).visible_tip_height)?;
+    Ok(view)
+}
+
+async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
+    reads: &Reads,
+    block_range: BlockHeightRange,
+    is_descending: bool,
+    stream_slot: crate::block_range::BlockRangeStreamSlot,
+    conversion: Source,
+) -> Result<BlockRangeResponse<Result<Source::Message, Status>>, Status> {
+    let chunks = BlockRangeChunks::new(block_range, is_descending);
+    let encoded_limit = chunks
+        .next_chunk()
+        .and_then(|chunk| conversion.encoded_range_read_limit(chunk, None));
+    let (view, read_permit) = first_chunk_view(reads, block_range.end, encoded_limit).await?;
+    let max_bytes = chunk_budget(encoded_limit, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES);
+    let first_cancel = CancellationToken::new();
+    let _cancel_on_drop = CancelOnDrop(first_cancel.clone());
+    let first_read = read_first_chunk(
+        reads.clone(),
+        view,
+        chunks,
+        (conversion.clone(), max_bytes, first_cancel),
+    );
+    let (first_messages, later_chunks) = stream_slot
+        .hold_during(async move {
+            let outcome = first_read.await;
+            drop(read_permit);
+            outcome
+        })
+        .await?;
+    let Some((chunks, continuity)) = later_chunks else {
+        return Ok(stream_slot.hold_for(first_messages));
+    };
+    let reads = reads.clone();
+    Ok(stream_slot.hold_with_reader(first_messages, |sink| {
+        stream_later_chunks(reads, chunks, continuity, conversion, sink)
+    }))
+}
+
+pub(crate) enum UnaryCompactBlock {
+    Encoded(EncodedBlock),
+    Message(lightwalletd::CompactBlock),
+}
+
+impl UnaryCompactBlock {
+    pub(crate) fn into_message(self) -> Result<lightwalletd::CompactBlock, Status> {
+        match self {
+            Self::Encoded(encoded) => lightwalletd::CompactBlock::decode(encoded.payload())
+                .map_err(|error| compact_block_decode_status(&error)),
+            Self::Message(message) => Ok(message),
+        }
+    }
+
+    pub(crate) fn into_encoded(self) -> Result<EncodedBlock, Status> {
+        match self {
+            Self::Encoded(encoded) => Ok(encoded),
+            Self::Message(message) => {
+                EncodedBlock::encode(&message).map_err(|error| Status::internal(error.to_string()))
+            }
+        }
+    }
+
+    fn check_hash(&self, requested_hash: &[u8]) -> Result<(), Status> {
+        if requested_hash.is_empty() {
+            return Ok(());
+        }
+        let matches = match self {
+            Self::Encoded(encoded) => {
+                CompactBlockHash::decode(encoded.payload())
+                    .map_err(|error| compact_block_decode_status(&error))?
+                    .hash
+                    == requested_hash
+            }
+            Self::Message(message) => message.hash == requested_hash,
+        };
+        if !matches {
+            return Err(Status::not_found(
+                "requested block hash does not match indexed block",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(prost::Message)]
+struct CompactBlockHash {
+    #[prost(bytes = "bytes", tag = "3")]
+    hash: prost::bytes::Bytes,
+}
+
+fn compact_block_decode_status(error: &prost::DecodeError) -> Status {
+    Status::data_loss(format!(
+        "failed to decode encoded compact block protobuf: {error}"
+    ))
+}
+
+/// Reads one block at a captured view and keeps its existing representation.
+async fn compact_block<Reads: CompactBlockReads>(
     reads: &Reads,
     block_id: &lightwalletd::BlockId,
     shape: CompactBlockShape,
-) -> Result<lightwalletd::CompactBlock, Status> {
-    let block = requested_block(block_id)?;
+) -> Result<UnaryCompactBlock, Status> {
+    let block = requested_block(block_id, decode_internal_block_hash)?;
     let view = reads.capture_view().await?;
     if let RequestedBlock::Height(height) = block {
         reject_future_block_height(height, Reads::view_chain_epoch(&view).visible_tip_height)?;
     }
-    let compact_block = reads.read_compact_block(&view, block).await?;
-    let compact_block = shape.message(compact_block)?;
-    if !block_id.hash.is_empty() && block_id.hash != compact_block.hash {
-        return Err(Status::not_found(
-            "requested block hash does not match indexed block",
-        ));
-    }
+    let compact_block = if let Some(selection) = shape.unary_splice_selection()
+        && let Some(encoded) = reads
+            .read_encoded_compact_block(&view, block, selection)
+            .await?
+    {
+        UnaryCompactBlock::Encoded(encoded)
+    } else {
+        let compact_block = reads.read_compact_block(&view, block).await?;
+        UnaryCompactBlock::Message(shape.message(compact_block)?)
+    };
+    compact_block.check_hash(&block_id.hash)?;
     Ok(compact_block)
 }
 
@@ -400,22 +805,26 @@ pub(crate) async fn compact_block<Reads: CompactBlockReads>(
 ///
 /// `BlockId { height, hash }` takes three shapes: height-only (`hash` empty),
 /// hash-only (`height = 0` with a 32-byte `hash`), and height-with-hash, whose
-/// hash the caller checks after its read. Height 0 with an empty hash is an
-/// unspecified identifier and returns `INVALID_ARGUMENT`, as reference
-/// lightwalletd does for unary block lookups.
-pub(crate) fn requested_block(block_id: &lightwalletd::BlockId) -> Result<RequestedBlock, Status> {
+/// hash the caller checks after its read when its contract requires that.
+/// Height 0 with an empty hash is an unspecified identifier and returns
+/// `INVALID_ARGUMENT`, as reference lightwalletd does for unary block lookups.
+///
+/// Callers pass the hash decoder matching their wire dialect:
+/// [`decode_internal_block_hash`] for `GetBlock` / `GetBlockNullifiers` and
+/// [`zinder_core::wire::decode_rpc_block_hash_bytes`] for `GetTreeState`.
+pub(crate) fn requested_block(
+    block_id: &lightwalletd::BlockId,
+    decode_hash: fn(&[u8]) -> Result<BlockHash, WireDecodeError>,
+) -> Result<RequestedBlock, Status> {
     if block_id.height != 0 {
         return block_range_height_from_id(block_id).map(RequestedBlock::Height);
     }
     if block_id.hash.is_empty() {
         return Err(Status::invalid_argument("block identifier is unspecified"));
     }
-    let hash_bytes: [u8; 32] = block_id
-        .hash
-        .as_slice()
-        .try_into()
-        .map_err(|_| Status::invalid_argument("block hash must be 32 bytes"))?;
-    Ok(RequestedBlock::Hash(BlockHash::from_bytes(hash_bytes)))
+    decode_hash(&block_id.hash)
+        .map(RequestedBlock::Hash)
+        .map_err(|_| Status::invalid_argument("block hash must be 32 bytes"))
 }
 
 /// Refuses a height above the visible tip with lightwalletd's
@@ -534,12 +943,76 @@ struct ChunkConversion {
 
 /// The messages of one chunk, as the response stream yields them. Each is
 /// `Ok`, because a chunk that cannot be converted fails whole.
-type ChunkMessages = Vec<Result<lightwalletd::CompactBlock, Status>>;
+pub(crate) type ChunkMessages<Message> = Vec<Result<Message, Status>>;
+
+pub(crate) trait RangeChunk: Send + 'static {
+    type Block: RangeBlock;
+
+    fn kept_blocks(&self) -> usize;
+    fn endpoints(&self) -> &[Self::Block];
+}
+
+impl<Block: RangeBlock + Send + 'static> RangeChunk for Vec<Block> {
+    type Block = Block;
+
+    fn kept_blocks(&self) -> usize {
+        self.len()
+    }
+
+    fn endpoints(&self) -> &[Block] {
+        self.as_slice()
+    }
+}
+
+pub(crate) trait RangeSource<Reads: CompactBlockReads>:
+    Clone + Send + Sync + 'static
+{
+    type Chunk: RangeChunk;
+    type Message: Send + 'static;
+
+    /// Returns the encoded-range read limit if the offered chunk or its possible
+    /// retry uses canonical `ZSHRNG02` / `live_tail_block` streaming.
+    fn encoded_range_read_limit(
+        &self,
+        _chunk: BlockHeightRange,
+        _retry: Option<BlockHeightRange>,
+    ) -> Option<&BlockRangeStreamLimit> {
+        None
+    }
+
+    fn messages(&self, blocks: Self::Chunk) -> Result<ChunkMessages<Self::Message>, Status>;
+
+    fn read<Output, Convert>(
+        &self,
+        reads: &Reads,
+        read: ChunkRead<Reads::View>,
+        convert: Convert,
+    ) -> impl Future<Output = ChunkReadOutcome<Output>> + Send
+    where
+        Output: Send + 'static,
+        Convert: FnOnce(ChainEpoch, Self::Chunk) -> Output + Send + 'static;
+}
 
 /// The chunks after the first, and the continuity the next must follow.
 type LaterChunks = Option<(BlockRangeChunks, BlockRangeContinuity)>;
 
-impl ChunkConversion {
+impl<Reads: CompactBlockReads> RangeSource<Reads> for ChunkConversion {
+    type Chunk = Vec<CompactBlockArtifact>;
+    type Message = lightwalletd::CompactBlock;
+
+    fn read<Output, Convert>(
+        &self,
+        reads: &Reads,
+        read: ChunkRead<Reads::View>,
+        convert: Convert,
+    ) -> impl Future<Output = ChunkReadOutcome<Output>> + Send
+    where
+        Output: Send + 'static,
+        Convert: FnOnce(ChainEpoch, Self::Chunk) -> Output + Send + 'static,
+    {
+        reads.read_compact_block_chunk(read, convert)
+    }
+
     /// Converts a chunk's blocks, in ascending height order, to the messages
     /// the stream sends, in its order.
     ///
@@ -547,7 +1020,10 @@ impl ChunkConversion {
     ///
     /// Returns the status of the first block that cannot be converted, and
     /// no message, so a stream never sends part of a chunk.
-    fn messages(self, mut blocks: Vec<CompactBlockArtifact>) -> Result<ChunkMessages, Status> {
+    fn messages(
+        &self,
+        mut blocks: Vec<CompactBlockArtifact>,
+    ) -> Result<ChunkMessages<Self::Message>, Status> {
         if self.is_descending {
             blocks.reverse();
         }
@@ -601,37 +1077,43 @@ impl ChunkTimings {
 /// under [`crate::block_range::BlockRangeStreamSlot::hold_during`], because
 /// the read and its conversion finish on the blocking pool even when the
 /// client cancels the request.
-async fn read_first_chunk<Reads: CompactBlockReads>(
+async fn read_first_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     reads: Reads,
     view: Reads::View,
     mut chunks: BlockRangeChunks,
-    conversion: ChunkConversion,
-) -> Result<(ChunkMessages, LaterChunks), Status> {
+    (conversion, max_bytes, cancel): (Source, usize, CancellationToken),
+) -> Result<(ChunkMessages<Source::Message>, LaterChunks), Status> {
     let Some(chunk) = chunks.next_chunk() else {
         return Ok((Vec::new(), None));
     };
     let read = ChunkRead {
         chunk,
         order: chunks.order(),
-        max_bytes: BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES,
+        max_bytes,
         view: ChunkView::Captured(view),
+        cancel,
     };
-    read_chunk(&reads, read, move |read_at, blocks, timings| {
-        chunks.advance(blocks.len());
-        let later_chunks = chunks
-            .has_remaining()
-            .then(|| {
-                BlockRangeContinuity::after_first_chunk(
-                    &blocks,
-                    read_at.id,
-                    conversion.is_descending,
-                )
-                .map(|continuity| (chunks, continuity))
-            })
-            .transpose()?;
-        let messages = timings.time_convert(|| conversion.messages(blocks))?;
-        Ok((messages, later_chunks))
-    })
+    read_chunk(
+        &reads,
+        conversion.clone(),
+        read,
+        move |read_at, blocks, timings| {
+            chunks.advance(blocks.kept_blocks());
+            let later_chunks = chunks
+                .has_remaining()
+                .then(|| {
+                    BlockRangeContinuity::after_first_chunk(
+                        blocks.endpoints(),
+                        read_at.id,
+                        matches!(chunks.order(), HeightOrder::Descending),
+                    )
+                    .map(|continuity| (chunks, continuity))
+                })
+                .transpose()?;
+            let messages = timings.time_convert(|| conversion.messages(blocks))?;
+            Ok((messages, later_chunks))
+        },
+    )
     .await
     .map_err(|failure| match failure {
         ChunkReadFailure::TipBelowChunk(read_at) => {
@@ -658,13 +1140,14 @@ async fn read_first_chunk<Reads: CompactBlockReads>(
 /// client has dropped the response, the task
 /// finishes the read in flight and starts no other, so it holds the stream's
 /// slot only while that read runs.
-async fn stream_later_chunks<Reads: CompactBlockReads>(
+async fn stream_later_chunks<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     reads: Reads,
     mut chunks: BlockRangeChunks,
     mut continuity: BlockRangeContinuity,
-    conversion: ChunkConversion,
-    sink: BlockRangeSink<Result<lightwalletd::CompactBlock, Status>>,
+    conversion: Source,
+    sink: BlockRangeSink<Result<Source::Message, Status>>,
 ) {
+    let cancel = sink.cancellation();
     while let Some(chunk) = chunks.next_chunk() {
         let Some(room) = BlockRangeStage::Send
             .time_async(sink.room_for_chunk())
@@ -672,14 +1155,44 @@ async fn stream_later_chunks<Reads: CompactBlockReads>(
         else {
             return;
         };
-        let mut outcome = read_later_chunk(&reads, chunk, chunks, continuity, conversion).await;
+        let checked = chunks.checked_heights();
+        let limit = conversion.encoded_range_read_limit(chunk, checked.map(|(range, _)| range));
+        let read_permit = tokio::select! {
+            biased;
+            () = sink.closed() => return,
+            admission = encoded_range_read_permit(limit) => match admission {
+                Ok(permit) => permit,
+                Err(status) => { room.fill(vec![Err(status)]); return; }
+            }
+        };
+        if sink.is_closed() {
+            drop(read_permit);
+            return;
+        }
+        let max_bytes = chunk_budget(limit, BLOCK_RANGE_CHUNK_MAX_BYTES);
+        let mut outcome = read_later_chunk(
+            &reads,
+            chunk,
+            chunks,
+            continuity,
+            (conversion.clone(), max_bytes, cancel.clone()),
+        )
+        .await;
         if let Err(status) = &outcome
             && status.code() == Code::NotFound
             && !sink.is_closed()
-            && let Some((checked, only_checked)) = chunks.checked_heights()
+            && let Some((checked, only_checked)) = checked
         {
-            outcome = read_later_chunk(&reads, checked, only_checked, continuity, conversion).await;
+            outcome = read_later_chunk(
+                &reads,
+                checked,
+                only_checked,
+                continuity,
+                (conversion.clone(), max_bytes, cancel.clone()),
+            )
+            .await;
         }
+        drop(read_permit);
         match outcome {
             Ok((next_chunks, next_continuity, messages)) => {
                 chunks = next_chunks;
@@ -702,30 +1215,43 @@ async fn stream_later_chunks<Reads: CompactBlockReads>(
 /// where the chunk is read, and their outcome is recorded here, on the
 /// stream's task. Returns the plan and the continuity moved past the chunk,
 /// with its messages.
-async fn read_later_chunk<Reads: CompactBlockReads>(
+async fn read_later_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     reads: &Reads,
     chunk: BlockHeightRange,
     mut chunks: BlockRangeChunks,
     mut continuity: BlockRangeContinuity,
-    conversion: ChunkConversion,
-) -> Result<(BlockRangeChunks, BlockRangeContinuity, ChunkMessages), Status> {
+    (conversion, max_bytes, cancel): (Source, usize, CancellationToken),
+) -> Result<
+    (
+        BlockRangeChunks,
+        BlockRangeContinuity,
+        ChunkMessages<Source::Message>,
+    ),
+    Status,
+> {
     let read = ChunkRead {
         chunk,
         order: chunks.order(),
-        max_bytes: BLOCK_RANGE_CHUNK_MAX_BYTES,
+        max_bytes,
         view: ChunkView::Current,
+        cancel,
     };
     let sent = continuity;
-    let (link, kept_blocks, messages) = read_chunk(reads, read, move |read_at, blocks, timings| {
-        let link = sent.link(chunk, read_at.id, &blocks);
-        let kept_blocks = blocks.len();
-        let messages = if link.continues() {
-            timings.time_convert(|| conversion.messages(blocks))?
-        } else {
-            Vec::new()
-        };
-        Ok((link, kept_blocks, messages))
-    })
+    let (link, kept_blocks, messages) = read_chunk(
+        reads,
+        conversion.clone(),
+        read,
+        move |read_at, blocks, timings| {
+            let link = sent.link(chunk, read_at.id, blocks.endpoints());
+            let kept_blocks = blocks.kept_blocks();
+            let messages = if link.continues() {
+                timings.time_convert(|| conversion.messages(blocks))?
+            } else {
+                Vec::new()
+            };
+            Ok((link, kept_blocks, messages))
+        },
+    )
     .await
     .map_err(|failure| match failure {
         ChunkReadFailure::TipBelowChunk(read_at) => continuity.end_below_tip(chunk, &read_at),
@@ -741,23 +1267,21 @@ async fn read_later_chunk<Reads: CompactBlockReads>(
 ///
 /// The read stage is the storage read the serving mode reports, and is
 /// recorded for a read that fails too.
-async fn read_chunk<Reads, Output>(
+async fn read_chunk<Reads, Source, Output>(
     reads: &Reads,
+    source: Source,
     read: ChunkRead<Reads::View>,
-    convert: impl FnOnce(
-        ChainEpoch,
-        Vec<CompactBlockArtifact>,
-        &mut ChunkTimings,
-    ) -> Result<Output, Status>
+    convert: impl FnOnce(ChainEpoch, Source::Chunk, &mut ChunkTimings) -> Result<Output, Status>
     + Send
     + 'static,
 ) -> Result<Output, ChunkReadFailure>
 where
     Reads: CompactBlockReads,
+    Source: RangeSource<Reads>,
     Output: Send + 'static,
 {
-    let outcome = reads
-        .read_compact_block_chunk(read, move |read_at, blocks| {
+    let outcome = source
+        .read(reads, read, move |read_at, blocks| {
             let mut timings = ChunkTimings::default();
             let output = convert(read_at, blocks, &mut timings);
             (output, timings.convert)
@@ -778,9 +1302,11 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
+        num::NonZeroU32,
         sync::{
             Arc,
-            atomic::{AtomicI64, Ordering},
+            atomic::{AtomicI64, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -791,12 +1317,13 @@ mod tests {
         CompactBlockArtifact, Network, NetworkUpgradeActivations, UnixTimestampMillis,
         wire::encode_branch_id_hex,
     };
+    use zinder_proto::compat::lightwalletd;
 
     use super::{
         BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, CompactBlockReads,
-        RequestedBlock, lightd_info,
+        RequestedBlock, lightd_info, resolve_shielded_shape,
     };
-    use crate::stale_tip::StaleTipLimit;
+    use crate::{compact_block_messages::CompactBlockShape, stale_tip::StaleTipLimit};
 
     /// The block time in the header of the served tip in the slow-header
     /// test.
@@ -921,6 +1448,246 @@ mod tests {
         );
     }
 
+    /// One scripted chain view: its epoch and the activation schedule the
+    /// writer had admitted with it.
+    struct ScriptedView {
+        epoch: ChainEpoch,
+        activations: NetworkUpgradeActivations,
+    }
+
+    /// Reads that hand out `views` in order, repeating the last one, and
+    /// count the views captured.
+    #[derive(Clone)]
+    struct ScriptedViews {
+        views: Arc<parking_lot::Mutex<std::collections::VecDeque<Arc<ScriptedView>>>>,
+        captures: Arc<AtomicUsize>,
+        ephemeral_captures: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedViews {
+        fn new(views: impl IntoIterator<Item = (u32, NetworkUpgradeActivations)>) -> Self {
+            let views = views
+                .into_iter()
+                .map(|(tip, activations)| {
+                    Arc::new(ScriptedView {
+                        epoch: ChainEpoch {
+                            id: ChainEpochId::new(u64::from(tip)),
+                            network: Network::ZcashRegtest,
+                            visible_tip_height: BlockHeight::new(tip),
+                            visible_tip_hash: BlockHash::from_bytes([1; 32]),
+                            settled_tip_height: BlockHeight::new(tip),
+                            settled_tip_hash: BlockHash::from_bytes([1; 32]),
+                            artifact_schema_version: ArtifactSchemaVersion::new(1),
+                            tip_metadata: ChainTipMetadata::new(0, 0, 0),
+                            created_at: UnixTimestampMillis::new(0),
+                        },
+                        activations,
+                    })
+                })
+                .collect();
+            Self {
+                views: Arc::new(parking_lot::Mutex::new(views)),
+                captures: Arc::new(AtomicUsize::new(0)),
+                ephemeral_captures: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// The views captured as observed, which a serving pair retains.
+        fn captures(&self) -> usize {
+            self.captures.load(Ordering::SeqCst)
+        }
+
+        /// The views captured by probes, which retain nothing.
+        fn ephemeral_captures(&self) -> usize {
+            self.ephemeral_captures.load(Ordering::SeqCst)
+        }
+
+        fn next_view(&self) -> Result<Arc<ScriptedView>, Status> {
+            let mut views = self.views.lock();
+            let view = if views.len() > 1 {
+                views.pop_front()
+            } else {
+                views.front().cloned()
+            };
+            view.ok_or_else(|| Status::unavailable("no scripted view"))
+        }
+    }
+
+    impl CompactBlockReads for ScriptedViews {
+        type View = Arc<ScriptedView>;
+
+        fn capture_view(&self) -> impl Future<Output = Result<Self::View, Status>> + Send {
+            self.captures.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(self.next_view())
+        }
+
+        fn capture_ephemeral_view(
+            &self,
+        ) -> impl Future<Output = Result<Self::View, Status>> + Send {
+            self.ephemeral_captures.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(self.next_view())
+        }
+
+        fn view_chain_epoch(view: &Self::View) -> ChainEpoch {
+            view.epoch
+        }
+
+        fn view_activations(
+            &self,
+            view: &Self::View,
+        ) -> impl Future<Output = Result<NetworkUpgradeActivations, Status>> + Send {
+            std::future::ready(Ok(view.activations.clone()))
+        }
+
+        fn tip_block_time(
+            &self,
+            _view: &Self::View,
+        ) -> impl Future<Output = Result<i64, Status>> + Send {
+            std::future::ready(Err(Status::unimplemented("the test serves no tip time")))
+        }
+
+        fn read_compact_block(
+            &self,
+            _view: &Self::View,
+            _block: RequestedBlock,
+        ) -> impl Future<Output = Result<CompactBlockArtifact, Status>> + Send {
+            std::future::ready(Err(Status::unimplemented("the test serves no block")))
+        }
+
+        fn read_compact_block_chunk<Output, Convert>(
+            &self,
+            _read: ChunkRead<Self::View>,
+            _convert: Convert,
+        ) -> impl Future<Output = ChunkReadOutcome<Output>> + Send
+        where
+            Output: Send + 'static,
+            Convert: FnOnce(ChainEpoch, Vec<CompactBlockArtifact>) -> Output + Send + 'static,
+        {
+            std::future::ready(ChunkReadOutcome::unread(ChunkReadFailure::Failed(
+                Status::unimplemented("the test serves no block range"),
+            )))
+        }
+    }
+
+    fn sapling_orchard() -> Result<CompactBlockShape, Status> {
+        CompactBlockShape::for_range(&[
+            lightwalletd::PoolType::Sapling as i32,
+            lightwalletd::PoolType::Orchard as i32,
+        ])
+    }
+
+    /// Equivalence needs a view that reaches the request's end and an
+    /// Ironwood activation above it.
+    #[tokio::test]
+    async fn two_pool_equivalence_needs_a_view_that_reaches_the_request_end() -> Result<(), Status>
+    {
+        let explicit = sapling_orchard()?;
+        let default_shape = explicit
+            .default_shielded_equivalent()
+            .ok_or_else(|| Status::internal("the selection omits only Ironwood"))?;
+        let scheduled = zinder_testkit::sample_regtest_upgrade_activations();
+        let unscheduled = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let end = BlockHeight::new(700);
+
+        // A view that reaches the end and carries no activation at or below
+        // it proves equivalence.
+        let covering = ScriptedViews::new([(700, unscheduled.clone())]);
+        assert_eq!(
+            resolve_shielded_shape(&covering, explicit, end).await,
+            default_shape
+        );
+        // An activation at or below the end disproves it.
+        let activated = ScriptedViews::new([(700, scheduled.clone())]);
+        assert_eq!(
+            resolve_shielded_shape(&activated, explicit, end).await,
+            explicit
+        );
+        let below_activation = ScriptedViews::new([(700, scheduled.clone())]);
+        assert_eq!(
+            resolve_shielded_shape(&below_activation, explicit, BlockHeight::new(602)).await,
+            default_shape
+        );
+
+        // The first view stops short of the end and has no activation yet; the
+        // writer admits one before the next view, which sees the end. The
+        // short view proves nothing, so the explicit pools stay.
+        let successive = ScriptedViews::new([(100, unscheduled), (700, scheduled)]);
+        assert_eq!(
+            resolve_shielded_shape(&successive, explicit, end).await,
+            explicit
+        );
+        assert_eq!(successive.ephemeral_captures(), 1);
+        assert_eq!(successive.captures(), 0, "the probe observed a view");
+        Ok(())
+    }
+
+    /// A request that waits for an encoded-range permit holds no observed
+    /// view while it waits, and captures one only once it is admitted.
+    #[tokio::test]
+    async fn a_queued_first_chunk_captures_an_observed_view_only_once_admitted()
+    -> Result<(), Status> {
+        let one_stream = NonZeroU32::new(1).ok_or_else(|| Status::internal("zero streams"))?;
+        let limit = crate::block_range::BlockRangeStreamLimit::new(one_stream);
+        let mut held: Vec<_> =
+            std::iter::from_fn(|| limit.try_encoded_range_read_permit()).collect();
+        let reads =
+            ScriptedViews::new([(700, NetworkUpgradeActivations::empty(Network::ZcashRegtest))]);
+        let waiting = tokio::spawn({
+            let (reads, limit) = (reads.clone(), limit.clone());
+            async move { super::first_chunk_view(&reads, BlockHeight::new(10), Some(&limit)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "the request did not queue");
+        assert_eq!(reads.ephemeral_captures(), 1);
+        assert_eq!(reads.captures(), 0, "a queued request observed a view");
+
+        drop(held.pop());
+        let (_view, permit) = waiting
+            .await
+            .map_err(|error| Status::internal(error.to_string()))??;
+        assert!(permit.is_some());
+        assert_eq!(reads.captures(), 1);
+        drop(held);
+        Ok(())
+    }
+
+    /// A listener at its stream limit refuses a two-pool request before it
+    /// captures a view or reads an activation schedule.
+    #[tokio::test]
+    async fn a_saturated_listener_refuses_a_two_pool_request_before_any_view_read()
+    -> Result<(), Status> {
+        let one_stream = NonZeroU32::new(1).ok_or_else(|| Status::internal("zero streams"))?;
+        let methods = BlockMethods::default()
+            .with_max_concurrent_block_range_streams(one_stream)
+            .with_block_range_admission_wait(Duration::ZERO);
+        let reads =
+            ScriptedViews::new([(700, NetworkUpgradeActivations::empty(Network::ZcashRegtest))]);
+        let _held = methods.block_range_streams().open().await?;
+        let request = lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: 700,
+                hash: Vec::new(),
+            }),
+            pool_types: vec![
+                lightwalletd::PoolType::Sapling as i32,
+                lightwalletd::PoolType::Orchard as i32,
+            ],
+        };
+        let refused = methods
+            .encoded_block_range(&reads, &request, CompactBlockShape::for_range)
+            .await;
+        assert_eq!(
+            refused.err().map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+        assert_eq!(reads.captures(), 0);
+        Ok(())
+    }
+
     #[test]
     fn lightd_info_reports_the_active_branch_and_the_next_pending_upgrade() {
         let activations = zinder_testkit::sample_regtest_upgrade_activations();
@@ -979,5 +1746,57 @@ mod tests {
             lightd_info_response.git_commit,
             zinder_runtime::BUILD_GIT_COMMIT
         );
+    }
+
+    #[test]
+    fn requested_block_decodes_each_hash_dialect_and_validates_selectors() {
+        use super::{lightwalletd, requested_block};
+        use zinder_core::wire::{decode_internal_block_hash, decode_rpc_block_hash_bytes};
+
+        // Testnet block 4031230 (non-palindromic): internal vs RPC byte order.
+        let internal_bytes: [u8; 32] = [
+            0xee, 0xce, 0xfc, 0x22, 0xf4, 0xa0, 0x9f, 0xe4, 0x30, 0x6f, 0x40, 0xaf, 0xa3, 0xa6,
+            0xf3, 0xdb, 0x17, 0x3f, 0x1a, 0x5e, 0x3a, 0x0c, 0xcc, 0x3d, 0x8f, 0xeb, 0x22, 0xc6,
+            0xba, 0xf1, 0x33, 0x00,
+        ];
+        let mut rpc_bytes = internal_bytes;
+        rpc_bytes.reverse();
+        let expected_hash = BlockHash::from_bytes(internal_bytes);
+
+        let by_hash = |hash| lightwalletd::BlockId { height: 0, hash };
+        assert_eq!(
+            requested_block(
+                &by_hash(internal_bytes.to_vec()),
+                decode_internal_block_hash
+            )
+            .ok(),
+            Some(RequestedBlock::Hash(expected_hash))
+        );
+        assert_eq!(
+            requested_block(&by_hash(rpc_bytes.to_vec()), decode_rpc_block_hash_bytes).ok(),
+            Some(RequestedBlock::Hash(expected_hash))
+        );
+
+        // Positive height takes precedence over hash length in requested_block.
+        let height_with_short_hash = requested_block(
+            &lightwalletd::BlockId {
+                height: 42,
+                hash: vec![0xaa],
+            },
+            decode_rpc_block_hash_bytes,
+        );
+        assert_eq!(
+            height_with_short_hash.ok(),
+            Some(RequestedBlock::Height(BlockHeight::new(42)))
+        );
+
+        for length in [0, 31, 33] {
+            let outcome =
+                requested_block(&by_hash(vec![0xaa; length]), decode_rpc_block_hash_bytes);
+            assert_eq!(
+                outcome.err().map(|status| status.code()),
+                Some(Code::InvalidArgument)
+            );
+        }
     }
 }

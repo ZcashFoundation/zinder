@@ -15,9 +15,15 @@ mod chain_index;
 mod error;
 mod error_reason;
 #[cfg(feature = "remote")]
+mod proxy;
+#[cfg(feature = "remote")]
 mod remote;
 #[cfg(feature = "remote")]
+mod retry;
+#[cfg(feature = "remote")]
 mod server_info;
+#[cfg(feature = "remote")]
+mod tls;
 
 #[cfg(feature = "remote")]
 pub use capability::{Capability, CapabilityDescriptor};
@@ -30,15 +36,18 @@ pub use chain_index::{
     MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView,
 };
 pub use chain_index::{
-    ChainIndex, ChainSnapshot, IndexStream, OwnedChainSnapshot, TransparentAddressTransactionChunk,
-    TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream,
-    TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
-    TransparentHistoryCursor, TransparentOutpointSpendStatuses, TransparentUnspentOutputChunk,
+    ChainIndex, ChainSnapshot, CompactRangeQuery, IndexStream, OwnedChainSnapshot,
+    TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
+    TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
+    TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
+    TransparentOutpointSpendStatuses, TransparentUnspentOutputChunk,
 };
 pub use error::{ChainEventCursorRecovery, IndexerError, RetryPolicy};
 pub use error_reason::ErrorReason;
 #[cfg(feature = "remote")]
-pub use remote::{MIN_SUPPORTED_CONTRACT_REVISION, RemoteChainIndex, RemoteOpenOptions};
+pub use remote::{
+    MIN_SUPPORTED_CONTRACT_REVISION, RemoteChainIndex, RemoteClientOptions, RemoteOpenOptions,
+};
 #[cfg(feature = "remote")]
 pub use server_info::{NodeServerInfo, ServerInfo};
 pub use zinder_core::{
@@ -46,14 +55,16 @@ pub use zinder_core::{
     BlockHeightRange, BlockId, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
     BroadcastUnknown, ChainEpoch, ChainEpochId, ChainValuePool, ChainValuePools,
-    ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId,
-    MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MAX_SUBTREE_ROOTS_PER_REQUEST, MempoolEntry,
+    ChainValuePoolsAtTip, CompactBlockArtifact, CompactBlockNullifiers, CompactPool,
+    CompactTransactionNullifiers, ConsensusBranchId, MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST,
+    MAX_SUBTREE_ROOTS_PER_REQUEST, MAX_TRANSPARENT_ADDRESSES_PER_BATCH, MempoolEntry,
     MempoolEvictionReason, MinedTransaction, MinedTransactionChainContext, Network,
     NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
-    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentMempoolOutput, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentOutpointSpendStatus, TransparentUnspentOutput, TreeStateArtifact, TxStatus,
+    StandardFee, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBroadcastOutcome, TransactionId, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
+    TransparentMempoolSpend, TransparentOutPoint, TransparentOutpointSpendStatus,
+    TransparentUnspentOutput, TreeStateArtifact, TxStatus,
 };
 /// The server-side wallet recipe, compiled as a doctest so its worked skeleton
 /// cannot drift from the real `connect` and stream API.

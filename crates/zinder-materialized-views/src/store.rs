@@ -34,7 +34,8 @@ use zinder_core::{BlockHash, BlockHeight, ChainEpoch, ChainEpochId};
 use zinder_store::{
     CanonicalReorgPolicy, ChainEvent, ResourceGaugeThrottle, RocksDbIoMode, RocksDbOpenRole,
     RocksDbResourceBudget, RocksDbResourceGaugeInputs, StoreRole, build_block_based_table_factory,
-    open_bounded_rocksdb, record_rocksdb_resource_gauges,
+    keep_blocks_of_dropped_table_files, open_bounded_rocksdb, open_bounded_rocksdb_read_only_probe,
+    record_rocksdb_resource_gauges,
 };
 
 use crate::{
@@ -78,11 +79,11 @@ pub const MATERIALIZED_VIEW_STORE_SUBDIR: &str = "materialized-views";
 /// rebuilds it from a certified recovery source. The version is persisted in
 /// the `consumer_metadata` column family on first open and validated on
 /// subsequent opens.
-pub const MATERIALIZED_VIEW_STORE_FORMAT_VERSION: u16 = 9;
+pub const MATERIALIZED_VIEW_STORE_FORMAT_VERSION: u16 = 1;
 
 /// Total attempts used to cross a primary-compaction race while a secondary
 /// catches up and validates its newly replayed manifest.
-const SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS: u32 = 3;
+const MISSING_SST_ATTEMPTS: u32 = 3;
 
 const STORE_FORMAT_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
 const MATERIALIZED_VIEW_STATUS_KEY: &[u8] = b"\x00\x02materialized_view_status";
@@ -189,7 +190,7 @@ enum ManifestAdmission {
 /// budget so one buffer can rotate to immutable while another keeps absorbing
 /// puts during compaction.
 ///
-/// Every level compresses with ZSTD. View rows carry hex transaction ids and
+/// Every level compresses with ZSTD. View rows carry binary transaction IDs and
 /// repeated address prefixes that ZSTD's entropy coding shrinks and the
 /// earlier Snappy default did not, and smaller files also cut the bytes each
 /// compaction rewrites. View writes are a small share of replay time, so the
@@ -203,6 +204,7 @@ fn column_family_options(cache: &Cache, rocksdb_resource_budget: RocksDbResource
         usize::try_from(rocksdb_resource_budget.write_buffer_bytes).unwrap_or(usize::MAX),
     );
     options.set_max_write_buffer_number(rocksdb_resource_budget.max_write_buffer_count);
+    keep_blocks_of_dropped_table_files(&mut options);
     options.set_compression_type(DBCompressionType::Zstd);
     options
 }
@@ -242,6 +244,29 @@ fn column_family_descriptors(
         ColumnFamilyDescriptor::new(name, column_family_options(cache, rocksdb_resource_budget))
     });
     store_families.chain(consumer_families).collect()
+}
+
+/// Builds secondary open-time descriptors for the column families already
+/// recorded in the primary's MANIFEST.
+///
+/// Opening only the persisted families lets the secondary handle validate the
+/// store format version, consumer manifest, and exact column-family identity
+/// without a separate read-only probe against a live compacting primary.
+fn existing_column_family_descriptors(
+    cache: &Cache,
+    rocksdb_resource_budget: RocksDbResourceBudget,
+    existing_column_families: &[String],
+) -> Vec<ColumnFamilyDescriptor> {
+    existing_column_families
+        .iter()
+        .filter(|name| name.as_str() != ROCKSDB_DEFAULT_COLUMN_FAMILY)
+        .map(|name| {
+            ColumnFamilyDescriptor::new(
+                name.clone(),
+                column_family_options(cache, rocksdb_resource_budget),
+            )
+        })
+        .collect()
 }
 
 /// Lists the column families already present at `path`, or an empty list when
@@ -1023,11 +1048,14 @@ impl MaterializedViewStore {
     /// store. Rejects a store whose format version differs from this binary or
     /// whose manifest records a consumer this release does not bundle.
     pub fn exists_at_path(path: impl AsRef<Path>) -> Result<bool, MaterializedViewStoreError> {
-        Self::require_matching_store_format_at_path(path.as_ref())?;
-        let Some(recorded_consumers) = Self::read_consumer_manifest_at_path(path.as_ref())? else {
+        let Some(probed) = Self::probe_existing_store_at_path(
+            path.as_ref(),
+            RocksDbResourceBudget::read_only_probe_defaults(),
+        )?
+        else {
             return Ok(false);
         };
-        Self::reject_unknown_consumer_identities(&recorded_consumers)?;
+        Self::reject_unknown_consumer_identities(&probed.recorded_consumers)?;
         Ok(true)
     }
 
@@ -1041,16 +1069,26 @@ impl MaterializedViewStore {
             .validate()
             .map_err(|reason| MaterializedViewStoreError::InvalidOptions { reason })?;
         validate_consumer_declarations(options.consumers)?;
-        Self::require_matching_store_format_at_path(path)?;
-        let existing_column_families = existing_column_family_names(path);
-        let is_fresh_store = existing_column_families.is_empty();
-        if manifest_admission == ManifestAdmission::ExactBundled {
-            Self::preflight_exact_bundled_manifest_at_path(path)?;
-        }
-        if !is_fresh_store {
-            Self::preflight_consumer_schemas_at_path(path, options.consumers)?;
-            validate_column_family_identity(&existing_column_families, options.consumers)?;
-        }
+        let (is_fresh_store, existing_column_families) =
+            match Self::probe_existing_store_at_path(path, options.rocksdb_resource_budget)? {
+                None => (true, Vec::new()),
+                Some(probed) => {
+                    if manifest_admission == ManifestAdmission::ExactBundled {
+                        Self::validate_exact_bundled_consumer_identities(
+                            &probed.recorded_consumers,
+                        )?;
+                    }
+                    Self::validate_declared_consumer_schemas(
+                        options.consumers,
+                        &probed.recorded_consumers,
+                    )?;
+                    validate_column_family_identity(
+                        &probed.existing_column_families,
+                        options.consumers,
+                    )?;
+                    (false, probed.existing_column_families)
+                }
+            };
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Primary { path },
             options.rocksdb_resource_budget,
@@ -1156,15 +1194,7 @@ impl MaterializedViewStore {
             .validate()
             .map_err(|reason| MaterializedViewStoreError::InvalidOptions { reason })?;
         validate_consumer_declarations(options.consumers)?;
-        Self::require_matching_store_format_at_path(primary_path)?;
-        if manifest_admission == ManifestAdmission::ExactBundled {
-            Self::preflight_exact_bundled_manifest_at_path(primary_path)?;
-        }
         let existing_column_families = existing_column_family_names(primary_path);
-        if !existing_column_families.is_empty() {
-            Self::preflight_consumer_schemas_at_path(primary_path, options.consumers)?;
-            validate_column_family_identity(&existing_column_families, options.consumers)?;
-        }
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Secondary {
                 primary_path,
@@ -1172,10 +1202,9 @@ impl MaterializedViewStore {
             },
             options.rocksdb_resource_budget,
             |cache, rocksdb_resource_budget| {
-                column_family_descriptors(
+                existing_column_family_descriptors(
                     cache,
                     rocksdb_resource_budget,
-                    options.consumers,
                     &existing_column_families,
                 )
             },
@@ -1200,10 +1229,33 @@ impl MaterializedViewStore {
             resource_gauge_throttle: Arc::new(ResourceGaugeThrottle::default()),
             logical_write_bytes: Arc::new(AtomicU64::new(0)),
         };
-        store.require_matching_store_format_version()?;
-        store.validate_secondary_consumer_schemas()?;
+        store.admit_open_secondary_store(manifest_admission)?;
         store.record_rocksdb_properties();
         Ok(store)
+    }
+
+    fn admit_open_secondary_store(
+        &self,
+        manifest_admission: ManifestAdmission,
+    ) -> Result<(), MaterializedViewStoreError> {
+        Self::retry_secondary_validation(
+            false,
+            || self.catch_up_secondary(),
+            || self.validate_open_secondary_store_once(manifest_admission),
+        )
+    }
+
+    fn validate_open_secondary_store_once(
+        &self,
+        manifest_admission: ManifestAdmission,
+    ) -> Result<(), MaterializedViewStoreError> {
+        self.require_matching_store_format_version()?;
+        let recorded = self.read_consumer_manifest()?;
+        if manifest_admission == ManifestAdmission::ExactBundled {
+            Self::validate_exact_bundled_consumer_identities(&recorded)?;
+        }
+        Self::validate_declared_consumer_schemas(self.consumers, &recorded)?;
+        validate_column_family_identity(&self.db.cf_names(), self.consumers)
     }
 
     /// Advances the secondary instance's view to the primary's latest
@@ -1216,41 +1268,48 @@ impl MaterializedViewStore {
             return Ok(());
         }
         let _catch_up_guard = self.catch_up_barrier.write();
-        let mut attempt = 1;
-        loop {
-            let outcome = self.try_catch_up_once();
-            if outcome
-                .as_ref()
-                .is_err_and(is_transient_secondary_missing_sst)
-                && attempt < SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS
-            {
+        Self::retry_secondary_validation(
+            true,
+            || self.catch_up_secondary(),
+            || {
+                self.require_matching_store_format_version()?;
+                self.validate_consumer_schemas()
+            },
+        )
+    }
+
+    fn retry_secondary_validation(
+        catch_up_first: bool,
+        mut catch_up: impl FnMut() -> Result<(), MaterializedViewStoreError>,
+        mut validate: impl FnMut() -> Result<(), MaterializedViewStoreError>,
+    ) -> Result<(), MaterializedViewStoreError> {
+        retry_missing_sst(|attempt| {
+            if attempt > 1 {
                 metrics::counter!("zinder_materialized_views_secondary_catchup_retries_total")
                     .increment(1);
                 tracing::debug!(
                     target: "zinder::materialized_views",
                     event = "secondary_catchup_missing_sst_retry",
-                    attempt,
-                    max_attempts = SECONDARY_CATCHUP_MISSING_SST_ATTEMPTS,
+                    attempt = attempt - 1,
+                    max_attempts = MISSING_SST_ATTEMPTS,
                     "materialized-view secondary crossed a primary-compaction file race; retrying catchup"
                 );
-                std::thread::yield_now();
-                attempt += 1;
-                continue;
             }
-            return outcome;
-        }
+            if catch_up_first || attempt > 1 {
+                catch_up()?;
+            }
+            validate()
+        })
     }
 
-    fn try_catch_up_once(&self) -> Result<(), MaterializedViewStoreError> {
+    fn catch_up_secondary(&self) -> Result<(), MaterializedViewStoreError> {
         self.db.try_catch_up_with_primary().map_err(|source| {
             MaterializedViewStoreError::Operation {
                 operation: "try_catch_up_with_primary",
                 column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
                 source,
             }
-        })?;
-        self.require_matching_store_format_version()?;
-        self.validate_secondary_consumer_schemas()
+        })
     }
 
     /// Flushes the write-ahead log to disk so every prior write is durable.
@@ -2422,51 +2481,43 @@ impl MaterializedViewStore {
         }
     }
 
-    /// Rejects a secondary open whose consumer declaration cannot safely read
-    /// the persisted manifest.
-    fn validate_secondary_consumer_schemas(&self) -> Result<(), MaterializedViewStoreError> {
-        self.validate_consumer_schemas()
-    }
-
-    /// Rejects a persisted container version different from the running
-    /// format without opening the store for mutation.
-    fn require_matching_store_format_at_path(
-        path: &Path,
-    ) -> Result<(), MaterializedViewStoreError> {
-        let Some(persisted) = Self::peek_store_format_version(path)? else {
-            return Ok(());
-        };
-        if persisted == MATERIALIZED_VIEW_STORE_FORMAT_VERSION {
-            return Ok(());
-        }
-        Err(MaterializedViewStoreError::SchemaMismatch {
-            persisted,
-            running: MATERIALIZED_VIEW_STORE_FORMAT_VERSION,
-        })
-    }
-
-    /// Reads the persisted container version without keeping the store open.
+    /// Reads an existing store's format version and consumer manifest in one
+    /// bounded read-only probe, without opening the store for writes or
+    /// creating column families.
     ///
-    /// Returns `None` when `path` holds no materialized-view store yet. The store is
-    /// opened read-only and closed before the caller decides whether it may open
-    /// the current format.
-    fn peek_store_format_version(path: &Path) -> Result<Option<u16>, MaterializedViewStoreError> {
+    /// Returns `Ok(None)` when `path` does not yet hold a materialized-view
+    /// `RocksDB` store. Validates the persisted container format version
+    /// before decoding the consumer manifest so an incompatible store format
+    /// always fails with [`MaterializedViewStoreError::SchemaMismatch`].
+    fn probe_existing_store_at_path(
+        path: &Path,
+        resource_budget: RocksDbResourceBudget,
+    ) -> Result<Option<ProbedStoreMetadata>, MaterializedViewStoreError> {
+        retry_missing_sst(|_| Self::probe_existing_store_once(path, resource_budget))
+    }
+
+    fn probe_existing_store_once(
+        path: &Path,
+        resource_budget: RocksDbResourceBudget,
+    ) -> Result<Option<ProbedStoreMetadata>, MaterializedViewStoreError> {
         let existing_column_families = existing_column_family_names(path);
         if existing_column_families.is_empty() {
             return Ok(None);
         }
-        let db =
-            DB::open_cf_for_read_only(&Options::default(), path, &existing_column_families, false)
+        let bounded_open =
+            open_bounded_rocksdb_read_only_probe(path, &existing_column_families, resource_budget)
                 .map_err(|source| MaterializedViewStoreError::Open {
                     path: path.to_path_buf(),
                     source,
                 })?;
-        let column_family = db
+        let column_family = bounded_open
+            .db
             .cf_handle(MaterializedViewStoreTable::ConsumerMetadata.column_family_name())
             .ok_or(MaterializedViewStoreError::ColumnFamilyMissing {
                 column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
             })?;
-        let persisted = db
+        let persisted_format_version = bounded_open
+            .db
             .get_cf(&column_family, STORE_FORMAT_VERSION_KEY)
             .map_err(|source| MaterializedViewStoreError::Operation {
                 operation: "get",
@@ -2479,45 +2530,23 @@ impl MaterializedViewStore {
                 column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
                 reason,
             })?;
-        Ok(persisted)
-    }
-
-    /// Reads the existing per-consumer manifest without opening the store for
-    /// writes or creating column families.
-    fn preflight_exact_bundled_manifest_at_path(
-        path: &Path,
-    ) -> Result<(), MaterializedViewStoreError> {
-        Self::require_matching_store_format_at_path(path)?;
-        let Some(recorded_consumers) = Self::read_consumer_manifest_at_path(path)? else {
-            return Ok(());
-        };
-        Self::validate_exact_bundled_consumer_identities(&recorded_consumers)
-    }
-
-    fn read_consumer_manifest_at_path(
-        path: &Path,
-    ) -> Result<Option<BTreeMap<String, ConsumerManifestEntry>>, MaterializedViewStoreError> {
-        let existing_column_families = existing_column_family_names(path);
-        if existing_column_families.is_empty() {
-            return Ok(None);
+        if let Some(persisted) = persisted_format_version
+            && persisted != MATERIALIZED_VIEW_STORE_FORMAT_VERSION
+        {
+            return Err(MaterializedViewStoreError::SchemaMismatch {
+                persisted,
+                running: MATERIALIZED_VIEW_STORE_FORMAT_VERSION,
+            });
         }
-        let db =
-            DB::open_cf_for_read_only(&Options::default(), path, &existing_column_families, false)
-                .map_err(|source| MaterializedViewStoreError::Open {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-        let Some(column_family) =
-            db.cf_handle(MaterializedViewStoreTable::ConsumerMetadata.column_family_name())
-        else {
-            return Ok(Some(BTreeMap::new()));
-        };
-        let iterator = db.iterator_cf(
+        let iterator = bounded_open.db.iterator_cf(
             &column_family,
             IteratorMode::From(CONSUMER_SCHEMA_KEY_PREFIX, rust_rocksdb::Direction::Forward),
         );
         let recorded_consumers = decode_consumer_manifest_entries(iterator)?;
-        Ok(Some(recorded_consumers))
+        Ok(Some(ProbedStoreMetadata {
+            existing_column_families,
+            recorded_consumers,
+        }))
     }
 
     /// Writes the current container version and the full consumer manifest to
@@ -2544,16 +2573,6 @@ impl MaterializedViewStore {
             );
         }
         self.write_batch(&batch)
-    }
-
-    fn preflight_consumer_schemas_at_path(
-        path: &Path,
-        consumers: &[MaterializedViewConsumerSchema],
-    ) -> Result<(), MaterializedViewStoreError> {
-        let Some(recorded) = Self::read_consumer_manifest_at_path(path)? else {
-            return Ok(());
-        };
-        Self::validate_declared_consumer_schemas(consumers, &recorded)
     }
 
     fn validate_consumer_schemas(&self) -> Result<(), MaterializedViewStoreError> {
@@ -2711,7 +2730,7 @@ impl MaterializedViewStore {
         } else {
             StoreRole::MaterializedViewPrimary
         };
-        record_rocksdb_resource_gauges(&RocksDbResourceGaugeInputs {
+        let inputs = RocksDbResourceGaugeInputs {
             db: &self.db,
             store_role,
             column_family_names: &column_family_names,
@@ -2720,7 +2739,8 @@ impl MaterializedViewStore {
             statistics: &self.statistics,
             io_mode: self.io_mode,
             resource_budget: self.rocksdb_resource_budget,
-        });
+        };
+        record_rocksdb_resource_gauges(&inputs);
         self.record_materialized_view_rocksdb_properties(store_role);
     }
 
@@ -2947,11 +2967,11 @@ fn decode_consumer_manifest_entries(
 ) -> Result<BTreeMap<String, ConsumerManifestEntry>, MaterializedViewStoreError> {
     let mut manifest = BTreeMap::new();
     for entry in iterator {
-        let (key, payload) =
-            entry.map_err(|source| MaterializedViewStoreError::ConsumerManifest {
-                operation: "read_manifest",
-                reason: source.to_string(),
-            })?;
+        let (key, payload) = entry.map_err(|source| MaterializedViewStoreError::Operation {
+            operation: "read_manifest",
+            column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
+            source,
+        })?;
         let Some(name_bytes) = key.strip_prefix(CONSUMER_SCHEMA_KEY_PREFIX) else {
             break;
         };
@@ -2970,6 +2990,12 @@ fn decode_consumer_manifest_entries(
         manifest.insert(name, decoded);
     }
     Ok(manifest)
+}
+
+/// Metadata read from an existing store during one bounded read-only probe.
+struct ProbedStoreMetadata {
+    existing_column_families: Vec<String>,
+    recorded_consumers: BTreeMap<String, ConsumerManifestEntry>,
 }
 
 /// One consumer's persisted schema manifest row: its declared version and the
@@ -3198,7 +3224,23 @@ fn read_manifest_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
     Ok(u16::from_be_bytes(array))
 }
 
-fn is_transient_secondary_missing_sst(error: &MaterializedViewStoreError) -> bool {
+// Read-only probes reopen, while secondary readers catch up before revalidating.
+fn retry_missing_sst<T>(
+    mut run: impl FnMut(u32) -> Result<T, MaterializedViewStoreError>,
+) -> Result<T, MaterializedViewStoreError> {
+    let mut attempt = 1;
+    loop {
+        let outcome = run(attempt);
+        if attempt >= MISSING_SST_ATTEMPTS || !outcome.as_ref().is_err_and(is_transient_missing_sst)
+        {
+            return outcome;
+        }
+        std::thread::yield_now();
+        attempt += 1;
+    }
+}
+
+fn is_transient_missing_sst(error: &MaterializedViewStoreError) -> bool {
     std::error::Error::source(error)
         .and_then(|source| source.downcast_ref::<rust_rocksdb::Error>())
         .is_some_and(zinder_store::is_missing_table_file_error)
@@ -3243,6 +3285,15 @@ mod tests {
             MaterializedViewStore::bundled_chain_event_consumer_names()
                 .contains(&PAID_FEE_DISTRIBUTION_SCHEMA.name)
         );
+    }
+
+    #[test]
+    fn data_families_keep_the_blocks_of_dropped_table_files() {
+        let options = column_family_options(
+            &Cache::new_lru_cache(1024 * 1024),
+            RocksDbResourceBudget::for_local_tests(),
+        );
+        assert_eq!(options.get_uncache_aggressiveness(), 0);
     }
 
     #[test]
@@ -3714,17 +3765,13 @@ mod tests {
 
     #[test]
     fn lower_store_format_version_returns_mismatch_without_mutation() -> Result<()> {
-        incompatible_store_format_rejection_preserves_rows(
-            MATERIALIZED_VIEW_STORE_FORMAT_VERSION - 1,
-        )
+        incompatible_store_format_rejection_preserves_rows(0)
     }
 
     #[test]
     fn reopening_a_store_with_an_advanced_store_format_version_returns_mismatch_without_mutation()
     -> Result<()> {
-        incompatible_store_format_rejection_preserves_rows(
-            MATERIALIZED_VIEW_STORE_FORMAT_VERSION + 1,
-        )
+        incompatible_store_format_rejection_preserves_rows(2)
     }
 
     #[test]
@@ -3746,15 +3793,31 @@ mod tests {
             store.put(
                 MaterializedViewStoreTable::ConsumerMetadata,
                 STORE_FORMAT_VERSION_KEY,
-                &(MATERIALIZED_VIEW_STORE_FORMAT_VERSION - 1).to_be_bytes(),
+                &0_u16.to_be_bytes(),
             )?;
         }
 
+        let secondary = tempfile::tempdir()?;
         for outcome in [
             MaterializedViewStore::exists_at_path(tempdir.path()).map(|_| ()),
             MaterializedViewStore::open_explorer_views(
                 tempdir.path(),
                 MaterializedViewStoreOptions::default(),
+            )
+            .map(|_| ()),
+            MaterializedViewStore::open_explorer_views_secondary(
+                tempdir.path(),
+                secondary.path(),
+                MaterializedViewStoreOptions::default(),
+            )
+            .map(|_| ()),
+            MaterializedViewStore::open_secondary(
+                tempdir.path(),
+                secondary.path(),
+                MaterializedViewStoreOptions {
+                    consumers: &[TEST_CONSUMER_SCHEMA],
+                    ..MaterializedViewStoreOptions::default()
+                },
             )
             .map(|_| ()),
         ] {
@@ -3763,10 +3826,119 @@ mod tests {
                 Err(MaterializedViewStoreError::SchemaMismatch {
                     persisted,
                     running,
-                }) if persisted == MATERIALIZED_VIEW_STORE_FORMAT_VERSION - 1 && running == MATERIALIZED_VIEW_STORE_FORMAT_VERSION
+                }) if persisted == 0 && running == MATERIALIZED_VIEW_STORE_FORMAT_VERSION
             ));
         }
         Ok(())
+    }
+
+    #[test]
+    fn secondary_open_rejects_missing_primary_and_missing_metadata_family() -> Result<()> {
+        let missing_primary = tempdir()?;
+        let missing_secondary = tempdir()?;
+        let missing_outcome = MaterializedViewStore::open_secondary(
+            missing_primary.path(),
+            missing_secondary.path(),
+            MaterializedViewStoreOptions::default(),
+        );
+        assert!(matches!(
+            missing_outcome,
+            Err(MaterializedViewStoreError::Open { .. })
+        ));
+
+        let bare_primary = tempdir()?;
+        let bare_secondary = tempdir()?;
+        {
+            let mut db_options = Options::default();
+            db_options.create_if_missing(true);
+            let _bare_db = DB::open(&db_options, bare_primary.path())?;
+        }
+        let missing_metadata_outcome = MaterializedViewStore::open_secondary(
+            bare_primary.path(),
+            bare_secondary.path(),
+            MaterializedViewStoreOptions::default(),
+        );
+        assert!(matches!(
+            missing_metadata_outcome,
+            Err(MaterializedViewStoreError::ColumnFamilyMissing {
+                column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_manifest_sst_triggers_secondary_catchup_before_revalidation() -> Result<()> {
+        use std::cell::RefCell;
+
+        let source = missing_manifest_sst_error()?;
+        let calls = RefCell::new(Vec::new());
+        MaterializedViewStore::retry_secondary_validation(
+            false,
+            || {
+                calls.borrow_mut().push("catch up");
+                Ok(())
+            },
+            || {
+                let mut calls = calls.borrow_mut();
+                calls.push("validate");
+                if calls.len() == 1 {
+                    decode_consumer_manifest_entries(std::iter::once(Err(source.clone())))?;
+                }
+                Ok(())
+            },
+        )?;
+        assert_eq!(*calls.borrow(), ["validate", "catch up", "validate"]);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_sst_retries_are_bounded_and_schema_mismatches_fail_immediately() -> Result<()> {
+        use std::cell::Cell;
+
+        let source = missing_manifest_sst_error()?;
+        let catchups = Cell::new(0);
+        let validations = Cell::new(0);
+        let result = MaterializedViewStore::retry_secondary_validation(
+            false,
+            || {
+                catchups.set(catchups.get() + 1);
+                Ok(())
+            },
+            || {
+                validations.set(validations.get() + 1);
+                decode_consumer_manifest_entries(std::iter::once(Err(source.clone()))).map(|_| ())
+            },
+        );
+        assert!(result.as_ref().is_err_and(is_transient_missing_sst));
+        assert_eq!(validations.get(), MISSING_SST_ATTEMPTS);
+        assert_eq!(catchups.get(), MISSING_SST_ATTEMPTS - 1);
+
+        let mut attempts = Vec::new();
+        let result = retry_missing_sst(|attempt| {
+            attempts.push(attempt);
+            Err::<(), _>(MaterializedViewStoreError::SchemaMismatch {
+                persisted: 0,
+                running: MATERIALIZED_VIEW_STORE_FORMAT_VERSION,
+            })
+        });
+        assert!(matches!(
+            result,
+            Err(MaterializedViewStoreError::SchemaMismatch { .. })
+        ));
+        assert_eq!(attempts, [1]);
+        Ok(())
+    }
+
+    fn missing_manifest_sst_error() -> Result<rust_rocksdb::Error> {
+        let temporary = tempdir()?;
+        let options = rust_rocksdb::Options::default();
+        let mut writer = rust_rocksdb::SstFileWriter::create(&options);
+        let missing_table = temporary.path().join("absent").join("000001.sst");
+        let Err(source) = writer.open(missing_table) else {
+            eyre::bail!("an SST in a missing directory must fail to open");
+        };
+        Ok(source)
     }
 
     #[test]

@@ -139,6 +139,73 @@ pub fn encode_compact_block_artifact(block: &CompactBlockArtifact) -> Vec<u8> {
     compact_block_message(block).encode_to_vec()
 }
 
+/// Returns the exact encoded protobuf byte length of [`encode_compact_block_artifact`]
+/// without allocating intermediate transaction or output vectors.
+#[must_use]
+pub(crate) fn encoded_compact_block_artifact_len(block: &CompactBlockArtifact) -> usize {
+    const RPC_HEX_FIELD_LEN: usize = 66;
+    const TXID_FIELD_LEN: usize = 34;
+
+    let metadata = block.chain_metadata();
+    let metadata_len = u32_field_len(metadata.sapling_commitment_tree_size)
+        + u32_field_len(metadata.orchard_commitment_tree_size)
+        + u32_field_len(metadata.ironwood_commitment_tree_size);
+
+    let mut total = u32_field_len(block.height().value())
+        + RPC_HEX_FIELD_LEN
+        + RPC_HEX_FIELD_LEN
+        + u32_field_len(block.time())
+        + len_delimited_field_len(metadata_len);
+
+    for tx in block.transactions() {
+        let scan = &tx.data;
+        let mut scan_len = scan
+            .fee_zat
+            .map_or(0, |fee| 1 + prost::encoding::encoded_len_varint(fee))
+            + scan.sapling_spends.len() * 36
+            + scan.sapling_outputs.len() * 124
+            + scan.orchard_actions.len() * 159
+            + scan.ironwood_actions.len() * 159;
+        for inp in &scan.transparent_inputs {
+            scan_len +=
+                len_delimited_field_len(TXID_FIELD_LEN + u32_field_len(inp.previous_output_index));
+        }
+        for out in &scan.transparent_outputs {
+            let script_len = if out.script_pub_key.is_empty() {
+                0
+            } else {
+                len_delimited_field_len(out.script_pub_key.len())
+            };
+            scan_len += len_delimited_field_len(u64_field_len(out.value_zat) + script_len);
+        }
+        let tx_len = u64_field_len(tx.index) + TXID_FIELD_LEN + len_delimited_field_len(scan_len);
+        total += len_delimited_field_len(tx_len);
+    }
+
+    total
+}
+
+fn len_delimited_field_len(payload_len: usize) -> usize {
+    let payload_u64 = u64::try_from(payload_len).unwrap_or(u64::MAX);
+    1 + prost::encoding::encoded_len_varint(payload_u64) + payload_len
+}
+
+fn u32_field_len(num: u32) -> usize {
+    if num == 0 {
+        0
+    } else {
+        1 + prost::encoding::encoded_len_varint(u64::from(num))
+    }
+}
+
+fn u64_field_len(num: u64) -> usize {
+    if num == 0 {
+        0
+    } else {
+        1 + prost::encoding::encoded_len_varint(num)
+    }
+}
+
 /// Decodes and validates one native compact block from canonical storage or the wire.
 pub fn compact_block_from_message(
     message: wallet::CompactBlock,
@@ -704,4 +771,135 @@ fn block_hash_from_rpc_hex(
         field,
         reason: error.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use zinder_core::{
+        BlockHash, BlockHeight, BlockId, CompactBlockArtifact, CompactChainMetadata,
+        CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransaction,
+        CompactTransactionData, CompactTransparentInput, CompactTransparentOutput, TransactionId,
+    };
+
+    use super::{encode_compact_block_artifact, encoded_compact_block_artifact_len};
+
+    #[test]
+    fn encoded_compact_block_artifact_len_matches_wire_encoding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty = CompactBlockArtifact::empty(
+            BlockId::new(BlockHeight::new(0), BlockHash::from_bytes([0x11; 32])),
+            BlockHash::from_bytes([0x22; 32]),
+            0,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
+        );
+        assert_eq!(
+            encoded_compact_block_artifact_len(&empty),
+            encode_compact_block_artifact(&empty).len()
+        );
+
+        let mixed = sample_mixed_compact_block()?;
+        assert_eq!(
+            encoded_compact_block_artifact_len(&mixed),
+            encode_compact_block_artifact(&mixed).len()
+        );
+        Ok(())
+    }
+
+    fn sample_mixed_compact_block() -> Result<CompactBlockArtifact, Box<dyn std::error::Error>> {
+        let tx0 = CompactTransaction {
+            index: 0,
+            transaction_id: TransactionId::from_bytes([0x01; 32]),
+            data: CompactTransactionData {
+                fee_zat: None,
+                transparent_outputs: vec![
+                    CompactTransparentOutput {
+                        value_zat: 0,
+                        script_pub_key: Vec::new(),
+                    },
+                    CompactTransparentOutput {
+                        value_zat: 123_456,
+                        script_pub_key: vec![0x76, 0xa9, 0x14, 0x88],
+                    },
+                ],
+                ..Default::default()
+            },
+        };
+        let tx1 = sample_shielded_and_transparent_tx();
+        let tx2 = CompactTransaction {
+            index: 250,
+            transaction_id: TransactionId::from_bytes([0x03; 32]),
+            data: CompactTransactionData {
+                fee_zat: Some(u64::MAX),
+                sapling_spends: vec![
+                    CompactSaplingSpend {
+                        nullifier: [0x21; 32],
+                    };
+                    300
+                ],
+                ..Default::default()
+            },
+        };
+        Ok(CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(987_654), BlockHash::from_bytes([0x33; 32])),
+            BlockHash::from_bytes([0x44; 32]),
+            1_750_000_123,
+            vec![tx0, tx1, tx2],
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 12_345,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 678_910,
+            },
+        )?)
+    }
+
+    fn sample_shielded_and_transparent_tx() -> CompactTransaction {
+        CompactTransaction {
+            index: 1,
+            transaction_id: TransactionId::from_bytes([0x02; 32]),
+            data: CompactTransactionData {
+                fee_zat: Some(0),
+                sapling_spends: vec![
+                    CompactSaplingSpend {
+                        nullifier: [0x55; 32],
+                    };
+                    10
+                ],
+                sapling_outputs: vec![CompactSaplingOutput {
+                    commitment: [0x66; 32],
+                    ephemeral_key: [0x77; 32],
+                    ciphertext: [0x88; 52],
+                }],
+                orchard_actions: vec![CompactShieldedAction {
+                    nullifier: [0x99; 32],
+                    commitment: [0xaa; 32],
+                    ephemeral_key: [0xbb; 32],
+                    ciphertext: [0xcc; 52],
+                }],
+                ironwood_actions: vec![CompactShieldedAction {
+                    nullifier: [0xdd; 32],
+                    commitment: [0xee; 32],
+                    ephemeral_key: [0xff; 32],
+                    ciphertext: [0x12; 52],
+                }],
+                transparent_inputs: vec![
+                    CompactTransparentInput {
+                        previous_transaction_id: TransactionId::from_bytes([0x13; 32]),
+                        previous_output_index: 0,
+                    },
+                    CompactTransparentInput {
+                        previous_transaction_id: TransactionId::from_bytes([0x14; 32]),
+                        previous_output_index: u32::MAX,
+                    },
+                ],
+                transparent_outputs: vec![CompactTransparentOutput {
+                    value_zat: u64::MAX,
+                    script_pub_key: vec![0xab; 200],
+                }],
+            },
+        }
+    }
 }

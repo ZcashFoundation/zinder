@@ -31,7 +31,8 @@
 //!
 //! [`RpcReply::Delay`] holds a reply back on the connection's OS thread
 //! before answering, and [`RpcReply::Close`] closes the connection without
-//! writing a response.
+//! writing a response. [`RpcReply::RateLimited`] answers HTTP 429, as Zebra
+//! does once its JSON-RPC server holds its connection limit.
 //!
 //! # Batches
 //!
@@ -40,7 +41,8 @@
 //! member is recorded in [`JsonRpcTestServer::requests`] exactly like a
 //! single request, and [`JsonRpcTestServer::batch_sizes`] records the member
 //! count of each batch. When a member's reply is an HTTP-level reply
-//! ([`RpcReply::HttpStatus`], [`RpcReply::Unauthenticated`]) or
+//! ([`RpcReply::HttpStatus`], [`RpcReply::Unauthenticated`],
+//! [`RpcReply::RateLimited`]) or
 //! [`RpcReply::Close`], that reply answers the whole batch and the remaining
 //! members are neither recorded nor answered.
 //!
@@ -54,7 +56,9 @@
 //! The server spawns one OS thread per accepted connection, so callers that
 //! issue several requests in parallel (`tokio::join!`) are served
 //! concurrently and the test observes the same wire surface as a real
-//! `zebrad` instance.
+//! `zebrad` instance. [`JsonRpcTestServer::peak_requests_in_flight`] reports
+//! the most requests the server held at once, counted from a request's
+//! arrival until its response is written.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -63,7 +67,7 @@ use std::{
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -99,6 +103,8 @@ struct ServerState {
     requests: Mutex<Vec<JsonRpcRequest>>,
     batch_sizes: Mutex<Vec<usize>>,
     batch_shaper: Mutex<Option<BatchShaper>>,
+    requests_in_flight: AtomicUsize,
+    peak_requests_in_flight: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -203,6 +209,9 @@ pub enum RpcReply {
     /// cookie credentials: a `WWW-Authenticate` challenge and a JSON-RPC
     /// error body with code 401.
     Unauthenticated,
+    /// The HTTP 429 answer Zebra sends once its JSON-RPC server holds its
+    /// connection limit.
+    RateLimited,
     /// JSON-RPC response with neither `result` nor `error` set.
     Empty,
     /// Waits for the duration on the connection's OS thread, then answers
@@ -254,6 +263,12 @@ impl RpcReply {
     #[must_use]
     pub const fn unauthenticated() -> Self {
         Self::Unauthenticated
+    }
+
+    /// Builds Zebra's HTTP 429 refusal of a connection over its limit.
+    #[must_use]
+    pub const fn rate_limited() -> Self {
+        Self::RateLimited
     }
 
     /// Builds an empty JSON-RPC response (no `result` and no `error` field).
@@ -310,6 +325,12 @@ impl RpcReply {
                     "id": null,
                 })
                 .to_string(),
+            }),
+            Self::RateLimited => ResolvedReply::Http(HttpResponse {
+                status_code: 429,
+                reason_phrase: "Too Many Requests",
+                extra_headers: "",
+                body: "Too many connections".to_owned(),
             }),
             Self::Empty => ResolvedReply::Body(json!({"jsonrpc": "2.0", "id": request_id})),
             Self::Delay(delay, reply) => {
@@ -379,6 +400,8 @@ impl JsonRpcTestServer {
             requests: Mutex::new(Vec::new()),
             batch_sizes: Mutex::new(Vec::new()),
             batch_shaper: Mutex::new(None),
+            requests_in_flight: AtomicUsize::new(0),
+            peak_requests_in_flight: AtomicUsize::new(0),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
         let accept_state = Arc::clone(&state);
@@ -418,6 +441,12 @@ impl JsonRpcTestServer {
     #[must_use]
     pub fn batch_sizes(&self) -> Vec<usize> {
         self.state.batch_sizes.lock().clone()
+    }
+
+    /// Returns the most HTTP requests the server has held at once.
+    #[must_use]
+    pub fn peak_requests_in_flight(&self) -> usize {
+        self.state.peak_requests_in_flight.load(Ordering::SeqCst)
     }
 
     /// Reshapes later batch responses.
@@ -558,6 +587,7 @@ fn handle_connection(mut stream: TcpStream, state: &ServerState) {
     let Ok(http_request) = read_http_request(&mut stream) else {
         return;
     };
+    let _in_flight = InFlightRequest::enter(state);
     let authorization = http_request.authorization.as_deref();
 
     let resolved = match &http_request.body {
@@ -584,6 +614,30 @@ fn handle_connection(mut stream: TcpStream, state: &ServerState) {
         ResolvedReply::Close => {
             let _ = stream.shutdown(Shutdown::Both);
         }
+    }
+}
+
+/// Counts one request from its arrival until its response is written.
+struct InFlightRequest<'state> {
+    state: &'state ServerState,
+}
+
+impl<'state> InFlightRequest<'state> {
+    fn enter(state: &'state ServerState) -> Self {
+        let in_flight = state
+            .requests_in_flight
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        state
+            .peak_requests_in_flight
+            .fetch_max(in_flight, Ordering::SeqCst);
+        Self { state }
+    }
+}
+
+impl Drop for InFlightRequest<'_> {
+    fn drop(&mut self) {
+        self.state.requests_in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

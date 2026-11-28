@@ -1,193 +1,127 @@
 # Exposing over TLS
 
-Use this runbook to make the lightwalletd-compatible endpoint reachable by
-wallets on the internet. You put Caddy in front of
-`zinder-compat-lightwalletd`. Caddy terminates TLS on port 443, sends each
-new request only while Zinder reports ready, and forwards it to Zinder's
-plaintext gRPC listener on loopback.
+Use this runbook to expose Zinder's lightwalletd-compatible, native `WalletQuery`, or `ExplorerQuery` gRPC listeners behind Caddy on port `443`. Caddy terminates TLS, gates every new call on `/readyz`, forwards HTTP/2 (`h2c`) traffic to Zinder on host loopback, and replaces `X-Zinder-Client-Address` so Zinder's per-connection limits isolate individual wallets.
 
-TLS termination, client access rules, and rate limits belong in the proxy,
-and Zinder serves plaintext gRPC behind it. Keep private everything that
-[Service operations](../architecture/service-operations.md#security-boundary)
-lists.
+Zinder serves plaintext gRPC only; keep all gRPC, ops, control, and observability ports private as listed in the [security boundary](../architecture/service-operations.md#security-boundary).
 
-## Prerequisites
+## Production proxy setup
 
-- A deployment whose `/readyz` endpoints all return 200, as described in
-  [Initial sync](initial-sync.md).
-- A DNS name you control, with A and, if you publish IPv6, AAAA records that
-  point to the host running Caddy.
-- A certificate and private key for that name, which you obtain and renew.
-  The template reads them from the files you name. Mobile wallets check the
-  certificate against the device's trust store, so use a publicly trusted
-  certificate whose subject alternative names include the exact DNS name.
-- Caddy v2 on the same host as Zinder, and `grpcurl` on a machine outside it.
-- Inbound TCP port 443 open to the internet. Every other Zinder port stays
-  closed to the internet.
+### Prerequisites
 
-The Compose deployment publishes the compatibility gRPC listener and its ops
-endpoint on loopback, at the host ports in
-[What you deploy](deploying.md#what-you-deploy).
+- All `/readyz` endpoints return `200` ([Initial sync](initial-sync.md)) on the host loopback ports in [Processes and canonical ports](deploying.md#what-you-deploy).
+- A public DNS name (`A` and optional `AAAA` records) pointing to the Caddy host, and a certificate/key chain trusted by WebPKI/platform roots for that exact FQDN. (Installing a private CA on a device does not establish that mobile or bundled-root wallets will trust it.)
+- Caddy on the Zinder host (tested with Caddy 2.11.9) and `grpcurl` on an external host. For QUIC connection migration, use a Caddy build with quic-go 0.50.0 or later. [quic-go server-side path validation](https://github.com/quic-go/quic-go/releases/tag/v0.50.0).
+- Inbound TCP `443` for HTTP/2 and UDP `443` for HTTP/3 through the host firewall and any network firewall, port forward, or container port mapping in front of Caddy. Keep all other Zinder ports closed externally.
 
-## Configure Caddy
+### Configure Caddy
 
-The template is `deploy/compat-lightwalletd.Caddyfile`. It reads these
-environment variables when Caddy loads it, so set them in Caddy's service
-environment:
+`deploy/compat-lightwalletd.Caddyfile` reads these environment variables from Caddy's service environment (restrict the private key and its directory to the Caddy account):
 
 | Variable | Value |
 | --- | --- |
-| `ZINDER_COMPAT_PUBLIC_FQDN` | The public DNS name, for example `lightwalletd.example.org` |
-| `ZINDER_COMPAT_TLS_CERT_FILE` | Path to the certificate chain |
-| `ZINDER_COMPAT_TLS_KEY_FILE` | Path to the private key |
-| `ZINDER_COMPAT_HOST_PORT` | The compatibility gRPC host port, 9067 on Mainnet |
-| `ZINDER_COMPAT_OPS_HOST_PORT` | The compatibility ops host port, 9107 on Mainnet |
+| `DEPLOY_COMPAT_PUBLIC_FQDN` | Public DNS name, e.g. `lightwalletd.example.org` |
+| `DEPLOY_COMPAT_TLS_CERT_FILE` | Path to certificate chain |
+| `DEPLOY_COMPAT_TLS_KEY_FILE` | Path to private key |
+| `DEPLOY_COMPAT_HOST_PORT` | Compatibility gRPC host port (`9067` Mainnet) |
+| `DEPLOY_SERVE_OPS_HOST_PORT` | Reader ops `/readyz` host port (`9108` under `zinder-serve` / Compose, or `9107` standalone) |
 
-Restrict the private key and its directory to the account that runs Caddy.
+Apply in this exact order so Caddy strips client-supplied headers **before** Zinder trusts `X-Zinder-Client-Address`:
 
-Do these steps in order. Caddy must replace the client address header before
-Zinder trusts it, because until then any wallet can send its own.
-
-1. Validate the configuration with the variables set:
+1. Validate the Caddyfile:
 
    ```bash
    caddy adapt --config deploy/compat-lightwalletd.Caddyfile \
      --adapter caddyfile --validate >/dev/null
    ```
 
-2. Load it into your Caddy service, for example with `caddy reload` or by
-   restarting the service.
+2. Load the config into Caddy (e.g. `caddy reload` or restart the Caddy service).
+3. Verify the isolation requirements in [Keep wallets apart in the receive limit](#keep-wallets-apart-in-the-receive-limit), add `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true` to your Compose runtime `zinder.env` file (or `compat.trust_proxy_client_address = true` outside Compose), and recreate `zinder-serve` (or standalone `zinder-compat-lightwalletd`) using the deployment's `deploy.env` file and `-f` list.
 
-3. Check the requirements in
-   [Keep wallets apart in the receive limit](#keep-wallets-apart-in-the-receive-limit),
-   then tell Zinder to trust the client address Caddy forwards. Add this line
-   to the env file you pass to Compose, then recreate the compatibility
-   container with that env file and every `-f` file the deployment runs
-   with, as in [Roll back the proxy](#roll-back-the-proxy):
+The template sets `auto_https off` and uses the supplied certificate. When renewing certificates, replace the files and reload Caddy.
 
-   ```bash
-   ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true
-   ```
+The template explicitly sets `protocols h1 h2 h3`. Caddy advertises HTTP/3 on responses over HTTP/2 with an `Alt-Svc` header containing `h3=":443"`. Clients that fall back to HTTP/2 can reach the endpoint over TCP `443` when UDP is blocked. Native gRPC clients that use HTTP/2 continue to negotiate `h2`. [HTTP/3 discovery](https://www.rfc-editor.org/rfc/rfc9114#section-3.1).
 
-   Outside Compose, set `compat.trust_proxy_client_address = true` in the
-   compatibility config file instead. Running the binary with
-   `--print-config` shows the resolved value.
-
-The template does four things:
-
-- It serves TLS on `:443` for the exact name, with your certificate, and
-  offers only HTTP/2 (`alpn h2`), which gRPC needs. Its `auto_https off`
-  setting turns off Caddy's own certificate management and HTTP redirects.
-- Before every new gRPC call, `forward_auth` sends `HEAD /readyz` to the
-  compatibility ops port. A 2xx status lets the call through. Caddy returns
-  a refusing status to the client. A not-ready runtime answers 503, which a
-  gRPC client reports as `UNAVAILABLE`.
-- `reverse_proxy h2c://127.0.0.1:...` forwards admitted calls to the
-  plaintext gRPC listener on loopback.
-- `header_up X-Zinder-Client-Address {http.request.remote}` names, on every
-  forwarded call, the wallet connection it came from, as an IP address and
-  port. Caddy replaces any value the wallet sent.
-
-When you renew the certificate, replace the files and reload Caddy.
+An active HTTP/3 stream can survive a network change when the client initiates QUIC connection migration and Caddy can validate and switch to the new path. That path must reach the same Caddy instance. Loopback testing covered a change of client IP and port. Physical handoffs between Wi-Fi and cellular remain unverified. [QUIC connection migration](https://www.rfc-editor.org/rfc/rfc9000#section-9).
 
 ## Keep wallets apart in the receive limit
 
-Zinder admits at most 32 requests whose message is still arriving, as
-[Configuration](../reference/configuration.md#public-grpc-listeners)
-describes. When that pool is full, a new request takes the oldest slot of the
-client holding the most slots, but only if that client holds strictly more
-slots than the requester. Otherwise the new request is refused with
-`UNAVAILABLE`. A client that holds no slot is therefore always admitted, and a
-client is refused only while it holds at least as many slots as every other
-client. When clients hold equal shares, a further request from any of them is
-refused.
+Zinder admits at most 32 requests whose message is still arriving ([Public gRPC listeners](../reference/configuration.md#public-grpc-listeners)). When full, a new request evicts the oldest slot of the client holding the most slots (strictly more than the requester) or fails with `UNAVAILABLE`.
 
-Caddy reaches Zinder over a few pooled connections. Without a client address,
-every wallet behind Caddy counts as one of those few clients, so one wallet
-that opens many slow requests gets the others refused.
+Because Caddy multiplexes wallets onto a few pooled `h2c` connections, Zinder would otherwise treat every wallet behind Caddy as one client. With `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true` and Caddy setting `X-Zinder-Client-Address` to `{http.request.remote}`, Zinder keys each wallet connection independently:
 
-With the header set and `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true`,
-Zinder counts each wallet connection as its own client, as it does for a
-direct connection. A wallet that opens many slow requests then loses its own
-oldest slots to wallets holding fewer, and it cannot get a wallet with fewer
-slots refused.
+- Caddy must replace `X-Zinder-Client-Address` on every forwarded call as one `ip:port` or bare IP. Missing, repeated, comma-separated, or malformed values fall back to Caddy's own connection and increment `zinder_grpc_proxy_client_address_fallbacks_total` (headerless supervisor `grpc.health.v1.Health/Check` probes use loopback and do not increment it). A proxy forwarding only a bare IP (such as GCP Global External Application Load Balancer) groups all connections from that IP as one client; ensure its replace semantics are `true` so it never appends.
+- Only Caddy (and equally trusted peers) may reach the listening port directly, because Zinder trusts the header from any caller once enabled. In the Compose deployment, every public listener shares `zinder-index`'s network namespace and is directly reachable from:
+  - host processes via loopback or container addresses;
+  - every container on the Compose `node` network (`DEPLOY_NODE_NETWORK`, including the node and any external fallback node networks you attach); and
+  - every container on the Compose `observability` network (including Prometheus and Grafana).
 
-This guarantee depends on these settings:
+Before enabling `TRUST_PROXY_CLIENT_ADDRESS`, confirm the host runs no untrusted workloads and inspect every attached container with the exact `deploy.env` file and `-f` files your deployment runs:
 
-- Caddy sets `X-Zinder-Client-Address` to `{http.request.remote}` on every
-  forwarded call, replacing any value the client sent. Zinder reads the
-  header only when a request carries it once, as one IP address and port,
-  such as `203.0.113.7:51234` or `[2001:db8::7]:51234`. It counts a request
-  against Caddy's own connection when the header is missing, appears more
-  than once, holds a comma-separated list, or holds anything else.
-  `zinder_grpc_proxy_client_address_fallbacks_total` counts these requests by
-  reason, and stays at zero behind this template.
-- Only Caddy can reach the gRPC listener, apart from peers you trust as much
-  as Caddy. Zinder reads the header from every connection once the setting is
-  on. A peer that reaches the listener without going through Caddy can name
-  another wallet's connection, so that wallet loses its slots or is refused.
-  The scan in [Verify from outside](#verify-from-outside) cannot show these
-  paths. In the Compose deployment, the listener binds every address of the
-  network namespace it shares with ingest, so besides Caddy it is reachable
-  from:
-  - every process on the host, through the loopback port or the container's
-    own addresses;
-  - every container on the Compose `node` network, the node's Docker network
-    that `ZINDER_SOURCE_NETWORK_NAME` names, including the node;
-  - every container on the Compose `node-fallback` network, the fallback
-    node's Docker network that `ZINDER_FALLBACK_SOURCE_NETWORK_NAME` names,
-    including the fallback node, when the deployment merges
-    `deploy/docker-compose.node-fallback.yml`; and
-  - every container on the Compose `observability` network, including
-    Prometheus and Grafana.
+```bash
+env_file=deploy/profiles/mainnet/deploy.env
+compose_files=(-f deploy/docker-compose.yml)
+ingest="$(docker compose --env-file "$env_file" "${compose_files[@]}" ps -q zinder-index)"
+for network in $(docker inspect "$ingest" \
+  --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}'); do
+  docker network inspect "$network" \
+    --format '{{.Name}}: {{range .Containers}}{{.Name}} {{end}}'
+done
+```
 
-  Before you turn the setting on, confirm that the host runs no untrusted
-  users or workloads, and that you run and trust every container on those
-  networks. This lists them. Set `env_file` and `compose_files` to the env
-  file and the `-f` files the deployment runs with, in the same order:
+- Because wallets behind Tor share exit IPs, Zinder keys connections (`ip:port`), not IPs (except bare-IP proxy headers). Enforce per-client connection limits at your proxy as well.
 
-  ```bash
-  env_file=deploy/.env.mainnet
-  compose_files=(-f deploy/docker-compose.yml -f deploy/docker-compose.node-fallback.yml)
-  ingest="$(docker compose --env-file "$env_file" "${compose_files[@]}" ps -q zinder-ingest)"
-  for network in $(docker inspect "$ingest" \
-    --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}'); do
-    docker network inspect "$network" \
-      --format '{{.Name}}: {{range .Containers}}{{.Name}} {{end}}'
-  done
-  ```
+Leave `TRUST_PROXY_CLIENT_ADDRESS` off (`false`) when wallets connect directly without a proxy.
 
-- Zinder identifies wallets by connection, not by IP address, because wallets
-  behind Tor share exit addresses. A client that opens many connections still
-  counts as many clients, so keep the per-client connection limit described
-  in [Add access control and rate limits](#add-access-control-and-rate-limits).
+## Forward client addresses from a TCP proxy
 
-Leave the setting off when wallets connect to Zinder without a proxy. With it
-off, Zinder ignores the header.
+Terminate TLS at the edge and configure the TCP proxy to prepend [PROXY v1 or v2](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt) to each plaintext connection to Zinder. Bind each backend on a private address and restrict access to the proxy in your firewall. Set `ZINDER_COMPAT__PROXY_PROTOCOL_TRUSTED_CIDRS` or `ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS` to the **proxy's backend source networks**, for example `192.0.2.10/32,2001:db8::10/128` (to explicitly disable PROXY protocol, omit the variable or set it to `none`; empty `KEY=` values are rejected). Leave HTTP header forwarding disabled on that listener.
+
+Probe `/readyz` on the private ops port for backend readiness, or send a valid PROXY preface before a backend gRPC probe. Verify wallet RPCs through the public endpoint after enabling forwarding. For rollback, remove the allowlist and disable the proxy's preface together before directing traffic to the backend.
 
 ## How readiness reaches wallets
 
-Caddy checks readiness once per new call, using up to 16 connections to the
-ops listener. Further checks wait for a connection. Each connection can
-serve another check as soon as Caddy receives the status, even while the
-admitted wallet call is streaming. This leaves 48 of the
-listener's 64 connections available for other ops traffic. Caddy closes idle
-connections after 5 seconds, before the listener's 10-second idle deadline.
+Caddy checks `HEAD /readyz` once per new gRPC call (16 pooled connections, leaving 48 of the 64 ops connections free; 5s idle close before Zinder's 10s idle deadline). A `503` causes Caddy to reject the call (`UNAVAILABLE` to gRPC clients); once admitted, an active block-range stream continues if readiness later changes, while `zinder-compat-lightwalletd` re-checks readiness before starting the RPC handler. Node outages do not drain compatibility ([During a node outage](../reference/readiness.md#during-a-node-outage)).
 
-The first check after readiness turns refusing stops the call at Caddy. If
-readiness changes after the check, compatibility checks it again before
-running the wallet RPC. An admitted block-range stream continues when
-readiness changes.
+## Add access control and rate limits
 
-A node outage does not drain compatibility; see
-[Readiness](../reference/readiness.md#during-a-node-outage).
+Before announcing a public endpoint, configure client authentication and per-client limits on connections, requests, and concurrent streams in Caddy or your edge gateway. Leave headroom for normal wallet sync bursts; per-client connection limits at the proxy prevent one client from opening many connections to bypass Zinder's per-connection receive limit.
+
+<a id="enable-browser-wallets"></a>
+
+## Enable browser clients
+
+Set the target listener's [browser origins](../reference/configuration.md#browser-origins)
+to the browser application's `location.origin` and restart that runtime.
+Forward both OPTIONS preflights and gRPC-Web POST requests through the same
+Caddy site as native gRPC. Keep edge rate limits in the proxy. For lightwalletd
+sync, select `compat.serving = "wallet"` or `"light-wallet"`.
+
+Browsers that negotiate HTTP/3 can send gRPC-Web calls to Caddy over `h3`.
+Caddy forwards the requests to Zinder over `h2c`. In the browser network
+panel, check that preflight grants your origin and that the RPC completes.
+For lightwalletd sync, confirm that `GetBlockRange` advances scanned height.
+Check that the Protocol column shows `h3` after discovery. Block UDP port
+443 on the test client and repeat the call to confirm it also works over
+`h2`.
+
+If preflight fails, check `/readyz` first because Caddy applies
+`forward_auth` to OPTIONS too. Then compare the request's `Origin` header,
+including its port, with the configured origin. If ExplorerQuery requires a
+bearer token, let preflight request the `authorization` header and send the
+token on the POST.
+
+## Expose the native endpoint too
+
+To expose `WalletQuery` or `ExplorerQuery` (with `ZINDER_DEPLOYMENT__PROFILE=explorer` in `zinder.env`, or `--preset explorer` on standalone CLI runs), add a site block per service to the Caddyfile with its own DNS name, certificate, `forward_auth` ops port, `reverse_proxy h2c://127.0.0.1:<port>`, and `header_up X-Zinder-Client-Address {http.request.remote}`:
+
+- **Native `WalletQuery`:** `DEPLOY_SERVE_OPS_HOST_PORT` (`9108` under `zinder-serve`, or `9106` standalone) and `DEPLOY_QUERY_HOST_PORT` (`9102` Mainnet); once Caddy reloads, set `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=true` in `zinder.env` and verify `zinder.v1.wallet.WalletQuery/ServerInfo`. See [Integration surfaces](../reference/integration-surfaces.md).
+- **`ExplorerQuery`:** `DEPLOY_SERVE_OPS_HOST_PORT` (`9108` under `zinder-serve`, or `9069` standalone) and `DEPLOY_EXPLORER_HOST_PORT` (`9068` Mainnet); once Caddy reloads, set `ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=true` in `zinder.env` and verify `zinder.v1.explorer.ExplorerQuery/ServerInfo`.
 
 ## Verify from outside
 
-Run these from a machine outside the host's network. Replace the name with
-yours.
+Run from a machine outside the host's network:
 
-1. Check DNS, TLS, and HTTP/2 negotiation:
+1. Check DNS, TLS, and HTTP/2 ALPN (`ALPN protocol: h2`):
 
    ```bash
    name=lightwalletd.example.org
@@ -197,114 +131,90 @@ yours.
      -alpn h2 -verify_hostname "$name" -verify_return_error </dev/null
    ```
 
-   The certificate verifies, and the output contains `ALPN protocol: h2`.
-
-2. Call the endpoint through TLS:
+2. Call `GetLightdInfo` over TLS (expect your network and `"taddrSupport": true`):
 
    ```bash
    grpcurl -d '{}' "$name:443" \
      cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
    ```
 
-   The response names the expected network and reports
-   `"taddrSupport": true`.
+3. With a curl build that reports `HTTP2` and `HTTP3` in `curl --version`, check that the first command reports `HTTP/2` and an `Alt-Svc` header containing `h3=":443"`. The second must report `HTTP/3`. These probes check the edge transport. Use the RPC and browser checks to verify wallet calls.
 
-3. Check that nothing else is reachable. Scan every public address of the host
-   from outside. Only port 443 answers. The plaintext gRPC ports, the ops
-   ports (9105, 9106, 9107, and 9110 on Mainnet), the private ingest and
-   projector control ports (9100 and 9101), Prometheus, and Grafana do not.
-   `grpcurl -plaintext "$name:443" list` fails.
+   ```bash
+   curl --http2 --max-time 10 -sS -D - -o /dev/null \
+     -w 'HTTP/%{http_version}\n' "https://$name/"
+   curl --http3-only --max-time 10 -sS -o /dev/null \
+     -w 'HTTP/%{http_version}\n' "https://$name/"
+   ```
 
-A loopback-only port mapping in Compose is not proof on its own. Confirm it
-with a scan from outside.
+   If HTTP/3 fails while HTTP/2 succeeds, check UDP `443` on each firewall, forwarder, and port mapping. To test fallback, block UDP `443` on the test client and repeat the second command with `--http3` in place of `--http3-only`. It should report `HTTP/2`.
 
-## Add access control and rate limits
-
-Add your client authentication and rate limits before you announce a public
-endpoint. Put a policy in Caddy or in front of it that limits connections,
-requests, and concurrent streams per client. Leave room for normal wallet
-sync, which streams many blocks in a row. Zinder's receive limit tells
-connections apart, not addresses, so only a per-client connection limit at
-the proxy stops one client from spreading its requests over many
-connections.
-
-## Enable browser wallets
-
-On the compatibility runtime, set the origins of the wallet sites you serve. To get the exact value, open the wallet page and read `location.origin` in the browser console. For example:
-
-```toml
-[compat]
-browser_origins = ["https://wallet.example.org"]
-```
-
-Restart compatibility and give the wallet developer your public lightwalletd URL. Use the default `wallet` serving mode for a wallet that syncs. The stock Caddy configuration forwards gRPC-Web to the same port as native gRPC. A local development wallet can use the loopback endpoint directly, with its exact development origin in the list, such as `http://localhost:5173`.
-
-To verify, open the wallet at an allowed origin, select your endpoint, and start a sync. In the browser network panel, check that cross-origin preflight succeeds and the wallet sends `GetBlockRange` to your hostname. Confirm that its scanned height advances.
-
-If preflight fails, check the private compatibility `/readyz` first. Caddy checks readiness even for `OPTIONS`, and a browser can report the proxy's refusal as a CORS error. Once the reader is ready, compare the request's `Origin` with the configured value, including its port. If only block reads work, check the serving mode.
-
-The origin list controls browser access. Keep authentication and per-client limits at the public proxy. See [Configuration](../reference/configuration.md) for the environment setting and the explicit wildcard for public wallet endpoints.
-
-## Expose the native endpoint too
-
-To expose the native `WalletQuery` endpoint as well, add a second site block
-to the template, with its own DNS name and certificate. Point its `forward_auth` at the query ops port
-(`ZINDER_QUERY_OPS_HOST_PORT`, 9106 on Mainnet) and its `reverse_proxy` at
-`h2c://127.0.0.1:` plus the query gRPC port (`ZINDER_QUERY_HOST_PORT`, 9102 on
-Mainnet). Keep the same `header_up X-Zinder-Client-Address` line. Once Caddy
-serves the new site, set `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=true`
-under the same requirements. Verify it the same way, calling
-`zinder.v1.wallet.WalletQuery/ServerInfo`. How native clients connect is in
-[Integration surfaces](../reference/integration-surfaces.md).
-
-The `ExplorerQuery` endpoint, which runs when the deployment merges
-`deploy/docker-compose.explorer.yml`, is exposed the same way. Its site
-block points `forward_auth` at the explorer ops port
-(`ZINDER_EXPLORER_OPS_HOST_PORT`, 9069 on Mainnet) and `reverse_proxy` at the
-explorer gRPC port (`ZINDER_EXPLORER_HOST_PORT`, 9068 on Mainnet). The
-explorer listener also runs in ingest's network namespace, so
-`ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=true` has the same requirements.
-Verify it by calling `zinder.v1.explorer.ExplorerQuery/ServerInfo`.
+4. Scan every public IP of the host. Confirm only port `443` answers on TCP and UDP and that `grpcurl -plaintext "$name:443" list` fails. All private gRPC, ops, control, and observability ports must be unreachable.
 
 ## Supported wallets
 
-Wallet apps are supported by name, each after end-to-end certification, as
-[Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#claim-boundary)
-describes.
-When you test a wallet, configure its endpoint as `https://<your name>:443`
-and confirm that it does not fall back to a bundled server.
+Wallet apps are supported by name after end-to-end certification ([Claim boundary](../reference/lightwalletd-compatibility.md#claim-boundary)). When testing an app, set its endpoint to `https://<your name>:443` and confirm it does not fall back to a bundled server.
 
 ## Roll back the proxy
 
-If a certificate rotation or a Caddy change breaks the endpoint, roll back in
-this order. A Caddyfile without the `header_up X-Zinder-Client-Address` line
-passes on whatever value a wallet sends, so Zinder must stop trusting the
-header before Caddy loads such a file.
+If a Caddy change or certificate rotation breaks serving, roll back in this order so Zinder stops trusting `X-Zinder-Client-Address` **before** Caddy loads a config that omits `header_up`:
 
-1. If the Caddyfile you restore does not set `X-Zinder-Client-Address`, turn
-   the setting off first. In the env file you pass to Compose, set
-   `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=false`. Also set
-   `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=false` if you expose the native
-   endpoint, and `ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=false` if you
-   expose the explorer endpoint. Then recreate each container whose setting
-   you changed. Give Compose the same env file and the same `-f` files, in
-   the same order, that the deployment runs with. With fewer files, Compose
-   recreates the container without what the missing overlays add, such as
-   the fallback node's settings and cookie mount from
-   `deploy/docker-compose.node-fallback.yml`. For a Mainnet deployment that
-   merges that overlay:
+1. Set `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=false` (and `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=false` / `ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=false` if enabled) in your `zinder.env` file, then recreate the reader service using your `deploy.env` file and `-f` list:
 
    ```bash
-   env_file=deploy/.env.mainnet
-   compose_files=(-f deploy/docker-compose.yml -f deploy/docker-compose.node-fallback.yml)
+   env_file=deploy/profiles/mainnet/deploy.env
+   compose_files=(-f deploy/docker-compose.yml)
    docker compose --env-file "$env_file" "${compose_files[@]}" \
-     up -d zinder-compat-lightwalletd # and zinder-query or zinder-explorer, if you changed them
+     up -d zinder-serve
    ```
 
-   Outside Compose, set `trust_proxy_client_address = false` and restart each
-   runtime. Check the resolved value with `--print-config` before you go on.
+   Outside Compose, set `trust_proxy_client_address = false`, restart each runtime, and confirm with `--print-config`.
 2. Restore the previous certificate files and Caddyfile, and reload Caddy.
-3. If no trusted certificate is available, stop serving the public name.
-4. Repeat the checks in [Verify from outside](#verify-from-outside).
+3. If no valid certificate is available, stop serving the public name.
+4. Repeat [Verify from outside](#verify-from-outside).
 
-A proxy rollback does not change Zinder's stores.
+A proxy rollback does not alter Zinder's stores.
+
+---
+
+## Local private-CA smoke test and traffic attribution
+
+### Verify a local TLS route
+
+For an isolated local fixture, generate a short-lived (2-day) private CA and loopback Caddy config for `localhost` / `127.0.0.1` without touching system trust roots. Prerequisites: Python 3, OpenSSL, Caddy v2, GNU `timeout`, `ripgrep`, and `grpcurl`.
+
+```bash
+python3 scripts/prepare-wallet-tls-smoke.py --output .tmp/wallet-tls \
+  --port 32543 --grpc-port 32567 --ops-port 32507
+caddy adapt --config "$PWD/.tmp/wallet-tls/Caddyfile" --adapter caddyfile --validate >/dev/null
+XDG_DATA_HOME="$PWD/.tmp/wallet-tls/data" \
+XDG_CONFIG_HOME="$PWD/.tmp/wallet-tls/config" \
+  caddy run --config "$PWD/.tmp/wallet-tls/Caddyfile" --adapter caddyfile
+```
+
+In a second terminal against a frozen fixture, verify handshake, CA trust, SNI rejection, and plaintext rejection:
+
+```bash
+scripts/verify-wallet-tls.sh .tmp/wallet-tls 32543 32567 .tmp/wallet-tls-receipt
+```
+
+Test `zinder-bench` against the private CA directly:
+
+```bash
+zinder-bench lightwalletd-wallet-load --endpoint https://127.0.0.1:32543 \
+  --tls-ca-cert .tmp/wallet-tls/ca.pem --tls-domain-name localhost \
+  --workload classic-sdk --wallets 1 --from-height 150 --to-height 150
+```
+
+Stop Caddy and delete `.tmp/wallet-tls` (`*-key.pem`) once finished. Note that unmodified apps bundling `webpki-roots` (such as Zingolib 8.0.0 or Zkool v6.37.0 CLI paths) reject private CAs with `UnknownIssuer`; qualifying unmodified apps requires a publicly trusted cert or a client CA flag, while Android ([Network Security Configuration](https://developer.android.com/privacy-and-security/security-config)) and Apple ([manually installed certificate profiles](https://support.apple.com/en-us/102390)) platform-trust paths require device-owner trust configuration.
+
+### Attribute wallet traffic and exclude fallback
+
+Verify a Linux CLI wallet connects only to your fixture and does not fall back to bundled endpoints:
+
+```bash
+python3 scripts/trace-wallet-endpoint.py --endpoint-port 32543 \
+  --output .tmp/wallet-attribution -- "${wallet_command[@]}"
+```
+
+The wrapper records `connect.log` and `report.json` and fails on non-loopback or unexpected port connections (trace mobile/browser apps with their platform's network tooling). Repeat with the candidate endpoint stopped to confirm zero fallback attempts before recording `fallback_used: false` on a lifecycle receipt.

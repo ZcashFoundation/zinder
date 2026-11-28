@@ -1000,6 +1000,7 @@ mod tests {
     fn other_failure_classes_never_switch() {
         let policy = NodeFailoverPolicy::default();
         for class in [
+            SourceFailureClass::NodeRateLimited,
             SourceFailureClass::UpstreamViewChanged,
             SourceFailureClass::ProtocolMismatch,
             SourceFailureClass::Malformed,

@@ -44,7 +44,7 @@ The fixture directory holds one `segment-NNNNNN.bin` file per segment plus a
 `manifest.json` recording the network, range, consensus activations,
 canonical artifact schema version, replay tip hash, per-segment SHA-256,
 and each shielded protocol's complete subtree-root prefix through the fixed
-tip. Fixture format version 3 records the exact completing block identity for
+tip. Fixture format version 1 records the exact completing block identity for
 every root, including roots completed before the captured block range, plus
 the versioned `CanonicalBlockFacts` block and ordered-sequence digest evidence
 used by both canonical-replay-storage arms. Workload totals and per-block
@@ -86,11 +86,21 @@ zinder-bench rocksdb-canonical-fixture-replay \
 ```
 
 The canonical store path must be fresh and disjoint from the fixture. Defaults
-are derived from the established 10 CPU, 10 GiB, 64 MiB-response profile and
-use the canonical writer resource budget. Every `CanonicalPipelineLimits`
-field has an explicit positive override for controlled source-admission
-experiments, and `--source-segment-delay-millis` injects a fixed delay into each
-outer fixture segment response.
+are derived from the established 10 CPU, 10 GiB, 64 MiB-response profile, use
+the canonical writer resource budget, and persist checkpoints at the predecessor,
+every 100 blocks, and at the build tip. This matches fresh ingest with `explicit` coverage.
+Pass `--tree-state-checkpoint-coverage every-block` to measure dense construction.
+The report records the constructed coverage in
+`resource_limits.tree_state_checkpoint_coverage` and verifies
+`source_load.tree_state_checkpoint_count` against it. Every
+`CanonicalPipelineLimits` field has an explicit positive override for controlled
+source-admission experiments, including `--tree-hashing-workers` for the
+loader's commitment-tree hashing threads, and `--source-segment-delay-millis`
+injects a fixed delay into each outer fixture segment response. The report's
+`stage_durations` include the ordered loader's stages
+(`canonical_block_load`) and the store's per-block stages
+(`canonical_block_store_load`), and the replay requires every subtree root the
+loaded blocks complete to equal the fixture's node-observed root.
 
 This command certifies the exact captured bytes, the complete index-zero
 subtree-root prefixes through the fixed tip, replay-plan checkpoints, canonical
@@ -117,11 +127,14 @@ zinder-bench rocksdb-raw-blob-retention-comparison \
 
 All four store paths must be absent, have existing parents, and be pairwise
 disjoint from each other and the fixture. The command uses the same fixture,
-pipeline limits, reorg policy, wallet workload, writer budget, and reader
-budget for both arms. It fails instead of reporting if their authenticated
-fixture, replay plan, logical replay, subtree-root load coverage and digest,
-fence, or effective-limit identities differ. The report records each retention
-contract, raw-blob counts, physical canonical bytes, replay throughput, and a
+pipeline limits, tree-state checkpoint coverage (`cadence-and-tip` by default),
+reorg policy, wallet
+workload, writer budget, and reader budget for both arms. It fails instead of
+reporting if their authenticated fixture, replay plan, logical replay,
+subtree-root load coverage and digest, fence, or effective-limit identities
+differ. Report format version 1 records each retention
+contract, `effective_limits.tree_state_checkpoint_coverage`, raw-blob counts,
+physical canonical bytes, replay throughput, and a
 fresh secondary READY-admission timing. `authenticated_replay_lifecycle_seconds`
 and its throughput field cover the complete authenticated replay lifecycle:
 load, publication, cold reopen, and full-scan certification. They are not
@@ -164,9 +177,23 @@ zinder-bench rocksdb-storage-lifecycle \
 
 The closed lifecycle derives its source and block-preparation limits from the
 declared CPU and memory envelope plus `--max-response-bytes`; it does not accept
-independent pipeline tuning flags. The report validator recomputes those limits
-before accepting evidence. Diagnostic parameter sweeps belong to
-`rocksdb-canonical-fixture-replay`.
+independent pipeline tuning flags. Canonical construction defaults to
+`--tree-state-checkpoint-coverage cadence-and-tip` to match fresh ingest with `explicit` coverage.
+Pass `--tree-state-checkpoint-coverage every-block` to measure the cost of
+writing dense checkpoints before READY, as wallet-serving ingest does by default. Report
+format 1 records the constructed coverage in
+`resource_limits.tree_state_checkpoint_coverage`, the canonical publication mode
+in `resource_limits.canonical_publication_mode` (`trusted-fresh` or
+`cold-certified`), and the persisted row count in
+`canonical_storage_ready.tree_state_checkpoint_count`. The validator recomputes
+the limits and checkpoint counts and requires wallet schema 1 and the
+`lthash16-chacha12` UTXO commitment scheme.
+Diagnostic parameter sweeps belong to `rocksdb-canonical-fixture-replay`.
+
+By default, `--canonical-publication-mode trusted-fresh` uses the same
+prepublication checks as fresh ingest. Use `--canonical-publication-mode
+cold-certified` in a separate run to measure full certification. The report
+identifies the mode in `resource_limits.canonical_publication_mode`.
 
 The report exposes two independent acceptance measurements:
 
@@ -182,7 +209,11 @@ Optional target and hard-limit pairs are
 `--wallet-storage-ready-hard-limit-secs`. The report contains the fixed source
 fence, all storage contract identities, effective source and RocksDB limits,
 phase durations, row and digest evidence, external-sort evidence, physical
-bytes, and peak process RSS. It certifies storage readiness only; it does not
+bytes, and peak process RSS. Its wallet section, like the
+`rocksdb-wallet-rebuild` report, lists `build_stages`: the wallet build's
+non-overlapping stages in order, the same stages the projector records in
+`zinder_wallet_projection_build_stage_duration_seconds`, so the stage seconds
+add up to at most the build's total. It certifies storage readiness only; it does not
 claim query compatibility, service startup, live following, or reorg execution.
 
 ## 3. Compare canonical-replay storage engines
@@ -637,13 +668,96 @@ rebuild a wallet from the kept canonical store with `rocksdb-wallet-rebuild`.
 
 ## 6. Measure tree-state reconstruction at wallet anchors
 
+### Compare fresh checkpoint policies
+
+From the repository root, run the four-arm comparison on the checked-in
+Regtest fixture:
+
+```bash
+mkdir -p .tmp && CARGO_TARGET_DIR="$PWD/.tmp/target" cargo run -p zinder-bench -- \
+  rocksdb-checkpoint-policy-comparison \
+  --fixture services/zinder-bench/fixtures/checkpoint-policy \
+  --scratch-directory .tmp
+```
+
+The command builds four fresh stores with `cadence-and-tip`, commitment
+budgets of 1 and 3, and `every-block`. The fixture uses block 603 from
+`z3-regtest-ironwood-block-603.json` followed by three linked synthetic
+coinbase-only blocks. It exercises a checkpoint off cadence and replay
+between stored rows. The command removes its temporary stores and writes
+JSON to stdout. Pass `--report PATH` to write to a new file.
+
+Each arm reports time from builder open to READY and time to reopen and
+authenticate the append anchor. The checkpoint row count and logical bytes
+include the history predecessor. The SST byte count measures staged
+checkpoint files before ingest. Maximum replay blocks and commitments cover
+every retained height. The command warms a loopback lightwalletd gRPC
+connection at the stored tip and times one request per sampled height.
+It classifies each sample using the store's lookup at that height, and
+reports nearest-rank miss p50, p90, and p99 with the miss sample count.
+An arm with no misses reports `null` percentiles. The run fails if any arm
+returns different protobuf response bytes or a different canonical sequence.
+
+`rocksdb-canonical-fixture-replay`, `rocksdb-raw-blob-retention-comparison`,
+and `rocksdb-storage-lifecycle` accept
+`--tree-state-checkpoint-coverage commitment-budget`. Set
+`--tree-state-commitment-budget N` to override the ingest default of
+1,024 commitments. The report includes the resolved threshold alongside the
+coverage. Zero is invalid, and the threshold flag applies only to
+`commitment-budget`.
+
+#### Re-run the recorded Mainnet window
+
+Mainnet re-verification requires the external `z470-window-1730000.tar.zst`
+archive and is deferred when it is unavailable. With Python 3.11, GNU tar,
+and zstd installed, run:
+
+```bash
+python3 scripts/bench-checkpoint-policy-mainnet.py \
+  --archive /path/to/z470-window-1730000.tar.zst \
+  --report .tmp/checkpoint-policy-mainnet.json
+```
+
+The script verifies the archive's SHA-256
+`da252aaa5ca976f98060a512db0345a3564a53a9328d3acb97fd2717f5b6d655`
+before extraction, then serves its blocks, boundary checkpoints, and
+subtree roots over loopback. The release build measures heights
+1,730,000–1,731,999 at budgets 256 and 4,096. It uses the current default
+raw-blob retention (`none`). The original campaign retained transactions,
+a mode since retired. It samples every 17th block
+and the tip for 119 requests per arm.
+
+The original campaign observed the following results with four pinned CPU
+cores on a Ryzen 9 9950X.
+The two READY values show the run-to-run spread observed when the campaign
+reversed arm order. Miss latencies were measured once per policy. Compare
+latencies on a matching host and build profile, and use repeated runs to
+establish local timing variance. [Recorded #479 campaign](https://github.com/ZcashFoundation/zinder/pull/479)
+
+| Policy | READY (s) | Checkpoint rows | Staged checkpoint SST (bytes) | Max replayed commitments | Misses | Miss p50 / p99 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cadence and tip | 72.97 / 77.29 | 22 | 15,769 | 100,420 | 116 | 1,363.52 / 4,461.67 |
+| Budget 256 | 78.76 / 81.07 | 1,256 | 722,331 | 255 | 51 | 3.82 / 8.67 |
+| Budget 4,096 | 64.84 / 71.15 | 332 | 195,316 | 4,092 | 104 | 52.74 / 108.04 |
+| Every block | 64.25 / 66.45 | 2,001 | 1,061,433 | 0 | 0 | — |
+
+The recorded canonical sequence SHA-256 is
+`dfaa03a4f76b80bedb6ad613ff655ffbdd2180219f2139208779042e644526f1`.
+The recorded response SHA-256 is
+`4e322b8aa771d818b3a3f5c4b76d033de174e193c294b163638cd499995bc627`.
+The digest frames each protobuf response with an eight-byte little-endian
+length in request order.
+
+### Measure replay at wallet anchors
+
 `TreeStateAtHeight` and lightwalletd `GetTreeState` answer a height without a
 stored checkpoint by replaying stored compact blocks from the checkpoint below
-it. Construction checkpoints every 100 blocks, and a wallet that scans in
-100-block rounds anchors one block below each boundary, at `k * 100 - 1`, so
-every such request replays the full 99-block stride. Measure that case on a
-READY canonical store, such as one built with
-`rocksdb-canonical-fixture-replay`:
+it. Sparse construction (`--tree-state-checkpoint-coverage cadence-and-tip`)
+checkpoints every 100 blocks, and a wallet that scans in 100-block rounds
+anchors one block below each boundary, at `k * 100 - 1`, so every such request
+replays the full 99-block stride. Measure that case on a READY canonical store,
+such as one built with
+`rocksdb-canonical-fixture-replay --tree-state-checkpoint-coverage cadence-and-tip`:
 
 ```bash
 zinder-bench rocksdb-tree-state-replay \
@@ -672,7 +786,133 @@ checkpoint, the replayed blocks and note commitments, and its cold and warm
 seconds. `cold_seconds` and `warm_seconds` summarize the anchors as
 nearest-rank p50, p90, and p99 and the maximum.
 
+To compare the same historical reads across sparse and dense stores, replace
+`--from-height`, `--to-height`, and `--max-anchors` with
+`--heights-file ./frontiers.txt`. The file contains one decimal u32 height per
+line. Every listed height is measured in order, including duplicates and stored
+checkpoints; no sampling limit applies. The explicit window includes the build
+plan's history-predecessor checkpoint through the visible tip. For a full-history
+store whose first retained block is 1, height 0 is a valid stored read. Empty
+files, blank or malformed lines, and heights outside that served window fail
+the command. This option conflicts
+with the three sampling options; omitting it preserves the default sampling and
+stored-checkpoint skipping behavior.
+
+To record the construction threshold for a previously built store, pass
+`--tree-state-checkpoint-coverage commitment-budget` and its
+`--tree-state-commitment-budget` override, if any. The report records the
+resolved value under `declared_checkpoint_policy` and checks it against
+sampled replays. The store lookup supplies the source and replay depth for
+each request.
+
+Report format version 4 uses `wallet-query-store` for both sampling modes.
+Each timing covers `tree_state_lookup` and any required `replay_tree_state`,
+the WalletQuery storage path. Default sampling looks up candidates first
+to skip stored anchors. A height file measures every listed request without
+that preselection. Stored outcomes record zero replayed blocks and
+commitments. Cold and warm label the first read and its immediate repeat in
+the same secondary. The report measures storage calls and their RocksDB
+counters. Use identical height files and binary digests for paired runs.
+
+### Attribute compact-block and subtree-root reads
+
+Use the following release build to match the x86-64 CPU flags used in Zinder's
+release images. Keep the executable and inputs fixed when comparing read paths.
+
+```bash
+CARGO_TARGET_DIR=.tmp/target-v3 \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq --cfg chacha20_avx512" \
+  cargo build --release --locked -p zinder-bench
+
+bench=.tmp/target-v3/release/zinder-bench
+store=(--fixture ./fixtures/testnet --canonical-store ./candidate/canonical
+       --software-revision "$(git rev-parse HEAD)")
+mkdir -p .tmp/reads
+"$bench" rocksdb-compact-block-range "${store[@]}" \
+  --secondary-root .tmp/reads/ranges --rocksdb-statistics-level full \
+  --report .tmp/reads/ranges.json
+"$bench" rocksdb-subtree-roots "${store[@]}" --protocol orchard --max-entries 1024 \
+  --secondary-root .tmp/reads/roots --report .tmp/reads/roots.json
+"$bench" rocksdb-store-properties "${store[@]}" \
+  --secondary-root .tmp/reads/properties --report .tmp/reads/properties.json
+```
+
+These commands and `rocksdb-tree-state-replay` admit the READY primary
+read-only. Give each invocation an absent `--secondary-root` under an
+existing directory outside the primary. `--report` writes a new JSON file
+outside the primary. Omit it to print JSON to stdout. Set `--workload`
+(`wallet` or `explorer`), `--raw-blob-retention` (`none`, `transactions`, or
+`all`), and `--supported-reorg-depth` to the values persisted in the store.
+The defaults are `wallet`, `transactions`, and 1,000 blocks. Pass
+`--canonical-io-mode direct|buffered` (default `direct`) to compare direct
+and buffered canonical reads, and `--evict-page-cache` on Linux to sync each
+file in `--canonical-store` and drop its cached pages with
+`posix_fadvise(POSIX_FADV_DONTNEED)` before each cold secondary open.
+Reproducible cold measurements require a quiescent store because concurrent
+reads or writes can repopulate the OS page cache.
+
+The compact-block report (version 4) retains the 128-, 512-, and 1,024-block
+unbounded calls in `cases`. Each entry in `bounded_cases` measures one
+`compact_blocks_in_range_up_to` call over the same final 1,000 heights. The
+256 KiB opening budget and the 2 MiB steady budget each run independently in
+both directions. Descending reads select the high end of the range and return
+their rows in height order. A single oversized block occupies a whole chunk.
+Use `output.block_count`, `first_height`, `last_height`, and `stored_bytes` to
+see what fit. Throughput uses the returned block count. The structured digest
+checks that all four reads of a case agree.
+
+The subtree command measures one page in `--protocol` (`sapling` by default,
+`orchard`, or `ironwood`). Its default start is the first root completed in
+retained history. Use `--start-index` to select another page.
+`--max-entries` accepts 1 through 1,024 and defaults to 1,024. The visible
+tree bounds the page. The command requires at least one available root and
+checks the returned indices, root hashes, and completing blocks across reads.
+
+Each range and subtree case opens a fresh secondary for the direct read and
+another at the same READY fence for the query reader. **Cold** is the first
+measured read after admission. **Warm** repeats it on the same handle. Admission
+may already have populated the block cache, and the host page cache persists
+across opens. Tree replay uses one secondary for the window. Its checkpoint
+discovery and earlier anchors can warm later reads.
+
+`--rocksdb-statistics-level` defaults to `tickers`. At `off`, ticker and
+histogram deltas are null. At `tickers`, each read records DB-wide counter
+deltas for Gets, MultiGets, seeks, iterator steps, bytes, data and index cache
+hits and misses, file opens and errors, and prefetch. At `full`, each of the
+six read histograms also reports the change in sample count and sum in
+microseconds. **Full and Tickers runs are not directly comparable** because
+collecting the histograms adds work.
+
+All three read benchmarks measure thread-local PerfContext at every statistics
+level. Times are nanoseconds. Block read bytes include separate data, index, and
+filter counters. A cache hit can serve bytes without a file read. Query-reader
+latency includes dispatch to and return from the blocking pool, with counters
+sampled on the thread that performs the read. Timers exclude taking snapshots
+and hashing the output. Tree replay report version 2 adds `cold_counters` and
+`warm_counters` to each anchor. Each report records the cache budget, statistics
+level, host CPU model when available, Cargo profile, compiler, target, Rust
+flags, explicit target CPU, and compiled target features.
+
+### Inspect column-family properties
+
+`rocksdb-store-properties` reports the default family and every canonical
+data family from one admitted secondary. The report includes
+`construction_tree_state_checkpoint_policy` from the authenticated manifest.
+The policy has a `selection` and, for `commitment-budget`, a numeric
+`commitment_budget`. A null policy means the manifest predates the record.
+Each family includes total SST bytes,
+estimated live bytes, and the file count and estimated compression ratio at
+each level from 0 to 6. A null ratio means RocksDB has no estimate. The
+parsed aggregate table properties include index, filter, and data bytes,
+raw key and value bytes, and entry and block counts. RocksDB omits format
+versions from this aggregate, so `sst_files_by_format_version` counts the
+version in each live block-based SST's read-only footer. Compression ratios
+describe the existing files. Measuring savings from another codec requires a
+separate recompression run on copies.
+
 ## 7. Drive wallet-shaped load at an endpoint
+
+For a two-binary A/B comparison on a private fixture, follow [Wallet performance qualification](../../docs/runbooks/wallet-performance-qualification.md).
 
 `lightwalletd-wallet-load` syncs a height range from a running
 lightwalletd-compatible endpoint the way a real wallet engine does, for many
@@ -739,14 +979,18 @@ source:
   connection downloads serial 1,000-block batches (100 where a batch touches
   heights 1,710,000 to 2,050,000), each after the tree state below its first
   block, with an empty pool filter. Each call gets 5 attempts.
-- `point-reads`: no block downloads. Each wallet repeats `--rounds` rounds
-  of `GetLightdInfo`, `GetLatestBlock`, a tree state at a stored checkpoint
-  and one at the height below it, which Zinder rebuilds by replaying 99
-  blocks, and, for each `--transparent-address`, `GetTaddressTxids` over the
-  range plus one `GetAddressUtxosStream` for all of them. The two tree states
-  are reported as `GetTreeState(stored checkpoint)` and
-  `GetTreeState(replay)`. Calls are not retried. The settings below add
-  further reads and are off unless set.
+- `point-reads`: each wallet repeats `--rounds` rounds of `GetLightdInfo`,
+  `GetLatestBlock`, and two tree-state reads at a 100-block cadence boundary
+  and the preceding height. For each `--transparent-address` it also calls
+  `GetTaddressTxids` over the range, then calls `GetAddressUtxosStream` once
+  for all addresses. Each call gets one attempt.
+
+Point-read report format 2 labels the requests `GetTreeState(on cadence)` and
+`GetTreeState(off cadence)` and records `on_cadence_height` and
+`off_cadence_height`. A dense store can serve both heights directly.
+Format 1 called these requests `stored checkpoint` and `replay` based on
+height alone. To measure how Zinder served them, use the `source` label on
+`zinder_query_tree_state_reads_total`.
 
 The `point-reads` settings below, and the setup they run, apply only to that
 workload. `--workload` values that download blocks refuse them. Setup calls
@@ -949,8 +1193,21 @@ identity, the workload's constants, and, over all wallets:
   `chain_metadata_error` then holds its status.
   `chain_metadata_block_is_tip` is true only when that block has
   `tip_before`'s height and the same 32-byte hash; it is false when a hash is
-  missing or not 32 bytes, because the identity cannot be shown. A `hash_hex` is in RPC byte order, as block explorers show
-  it, or the bytes as sent when the server's hash is not 32 bytes.
+  missing or malformed. A complete `hash_hex` uses RPC byte order. Shorter
+  hashes preserve the bytes as sent. A hash longer than 32 bytes fails the
+  probe that returned it. An oversized `GetBlock` hash appears in
+  `chain_metadata_error` and leaves the tree sizes unknown.
+- `wallet_request_identity_sha256`: identifies how range, tree-state, and
+  transaction requests were distributed among the simulated wallets. Each
+  wallet contributes its own digest of full requests, counting retries and
+  duplicates. Sorting the wallet digests allows wallets to run in any order
+  while preserving the work each wallet performed. Compare this field, RPC
+  statuses, and delivered bytes across runs.
+- `tip_before` and `tip_after`: the height and RPC-display hash observed at
+  the boundaries of the wallet workload. The closing probe is outside the
+  measured interval. If it fails, `tip_after.error` records the failure and
+  the report retains the wallet results. A frozen-snapshot comparison
+  requires both observations to match the expected height and hash.
 - `tree_state_heights`: how many requested heights sit on Zinder's 100-block
   checkpoint stride, and each other height's offset from it. Below the
   first-sync tip, that offset is the number of blocks Zinder replays. Above
@@ -968,6 +1225,9 @@ identity, the workload's constants, and, over all wallets:
   state reads are also split by `height_band`, the first height of the
   250,000-block band that holds the requested height, in
   `tree_state_stored_reads_by_band` and `tree_state_replayed_reads_by_band`.
+  `tree_state_reconstructions` counts replayed reads on servers that report
+  reads by source. Older servers record the replayed-blocks histogram only
+  for rebuilds, so the report uses its observation count on those servers.
   `receive_evictions` counts requests that lost their receive slot to a
   client holding fewer, and `receive_pools` describes each receive pool of
   the server's public gRPC listener: the requests it admitted, refused, and
@@ -1007,12 +1267,159 @@ not finished within 10 seconds, and sends no HTTP/2 keep-alive pings. Go lightwa
 more often than every five minutes, so pinging would end streams a real
 wallet keeps.
 
+### Verify PepperSync restore requests locally
+
+Run the real PepperSync engine against a synthetic loopback gRPC fixture to
+reproduce a fresh, unfunded restore on a fixed tip. Zingo Mobile 3.0.0-324
+pins Zingolib 8.0.0 at `81d799775f11e882896e8710e8af12d6d4d29a41`. Build
+the CLI from that revision in direct test mode, which lets it use the
+loopback indexer.
+[Zingo Mobile binding pin](https://github.com/zingolabs/zingo-mobile/blob/5fd3662f39dc20f953e4f93c2be738a4c03d3690/binding-layer.json)
+
+From the Zinder repository, with Rust 1.99.1 and `protoc` installed:
+
+```bash
+zingolib_source="$PWD/.tmp/zingolib-81d7997"
+mkdir -p "$zingolib_source"
+curl -fsSL https://codeload.github.com/zingolabs/zingolib/tar.gz/81d799775f11e882896e8710e8af12d6d4d29a41 \
+  | tar -xz --strip-components=1 -C "$zingolib_source"
+cargo +1.99.1 build --manifest-path "$zingolib_source/Cargo.toml" --locked \
+  -p zingo-cli --no-default-features --features nakednet-test-mode
+ZINDER_TEST_PEPPER_SYNC_BIN="$zingolib_source/target/debug/zingo-cli" \
+  cargo nextest run -p zinder-bench --profile=ci --run-ignored=all \
+  -E 'test(pepper_sync_fresh_restore_requests)'
+```
+
+The test restores a disposable wallet over blocks 3,424,811 through
+3,424,874. It checks that one connection carries the mempool subscription and
+the sync requests, including the predecessor, tip, and birthday tree states.
+The fixture has empty transparent history and one Sapling subtree completed
+before the birthday. The client makes 21 `GetTaddressTxids` requests from
+1,000 blocks below the birthday through the tip. It requests each shielded
+pool's roots from index zero, then confirms the end of the Sapling roots
+with an empty reply from index one. It requests a 10-block range, resumes
+from the fifth block after the fixture interrupts the first stream with
+`DEADLINE_EXCEEDED`, and requests the remaining 54 blocks. Every range
+selects Sapling, Orchard, and Ironwood. The CLI reports all 64 blocks
+scanned.
+
+The fixture exercises the pinned client's direct gRPC path through sync
+completion over a span with no new note commitments. On a populated chain,
+subtree boundaries and discovered transactions change which ranges
+PepperSync prioritizes. Wallets with history can trigger additional lookups.
+[PepperSync sync loop](https://github.com/zingolabs/zingolib/blob/81d799775f11e882896e8710e8af12d6d4d29a41/pepper-sync/src/sync.rs)
+
+### Verify raw block-range frames
+
+`raw-range-probe` requests `GetBlockRange` from a running lightwalletd-compatible
+server and checks the bytes it puts on the wire. Each response frame is hashed
+as the raw protobuf payload, without decoding it. The digest is the SHA-256 of
+every frame in stream order, each frame written as its payload length as a
+big-endian `u32` followed by the payload. A server that reorders, drops, adds, or
+changes a block fails the request even when a wallet would still parse it.
+
+Every request is compared with an oracle of frame count, payload bytes, and
+digest. The oracle comes from a file, or from a different reference server read
+before the run. The probe rejects two URLs resolving to a common host and port. For listeners behind proxies, supply a known independent source or a trusted oracle file. A `START:END`
+range with `START` above `END` streams descending.
+
+```bash
+# Record the oracle from a reference server, then probe the server under test.
+zinder-bench raw-range-probe \
+  --endpoint http://127.0.0.1:9067 \
+  --oracle-endpoint http://127.0.0.1:9068 \
+  --range 4598001:4600000 --both-directions \
+  --write-oracle .tmp/oracle.json \
+  --clients 4 --repetitions 32 --warmup-repetitions 1 \
+  --server-pid "$READER_PID" --server-executable "$READER_BINARY" \
+  --report .tmp/raw-range-probe.json
+
+# Later runs reuse the recorded oracle.
+zinder-bench raw-range-probe --endpoint http://127.0.0.1:9067 --oracle .tmp/oracle.json
+```
+
+An oracle file is `{"schema": "zinder-bench/raw-range-oracle/v1", "jobs": [...]}`,
+and each job is `{"start", "end", "blocks", "bytes", "framed_sha256"}` with a
+lowercase hex digest. Any tool can write one.
+
+Each client opens its own HTTP/2 connection. After the connections open, the
+warmup passes run untimed but verified, then every client's passes run together
+as the timed interval. The probe exits non-zero when any request differs from
+the oracle, after writing the report, so a campaign can require
+`/verified` to be `true`.
+
+The report (`schema` `zinder-bench/raw-range-probe/v1`) records:
+
+- `verified`, `problems`, and `oracle` with its `source` and `sha256`.
+- `chain`: the endpoint's `GetLightdInfo` identity and the `GetLatestBlock` tip
+  before and after the timed interval, with hashes in display (RPC byte) order
+  and `tip_unchanged`. Both reads sit outside the timed interval.
+- `totals`: verified and failed request counts, blocks, bytes, `wall_ns`,
+  `blocks_per_second`, and `mib_per_second`.
+- `latency_ms`, overall and per range in `by_job`: nearest-rank minimum, `p50`,
+  `p95`, and maximum for the first frame, completion, and largest frame gap.
+- `client.cpu_ms`, and with `--server-pid` a `server` object: CPU over the timed
+  interval and per MiB, and resident memory with the process's lifetime
+  high-water mark before and after. The server is sampled read-only from
+  `/proc`, in whole clock ticks, and its high-water mark is never reset.
+- `counters`: with `--server-metrics-url`, `--server-freshness-counter`, and
+  `--server-counter` or `--rocksdb-multiget-counters`, each series' increase
+  over the timed interval in `increases`, summed over every label the selector
+  leaves out. A selector is `[ALIAS=]NAME[{label=value,...}]`. Each selector
+  needs a unique report key (its alias, or the whole selector if omitted).
+  `--rocksdb-multiget-counters` reports the canonical secondary's
+  `multiget_get`, `multiget_keys_read`, and `multiget_bytes_read` tickers. A
+  server may publish these tickers on a timer, so each read waits, outside the
+  timed interval, for the witness series to advance and for every counter to
+  appear in that same scrape (up to `--server-counter-wait-secs`). When it does
+  not, or a counter went backwards, `available` is `false` with a `reason` and
+  no numbers, never zeros. An example witness for a full wallet serving pair is
+  `zinder_wallet_serving_pair_publisher_refresh_total{status=ok}`.
+- `warmup` and `observations`: every request as measured, including its digest.
+
+Each request in `warmup` and `observations` reports `max_frame_gap_ns`,
+the longest interval between two consecutive frames at the probe.
+`max_frame_gap_after` is the **one-based ordinal of the frame ending that
+interval**, in delivery order for either direction. A gap ending at frame 237
+spans frames 236 and 237. The earliest maximum wins a tie. Both fields are
+zero when fewer than two frames arrive or all observed offsets are equal.
+Read these alongside `first_frame_ns` and `completion_ns`. The gap excludes the
+wait for the first frame and the time from the last frame to stream completion.
+Client scheduling and frame processing contribute to the observed interval.
+
+To check the gap against the full sequence, run one request per job with
+an oracle for the range and direction you want to inspect. Use a new report path.
+
+```bash
+zinder-bench raw-range-probe --endpoint "$ENDPOINT" --oracle "$ORACLE" \
+  --record-frame-arrivals --report "$REPORT"
+jq '.observations[] | {start, end, outcome, max_frame_gap_ns, max_frame_gap_after}' "$REPORT"
+```
+
+With `--record-frame-arrivals`, each request also records `frame_arrivals_ns`
+as offsets from request start, including frames received before a stream error.
+Subtract adjacent integer nanosecond offsets to reproduce the gap. To display
+milliseconds, divide the integer gap by 1,000,000 and round once to the nearest
+0.0001 ms. The default records the maximum with constant space per request.
+The flag retains one offset per received frame, including warmups. Use matching
+flag settings when comparing readers.
+
+For a paired policy, use `/latency_ms/max_frame_gap/p95` in milliseconds with
+`lower_is_better`. Each verified timed request with at least two frames
+contributes one maximum, including a genuine zero when the offsets coincide.
+Warmups, failed requests, and requests with fewer than two frames contribute
+no samples. The summary uses nearest rank and is absent without eligible
+requests. For the first oracle job, the pointer is
+`/by_job/0/max_frame_gap_ms/p95`. Add `/config/record_frame_arrivals` to the
+campaign case's `match` list when comparing reports that expose this flag.
+
 ## Report fields
 
 - `contract_identity`: exact benchmark report contract identity. The current identity is
   `benchmark-report`; missing or earlier identities are rejected.
-- `report_format_version`: machine-readable report contract version. The
-  closed measurement contract described here is version 4.
+- `report_format_version`: machine-readable report contract version.
+  `canonical-replay-storage`, `rocksdb-canonical-fixture-replay`, and
+  `rocksdb-storage-lifecycle` reports all use version 1.
 - `measurement_kind`: `rocksdb-canonical-fixture-replay`,
   `canonical-replay-storage`, or `rocksdb-storage-lifecycle`. The tagged shape
   prevents block-local replay evidence from acquiring placeholder lifecycle or
@@ -1024,32 +1431,37 @@ wallet keeps.
 - `storage_candidate`: identifies `rocksdb-canonical-fixture-replay`,
   `rocksdb-storage-lifecycle`, `rocksdb-canonical-replay-storage`, or
   `postgres-canonical-replay-storage`, including the logical model and the
-  `rocksdb-single-host` or `postgres-scale-out` topology represented by that
+  `rocksdb` or `postgres-diagnostic` topology represented by that
   arm. This is candidate identity, not topology certification.
 - `fixture.contract_identity`, `fixture.fixture_format_version`,
   `fixture.canonical_artifact_schema_version`,
   `fixture.canonical_block_facts_digest_evidence`, `fixture.tip_hash_hex`, and
   `fixture.digest_sha256`: fixture provenance required to compare candidates
   against identical source bytes and digest contracts. Each driver verifies
-  every segment SHA-256 before writing its rows. Fixture format 3 requires the
+  every segment SHA-256 before writing its rows. Fixture format 1 requires the
   exact identity `canonical-fixture`; earlier numeric versions are refused.
 - `fixture.workload_density`: the immutable workload totals and per-block
   maxima copied from the captured fixture manifest.
 - Canonical-fixture `total_seconds` and `blocks_per_second`: the complete
   measured lifecycle and its end-to-end loaded-block rate.
 - Canonical-fixture `resource_limits`: the CPU and memory envelope, the exact
-  source-planner, admission, preparation, and deterministic delay settings, and
-  the canonical `RocksDB` budget used by the run.
-- Canonical-fixture `source_fetch_attribution`: completed segment requests, request and
-  payload rates over replay wall time, cumulative concurrent request-task
-  seconds, adaptive restart counts, and speculative discard totals. Total
-  connected blocks and response payload bytes include completed responses that
-  the adaptive planner later discarded and fetched again. The completed
-  response bytes discarded on restart are exact for responses already held in
-  the reorder buffer, but they are only a lower bound on wasted network work
-  because canceled in-flight requests do not expose trustworthy actual bytes.
-  The object is `null` when no metrics recorder covered completed segment
-  requests.
+  source-planner, admission, preparation, deterministic delay, and
+  `tree_state_checkpoint_coverage` and resolved
+  `tree_state_commitment_budget` settings, and the canonical `RocksDB`
+  budget used by the run.
+- Storage-lifecycle `resource_limits.tree_state_checkpoint_coverage`,
+  `resource_limits.canonical_publication_mode`, and
+  `canonical_storage_ready.tree_state_checkpoint_count` (version 1): the actual
+  construction checkpoint coverage, its resolved commitment budget in
+  `resource_limits.tree_state_commitment_budget`, the canonical publication mode (`trusted-fresh` or `cold-certified`), and the
+  persisted checkpoint row count (including the predecessor checkpoint).
+- Canonical-fixture `source_fetch_attribution` reports completed segment
+  requests, request and payload rates over replay wall time, cumulative
+  request-task seconds, density adjustments, and retained and discarded
+  prefetch work. The planner applies size changes to future requests and keeps
+  disjoint prefetched ranges. Both restart counts are zero. Discarded bytes
+  count only completed responses. The object is `null` when no metrics
+  recorder covered completed segment requests.
 - Canonical-fixture `prohibited_reads`: explicit counters for historical
   prevout and cross-block wallet reads. Both metric series must be present and
   zero; missing telemetry fails report validation.
@@ -1111,3 +1523,77 @@ roots, and complete report-window coverage for every component.
   prove the session's authentication method. `NoTls` is limited to the isolated
   benchmark network; production remote transport still requires a
   certificate-validated TLS connector.
+
+## Active-writer publication benchmark (`active-writer-publication`)
+
+`zinder-bench active-writer-publication` drives three matched writer/serving
+arms against an identical synthetic Regtest chain while concurrent
+lightwalletd compatibility readers measure live canonical `ZSHRNG02` and
+`live_tail_block` serving visibility and throughput. Canonical settled-segment
+qualification requires crossing the fixed 4,096-block canonical `ZSHRNG02`
+stride (`coverage_scope: "settled_segment_crossing"`,
+`canonical_segment_blocks: 4096`, `crossed_segment_boundary_height: 4096`,
+`probe_anchor_height: 4096`):
+
+```bash
+zinder-bench active-writer-publication \
+  --base-blocks 4092 \
+  --live-blocks 16 \
+  --reorg-window-blocks 4 \
+  --io-mode direct \
+  --tail-probe-blocks 24 \
+  --dense-orchard-actions-per-tx 2 \
+  --report ./reports/active-writer-publication.json
+```
+
+Smaller workloads whose final settled height remains below 4,096 run as
+`live_tail_only` coverage (`coverage_scope: "live_tail_only"`,
+`canonical_segment_blocks: 4096`, `crossed_segment_boundary_height: null`,
+probes anchored around `base_settled`). To exercise sustained multi-hundred-MiB
+`live_tail_only` payloads and RocksDB memtable flushes across descending tail
+reads on real NVMe or scratch storage (not settled-segment coverage):
+
+```bash
+zinder-bench active-writer-publication \
+  --scratch-dir ./.tmp/active-writer-scratch \
+  --io-mode direct \
+  --base-blocks 258 \
+  --live-blocks 210 \
+  --reorg-window-blocks 4 \
+  --dense-block-cadence 1 \
+  --dense-txs-per-block 2 \
+  --dense-orchard-actions-per-tx 900 \
+  --tail-probe-blocks 210 \
+  --commit-interval-millis 5 \
+  --slow-reader-frame-delay-millis 0 \
+  --quiescent-rounds 2 \
+  --mempool-churn-size 10,50 \
+  --report ./.tmp/active-writer-sustained.json
+```
+
+Key command flags:
+
+- `--scratch-dir <PATH>`: optional parent directory for per-arm RocksDB stores (defaults to the system temporary directory).
+- `--io-mode <direct|buffered>`: requests `RocksDbIoMode::Direct` (with buffered fallback if the filesystem rejects direct I/O) or forces `Buffered` (default `direct`).
+- `--tail-probe-blocks <N>`: width in blocks (`>= 2`) of descending live-tail `GetBlockRange(tip, floor)` probes (default `24`).
+- `--dense-orchard-actions-per-tx <N>`: Orchard actions synthesized per dense shielded transaction (default `2`).
+- `--segment-blocks <N>`, `--publish-workers <N>`, `--require-tail-eviction`: retained CLI compatibility flags after retiring `history-publisher` and `EncodedTail`; `--segment-blocks` no longer configures canonical sealing (always 4,096 blocks) or qualification boundary claims, and `--require-tail-eviction` fails validation because `EncodedTail` is retired.
+
+The three matched modes are `quiescent_control`, `ingest_active`, and
+`ingest_and_projector`, paired with `canonical_quiescent_control` (2 canonical
+secondary generations, canonical-only adapter, no wallet RPC reader — matched
+baseline for `ingest_active`). Wallet serving arms drive 4 bounded
+canonical/wallet secondary generations with retained epoch-pin lookup
+(`SwappableWalletQuery`, matching `WalletServingPairPublisher`), and
+canonical-only `canonical_quiescent_control` and `ingest_active` drive 2
+canonical secondary generations. All arms share a deterministic `WorkloadTrace`
+(`request_trace_digest`) alongside unary `GetLatestBlock`, transparent wallet
+RPCs (`GetTaddressBalance`, `GetAddressUtxos`, `GetTransaction` via real
+coinbase spends), `GetTreeState`, slow boundary-crossing streams, descending
+live-tail cold/warm probes, mempool churn (`writer_overlap_verified`), ingest
+prepare/commit histograms, writer WAL fsyncs, `NodeSource` RPC counts, single
+shared-pool deduplicated RocksDB tickers (`canonical_writer`,
+`reader_canonical_secondaries`, `reader_wallet_secondaries`, `wallet_writer`,
+`projector_secondary`), stage differentials (`ModeDifferential`), and final-tip
+raw wire-byte SHA-256 parity validated by
+`ActiveWriterPublicationReport::validate(&config)`.

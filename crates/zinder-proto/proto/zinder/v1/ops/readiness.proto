@@ -149,6 +149,17 @@ message ReadinessCauseDetail {
 message SyncingDetail {
   // Distance between the visible chain tip and the target tip when known.
   optional uint64 lag_blocks = 1;
+  // What the canonical writer is waiting for in its current follow iteration.
+  optional FollowWaitReason wait_reason = 2;
+}
+
+// Work that keeps the canonical writer from admitting traffic while following.
+enum FollowWaitReason {
+  FOLLOW_WAIT_REASON_UNSPECIFIED = 0;
+  // The writer has confirmed its tip and is waiting for mempool hydration.
+  FOLLOW_WAIT_REASON_MEMPOOL_HYDRATION_AT_TIP = 1;
+  // The writer is checking its tip or processing a canonical transition.
+  FOLLOW_WAIT_REASON_CANONICAL_PROGRESS = 2;
 }
 
 // Detail for READINESS_CAUSE_NODE_CAPABILITY_MISSING.

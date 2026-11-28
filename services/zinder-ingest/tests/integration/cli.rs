@@ -204,13 +204,62 @@ fn print_config_rejects_indexer_tls_for_a_plaintext_indexer() -> Result<(), Box<
 }
 
 #[test]
-fn indexer_tls_pem_variable_names_the_images_that_accept_it() -> Result<(), Box<dyn Error>> {
+fn print_config_accepts_and_redacts_inline_indexer_tls_pems() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("indexer-tls-pem-store");
+    let storage_path = tempdir.path().join("indexer-tls-inline-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
     let output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_NODE__INDEXER_GRPC_ADDR", "https://zakura:8230")
+        .env(
+            "ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM",
+            "-----BEGIN CERTIFICATE-----\nca-sentinel\n-----END CERTIFICATE-----\n",
+        )
+        .env(
+            "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM",
+            "-----BEGIN CERTIFICATE-----\nclient-cert-sentinel\n-----END CERTIFICATE-----\n",
+        )
+        .env(
+            "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM",
+            "-----BEGIN PRIVATE KEY-----\nkey-material-sentinel\n-----END PRIVATE KEY-----\n",
+        )
+        .env("ZINDER_NODE__INDEXER_TLS__SERVER_NAME", "zakura.internal")
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("[node.indexer_tls]"), "{stdout}");
+    assert!(stdout.contains("ca_cert_pem = \"[REDACTED]\""), "{stdout}");
+    assert!(
+        stdout.contains("client_cert_pem = \"[REDACTED]\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("client_key_pem = \"[REDACTED]\""),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("ca-sentinel"), "{stdout}");
+    assert!(!stdout.contains("client-cert-sentinel"), "{stdout}");
+    assert!(!stdout.contains("key-material-sentinel"), "{stdout}");
+
+    Ok(())
+}
+
+#[test]
+fn print_config_rejects_simultaneous_indexer_tls_path_and_pem_without_leaking_secret()
+-> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("indexer-tls-conflict-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_NODE__INDEXER_GRPC_ADDR", "https://zakura:8230")
+        .env(
+            "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH",
+            "/run/secrets/client.key",
+        )
         .env(
             "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM",
             "-----BEGIN PRIVATE KEY-----\nkey-material-sentinel\n-----END PRIVATE KEY-----\n",
@@ -219,16 +268,8 @@ fn indexer_tls_pem_variable_names_the_images_that_accept_it() -> Result<(), Box<
 
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("zinder-canonical-runtime"), "{stderr}");
-    assert!(stderr.contains("zinder-wallet-serving"), "{stderr}");
-    assert!(
-        stderr.contains("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("client_key_path"), "{stderr}");
+    assert!(stderr.contains("client_key_pem"), "{stderr}");
     assert!(!stderr.contains("key-material-sentinel"), "{stderr}");
 
     Ok(())
@@ -244,7 +285,7 @@ fn startup_fails_before_connecting_when_the_indexer_ca_file_is_missing()
     fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
     let output = zinder_ingest_command()
         .args(["--config", path_str(&config_path)?])
-        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .env("ZINDER_OPS__LISTEN_ADDR", "none")
         .env("ZINDER_NODE__INDEXER_GRPC_ADDR", "https://127.0.0.1:1")
         .env(
             "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
@@ -345,7 +386,7 @@ fn run_ingest_against(node: &JsonRpcTestServer) -> Result<(Output, bool), Box<dy
     )?;
     let output = zinder_ingest_command()
         .args(["--config", path_str(&config_path)?])
-        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .env("ZINDER_OPS__LISTEN_ADDR", "none")
         .output()?;
     Ok((output, storage_path.exists()))
 }
@@ -358,7 +399,7 @@ fn startup_fails_before_opening_storage_when_rust_log_is_invalid() -> Result<(),
     fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
     let output = zinder_ingest_command()
         .args(["--config", path_str(&config_path)?])
-        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .env("ZINDER_OPS__LISTEN_ADDR", "none")
         .env("RUST_LOG", "zinder=bogus")
         .output()?;
 
@@ -410,6 +451,7 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("lag_threshold_blocks ="));
     assert!(stdout.contains("[ingest.run_overrides]"));
     assert!(stdout.contains("coverage = \"explicit\""));
+    assert!(stdout.contains("during_construction = false"));
 
     Ok(())
 }
@@ -492,7 +534,11 @@ fn print_config_output_round_trips() -> Result<(), Box<dyn Error>> {
     let storage_path = tempdir.path().join("round-trip-store");
     let source_config_path = tempdir.path().join("source.toml");
     let rendered_config_path = tempdir.path().join("rendered.toml");
-    fs::write(&source_config_path, ingest_config_toml(&storage_path)?)?;
+    let config = format!(
+        "{}\n[ingest.tree_state_densification]\nduring_construction = true\nselection = \"commitment-budget\"\ncommitment_budget = 256\n",
+        ingest_config_toml(&storage_path)?
+    );
+    fs::write(&source_config_path, config)?;
 
     let first_output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&source_config_path)?])
@@ -500,14 +546,45 @@ fn print_config_output_round_trips() -> Result<(), Box<dyn Error>> {
     assert!(first_output.status.success(), "{first_output:?}");
     fs::write(&rendered_config_path, &first_output.stdout)?;
 
-    let second_output = zinder_ingest_command()
+    let rejected_redacted = zinder_ingest_command()
         .args([
             "--print-config",
             "--config",
             path_str(&rendered_config_path)?,
         ])
         .output()?;
+    assert!(!rejected_redacted.status.success(), "{rejected_redacted:?}");
+    let rejected_stderr = String::from_utf8(rejected_redacted.stderr)?;
+    assert!(
+        rejected_stderr.contains("literal `[REDACTED]` is not a valid secret"),
+        "{rejected_stderr}"
+    );
+
+    let second_output = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&rendered_config_path)?,
+        ])
+        .env("ZINDER_NODE__AUTH__PASSWORD", "rpcpassword")
+        .output()?;
     assert!(second_output.status.success(), "{second_output:?}");
+
+    for rendered in [first_output.stdout, second_output.stdout] {
+        let config: toml::Table = toml::from_str(std::str::from_utf8(&rendered)?)?;
+        let densification = &config["ingest"]["tree_state_densification"];
+        assert_eq!(
+            densification
+                .get("during_construction")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            densification["selection"].as_str(),
+            Some("commitment-budget")
+        );
+        assert_eq!(densification["commitment_budget"].as_integer(), Some(256));
+    }
 
     Ok(())
 }
@@ -518,8 +595,8 @@ fn print_config_allows_disabled_ingest_control_for_one_shot_runs() -> Result<(),
     let storage_path = tempdir.path().join("disabled-ingest-control-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     let config = ingest_config_toml(&storage_path)?
-        .replace("listen_addr = \"127.0.0.1:9100\"", "listen_addr = \"\"");
-    fs::write(&config_path, config)?;
+        .replace("listen_addr = \"127.0.0.1:9100\"", "listen_addr = \"none\"");
+    fs::write(&config_path, &config)?;
 
     let output = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&config_path)?])
@@ -528,7 +605,14 @@ fn print_config_allows_disabled_ingest_control_for_one_shot_runs() -> Result<(),
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("[ingest_control]"));
-    assert!(stdout.contains("listen_addr = \"\""));
+    assert!(stdout.contains("listen_addr = \"none\""));
+
+    let empty_config = config.replace("listen_addr = \"none\"", "listen_addr = \"\"");
+    fs::write(&config_path, empty_config)?;
+    let rejected = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+    assert!(!rejected.status.success(), "{rejected:?}");
 
     Ok(())
 }
@@ -571,17 +655,11 @@ const REMOVED_INGEST_SETTINGS: &[(&str, &str, &str)] = &[
         "allow_reorg_window_settlement",
         "ZINDER_INGEST__RUN_OVERRIDES__ALLOW_REORG_WINDOW_SETTLEMENT",
     ),
-    (
-        "storage",
-        "secondary_path",
-        "ZINDER_STORAGE__SECONDARY_PATH",
-    ),
 ];
 
 fn removed_setting_toml_value(field: &str) -> &'static str {
     match field {
         "allow_reorg_window_settlement" => "true",
-        "secondary_path" => "\"/var/lib/zinder/ingest-secondary\"",
         _ => "1",
     }
 }
@@ -593,11 +671,7 @@ fn removed_ingest_settings_are_rejected_from_config_files() -> Result<(), Box<dy
         assert_ingest_cli_rejects(
             |root| {
                 let base = ingest_config_toml(&root.join("removed-setting-store"))?;
-                Ok(if *section == "storage" {
-                    base.replacen("[storage]\n", &format!("[storage]\n{field} = {value}\n"), 1)
-                } else {
-                    format!("{base}\n[{section}]\n{field} = {value}\n")
-                })
+                Ok(format!("{base}\n[{section}]\n{field} = {value}\n"))
             },
             &[],
             &[],
@@ -610,11 +684,7 @@ fn removed_ingest_settings_are_rejected_from_config_files() -> Result<(), Box<dy
 #[test]
 fn removed_ingest_settings_are_rejected_from_the_environment() -> Result<(), Box<dyn Error>> {
     for (_, field, environment_variable) in REMOVED_INGEST_SETTINGS {
-        let value = if *field == "secondary_path" {
-            "/var/lib/zinder/ingest-secondary"
-        } else {
-            removed_setting_toml_value(field)
-        };
+        let value = removed_setting_toml_value(field);
         assert_ingest_cli_rejects(
             |root| ingest_config_toml(&root.join("removed-setting-environment-store")),
             &[],
@@ -737,11 +807,86 @@ fn wallet_serving_print_config_marks_coverage() -> Result<(), Box<dyn Error>> {
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("coverage = \"wallet-serving\""), "{stdout}");
     assert!(stdout.contains("explorer_views = false"), "{stdout}");
-    assert!(
-        stdout.contains("raw_blob_policy = \"transactions\""),
-        "{stdout}"
-    );
+    assert!(stdout.contains("raw_blob_policy = \"none\""), "{stdout}");
 
+    Ok(())
+}
+
+#[test]
+fn packaged_wallet_configs_select_dense_construction_unless_overridden_or_serving_explorer()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempdir()?;
+    let token = temporary.path().join("fixture.token");
+    fs::write(&token, "fixture-token\n")?;
+    let json_rpc_toml = temporary.path().join("ingest-json-rpc.toml");
+    let grpc_toml = temporary.path().join("ingest-grpc.toml");
+    for (path, source) in [
+        (&json_rpc_toml, "zebra-json-rpc"),
+        (&grpc_toml, "zebra-indexer-grpc"),
+    ] {
+        fs::write(
+            path,
+            format!(
+                concat!(
+                    "[storage]\npath = \"/var/lib/zinder/canonical\"\n\n",
+                    "[ingest]\nsource = \"{source}\"\nexplorer_views = false\nreorg_window_blocks = 1000\n\n",
+                    "[ingest.run_overrides]\ncoverage = \"wallet-serving\"\n\n",
+                    "[ingest_control]\nlisten_addr = \"127.0.0.1:9100\"\n",
+                    "checkpoint_staging_root = \"/var/lib/zinder/checkpoints\"\n",
+                    "bearer_token_path = \"/var/run/zinder-control/ingest.token\"\n",
+                    "checkpoint_bearer_token_path = \"/var/run/zinder-checkpoint/checkpoint.token\"\n",
+                ),
+                source = source,
+            ),
+        )?;
+    }
+    let core_bounded_workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(8);
+
+    for (label, config_path) in [("json-rpc", &json_rpc_toml), ("indexer-grpc", &grpc_toml)] {
+        for (setting, dense) in [
+            (None, true),
+            (Some(("ZINDER_INGEST__EXPLORER_VIEWS", "true")), false),
+            (
+                Some((
+                    "ZINDER_INGEST__TREE_STATE_DENSIFICATION__DURING_CONSTRUCTION",
+                    "false",
+                )),
+                false,
+            ),
+        ] {
+            let output = zinder_ingest_command()
+                .args(["--print-config", "--config"])
+                .arg(config_path)
+                .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+                .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+                .env("ZINDER_NODE__INDEXER_GRPC_ADDR", "http://127.0.0.1:18155")
+                .env("ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH", &token)
+                .env(
+                    "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH",
+                    &token,
+                )
+                .envs(setting)
+                .output()?;
+            assert!(output.status.success(), "{label}: {output:?}");
+            let config: toml::Table = toml::from_str(std::str::from_utf8(&output.stdout)?)?;
+            let policy = &config["ingest"]["tree_state_densification"];
+            assert_eq!(policy["enabled"].as_bool(), Some(true), "{label}");
+            assert_eq!(policy["selection"].as_str(), Some("every-block"), "{label}");
+            assert_eq!(
+                policy["during_construction"].as_bool(),
+                Some(dense),
+                "{label}, override={setting:?}"
+            );
+            let expected_workers = if dense { core_bounded_workers } else { 1 };
+            assert_eq!(
+                config["ingest"]["construction"]["tree_hashing_workers"].as_integer(),
+                Some(i64::try_from(expected_workers)?),
+                "{label}, override={setting:?}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -824,21 +969,192 @@ fn explorer_views_reject_positive_checkpoint_before_storage_mutation() -> Result
 }
 
 #[test]
-fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn Error>> {
+fn wallet_serving_allows_default_none_retention_and_rejects_legacy_transactions()
+-> Result<(), Box<dyn Error>> {
     assert_ingest_cli_rejects(
         |root| {
             Ok(
                 wallet_serving_ingest_config_toml(&root.join("wallet-serving-store"))?.replacen(
                     "[storage]\n",
-                    "[storage]\nraw_blob_policy = \"none\"\n",
+                    "[storage]\nraw_blob_policy = \"transactions\"\n",
                     1,
                 ),
             )
         },
         &[],
         &[],
-        "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"",
+        "unknown variant `transactions`, expected `none` or `all`",
     )
+}
+
+fn assert_profile_print_and_conflict(
+    config_path: &Path,
+    profile: &str,
+    full_blocks: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let mut command = zinder_ingest_command();
+    command
+        .args(["--print-config", "--config", path_str(config_path)?])
+        .env("ZINDER_DEPLOYMENT__PROFILE", profile);
+    if let Some(full_blocks) = full_blocks {
+        command.env("ZINDER_STORAGE__FULL_BLOCKS", full_blocks);
+    }
+    let output = command.output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("[deployment]"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("profile = \"{profile}\"")),
+        "{stdout}"
+    );
+    if full_blocks == Some("true") {
+        assert!(stdout.contains("full_blocks = true"), "{stdout}");
+    }
+    assert!(!stdout.contains("coverage ="), "{stdout}");
+    assert!(!stdout.contains("raw_blob_policy ="), "{stdout}");
+    assert!(!stdout.contains("explorer_views ="), "{stdout}");
+
+    let conflicting_policy = if full_blocks == Some("true") {
+        "none"
+    } else {
+        "all"
+    };
+    let mut conflict_command = zinder_ingest_command();
+    conflict_command
+        .args(["--print-config", "--config", path_str(config_path)?])
+        .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+        .env("ZINDER_STORAGE__RAW_BLOB_POLICY", conflicting_policy);
+    if let Some(full_blocks) = full_blocks {
+        conflict_command.env("ZINDER_STORAGE__FULL_BLOCKS", full_blocks);
+    }
+    let conflict = conflict_command.output()?;
+    assert!(!conflict.status.success(), "{conflict:?}");
+    assert!(String::from_utf8(conflict.stderr)?.contains("remove conflicting overrides"));
+
+    let legacy_transactions = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(config_path)?])
+        .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+        .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
+        .output()?;
+    assert!(
+        !legacy_transactions.status.success(),
+        "{legacy_transactions:?}"
+    );
+    let legacy_stderr = String::from_utf8(legacy_transactions.stderr)?;
+    assert!(
+        legacy_stderr.contains("ZINDER_STORAGE__RAW_BLOB_POLICY")
+            && legacy_stderr.contains("expected `none` or `all`"),
+        "{legacy_stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn deployment_profiles_render_and_reject_conflicting_retention() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("wallet-serving-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    let config = wallet_serving_ingest_config_toml(&storage_path)?
+        .replace("coverage = \"wallet-serving\"\n", "");
+    fs::write(&config_path, config)?;
+
+    for (profile, full_blocks) in [
+        ("light-wallet", None),
+        ("wallet", None),
+        ("wallet", Some("true")),
+        ("explorer", None),
+    ] {
+        assert_profile_print_and_conflict(&config_path, profile, full_blocks)?;
+    }
+
+    // Wallet/light-wallet presets allow opting in to explorer_views = true, while
+    // explorer enables explorer_views = true automatically and rejects false.
+    let wallet_with_explorer = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_DEPLOYMENT__PROFILE", "wallet")
+        .env("ZINDER_INGEST__EXPLORER_VIEWS", "true")
+        .output()?;
+    assert!(
+        wallet_with_explorer.status.success(),
+        "{wallet_with_explorer:?}"
+    );
+    let wallet_stdout = String::from_utf8(wallet_with_explorer.stdout)?;
+    assert!(
+        wallet_stdout.contains("explorer_views = true"),
+        "{wallet_stdout}"
+    );
+
+    let explorer_false = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_DEPLOYMENT__PROFILE", "explorer")
+        .env("ZINDER_INGEST__EXPLORER_VIEWS", "false")
+        .output()?;
+    assert!(!explorer_false.status.success(), "{explorer_false:?}");
+
+    let legacy_key = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_PROFILE", "light-wallet")
+        .output()?;
+    assert!(!legacy_key.status.success(), "{legacy_key:?}");
+
+    Ok(())
+}
+
+#[test]
+fn shared_env_tolerates_sibling_sections_derives_data_dir_and_redacts_control_tokens()
+-> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let data_dir = tempdir.path().join("ingest-data-root");
+    let stripped_config_path = tempdir.path().join("ingest-data-dir.toml");
+    fs::write(
+        &stripped_config_path,
+        "[network]\nname = \"zcash-regtest\"\n\n[node]\njson_rpc_addr = \"http://127.0.0.1:39232\"\n\n[ingest]\nsource = \"zebra-json-rpc\"\n\n[explorer]\nlisten_addr = \"127.0.0.1:9068\"\n\n[projector]\nreorg_window_blocks = 100\n",
+    )?;
+    let shared_env_output = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&stripped_config_path)?,
+        ])
+        .env("ZINDER_STORAGE__DATA_DIR", &data_dir)
+        .env(
+            "ZINDER_INGEST_CONTROL__BEARER_TOKEN",
+            "ingest-inline-secret",
+        )
+        .env(
+            "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN",
+            "ckpt-inline-secret",
+        )
+        .env("ZINDER_CIPHERSCAN__LISTEN_ADDR", "127.0.0.1:9070")
+        .output()?;
+    assert!(shared_env_output.status.success(), "{shared_env_output:?}");
+    let shared_stdout = String::from_utf8(shared_env_output.stdout)?;
+    assert!(
+        shared_stdout.contains(&format!(
+            "path = \"{}\"",
+            data_dir.join("canonical").display()
+        )),
+        "{shared_stdout}"
+    );
+    assert!(
+        shared_stdout.contains("bearer_token = \"[REDACTED]\""),
+        "{shared_stdout}"
+    );
+    assert!(
+        shared_stdout.contains("checkpoint_bearer_token = \"[REDACTED]\""),
+        "{shared_stdout}"
+    );
+    assert!(
+        !shared_stdout.contains("ingest-inline-secret"),
+        "{shared_stdout}"
+    );
+    assert!(
+        !shared_stdout.contains("ckpt-inline-secret"),
+        "{shared_stdout}"
+    );
+
+    Ok(())
 }
 
 #[test]
@@ -1146,14 +1462,9 @@ fn zero_poll_interval_fails_before_storage_creation() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-fn storage_path_default_resolves_to_canonical_zinder_layout() -> Result<(), Box<dyn Error>> {
-    // The binary's default for `storage.path` matches the canonical Zinder
-    // layout under `/var/lib/zinder/store`. Operators on non-PaaS hosts
-    // override via `ZINDER_STORAGE__PATH` or the `--storage-path` flag.
-    // This test guards the default's stability so the env-only deployment
-    // shape (single-container Docker image) keeps working without a TOML
-    // file or a `--config` argument.
+fn storage_path_env_override_keeps_the_legacy_store() -> Result<(), Box<dyn Error>> {
     let output = zinder_ingest_command()
+        .env("ZINDER_STORAGE__PATH", "/var/lib/zinder/store")
         .args([
             "--print-config",
             "--network",
@@ -1170,11 +1481,10 @@ fn storage_path_default_resolves_to_canonical_zinder_layout() -> Result<(), Box<
         "print-config failed: stderr=\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8(output.stdout)?;
-    assert!(
-        stdout.contains("path = \"/var/lib/zinder/store\"")
-            || stdout.contains("path = '/var/lib/zinder/store'"),
-        "stdout does not carry the canonical storage.path default:\n{stdout}"
+    let config: toml::Table = toml::from_str(std::str::from_utf8(&output.stdout)?)?;
+    assert_eq!(
+        config["storage"]["path"].as_str(),
+        Some("/var/lib/zinder/store")
     );
 
     Ok(())
@@ -1237,6 +1547,348 @@ fn partial_basic_auth_fails_before_storage_creation() -> Result<(), Box<dyn Erro
         "{stderr}"
     );
 
+    Ok(())
+}
+
+fn run_wallet_serving_ingest_print_config(
+    temporary_root: &Path,
+    config_path: &Path,
+    store_path: &Path,
+    raw_blob_policy: Option<&str>,
+    profile: Option<&str>,
+) -> Result<Output, Box<dyn Error>> {
+    let token_path = temporary_root.join("fixture.token");
+    fs::write(&token_path, "fixture-token\n")?;
+
+    let mut command = zinder_ingest_command();
+    command
+        .args(["--print-config", "--config"])
+        .arg(config_path)
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+        .env("ZINDER_NODE__INDEXER_GRPC_ADDR", "http://127.0.0.1:18155")
+        .env("ZINDER_STORAGE__PATH", store_path)
+        .env("ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH", &token_path)
+        .env(
+            "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH",
+            &token_path,
+        );
+    match raw_blob_policy {
+        Some(policy_name) => {
+            command.env("ZINDER_STORAGE__RAW_BLOB_POLICY", policy_name);
+        }
+        None => {
+            command.env_remove("ZINDER_STORAGE__RAW_BLOB_POLICY");
+        }
+    }
+    match profile {
+        Some(profile_name) => {
+            command.env("ZINDER_DEPLOYMENT__PROFILE", profile_name);
+        }
+        None => {
+            command.env_remove("ZINDER_DEPLOYMENT__PROFILE");
+        }
+    }
+    Ok(command.output()?)
+}
+
+fn assert_single_volume_legacy_transactions_fails_closed(
+    temporary_root: &Path,
+    config_path: &Path,
+    store_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let rejected = run_wallet_serving_ingest_print_config(
+        temporary_root,
+        config_path,
+        store_path,
+        Some("transactions"),
+        None,
+    )?;
+    assert!(!rejected.status.success(), "{rejected:?}");
+    let stderr = String::from_utf8(rejected.stderr)?;
+    assert!(
+        stderr.contains("ZINDER_STORAGE__RAW_BLOB_POLICY")
+            && stderr.contains("expected `none` or `all`"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+async fn assert_binary_retention_mismatch_rejected(
+    source: &crate::common::construction_fixture::MultiBlockConstructionSource,
+    activations: &std::sync::Arc<zinder_core::NetworkUpgradeActivations>,
+    none_config: &zinder_ingest::CanonicalWriterConfig,
+    readiness: &zinder_runtime::ComposedReadiness,
+) -> Result<(), Box<dyn Error>> {
+    use std::sync::{Arc, atomic::Ordering};
+    use tokio_util::sync::CancellationToken;
+    use zinder_ingest::{CanonicalWriterConfig, CanonicalWriterError, admit_canonical_store};
+    use zinder_store::{CanonicalStoreError, RawBlobRetention};
+
+    let initial_store = admit_canonical_store(
+        source,
+        Arc::clone(activations),
+        none_config,
+        readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(initial_store.raw_blob_retention(), RawBlobRetention::None);
+    let construction_requests = source.chain_segment_requests.load(Ordering::SeqCst);
+    drop(initial_store);
+
+    let full_blocks_config = CanonicalWriterConfig {
+        raw_blob_retention: RawBlobRetention::All,
+        ..none_config.clone()
+    };
+    let rejected = admit_canonical_store(
+        source,
+        Arc::clone(activations),
+        &full_blocks_config,
+        readiness,
+        &CancellationToken::new(),
+    )
+    .await
+    .err()
+    .ok_or("full_blocks = true must reject reopening a none-retention store")?;
+    assert!(
+        matches!(
+            &rejected,
+            CanonicalWriterError::Store(CanonicalStoreError::AdmissionRefused { reason, .. })
+                if reason.contains("raw blob retention")
+                    && reason.contains("none")
+                    && reason.contains("all")
+        ),
+        "{rejected}"
+    );
+
+    let reopened = admit_canonical_store(
+        source,
+        Arc::clone(activations),
+        none_config,
+        readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(reopened.raw_blob_retention(), RawBlobRetention::None);
+    assert_eq!(
+        source.chain_segment_requests.load(Ordering::SeqCst),
+        construction_requests
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_transactions_policy_fails_closed_and_binary_retention_mismatch_is_refused()
+-> Result<(), Box<dyn Error>> {
+    use std::sync::Arc;
+    use zinder_runtime::{ComposedReadiness, Readiness};
+
+    use crate::common::construction_fixture::{
+        MultiBlockConstructionSource, multi_block_writer_config, regtest_activations,
+    };
+
+    let activations = regtest_activations();
+    let source =
+        MultiBlockConstructionSource::build_with_transactions(2, &activations, |_| Ok(Vec::new()))?;
+    let directory = tempdir()?;
+    let wallet_serving_ingest_config = directory.path().join("wallet-serving-ingest.toml");
+    fs::write(
+        &wallet_serving_ingest_config,
+        concat!(
+            "[storage]\npath = \"/var/lib/zinder/canonical\"\n\n",
+            "[ingest]\nsource = \"zebra-indexer-grpc\"\nexplorer_views = false\nreorg_window_blocks = 1000\n\n",
+            "[ingest.run_overrides]\ncoverage = \"wallet-serving\"\n\n",
+            "[ingest_control]\nlisten_addr = \"127.0.0.1:9100\"\n",
+            "checkpoint_staging_root = \"/var/lib/zinder/checkpoints\"\n",
+            "bearer_token_path = \"/var/run/zinder-control/ingest.token\"\n",
+            "checkpoint_bearer_token_path = \"/var/run/zinder-checkpoint/checkpoint.token\"\n",
+        ),
+    )?;
+    let store_path = directory.path().join("canonical");
+    assert_single_volume_legacy_transactions_fails_closed(
+        directory.path(),
+        &wallet_serving_ingest_config,
+        &store_path,
+    )?;
+
+    let none_config =
+        multi_block_writer_config(store_path.clone(), Arc::clone(&activations), false);
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    Box::pin(assert_binary_retention_mismatch_rejected(
+        &source,
+        &activations,
+        &none_config,
+        &readiness,
+    ))
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mounted_toml_wallet_profile_with_full_blocks_preserves_all_retention()
+-> Result<(), Box<dyn Error>> {
+    use std::sync::Arc;
+
+    use tokio_util::sync::CancellationToken;
+    use zinder_ingest::{CanonicalWriterConfig, CanonicalWriterError, admit_canonical_store};
+    use zinder_runtime::{ComposedReadiness, Readiness};
+    use zinder_store::{CanonicalStoreError, RawBlobRetention};
+
+    use crate::common::construction_fixture::{
+        MultiBlockConstructionSource, multi_block_writer_config, regtest_activations,
+    };
+
+    let directory = tempdir()?;
+    let custom_ingest_toml = directory.path().join("ingest.toml");
+    fs::write(
+        &custom_ingest_toml,
+        concat!(
+            "[deployment]\nprofile = \"wallet\"\n\n",
+            "[storage]\nfull_blocks = true\npath = \"/var/lib/zinder/canonical\"\n\n",
+            "[ingest]\nsource = \"zebra-indexer-grpc\"\nexplorer_views = false\nreorg_window_blocks = 1000\n\n",
+            "[ingest_control]\nlisten_addr = \"127.0.0.1:9100\"\n",
+            "checkpoint_staging_root = \"/var/lib/zinder/checkpoints\"\n",
+            "bearer_token_path = \"/var/run/zinder-control/ingest.token\"\n",
+            "checkpoint_bearer_token_path = \"/var/run/zinder-checkpoint/checkpoint.token\"\n",
+        ),
+    )?;
+
+    let store_path = directory.path().join("canonical");
+    // When deployment.profile = "wallet" is paired with storage.full_blocks = true,
+    // ingest keeps full blocks (`all` retention) rather than transaction-only blobs.
+    let printed = run_wallet_serving_ingest_print_config(
+        directory.path(),
+        &custom_ingest_toml,
+        &store_path,
+        None,
+        Some("wallet"),
+    )?;
+    assert!(printed.status.success(), "{printed:?}");
+    let stdout = String::from_utf8(printed.stdout)?;
+    assert!(stdout.contains("profile = \"wallet\""), "{stdout}");
+    assert!(stdout.contains("full_blocks = true"), "{stdout}");
+    assert!(!stdout.contains("raw_blob_policy ="), "{stdout}");
+
+    let activations = regtest_activations();
+    let source =
+        MultiBlockConstructionSource::build_with_transactions(2, &activations, |_| Ok(Vec::new()))?;
+    let archive_config = CanonicalWriterConfig {
+        raw_blob_retention: RawBlobRetention::All,
+        ..multi_block_writer_config(store_path, Arc::clone(&activations), false)
+    };
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let archive_store = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &archive_config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(archive_store.raw_blob_retention(), RawBlobRetention::All);
+    drop(archive_store);
+
+    // Clobbering with `wallet` (`none`) would fail admission on an existing archive store.
+    let lean_config = CanonicalWriterConfig {
+        raw_blob_retention: RawBlobRetention::None,
+        ..archive_config
+    };
+    let rejected = admit_canonical_store(
+        &source,
+        Arc::clone(&activations),
+        &lean_config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await
+    .err()
+    .ok_or("wallet profile must reject reopening a wallet-archive store")?;
+    assert!(
+        matches!(
+            &rejected,
+            CanonicalWriterError::Store(CanonicalStoreError::AdmissionRefused { reason, .. })
+                if reason.contains("raw blob retention")
+                    && reason.contains("all")
+                    && reason.contains("none")
+        ),
+        "{rejected}"
+    );
+    Ok(())
+}
+
+#[test]
+fn data_dir_derives_checkpoint_staging_root_and_rejects_sibling_typo() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempdir()?;
+    let custom_dir = directory.path().join("ingest-root");
+    let shared_toml = directory.path().join("shared.toml");
+    fs::write(
+        &shared_toml,
+        concat!(
+            "[deployment]\nprofile = \"wallet-archive\"\n",
+            "[storage]\n",
+            "secondary_path = \"/unused/by/ingest/secondary\"\n",
+            "[wallet]\n",
+            "path = \"/unused/wallet\"\n",
+            "secondary_path = \"/unused/wsec\"\n",
+            "[query]\nlisten_addr = \"127.0.0.1:9102\"\n",
+        ),
+    )?;
+
+    let output = zinder_ingest_command()
+        .arg("--print-config")
+        .arg("--config")
+        .arg(&shared_toml)
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:39232")
+        .env("ZINDER_STORAGE__DATA_DIR", &custom_dir)
+        .env(
+            "ZINDER_STORAGE__SECONDARY_PATH",
+            "/unused/by/ingest/sec-env",
+        )
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("profile = \"wallet-archive\""), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "checkpoint_staging_root = \"{}\"",
+            custom_dir.join("checkpoints").display()
+        )),
+        "{stdout}"
+    );
+
+    let removed_canonical_env = zinder_ingest_command()
+        .arg("--print-config")
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:39232")
+        .env("ZINDER_STORAGE__CANONICAL_PATH", "/removed/field")
+        .output()?;
+    assert!(!removed_canonical_env.status.success());
+
+    let sibling_env_typo = zinder_ingest_command()
+        .arg("--print-config")
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:39232")
+        .env("ZINDER_QUERY__LISTEN_ADRR", "127.0.0.1:9102")
+        .output()?;
+    assert!(!sibling_env_typo.status.success());
+    let stderr = String::from_utf8(sibling_env_typo.stderr)?;
+    assert!(stderr.contains("ZINDER_QUERY__LISTEN_ADRR"), "{stderr}");
+    assert!(stderr.contains("ZINDER_QUERY__LISTEN_ADDR"), "{stderr}");
+
+    let storage_env_typo = zinder_ingest_command()
+        .arg("--print-config")
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:39232")
+        .env("ZINDER_STORAGE__SECONDRY_PATH", "/typo")
+        .output()?;
+    assert!(!storage_env_typo.status.success());
+    let storage_stderr = String::from_utf8(storage_env_typo.stderr)?;
+    assert!(
+        storage_stderr.contains("unknown field `secondry_path`"),
+        "{storage_stderr}"
+    );
     Ok(())
 }
 

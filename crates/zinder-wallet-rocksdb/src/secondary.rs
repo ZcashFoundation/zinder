@@ -23,7 +23,10 @@ use zinder_wallet_projection::{
 
 use crate::{
     RocksDbWalletError, RocksDbWalletStore,
-    store::{decode_only_control, required_column_family_names, wallet_column_family_descriptors},
+    store::{
+        WALLET_DATA_COLUMN_FAMILIES, decode_only_control, required_column_family_names,
+        wallet_column_family_descriptors,
+    },
 };
 
 /// Result of one explicit wallet-secondary catch-up barrier.
@@ -116,11 +119,13 @@ impl RocksDbWalletSecondary {
         let control = decode_only_control(&bounded_open)?;
         let ready_evidence =
             ready_evidence_from_control(&control, &primary_path, expected_network)?;
+        let block_hash_cache = super::store::BlockHashChunkCache::for_bounded_open(&bounded_open);
         Ok(Self {
             store: RocksDbWalletStore {
                 bounded_open,
                 control,
                 ready_evidence,
+                block_hash_cache,
                 verified_undo_suffix_generation: None,
                 last_transition_footprint: None,
             },
@@ -167,6 +172,11 @@ impl RocksDbWalletSecondary {
         }
         self.store.control = control;
         self.store.ready_evidence = ready_evidence;
+        if after != before {
+            self.store
+                .block_hash_cache
+                .invalidate_from(before.settled_tip().height);
+        }
         Ok(WalletSecondaryCatchupOutcome { before, after })
     }
 
@@ -296,6 +306,46 @@ impl RocksDbWalletSecondary {
     #[must_use]
     pub const fn io_mode(&self) -> RocksDbIoMode {
         self.store.io_mode()
+    }
+
+    /// Returns this secondary's cumulative ticker, or zero with statistics off.
+    #[must_use]
+    pub fn rocksdb_ticker_count(&self, ticker: rust_rocksdb::statistics::Ticker) -> u64 {
+        self.store.bounded_open.statistics.get_ticker_count(ticker)
+    }
+
+    /// Publishes cache composition through one serving generation.
+    pub fn record_block_cache_entry_gauges(&self) {
+        self.store
+            .bounded_open
+            .record_block_cache_entry_gauges(zinder_store::StoreRole::WalletSecondary);
+    }
+
+    /// Publishes per-column-family integer properties and level file counts
+    /// for one serving generation under the `wallet_secondary` store role.
+    pub fn record_column_family_property_gauges(&self) {
+        self.store
+            .bounded_open
+            .record_column_family_property_gauges(
+                zinder_store::StoreRole::WalletSecondary,
+                &WALLET_DATA_COLUMN_FAMILIES.map(|(name, _)| name),
+            );
+    }
+
+    /// Reads one engine property at this secondary's view of a column family.
+    /// An unsupported property returns `None`.
+    pub fn rocksdb_property_value_cf(
+        &self,
+        family: &'static str,
+        property: &str,
+    ) -> Result<Option<String>, RocksDbWalletError> {
+        let db = &self.store.bounded_open.db;
+        let cf = db
+            .cf_handle(family)
+            .ok_or(RocksDbWalletError::ColumnFamilyUnavailable { name: family })?;
+        db.property_value_cf(&cf, property).map_err(|source| {
+            RocksDbWalletError::rocksdb("read wallet secondary column family property", source)
+        })
     }
 
     /// Samples the memory this secondary holds outside its block cache.

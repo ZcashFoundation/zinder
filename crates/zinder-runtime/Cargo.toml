@@ -15,15 +15,20 @@ publish.workspace = true
 axum.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
-config.workspace = true
+flate2.workspace = true
 futures-util.workspace = true
 http.workspace = true
 http-body.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
+hyper = { workspace = true, features = ["http2"] }
+hyper-util = { workspace = true, features = ["http2", "server-auto"] }
+ipnet.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
 parking_lot.workspace = true
+pasta_curves.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 secrecy.workspace = true
@@ -32,7 +37,7 @@ serde_json.workspace = true
 slab.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls.workspace = true
 tokio-util.workspace = true
 toml.workspace = true
@@ -40,23 +45,36 @@ tonic = { workspace = true, features = ["transport"] }
 tonic-health.workspace = true
 tonic-reflection.workspace = true
 tonic-types.workspace = true
+tonic-web.workspace = true
 tower.workspace = true
+tower-http = { workspace = true, features = ["cors", "validate-request"] }
 tracing.workspace = true
+tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 zinder-core.workspace = true
 zinder-proto.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true
+zstd = "0.14.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["param"] }
 tikv-jemallocator.workspace = true
 
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+raw-cpuid.workspace = true
+x86_64.workspace = true
+
 [dev-dependencies]
+base64.workspace = true
 axum = { workspace = true, features = ["ws"] }
 eyre.workspace = true
+h2.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http2"] }
 hyper-util = { workspace = true, features = ["http2"] }
+opentelemetry-proto.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 rcgen.workspace = true

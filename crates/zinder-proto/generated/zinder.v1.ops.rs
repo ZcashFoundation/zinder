@@ -142,6 +142,9 @@ pub struct SyncingDetail {
     /// Distance between the visible chain tip and the target tip when known.
     #[prost(uint64, optional, tag = "1")]
     pub lag_blocks: ::core::option::Option<u64>,
+    /// What the canonical writer is waiting for in its current follow iteration.
+    #[prost(enumeration = "FollowWaitReason", optional, tag = "2")]
+    pub wait_reason: ::core::option::Option<i32>,
 }
 /// Detail for READINESS_CAUSE_NODE_CAPABILITY_MISSING.
 #[allow(clippy::all)]
@@ -434,6 +437,41 @@ impl ReadinessCause {
         }
     }
 }
+/// Work that keeps the canonical writer from admitting traffic while following.
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FollowWaitReason {
+    Unspecified = 0,
+    /// The writer has confirmed its tip and is waiting for mempool hydration.
+    MempoolHydrationAtTip = 1,
+    /// The writer is checking its tip or processing a canonical transition.
+    CanonicalProgress = 2,
+}
+impl FollowWaitReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FOLLOW_WAIT_REASON_UNSPECIFIED",
+            Self::MempoolHydrationAtTip => "FOLLOW_WAIT_REASON_MEMPOOL_HYDRATION_AT_TIP",
+            Self::CanonicalProgress => "FOLLOW_WAIT_REASON_CANONICAL_PROGRESS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FOLLOW_WAIT_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "FOLLOW_WAIT_REASON_MEMPOOL_HYDRATION_AT_TIP" => {
+                Some(Self::MempoolHydrationAtTip)
+            }
+            "FOLLOW_WAIT_REASON_CANONICAL_PROGRESS" => Some(Self::CanonicalProgress),
+            _ => None,
+        }
+    }
+}
 /// Stable reason attached as `google.rpc.ErrorInfo.reason` on every gRPC
 /// `Status` returned by a Zinder service. The `domain` is `zinder.dev`.
 /// Auxiliary detail (resource family/key, precondition subject, field
@@ -467,7 +505,6 @@ pub enum ErrorReason {
     BroadcastTransactionTooLarge = 46,
     SubtreeRootRangeTooLarge = 49,
     /// FAILED_PRECONDITION family.
-    BroadcastDisabled = 11,
     ChainEventCursorExpired = 12,
     MempoolEventCursorExpired = 13,
     SnapshotPageCursorExpired = 45,
@@ -553,6 +590,25 @@ pub enum ErrorReason {
     /// serves its limit of open block-range streams. Retry with backoff; a slot
     /// frees when an open stream ends.
     CompactBlockStreamLimitReached = 56,
+    /// UNAVAILABLE family.
+    /// The upstream node refused a forwarded call with HTTP 429 because it
+    /// already holds its JSON-RPC connection or request limit. The node is up;
+    /// retry with backoff.
+    NodeRateLimited = 57,
+    /// RESOURCE_EXHAUSTED family.
+    /// A wallet read the server forwards to its node was refused because every
+    /// node-call or response slot of its kind stayed taken through the wait, or
+    /// every waiting place was taken. Retry with backoff.
+    ForwardedReadLimitReached = 58,
+    /// UNAVAILABLE family.
+    /// A forwarded transparent UTXO or balance lookup answered at a different
+    /// tip than the reader's served tip, or consecutive pages disagreed at that
+    /// tip. The node is up; retry after the `grpc-retry-pushback-ms` delay.
+    ServedTipMismatch = 59,
+    /// UNAVAILABLE family.
+    /// The wallet listener refused a native block-range stream at admission.
+    /// Retry on the existing connection after the grpc-retry-pushback-ms delay.
+    BlockRangeAdmissionRefused = 60,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -578,7 +634,6 @@ impl ErrorReason {
             Self::SnapshotPageCursorInvalid => "SNAPSHOT_PAGE_CURSOR_INVALID",
             Self::BroadcastTransactionTooLarge => "BROADCAST_TRANSACTION_TOO_LARGE",
             Self::SubtreeRootRangeTooLarge => "SUBTREE_ROOT_RANGE_TOO_LARGE",
-            Self::BroadcastDisabled => "BROADCAST_DISABLED",
             Self::ChainEventCursorExpired => "CHAIN_EVENT_CURSOR_EXPIRED",
             Self::MempoolEventCursorExpired => "MEMPOOL_EVENT_CURSOR_EXPIRED",
             Self::SnapshotPageCursorExpired => "SNAPSHOT_PAGE_CURSOR_EXPIRED",
@@ -619,6 +674,10 @@ impl ErrorReason {
             Self::TreeStateReplayLimitReached => "TREE_STATE_REPLAY_LIMIT_REACHED",
             Self::BroadcastBudgetExhausted => "BROADCAST_BUDGET_EXHAUSTED",
             Self::CompactBlockStreamLimitReached => "COMPACT_BLOCK_STREAM_LIMIT_REACHED",
+            Self::NodeRateLimited => "NODE_RATE_LIMITED",
+            Self::ForwardedReadLimitReached => "FORWARDED_READ_LIMIT_REACHED",
+            Self::ServedTipMismatch => "SERVED_TIP_MISMATCH",
+            Self::BlockRangeAdmissionRefused => "BLOCK_RANGE_ADMISSION_REFUSED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -643,7 +702,6 @@ impl ErrorReason {
             "SNAPSHOT_PAGE_CURSOR_INVALID" => Some(Self::SnapshotPageCursorInvalid),
             "BROADCAST_TRANSACTION_TOO_LARGE" => Some(Self::BroadcastTransactionTooLarge),
             "SUBTREE_ROOT_RANGE_TOO_LARGE" => Some(Self::SubtreeRootRangeTooLarge),
-            "BROADCAST_DISABLED" => Some(Self::BroadcastDisabled),
             "CHAIN_EVENT_CURSOR_EXPIRED" => Some(Self::ChainEventCursorExpired),
             "MEMPOOL_EVENT_CURSOR_EXPIRED" => Some(Self::MempoolEventCursorExpired),
             "SNAPSHOT_PAGE_CURSOR_EXPIRED" => Some(Self::SnapshotPageCursorExpired),
@@ -690,6 +748,10 @@ impl ErrorReason {
             "COMPACT_BLOCK_STREAM_LIMIT_REACHED" => {
                 Some(Self::CompactBlockStreamLimitReached)
             }
+            "NODE_RATE_LIMITED" => Some(Self::NodeRateLimited),
+            "FORWARDED_READ_LIMIT_REACHED" => Some(Self::ForwardedReadLimitReached),
+            "SERVED_TIP_MISMATCH" => Some(Self::ServedTipMismatch),
+            "BLOCK_RANGE_ADMISSION_REFUSED" => Some(Self::BlockRangeAdmissionRefused),
             _ => None,
         }
     }

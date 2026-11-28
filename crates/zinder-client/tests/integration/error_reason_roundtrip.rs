@@ -15,19 +15,6 @@ use zinder_query::{QueryError, status_from_query_error};
 const ZINDER_DOMAIN: &str = "zinder.dev";
 
 #[test]
-fn query_error_status_carries_error_info() {
-    let status = status_from_query_error(&QueryError::TransactionBroadcastDisabled);
-
-    let details = status.get_error_details();
-    let Some(error_info) = details.error_info() else {
-        unreachable!("status must carry an ErrorInfo detail")
-    };
-
-    assert_eq!(error_info.domain, ZINDER_DOMAIN);
-    assert_eq!(error_info.reason, "BROADCAST_DISABLED");
-}
-
-#[test]
 fn generic_remote_status_preserves_exact_reason_on_client() {
     let status = status_from_query_error(&QueryError::BlockRangeTooLarge {
         requested: 4_096,
@@ -38,6 +25,7 @@ fn generic_remote_status_preserves_exact_reason_on_client() {
     let Some(error_info) = details.error_info() else {
         unreachable!("status must carry an ErrorInfo detail")
     };
+    assert_eq!(error_info.domain, ZINDER_DOMAIN);
     assert_eq!(error_info.reason, "BLOCK_RANGE_TOO_LARGE");
 
     // Round-trip the status through the public-vocabulary compatibility
@@ -155,7 +143,6 @@ fn every_error_reason_round_trips_through_proto_str_name() {
         WireErrorReason::TransparentBalanceAddressCountExceeded,
         WireErrorReason::SnapshotPageCursorInvalid,
         WireErrorReason::BroadcastTransactionTooLarge,
-        WireErrorReason::BroadcastDisabled,
         WireErrorReason::ChainEventCursorExpired,
         WireErrorReason::MempoolEventCursorExpired,
         WireErrorReason::SnapshotPageCursorExpired,
@@ -194,6 +181,10 @@ fn every_error_reason_round_trips_through_proto_str_name() {
         WireErrorReason::TreeStateReplayLimitReached,
         WireErrorReason::BroadcastBudgetExhausted,
         WireErrorReason::CompactBlockStreamLimitReached,
+        WireErrorReason::BlockRangeAdmissionRefused,
+        WireErrorReason::NodeRateLimited,
+        WireErrorReason::ForwardedReadLimitReached,
+        WireErrorReason::ServedTipMismatch,
     ];
 
     for reason in reasons {

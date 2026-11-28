@@ -59,11 +59,33 @@ newest blocks one at a time, as in
 [Continuous following](#continuous-following), before ingest reports ready.
 
 Ingest fetches blocks in bounded batches, prepares them in parallel, and writes
-them in order. It rebuilds the note commitment trees from the blocks and stores
-a tree-state checkpoint every 100 blocks and at the build tip. The loader
-refuses a checkpoint that does not carry a frontier for exactly the pools the
+them in order. For a JSON-RPC `getblock` batch, each requested ID must appear
+once in the reply. A short reply or a repeated ID causes ingest to report
+`SourceProtocolMismatch` for the batch before assigning any reply to a height.
+
+Ingest rebuilds the note commitment trees from the blocks. It stores
+tree-state checkpoints at the heights the
+[construction checkpoint policy](#tree-state-densification) selects, including
+the build tip. The loader refuses a checkpoint that does not carry a frontier for exactly the pools the
 node's activation table makes active at its height, including a pool whose
 tree is still empty.
+
+The loader appends each block to the trees and writes it to the store in
+height order. Each stored checkpoint's canonical encoding must decode to
+exactly the appended frontier, and the root derived from that encoding must
+equal the root derived from the frontier. With
+`ingest.construction.tree_hashing_workers` above one, a dedicated tree-staging
+thread drains bounded batches of up to 64 prepared blocks, appends their note
+commitments across all worker threads (including parallel subtree hashing for
+dense commitment batches), and cross-checks only the distinct pool frontiers
+that changed across the batch in parallel while reusing unchanged pool
+checkpoints without re-encoding or re-deriving their depth-32 roots. Completed
+blocks — still holding their preparation memory permits — stream through a
+bounded one-batch queue to the `RocksDB` SST stager thread so SST encoding,
+hashing, and disk writes for batch `N` overlap with commitment-tree hashing for
+batch `N + 1`, while the preparation watermark still bounds total in-flight
+block memory. The stored trees, checkpoints, final roots, and subtree roots do
+not depend on the worker count.
 
 Before publishing, construction compares its derived tree state at the build
 tip, and every subtree root the loaded blocks complete, with the node's. A
@@ -153,30 +175,60 @@ commands such as `WriterStatus` at once. Writes, such as mempool appends, queue
 
 ### Tree-state densification
 
-A first sync stores a tree-state checkpoint only every 100 blocks, so a
-tree-state read between two of them replays stored blocks. Once ingest follows
-the tip, and Explorer views have caught up when they are enabled, a background
-pass fills settled history with stored checkpoints. Live following already
-stores one per block, so only history from a first sync needs the pass. The
-`ingest.tree_state_densification.selection` setting decides which blocks get
-one:
+The `[ingest.tree_state_densification]` settings control both initial
+construction checkpoint coverage and the background densification pass:
 
-- `every-block`, the default, stores one for every block, so a tree-state read
-  at any height in a completed stride is a stored read with no replay. Heights
-  in the stride the settled tip has not yet passed, such as 301 to 359 while
-  the tip is settled at 360, still replay from the nearest checkpoint until the
-  tip crosses the stride's end. On Mainnet this is
-  estimated to add 2.4 GB of rows before compression and about 4 to 5
-  CPU-hours of one-time work; both figures await measurement on a Mainnet
-  deployment.
-- `commitment-budget` stores one each time `commitment_budget` note
-  commitments (1,024 by default) have accumulated since the previous
-  checkpoint, so a read between two of them replays fewer than that many
-  commitments. On Mainnet this adds an estimated 0.13 GB. Setting
-  `commitment_budget` without a `selection` chooses it.
+- With `wallet-serving` coverage and Explorer views off,
+  `during_construction` defaults to `true`. With the default `enabled = true`
+  and `selection = "every-block"`, fresh construction stores a checkpoint for
+  every block through the build tip, including the final partial stride, so
+  every constructed height is served from a stored checkpoint at READY. Ingest
+  cross-checks and stores each frontier during construction on its
+  tree-hashing workers. Completed strides already satisfy the background pass,
+  avoiding a second replay of their commitments. The rows are estimated at
+  about 2.4 GB before compression.
+- With Explorer views on or `explicit` coverage, `during_construction`
+  defaults to `false`, and the first sync stores one checkpoint every 100
+  blocks and at the build tip. Once ingest follows the tip, the background
+  pass fills missing checkpoints in settled strides. A full Mainnet backfill is
+  estimated at 4 to 5 CPU-hours. Set `during_construction = true` before the
+  first sync to apply the selection during construction, or set it to `false`
+  in a wallet-serving deployment to keep construction sparse.
+- The `commitment-budget` selection stores a checkpoint once at least
+  `commitment_budget` note commitments across all pools have accumulated since
+  the previous checkpoint. The budget defaults to 1,024. Setting the budget
+  without a `selection` chooses this policy. With `during_construction = true`,
+  the rule applies during fresh construction alongside the 100-block cadence
+  and build tip. A read between checkpoints replays fewer commitments than
+  the budget and at most 99 blocks. Each cadence checkpoint resets the count.
+- Setting `enabled = false` keeps fresh construction sparse (every 100 blocks
+  and at the build tip) and disables the background pass.
+
+When construction stores checkpoints beyond the cadence and build tip,
+`ingest.construction.tree_hashing_workers` defaults to the detected logical
+CPU count, at most 8, or to 1 when the count cannot be detected. In the
+measured Mainnet builds, with 6 hashing workers on 8 physical cores and one
+thread per core, `every-block` and `commitment-budget` at a budget of 256
+reached READY within the three-hour budget of
+[ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md). Hosts with
+fewer logical CPUs take longer, and ingest logs
+`every_block_construction_below_qualified_cpus` when every-block construction
+starts on fewer than 8.
+[Bulk-catchup resource tuning](../runbooks/bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus)
+gives estimates and faster settings for smaller hosts.
+
+Live following already stores one checkpoint per block. Once ingest follows
+the tip, and Explorer views have caught up when they are enabled, the
+background pass runs for existing sparse stores, `commitment-budget` stores,
+and to check checkpoint-height coverage and advance the watermark on freshly
+constructed stores.
+Heights in a sparse store's stride that the settled tip has not yet passed,
+such as 301 to 359 while the tip is settled at 360, still replay from the
+nearest checkpoint until the tip crosses the stride's end.
 
 The pass works one stride at a time, from one stored checkpoint to the next
-multiple of 100. It replays the stride's compact blocks from the first
+multiple of 100. When the selected heights already have rows, the pass skips
+replay. For an incomplete stride, it replays compact blocks from the first
 checkpoint with the per-block step a tree-state rebuild runs, checks every
 replayed block against the canonical header at its height, and accepts the result
 only when the replay reproduces every checkpoint already stored in the stride,
@@ -215,9 +267,11 @@ serves its stored row as written, as every stored read does
 ([Wallet data plane](wallet-data-plane.md#tree-states-and-subtree-roots)). A
 missing densification row only makes that read replay, but a missing cadence
 checkpoint is store damage: a read at its height is refused, as is any read
-above it that would replay from below it. The writer commits through its
-command queue, so the pass runs only when `ingest_control.listen_addr` is set,
-as it is for wallet serving.
+above it that would replay from below it. The background pass commits through
+the writer's command queue, so it runs only when `ingest_control.listen_addr`
+is set, as it is for wallet serving. Fresh construction writes `every-block`
+checkpoints directly into its SSTs when `during_construction = true`,
+`enabled = true`, and `selection = "every-block"`, even without `ingest_control.listen_addr`.
 
 `ingest.tree_state_densification.workers` (2 by default) bounds how many
 strides the pass replays at once, each on one CPU, and `max_blocks_per_second`
@@ -232,8 +286,9 @@ scan that fails is charged 350 reads before its retry, the 199 reads a chunk
 makes before its last stride plus the 150 reads the costliest stride adds, so
 repeated failures stay within the configured rate. Progress is reported by the
 `zinder_ingest_tree_state_densification_*` metrics in
-[Metrics](../reference/metrics.md). A canonical rebuild returns history to the
-100-block cadence until the pass runs again.
+[Metrics](../reference/metrics.md). A canonical rebuild uses the same
+construction settings as a first sync. Changing those settings on an
+existing store preserves its checkpoint rows.
 
 ### Tree-state verification
 
@@ -251,14 +306,17 @@ again, as a writer checks a row it stores:
   height. The history predecessor has no stored header, so its row carries
   the block time recorded for it when the store was built. A row at any other
   height fails this check when its header is missing, does not decode, or
-  sits in a table block that fails its checksum when read. Unlike checkpoint
-  rows, headers are read through the block cache, so a header block already
-  cached on the verification secondary is checked from memory.
+  sits in a table block that fails its checksum when read.
 
-The pass starts when densification does: once ingest follows the tip, and
-Explorer views have caught up when they are enabled. A restart over a store
-it reports as damaged starts it sooner, as described below. It reads through
-its own canonical secondary and writes nothing to the store, so it runs
+Verification normally runs during tip follow once Explorer views catch up.
+When replay fails to read canonical history or rebuild commitment state, it
+requests one verification step. During tip follow, this lets the verifier
+resume its paced scan from its existing position while the views are behind.
+Repeated failures share one pending step. A successful replay pass or a
+resource pause clears an unused request.
+
+On restart, ingest rechecks recorded damage as described below. Verification
+reads through its own canonical secondary and writes nothing to the store, so it runs
 without `ingest_control.listen_addr`; without that listener, no reader
 attests the store, and ingest readiness alone reports the damage.
 
@@ -285,13 +343,12 @@ per cycle at the default rate. A real cycle takes longer: checking adds up to
 4.3 ms per row, the pass waits while historical work is closed, a store error
 costs a 30-second retry, and a restart can check up to a minute of rows again.
 
-The checkpoint family of the pass's secondary has no RocksDB block cache, so
-every read takes the checkpoint blocks from their table files and checks
-their checksums, whatever another read of the secondary loaded before. A
-block that fails its checksum is damage, reported like a row that fails a
-check, at the first height it may hold. A table file that the writer's
-compaction deleted under the pass's secondary is not damage: the step stops,
-and the pass retries it after catching up.
+The verification secondary bypasses the RocksDB block cache for checkpoint
+and header rows. For rows stored in table files, each read checks the
+checksum of the data block again. A block that fails its checksum is damage,
+reported like a row that fails a check, at the first height it may hold. A
+table file that the writer's compaction deleted under the pass's secondary is
+not damage: the step stops, and the pass retries it after catching up.
 
 The pass records the height its current cycle continues from in
 `tree-state-verification-watermark.json` inside the canonical store
@@ -368,9 +425,11 @@ two kinds of damage:
 - An Orchard frontier stored in the Ironwood position with its own root, or
   the reverse, because both pools hash alike.
 
-The write-time checks prevent those. Live following compares each row with
-the node's tree state, and densification replays each stride before it writes
-rows.
+Construction derives checkpoints from the loaded blocks and compares the build-tip
+tree state with the node. Live following compares each new checkpoint with the
+node's tree state. Densification compares existing checkpoints with replayed
+values only when a stride needs more checkpoints. A stride that already meets
+the selection passes the coverage check without that comparison.
 
 ## Node endpoint failover
 
@@ -410,7 +469,9 @@ The follower switches after either:
 - 300 seconds of the active endpoint reporting not ready.
 
 Other failure classes, such as a malformed response, never switch, because
-switching would hide the problem behind whichever node answers. The follower
+switching would hide the problem behind whichever node answers. A node that
+refuses calls with HTTP 429 (`node_rate_limited`) is up, so the follower backs
+off and retries it instead. The follower
 tries standbys that hold ingest's tip first, in list order, then standbys on
 another branch above the settled tip, which it handles as a reorg. It logs
 `node_endpoint_switched`, restarts the mempool stream from the new endpoint,
@@ -462,6 +523,24 @@ loads a full snapshot before ingest reports ready, then applies added, mined,
 and invalidated events. Mempool state is not part of block commits. Readers get it
 through the private control API. See
 [ADR-0012](../adrs/0012-mempool-topology-and-retention.md).
+
+After a tip change, the certified mempool can serve at its own tip for up to
+30 seconds while ingest stages a replacement. Further tip changes do not
+restart the clock. At expiry, ingest withdraws mempool readiness and live
+reads return `NODE_UNAVAILABLE`. The owner keeps following the source and
+resumes serving when a complete snapshot matches the canonical tip.
+
+Live mempool reads and ingest readiness use the same endpoint certification.
+After a switch, snapshot and transaction reads and the caught-up event stream
+refuse with `NODE_UNAVAILABLE` until the new active endpoint certifies.
+Retained events remain available for replay.
+
+Ingest control bounds a read, including time waiting for the owner, by the
+caller’s `grpc-timeout`. It reserves 10% of that budget, up to one second,
+to return a typed refusal.
+Wallet clients send `x-zinder-mempool-events-open-timeout-ms` on
+`MempoolEvents` so the 15-second opening budget ends when the stream opens.
+When both budgets are present, the shorter applies.
 
 ## Supported networks
 

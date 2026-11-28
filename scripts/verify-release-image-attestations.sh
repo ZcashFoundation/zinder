@@ -35,7 +35,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 digest_pattern='^sha256:[0-9a-f]{64}$'
-[[ "$image" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/zinder-[a-z0-9-]+$ ]] || usage
+[[ "$image" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/zinder(-[a-z0-9-]+)?$ ]] || usage
 [[ "$root_digest" =~ $digest_pattern ]] || usage
 [[ "$amd64_digest" =~ $digest_pattern ]] || usage
 [[ "$arm64_digest" =~ $digest_pattern ]] || usage

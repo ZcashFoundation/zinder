@@ -17,7 +17,7 @@ use zinder_core::{
 };
 
 use super::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RocksDbCanonicalStore, RocksDbTreeStateVerifier,
+    CanonicalReorgPolicy, RocksDbCanonicalStore, RocksDbTreeStateVerifier,
     TreeStateCheckpointMismatch, TreeStateCheckpointMismatchKind,
     TreeStateCheckpointRowVerification, TreeStateCheckpointSelection,
     TreeStateCheckpointVerification,
@@ -463,6 +463,93 @@ fn a_block_a_normal_read_loaded_does_not_mask_corruption_on_disk() -> TestResult
     Ok(())
 }
 
+#[test]
+fn verifying_a_header_again_detects_damage_to_its_table_file() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densified_store(&temporary)?;
+    split_rows_into_bottom_level_files(&store.bounded_open.db, BLOCK_HEADER_COLUMN_FAMILY)?;
+    let verifier = open_verifier(&temporary)?;
+    let activations = activations()?;
+    let height = BlockHeight::new(50);
+
+    assert_eq!(
+        verifier.verify_tree_state_checkpoint_at(height, &activations)?,
+        TreeStateCheckpointRowVerification::Intact
+    );
+    corrupt_table_file_holding(&store, BLOCK_HEADER_COLUMN_FAMILY, height)?;
+
+    let verification = verifier.verify_tree_state_checkpoints(height, rows(1)?, &activations)?;
+    let mismatch = verification
+        .mismatch
+        .ok_or("a damaged header must fail verification")?;
+    assert_eq!(
+        (mismatch.height, mismatch.kind, mismatch.pool),
+        (height, TreeStateCheckpointMismatchKind::Row, None)
+    );
+    assert!(
+        mismatch.reason.contains("block_header block"),
+        "{}",
+        mismatch.reason
+    );
+    assert_eq!(
+        (verification.verified_rows, verification.next_from),
+        (0, height)
+    );
+    assert_eq!(
+        verifier.verify_tree_state_checkpoint_at(height, &activations)?,
+        TreeStateCheckpointRowVerification::Mismatch(mismatch)
+    );
+    Ok(())
+}
+
+#[test]
+fn the_open_file_budget_limits_header_table_file_reader_memory() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densified_store(&temporary)?;
+    split_rows_into_bottom_level_files(&store.bounded_open.db, BLOCK_HEADER_COLUMN_FAMILY)?;
+    let activations = activations()?;
+
+    let mut tight_budget = RocksDbResourceBudget::for_local_tests();
+    tight_budget.max_open_files = RocksDbResourceBudget::MIN_MAX_OPEN_FILES;
+    let tight_verifier = open_verifier_with_budget(&temporary, "verifier-tight", tight_budget)?;
+    let open = &tight_verifier.secondary.bounded_open;
+    let cache_before_verify = open.block_cache.get_usage();
+    let verification = tight_verifier.verify_tree_state_checkpoints(
+        BlockHeight::new(0),
+        rows(1_000)?,
+        &activations,
+    )?;
+    assert_eq!(verification.mismatch, None);
+    assert_eq!(verification.verified_rows, SETTLED_ROWS);
+    assert_eq!(
+        open.block_cache.get_usage(),
+        cache_before_verify,
+        "verifying checkpoints and block headers must bypass the block cache"
+    );
+    let tight_table_reader_bytes = open.instance_memory().table_reader_bytes;
+
+    let mut wide_budget = RocksDbResourceBudget::for_local_tests();
+    wide_budget.max_open_files = 512;
+    let wide_verifier = open_verifier_with_budget(&temporary, "verifier-wide", wide_budget)?;
+    let wide_verification = wide_verifier.verify_tree_state_checkpoints(
+        BlockHeight::new(0),
+        rows(1_000)?,
+        &activations,
+    )?;
+    assert_eq!(wide_verification.mismatch, None);
+    let wide_table_reader_bytes = wide_verifier
+        .secondary
+        .bounded_open
+        .instance_memory()
+        .table_reader_bytes;
+    assert!(
+        tight_table_reader_bytes < wide_table_reader_bytes,
+        "max_open_files must bound table-reader memory for uncached verification families \
+         (tight={tight_table_reader_bytes}, wide={wide_table_reader_bytes})"
+    );
+    Ok(())
+}
+
 /// A table file the primary deleted under a secondary is not damage.
 ///
 /// The verification stops with an error that keeps the rows it already
@@ -607,14 +694,27 @@ fn densified_store(
 fn open_verifier(
     temporary: &TempDir,
 ) -> Result<RocksDbTreeStateVerifier, Box<dyn std::error::Error>> {
+    open_verifier_with_budget(
+        temporary,
+        "verifier",
+        RocksDbResourceBudget::for_local_tests(),
+    )
+}
+
+/// Opens a verifier on the store `densified_store` published in `temporary`
+/// with a custom secondary directory name and resource budget.
+fn open_verifier_with_budget(
+    temporary: &TempDir,
+    secondary_dir: &str,
+    resource_budget: RocksDbResourceBudget,
+) -> Result<RocksDbTreeStateVerifier, Box<dyn std::error::Error>> {
     Ok(RocksDbTreeStateVerifier::open_ready(
         temporary.path().join("canonical"),
-        temporary.path().join("verifier"),
+        temporary.path().join(secondary_dir),
         &activations()?,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
-        RocksDbResourceBudget::for_local_tests(),
+        resource_budget,
     )?)
 }
 

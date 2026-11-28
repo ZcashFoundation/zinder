@@ -48,8 +48,7 @@ pub(crate) enum SourceRecoveryDecision {
     /// continue the loop.
     Recover {
         /// Operator-actionable narrative for the readiness payload. The
-        /// caller is responsible for combining this with the current
-        /// outage window (see [`detail_for_ongoing_outage`]).
+        /// caller combines this with the current outage through [`SourceOutage::record`].
         failure_class: SourceFailureClass,
         /// Sanitized failure reason. Bounded in length by
         /// [`READINESS_REASON_MAX_BYTES`].
@@ -74,7 +73,8 @@ pub(crate) enum SourceRecoveryDecision {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SourceRecoveryBackoff {
     /// Backoff applied when the upstream node is unreachable
-    /// ([`SourceFailureClass::NodeUnreachable`]).
+    /// ([`SourceFailureClass::NodeUnreachable`]) or refused the request
+    /// with HTTP 429 ([`SourceFailureClass::NodeRateLimited`]).
     pub node_unreachable: Duration,
     /// Backoff applied when the upstream view changed under us
     /// ([`SourceFailureClass::UpstreamViewChanged`]).
@@ -123,7 +123,9 @@ impl SourceRecoveryBackoff {
     )]
     pub(crate) fn for_class(self, class: SourceFailureClass) -> Duration {
         match class {
-            SourceFailureClass::NodeUnreachable => self.node_unreachable,
+            SourceFailureClass::NodeUnreachable | SourceFailureClass::NodeRateLimited => {
+                self.node_unreachable
+            }
             SourceFailureClass::UpstreamViewChanged => self.view_changed,
             SourceFailureClass::StreamDisconnected => self.stream_disconnected,
             _ => self.operator_action,
@@ -191,31 +193,48 @@ pub(crate) fn decide_recovery(
     }
 }
 
-/// Produces a [`NodeUnavailableDetail`] for the first iteration of a new
-/// outage from the supplied recovery decision.
-///
-/// `class` and `last_reason` come from the decision the loop just made;
-/// the iteration counter starts at one and `outage_seconds` is zero.
-#[must_use]
-pub(crate) fn detail_for_new_outage(
-    failure_class: SourceFailureClass,
-    last_reason: Cow<'static, str>,
-) -> NodeUnavailableDetail {
-    NodeUnavailableDetail::first_iteration(failure_class.label(), last_reason)
+/// The source outage in progress, counted per failure class so a switch
+/// threshold for one class never counts another.
+pub(crate) struct SourceOutage {
+    started_at: std::time::Instant,
+    pub(crate) detail: NodeUnavailableDetail,
+    pub(crate) failure_class: SourceFailureClass,
+    pub(crate) consecutive_same_class: u32,
 }
 
-/// Extends an outage with the latest recovery decision and elapsed time.
-#[must_use]
-pub(crate) fn detail_for_ongoing_outage(
-    previous: &NodeUnavailableDetail,
-    failure_class: SourceFailureClass,
-    last_reason: Cow<'static, str>,
-    outage_seconds: u32,
-) -> NodeUnavailableDetail {
-    NodeUnavailableDetail::extend_with(previous, failure_class.label(), last_reason, outage_seconds)
+impl SourceOutage {
+    pub(crate) fn record(
+        previous: Option<Self>,
+        failure_class: SourceFailureClass,
+        last_reason: Cow<'static, str>,
+    ) -> Self {
+        match previous {
+            None => Self {
+                started_at: std::time::Instant::now(),
+                detail: NodeUnavailableDetail::first_iteration(failure_class.label(), last_reason),
+                failure_class,
+                consecutive_same_class: 1,
+            },
+            Some(previous) => Self {
+                detail: NodeUnavailableDetail::extend_with(
+                    &previous.detail,
+                    failure_class.label(),
+                    last_reason,
+                    u32::try_from(previous.started_at.elapsed().as_secs()).unwrap_or(u32::MAX),
+                ),
+                consecutive_same_class: if previous.failure_class == failure_class {
+                    previous.consecutive_same_class.saturating_add(1)
+                } else {
+                    1
+                },
+                started_at: previous.started_at,
+                failure_class,
+            },
+        }
+    }
 }
 
-fn sanitize_reason(error: &SourceError) -> Cow<'static, str> {
+pub(crate) fn sanitize_reason(error: &SourceError) -> Cow<'static, str> {
     Cow::Owned(truncate_reason(&error.to_string()))
 }
 
@@ -362,6 +381,10 @@ mod tests {
             "node_unreachable"
         );
         assert_eq!(
+            SourceFailureClass::NodeRateLimited.label(),
+            "node_rate_limited"
+        );
+        assert_eq!(
             SourceFailureClass::UpstreamViewChanged.label(),
             "upstream_view_changed"
         );
@@ -379,6 +402,30 @@ mod tests {
         );
         assert_eq!(SourceFailureClass::Malformed.label(), "malformed");
         assert_eq!(SourceFailureClass::Configuration.label(), "configuration");
+    }
+
+    #[test]
+    fn rate_limited_node_backs_off_like_an_unreachable_node() {
+        let backoff = SourceRecoveryBackoff {
+            node_unreachable: std::time::Duration::from_secs(2),
+            view_changed: std::time::Duration::from_millis(250),
+            stream_disconnected: std::time::Duration::from_secs(3),
+            operator_action: std::time::Duration::from_secs(10),
+            retry_exhausted: std::time::Duration::from_secs(2),
+        };
+        let error = IngestError::Source(SourceError::NodeRateLimited {
+            operation: "getblock",
+        });
+        let SourceRecoveryDecision::Recover {
+            failure_class,
+            backoff: chosen,
+            ..
+        } = decide_recovery(&error, backoff)
+        else {
+            unreachable!("a rate-limited node must be recoverable")
+        };
+        assert_eq!(failure_class, SourceFailureClass::NodeRateLimited);
+        assert_eq!(chosen, backoff.node_unreachable);
     }
 
     #[test]

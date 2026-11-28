@@ -47,15 +47,20 @@ rpc() {
     "$rpc_url"
 }
 
+# Native Windows jq can write CRLF even inside a Bash pipeline.
+jq_lf() {
+  jq "$@" | tr -d '\r'
+}
+
 # Prints the result of a JSON-RPC call, or exits with the node's response.
 rpc_result() {
   local response
   response="$(rpc "$1" "$2")" || true
-  if ! jq -e 'has("result") and .error == null' <<<"$response" >/dev/null 2>&1; then
+  if ! jq_lf -e 'has("result") and .error == null' <<<"$response" >/dev/null 2>&1; then
     echo >&2 "node $1 failed: ${response:-no response}"
     exit 1
   fi
-  jq -c '.result' <<<"$response"
+  jq_lf -c '.result' <<<"$response"
 }
 
 # Exits unless every shielded commitment tree holds notes at the end of the
@@ -63,7 +68,7 @@ rpc_result() {
 require_shielded_prefix() {
   local block sizes sapling orchard ironwood
   block="$(rpc_result getblock "[\"${shielded_prefix_blocks}\",1]")"
-  sizes="$(jq -r '[.trees.sapling.size // 0, .trees.orchard.size // 0, .trees.ironwood.size // 0] | @tsv' <<<"$block")"
+  sizes="$(jq_lf -r '[.trees.sapling.size // 0, .trees.orchard.size // 0, .trees.ironwood.size // 0] | @tsv' <<<"$block")"
   read -r sapling orchard ironwood <<<"$sizes"
   if [[ "$sapling" -eq 0 || "$orchard" -eq 0 || "$ironwood" -eq 0 ]]; then
     echo >&2 "shielded prefix is incomplete at height ${shielded_prefix_blocks}: Sapling ${sapling}, Orchard ${orchard}, Ironwood ${ironwood}"
@@ -75,7 +80,7 @@ require_shielded_prefix() {
 # Zebra answers RPC before it commits the genesis block, and getblockcount
 # fails with "No blocks in state" until it does.
 for _ in $(seq 1 60); do
-  if rpc getblockcount '[]' | jq -e '.result != null and .error == null' >/dev/null 2>&1; then
+  if rpc getblockcount '[]' | jq_lf -e '.result != null and .error == null' >/dev/null 2>&1; then
     break
   fi
   sleep 2
@@ -84,9 +89,9 @@ done
 tip="$(rpc_result getblockcount '[]')"
 if [[ "$tip" -eq 0 ]]; then
   response="$(rpc generatetoaddress "[${shielded_prefix_blocks},\"${shielded_miner_address}\"]")" || true
-  if jq -e ".error.code == ${json_rpc_method_not_found}" <<<"$response" >/dev/null 2>&1; then
+  if jq_lf -e ".error.code == ${json_rpc_method_not_found}" <<<"$response" >/dev/null 2>&1; then
     echo "node has no generatetoaddress; mining every block to its configured miner address"
-  elif jq -e 'has("result") and .error == null' <<<"$response" >/dev/null 2>&1; then
+  elif jq_lf -e 'has("result") and .error == null' <<<"$response" >/dev/null 2>&1; then
     require_shielded_prefix
   else
     echo >&2 "node generatetoaddress failed: ${response:-no response}"

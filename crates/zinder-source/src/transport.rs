@@ -17,6 +17,8 @@
 //! See [ADR-0007](../../../docs/adrs/0007-node-failure-recovery-and-transport-policy.md)
 //! for the boundary and policy decisions this module enforces.
 
+mod batch_ids;
+
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
@@ -26,13 +28,16 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures_util::future::BoxFuture;
-use jsonrpsee::http_client::{HeaderMap, HttpClient, HttpClientBuilder};
+use jsonrpsee::http_client::{HeaderMap, HttpClient, HttpClientBuilder, RpcServiceBuilder};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+use secrecy::ExposeSecret as _;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use crate::{NodeIndexerTls, SourceError, SourceFailureClass, ZebraIndexerSourceTarget};
+use crate::{
+    IndexerTlsMaterial, NodeIndexerTls, SourceError, SourceFailureClass, ZebraIndexerSourceTarget,
+};
 
 /// Consecutive transport-class failures that trigger a
 /// [`ResilientClient`] rebuild.
@@ -115,13 +120,38 @@ pub fn build_zebra_json_rpc_client(
     max_response_bytes: NonZeroU64,
     headers: HeaderMap,
 ) -> Result<HttpClient, ZebraTransportError> {
+    zebra_json_rpc_client_builder(request_timeout, max_response_bytes, headers)
+        .build(json_rpc_addr)
+        .map_err(|error| ZebraTransportError::ClientBuildFailed(error.to_string()))
+}
+
+pub(crate) type ZebraSourceClient = HttpClient<batch_ids::CheckBatchIds>;
+
+pub(crate) fn build_zebra_source_client(
+    json_rpc_addr: &str,
+    request_timeout: Duration,
+    max_response_bytes: NonZeroU64,
+    headers: HeaderMap,
+) -> Result<ZebraSourceClient, ZebraTransportError> {
+    let middleware = RpcServiceBuilder::new()
+        .layer_fn(batch_ids::CheckBatchIds)
+        .rpc_logger(1024);
+    zebra_json_rpc_client_builder(request_timeout, max_response_bytes, headers)
+        .set_rpc_middleware(middleware)
+        .build(json_rpc_addr)
+        .map_err(|error| ZebraTransportError::ClientBuildFailed(error.to_string()))
+}
+
+fn zebra_json_rpc_client_builder(
+    request_timeout: Duration,
+    max_response_bytes: NonZeroU64,
+    headers: HeaderMap,
+) -> HttpClientBuilder {
     let max_response_size = u32::try_from(max_response_bytes.get()).unwrap_or(u32::MAX);
     HttpClientBuilder::default()
         .request_timeout(request_timeout)
         .max_response_size(max_response_size)
         .set_headers(headers)
-        .build(json_rpc_addr)
-        .map_err(|error| ZebraTransportError::ClientBuildFailed(error.to_string()))
 }
 
 /// Runtime options for [`connect_zebra_indexer_channel`].
@@ -153,6 +183,20 @@ pub async fn connect_zebra_indexer_channel(
         .connect()
         .await
         .map_err(|error| ZebraTransportError::ConnectFailed(transport_error_chain(&error)))
+}
+
+/// Builds a lazily connecting HTTP/2 channel to a Zebra Indexer endpoint.
+///
+/// Validates the URI and loads any configured `https://` TLS material
+/// eagerly while deferring TCP/TLS handshakes until the first RPC, matching
+/// [`build_zebra_json_rpc_client`](crate::build_zebra_json_rpc_client) so
+/// startup failover sets can construct endpoints that are temporarily
+/// unreachable.
+pub fn connect_zebra_indexer_channel_lazy(
+    target: &ZebraIndexerSourceTarget,
+    options: ZebraIndexerChannelOptions,
+) -> Result<Channel, ZebraTransportError> {
+    Ok(zebra_indexer_endpoint(target, options)?.connect_lazy())
 }
 
 /// Checks that an indexer channel to `target` can be built, without
@@ -209,16 +253,16 @@ fn zebra_indexer_tls_config(
     handshake_timeout: Duration,
 ) -> Result<ClientTlsConfig, ZebraTransportError> {
     let mut config = ClientTlsConfig::new().timeout(handshake_timeout);
-    config = match tls.and_then(|tls| tls.ca_cert_path.as_deref()) {
-        Some(ca_cert_path) => config.ca_certificate(Certificate::from_pem(read_pem_certificates(
-            ca_cert_path,
+    config = match tls.and_then(|tls| tls.ca_cert.as_ref()) {
+        Some(ca_cert) => config.ca_certificate(Certificate::from_pem(load_pem_certificates(
+            ca_cert,
             "CA certificate",
         )?)),
         None => config.with_native_roots(),
     };
     if let Some(identity) = tls.and_then(|tls| tls.client_identity.as_ref()) {
-        let cert_chain = read_pem_certificates(&identity.cert_path, "client certificate")?;
-        let key = read_pem_private_key(&identity.key_path)?;
+        let cert_chain = load_pem_certificates(&identity.cert, "client certificate")?;
+        let key = load_pem_private_key(&identity.key)?;
         config = config.identity(Identity::from_pem(cert_chain, key));
     }
     if let Some(server_name) = tls.and_then(|tls| tls.server_name.as_ref()) {
@@ -227,39 +271,68 @@ fn zebra_indexer_tls_config(
     Ok(config)
 }
 
-/// Reads a PEM file that must hold at least one certificate.
+/// Reads and validates a PEM certificate chain from file or inline material.
 ///
-/// tonic skips unparsable entries, so a file without certificates would
+/// tonic skips unparsable entries, so material without certificates would
 /// otherwise yield an empty trust store or chain without an error.
-fn read_pem_certificates(path: &Path, role: &'static str) -> Result<Vec<u8>, ZebraTransportError> {
-    let pem = read_tls_file(path, role)?;
-    let mut certificate_count = 0_usize;
-    for certificate in CertificateDer::pem_slice_iter(&pem) {
-        certificate.map_err(|error| tls_material_unreadable(path, role, error.to_string()))?;
-        certificate_count = certificate_count.saturating_add(1);
-    }
-    if certificate_count == 0 {
-        return Err(tls_material_unreadable(
-            path,
-            role,
-            "contains no PEM certificate",
-        ));
-    }
+fn load_pem_certificates(
+    material: &IndexerTlsMaterial,
+    role: &'static str,
+) -> Result<Vec<u8>, ZebraTransportError> {
+    let pem = match material {
+        IndexerTlsMaterial::File(path) => read_tls_file(path, role)?,
+        IndexerTlsMaterial::Inline(secret) => secret.expose_secret().as_bytes().to_vec(),
+    };
+    validate_pem_certificates(&pem).map_err(|reason| tls_material_error(material, role, reason))?;
     Ok(pem)
 }
 
-fn read_pem_private_key(path: &Path) -> Result<Vec<u8>, ZebraTransportError> {
+fn load_pem_private_key(material: &IndexerTlsMaterial) -> Result<Vec<u8>, ZebraTransportError> {
     const ROLE: &str = "client key";
-    let pem = read_tls_file(path, ROLE)?;
-    PrivateKeyDer::from_pem_slice(&pem).map_err(|error| {
-        let reason = if matches!(error, rustls_pki_types::pem::Error::NoItemsFound) {
-            "contains no PEM private key".to_owned()
-        } else {
-            error.to_string()
-        };
-        tls_material_unreadable(path, ROLE, reason)
-    })?;
+    let pem = match material {
+        IndexerTlsMaterial::File(path) => read_tls_file(path, ROLE)?,
+        IndexerTlsMaterial::Inline(secret) => secret.expose_secret().as_bytes().to_vec(),
+    };
+    validate_pem_private_key(&pem).map_err(|reason| tls_material_error(material, ROLE, reason))?;
     Ok(pem)
+}
+
+fn validate_pem_certificates(pem: &[u8]) -> Result<(), String> {
+    let mut certificate_count = 0_usize;
+    for certificate in CertificateDer::pem_slice_iter(pem) {
+        certificate.map_err(|error| error.to_string())?;
+        certificate_count = certificate_count.saturating_add(1);
+    }
+    if certificate_count == 0 {
+        return Err("contains no PEM certificate".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_pem_private_key(pem: &[u8]) -> Result<(), String> {
+    PrivateKeyDer::from_pem_slice(pem)
+        .map(|_| ())
+        .map_err(|error| {
+            if matches!(error, rustls_pki_types::pem::Error::NoItemsFound) {
+                "contains no PEM private key".to_owned()
+            } else {
+                error.to_string()
+            }
+        })
+}
+
+fn tls_material_error(
+    material: &IndexerTlsMaterial,
+    role: &'static str,
+    reason: impl Into<String>,
+) -> ZebraTransportError {
+    match material {
+        IndexerTlsMaterial::File(path) => tls_material_unreadable(path, role, reason),
+        IndexerTlsMaterial::Inline(_) => ZebraTransportError::TlsConfigRejected(format!(
+            "indexer TLS inline {role} is unusable: {}",
+            reason.into()
+        )),
+    }
 }
 
 fn read_tls_file(path: &Path, role: &'static str) -> Result<Vec<u8>, ZebraTransportError> {
@@ -495,9 +568,11 @@ where
 /// [`SourceFailureClass::NodeUnreachable`] (transport-level connect or
 /// dispatch failure on the JSON-RPC client) or
 /// [`SourceFailureClass::StreamDisconnected`] (gRPC stream torn down).
-/// Everything else (`UpstreamViewChanged`, `CapabilityMissing`,
-/// `ProtocolMismatch`, `Malformed`, `Configuration`) is application
-/// state and must not trigger reconnects.
+/// Everything else (`NodeRateLimited`, `UpstreamViewChanged`,
+/// `CapabilityMissing`, `ProtocolMismatch`, `Malformed`, `Configuration`)
+/// is application state and must not trigger reconnects. An HTTP 429 in
+/// particular proves the wire works: rebuilding the client would open new
+/// connections to a node that is refusing them for having too many.
 #[must_use]
 pub fn is_transport_failure(error: &SourceError) -> bool {
     matches!(
@@ -649,6 +724,32 @@ mod resilient_client_tests {
             }
         ));
         assert!(!is_transport_failure(&non_transport_failure()));
+        assert!(!is_transport_failure(&rate_limited()));
+    }
+
+    fn rate_limited() -> SourceError {
+        SourceError::NodeRateLimited {
+            operation: "getblock",
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limited_failures_never_rebuild() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let client = ResilientClient::new(
+            0_u32,
+            "test",
+            ZEBRA_REBUILD_THRESHOLD,
+            rebuilder_counting(Arc::clone(&invocations)),
+        );
+
+        for _ in 0..ZEBRA_REBUILD_THRESHOLD.get().saturating_mul(4) {
+            client.record_outcome::<()>(&Err(rate_limited()));
+        }
+        tokio::task::yield_now().await;
+
+        assert_eq!(invocations.load(Ordering::Relaxed), 0);
+        assert_eq!(*client.snapshot(), 0);
     }
 
     #[tokio::test]

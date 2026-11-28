@@ -26,7 +26,7 @@ const AUTH_TAG_LEN: usize = 32;
 
 /// Fixed byte length of a mempool-snapshot paging cursor: the 50-byte fixed
 /// body, a 32-byte anchor transaction id, and the auth tag.
-const SNAPSHOT_PAGE_CURSOR_LEN: usize = CURSOR_BODY_LEN + 32 + AUTH_TAG_LEN;
+pub const SNAPSHOT_PAGE_CURSOR_LEN: usize = CURSOR_BODY_LEN + 32 + AUTH_TAG_LEN;
 
 /// Maximum number of `(height, hash)` entries a chain-event cursor locator carries.
 ///
@@ -46,8 +46,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub enum ChainEventStreamFamily {
     /// Visible stream: every committed chain event, including reorg events.
     Visible,
-    /// Settled stream: only non-reorg commits entirely at or below the
-    /// settled tip.
+    /// A commit covering each newly settled block range, anchored at its settled tip.
     Settled,
 }
 

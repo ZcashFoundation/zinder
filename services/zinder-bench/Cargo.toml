@@ -22,11 +22,12 @@ metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 rust-rocksdb.workspace = true
-rustix = { workspace = true, features = ["time"] }
+rustix = { workspace = true, features = ["param", "time"] }
 rustls.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
@@ -36,6 +37,7 @@ tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zebra-chain.workspace = true
+zinder-compat-lightwalletd.workspace = true
 zinder-core.workspace = true
 zinder-materialized-views.workspace = true
 zinder-ingest.workspace = true
@@ -55,8 +57,6 @@ workspace = true
 eyre.workspace = true
 http.workspace = true
 rcgen.workspace = true
-tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "test-util", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "test-util", "time"] }
 tower.workspace = true
-zinder-compat-lightwalletd.workspace = true
 zinder-testkit.workspace = true

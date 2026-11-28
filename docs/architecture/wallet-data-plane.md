@@ -8,7 +8,7 @@ Zinder serves public chain data. Keys, trial decryption, note and account state,
 
 Zinder publishes the chain as a sequence of numbered, immutable snapshots called chain epochs. Each time ingest commits new blocks or a reorg, it creates a new epoch, and `zinder-query` starts serving it. An epoch names one visible tip, one settled tip, and the stored data that belongs to that chain.
 
-Every read answers from exactly one epoch. A unary response carries it in `chain_view.chain_epoch`. A range or transparent-address stream sends it once in a leading header message; `FullBlocksInRange` repeats it on every chunk. One response therefore never mixes data from two branches of a reorg.
+Each stored chain lookup answers from exactly one epoch. A unary response carries it in `chain_view.chain_epoch`. A range or transparent-address stream sends it once in a leading header message. `FullBlocksInRange` repeats it on every chunk. One response therefore never mixes data from two branches of a reorg.
 
 To make several reads agree, pin them to one epoch:
 
@@ -22,13 +22,13 @@ The settled tip is the height at or below which ingest never replaces a block. T
 
 ### How long an epoch stays readable
 
-A replaced epoch stays readable for one minute after a newer one replaces it, however many blocks arrive in that minute. A workflow that finishes within that minute completes across new blocks. After it, a pinned read fails with `FAILED_PRECONDITION` and `CHAIN_EPOCH_PIN_UNAVAILABLE`. The client takes a new snapshot and restarts the whole workflow, not only the failed read. `zinder-client` reports this as `IndexerError::ChainEpochPinUnavailable` with `RetryPolicy::RefreshChainEpoch`.
+A replaced epoch that a response exposed stays readable for the [configured epoch-pin retention window](../reference/configuration.md#environment-variables) after replacement. An epoch that no response exposed has nothing to pin, so the server releases it as soon as a newer one replaces it. `GetLatestBlock` and `GetLightdInfo` on the compatibility listener expose no epoch, so polling them never extends retention. A workflow that finishes within that window completes across new blocks. After it, a pinned read fails with `FAILED_PRECONDITION` and `CHAIN_EPOCH_PIN_UNAVAILABLE`. The client takes a new snapshot and restarts the whole workflow, not only the failed read. `zinder-client` reports this as `IndexerError::ChainEpochPinUnavailable` with `RetryPolicy::RefreshChainEpoch`.
 
 A retained epoch still answers after a reorg replaces its blocks, because a pin promises that epoch's view, not the current best chain.
 
-`TransparentAddressUnspentOutputs`, `CompactBlocksInRange`, and `FullBlocksInRange` hold their epoch across many storage reads. If one of these streams is still running 30 seconds after its epoch leaves retention, the server ends it with `CHAIN_EPOCH_PIN_UNAVAILABLE` after the items it already sent. Those items are not a complete answer. Discard them and read again at a newer epoch. Every other read is one bounded storage read and finishes on its own.
+`TransparentAddressUnspentOutputs`, `TransparentAddressesUnspentOutputs`, `CompactBlocksInRange`, `CompactNullifiersInRange`, and `FullBlocksInRange` hold their epoch across many storage reads. If one of these streams is still running 30 seconds after its epoch leaves retention, the server ends it with `CHAIN_EPOCH_PIN_UNAVAILABLE` after the items it already sent. Those items are not a complete answer. Discard them and read again at a newer epoch. Every other read is one bounded storage read and finishes on its own.
 
-A reader keeps at most three replaced epochs open. While retained epochs and slow streams hold all of them, it postpones publishing new blocks. Together they delay a new block by at most about 90 seconds.
+A reader keeps at most three replaced epochs open. While retained epochs and slow streams hold all of them, it postpones publishing new blocks. After the last retained epoch expires, streams have up to 30 seconds to release their read views. All generations share the configured block cache for each store. The [storage backend](storage-backend.md#how-readers-pin-a-consistent-view) describes the per-generation memory. A burst of blocks that no workflow reads by epoch does not wait on retention.
 
 ## Methods
 
@@ -38,8 +38,9 @@ The service advertises a method's capability string only when this deployment ca
 | --- | --- | --- |
 | `VisibleTipBlock`, `SettledTipBlock` | Block identity at the visible or settled tip | Always |
 | `BlockIdBySelector` | Height and hash for a height or hash selector | Always |
-| `BlockHeaderBySelector` | Zinder header read model | Never |
+| `BlockHeaderBySelector` | Typed header at a height or hash | Always |
 | `CompactBlock`, `CompactBlocksInRange` | Compact blocks | Always |
+| `CompactNullifiersInRange` | Shielded nullifiers per block | Always |
 | `FullBlock`, `FullBlocksInRange` | Consensus-serialized blocks | Ingest retains block blobs (`storage.raw_blob_policy = "all"`) |
 | `TreeStateAtHeight`, `LatestTreeStateCheckpoint` | Sapling, Orchard, and Ironwood tree states | Always |
 | `SubtreeRoots` | Completed shielded subtree roots | Always |
@@ -47,10 +48,12 @@ The service advertises a method's capability string only when this deployment ca
 | `Transaction` | Mined or mempool status of one transaction | Always; mined bytes need transaction retention |
 | `ChainEvents` | Replayable chain events | Always |
 | `MempoolSnapshot`, `MempoolEvents` | Live mempool contents and changes | Always |
-| `TransparentAddressUnspentOutputs` | Unspent outputs of one transparent address | Always |
+| `TransparentAddressUnspentOutputs`, `TransparentAddressesUnspentOutputs` | Unspent outputs of one or more transparent addresses | Always |
+| `TransparentAddressBalances` | Confirmed balance across transparent addresses | Always |
 | `TransparentAddressTxIdsInRange` | Transaction ids that touch one transparent address | Always |
 | `TransparentOutpointSpendStatus` | Spend status of up to 1,024 outpoints | Always |
 | `ChainValuePoolsAtTip` | Chain value-pool totals | Never |
+| `StandardFee` | Recommended marginal fee and estimator version | A `[node]` endpoint is configured |
 | `BroadcastTransaction` | Typed broadcast outcome | A `[node]` endpoint is configured |
 | `ServerInfo` | Network, contract revision, capabilities, broadcast node | Always, not gated |
 
@@ -58,26 +61,28 @@ The service advertises a method's capability string only when this deployment ca
 
 ## Compact blocks
 
-`CompactBlock(height, at_epoch_id)` returns one stored compact block. `CompactBlocksInRange(start_height, end_height, at_epoch_id)` streams an inclusive ascending range of at most 1,000 blocks: first one header message (`body.header`) with the `ChainView` that answers the whole range, then one `CompactBlock` per height (`body.item`). The server reads about 2 MiB of stored blocks at a time and queues at most 16 blocks beyond that read, so a slow client does not make it hold the whole range. A range outside retained history or an unavailable epoch pin fails before the header. One process serves at most 100 of these streams at once and refuses more with `RESOURCE_EXHAUSTED` and `COMPACT_BLOCK_STREAM_LIMIT_REACHED`; retry after a short delay. A stream the client cancels or drops keeps its place until the read it has already started ends.
+`CompactBlock(height, at_epoch_id)` returns one stored compact block. `CompactBlocksInRange(start_height, end_height, at_epoch_id)` streams at most 1,000 blocks from the first endpoint through the last: first one header message (`body.header`) with the `ChainView` that answers the whole range, then one `CompactBlock` per height (`body.item`). The server reads about 2 MiB of stored blocks at a time and queues at most 16 blocks beyond that read, so a slow client does not make it hold the whole range. A range outside retained history or an unavailable epoch pin fails before the header. One process serves at most 100 of these streams at once and refuses more with `RESOURCE_EXHAUSTED` and `COMPACT_BLOCK_STREAM_LIMIT_REACHED`; retry after a short delay. A stream the client cancels or drops keeps its place until the read it has already started ends.
 
-Ingest builds compact blocks when it commits a block. Query never fetches a block from the node or builds one on demand.
+Set `start_height` above `end_height` to scan from newest to oldest. With `pool_types`, each block carries only the selected Sapling, Orchard, Ironwood, or transparent scan fields and transactions that contribute those fields. The chain metadata still gives the full block's commitment-tree sizes. An empty selection includes every pool. Check the [range capability](../reference/capabilities.md) before sending descending endpoints or a pool selection.
+
+Use `CompactNullifiersInRange` for spend detection without downloading note commitments, ciphertexts, or transparent fields. Each block carries its identity and the selected shielded nullifiers in transaction order. The server reads those nullifiers from canonical `ZSHRNG02` settled segments and the live tail. Both range methods share the same stream admission limit.
 
 | Condition | Status and reason |
 | --- | --- |
 | Range wider than 1,000 blocks | `INVALID_ARGUMENT`, `BLOCK_RANGE_TOO_LARGE` |
-| Start above end | `INVALID_ARGUMENT`, `INVALID_BLOCK_RANGE` |
+| More than four pool entries, an unknown pool, or transparent selected for a nullifier scan | `INVALID_ARGUMENT` |
 | Height above the visible tip or below the retained history | `NOT_FOUND`, `ARTIFACT_UNAVAILABLE` naming the first missing height |
 | Block missing inside retained history | `UNAVAILABLE`, `STORAGE_UNAVAILABLE` (store damage) |
 
 Canonical history never contains height 0. A complete store retains blocks from height 1.
 
-`zinder-client` validates the range stream. It fails with `IndexerError::MalformedResponse` when the server sends a block before the header, a second header, no header, a header for another network or another pinned epoch, a skipped, repeated, or extra height, a short stream, or a block above the header's visible tip. The client requires contract revision 8 or later and refuses an older server.
+`zinder-client` validates the range stream. It fails with `IndexerError::MalformedResponse` when the server sends a block before the header, a second header, no header, a header for another network or another pinned epoch, a skipped, repeated, or extra height, a short stream, or a block above the header's visible tip. The client requires contract revision 8 or later. Use `ChainSnapshot::scan_compact_blocks` to select pools or scan descending, and `ChainSnapshot::scan_compact_nullifiers` for spends. The remote SDK checks the endpoint's exact capability before it requests either extension.
 
 ## Full blocks
 
 `FullBlock(height, at_epoch_id)` returns one consensus-serialized block. `FullBlocksInRange(start_height, end_height, at_epoch_id)` streams an inclusive range of at most 1,000 blocks and repeats the `ChainView` on every chunk. The server reads 16 blocks at a time and buffers at most 4 chunks, so a slow client does not make it hold the whole range.
 
-Full blocks exist only when ingest writes block blobs, which requires `storage.raw_blob_policy = "all"`. Under `none` or `transactions` the methods are not advertised. A missing block inside an `all` store returns `NOT_FOUND` with `ARTIFACT_UNAVAILABLE`. Changing an existing store to `all` requires a rebuilt store.
+Full blocks exist only when ingest writes raw block segments, which requires `storage.raw_blob_policy = "all"` (`storage.full_blocks = true`). Under `none` the methods are not advertised. A missing block inside an `all` store returns `NOT_FOUND` with `ARTIFACT_UNAVAILABLE`. Changing an existing store to `all` requires a rebuilt store.
 
 ## Block identity and tips
 
@@ -85,27 +90,35 @@ Full blocks exist only when ingest writes block blobs, which requires `storage.r
 
 `BlockIdBySelector` resolves a height or a block hash against the best chain of the answering epoch. A hash that is unknown or belongs to a displaced block returns `NOT_FOUND` with `BLOCK_NOT_IN_BEST_CHAIN`. So does a height above the visible tip. A hash never resolves to the replacement block at the same height.
 
-`BlockHeaderBySelector` is in the protocol but never advertised. Its `BlockHeader` message omits the Equihash solution, so it is not a complete header. A client that needs the full header reads a full block and decodes it.
+`BlockHeaderBySelector` resolves a height or hash against the canonical best chain in the request's epoch. For the header fields and how to get the consensus-serialized header, see [Capabilities](../reference/capabilities.md#wallet-capabilities).
 
 ## Tree states and subtree roots
 
 `TreeStateAtHeight(height, at_epoch_id)` returns the Sapling, Orchard, and Ironwood note commitment tree states after the block at exactly `height`. The response height always equals the requested height. The server never asks the node.
 
-Ingest stores a tree-state checkpoint every 100 blocks during a first sync, at the tip where that sync ends, and at every block it appends afterwards. While following, it adds checkpoints to settled history from the first sync: by default one for every block, or one each time 1,024 note commitments have accumulated when `ingest.tree_state_densification.selection` is `commitment-budget`, as [Chain ingestion](chain-ingestion.md#tree-state-densification) describes. A height with a checkpoint is read directly: the stored frontier bytes are served as written, with only their framing checked, no hashing, and the stored roots left unread. Every checkpoint is validated when it is written: each frontier is a canonical encoding, derives its stored root, and belongs to the pool it is stored for. The bytes and root cannot show that last binding on their own, because every empty tree encodes as the same bytes and Orchard and Ironwood trees share a hash function. RocksDB block checksums detect corruption at rest, and ingest checks every settled row again in the background, as [Chain ingestion](chain-ingestion.md#tree-state-verification) describes. Any other height is rebuilt from the nearest checkpoint below it and the stored compact blocks in between, which replays at most 99 blocks. A rebuild parses that seed checkpoint in full and re-derives its roots before it appends to it.
+A wallet-serving first sync stores a tree-state checkpoint at every height by default, so reads at every constructed height use a stored checkpoint as soon as the store reaches READY. Explorer and `explicit` coverage default to sparse construction, which stores one every 100 blocks and at the build tip. Live following stores one per block, and the background pass fills missing settled checkpoints according to the selected policy. [Chain ingestion](chain-ingestion.md#tree-state-densification) describes the settings and tradeoff.
+
+A height with a checkpoint is read directly: the stored frontier bytes are served as written, with only their framing checked, no hashing, and the stored roots left unread. Every checkpoint is validated when it is written: each frontier is a canonical encoding, derives its stored root, and belongs to the pool it is stored for. The bytes and root cannot show that last binding on their own, because every empty tree encodes as the same bytes and Orchard and Ironwood trees share a hash function. RocksDB block checksums detect corruption at rest, and ingest checks every settled row again in the background, as [Chain ingestion](chain-ingestion.md#tree-state-verification) describes. Any other height is rebuilt from the nearest checkpoint below it and the stored compact blocks in between, which replays at most 99 blocks. A rebuild parses that seed checkpoint in full and re-derives its roots before it appends to it.
+
+Two reads that replay the same number of blocks can use different amounts of CPU. Each shielded note commitment updates its pool's Merkle tree, so blocks with more commitments take more hashing. Before serving the result, the reader decodes each canonical frontier and compares its position, leaf, and other frontier nodes with the tree it just rebuilt. Wallet responses carry only the frontier bytes, so this check requires no final root computation. Concurrent requests for the same height on one reader generation can share this work, including verification of the seed checkpoint. A replacement reader rebuilds against its own storage. The reader can also reuse up to 1,024 settled answers within an 8 MiB budget via a settled-chain LRU cache that survives tip appends with one canonical header check on settled-tip advance and resets on forks, schedule revisions, or retention changes.
 
 The query hands each tree state to its adapters as typed per-pool frontier bytes. Native `TreeStateAtHeight` and `LatestTreeStateCheckpoint` encode them as the `z_gettreestate`-shaped JSON `payload_bytes`, with an entry only for each pool active at that height. The lightwalletd adapter hex-encodes the same bytes into its per-pool strings and returns an empty string for an inactive pool.
 
 | Condition | Status and reason |
 | --- | --- |
 | Height above the visible tip, or below the parent of the store's first retained block | `NOT_FOUND`, `BLOCK_NOT_IN_BEST_CHAIN` |
-| A rebuild is needed, the query already runs one rebuild per available CPU, and no slot frees within the wait or every waiting place is taken | `RESOURCE_EXHAUSTED`, `TREE_STATE_REPLAY_LIMIT_REACHED` |
+| A request needs reconstruction and its admission deadline expires, or every waiting place is taken | `RESOURCE_EXHAUSTED`, `TREE_STATE_REPLAY_LIMIT_REACHED` |
 | A seed checkpoint is missing, or replayed history does not link or reach the recorded tree sizes | `UNAVAILABLE`, `STORAGE_UNAVAILABLE` (store damage) |
 
-A height with a stored checkpoint is never refused for the rebuild limit and never waits for a slot. A rebuild that finds every slot taken waits for one, up to 2 seconds by default and at most 5 (`query.tree_state_replay_wait_ms` in `zinder-query`, `compat.tree_state_replay_wait_ms` in wallet-serving `zinder-compat-lightwalletd`). At most 64 requests wait per slot by default, and 1 to 256 when set (`query.tree_state_replay_waiters_per_slot` in `zinder-query`, `compat.tree_state_replay_waiters_per_slot` in wallet-serving `zinder-compat-lightwalletd`); a rebuild that finds every waiting place taken is refused at once. At a 30 ms rebuild, about the 99th percentile measured on Testnet, one slot serves 64 waiting requests in 1.92 s, inside the default wait, so a burst of a few hundred wallets waits instead of being refused. A request whose client goes away gives up its waiting place at once. A full rebuild in the densest history can take longer than 2 seconds, so expect some refusals there under load. Retry a refused request after a short delay. `zinder_query_tree_state_replay_refusals_total` counts refusals by reason.
+Stored checkpoints and settled cache hits bypass rebuild admission. Each process has one rebuild slot per available CPU. The default wait for a slot is 2 seconds, with a maximum setting of 5 seconds. The same deadline applies across reader replacements. Set `query.tree_state_replay_wait_ms` for native query or `compat.tree_state_replay_wait_ms` for wallet-serving lightwalletd.
+
+Up to 64 requests can wait per slot by default. A request joining an existing rebuild uses one waiting place, including while the rebuild is running. Set `query.tree_state_replay_waiters_per_slot` or `compat.tree_state_replay_waiters_per_slot` to a value from 1 to 256. A disconnect releases the caller's place. Other callers keep their place in the queue and can still receive the answer. When the last caller leaves, the worker can stop at its next cancellation check. The slot becomes available when the worker exits.
+
+At 30 ms per rebuild, about the 99th percentile measured on Testnet, one slot can process 64 distinct rebuilds in 1.92 seconds. A single rebuild in dense history can exceed the default 2-second wait. Retry a refused request after a short delay. `zinder_query_tree_state_replay_refusals_total` counts refusals by reason.
 
 `LatestTreeStateCheckpoint(at_epoch_id)` returns the newest stored checkpoint at or below the visible tip.
 
-`SubtreeRoots(shielded_protocol, start_index, max_entries, at_epoch_id)` returns completed subtree roots in ascending index order. `max_entries` must be 1 to 1,024. Zero fails with `INVALID_ARGUMENT`, and a larger value with `INVALID_ARGUMENT` and `SUBTREE_ROOT_RANGE_TOO_LARGE`. A start index at or past the number of completed subtrees returns an empty list. On a store whose history starts after a checkpoint, a root completed before that checkpoint returns `NOT_FOUND` with `ARTIFACT_UNAVAILABLE`. `root_hash` is raw bytes, not RPC-order hex.
+`SubtreeRoots(shielded_protocol, start_index, max_entries, at_epoch_id)` returns completed subtree roots in ascending index order. `max_entries` must be 1 to 1,024. Zero fails with `INVALID_ARGUMENT`, and a larger value with `INVALID_ARGUMENT` and `SUBTREE_ROOT_RANGE_TOO_LARGE`. A start index at or past the number of completed subtrees returns an empty list. A checkpointed store can serve roots from before its checkpoint when it has complete-prefix coverage. Requesting an earlier root that the store lacks returns `NOT_FOUND` with `ARTIFACT_UNAVAILABLE`. See [Schema admission](storage-backend.md#schema-admission). `root_hash` carries raw bytes.
 
 ## Network-upgrade schedule
 
@@ -115,10 +128,10 @@ A height with a stored checkpoint is never refused for the rebuild limit and nev
 
 `Transaction(transaction_id, at_epoch_id)` returns where a transaction is, as a `TransactionLocation` with one of two arms:
 
-- `mined`: block height, hash, and position; `chain_context` with the consensus branch id, block time, and confirmations computed against the answering epoch's visible tip; and `raw_transaction_bytes` when ingest retains transaction blobs (`raw_blob_policy` is `transactions` or `all`).
+- `mined`: block height, hash, and position; `chain_context` with the consensus branch id, block time, and confirmations computed against the answering epoch's visible tip; and `raw_transaction_bytes` when the server advertises `wallet.read.transaction_bytes_v1`. The server reads retained transaction blobs or retrieves the exact bytes from the verified cold-byte source and checks them against the indexed digest.
 - `in_mempool`: the live `MempoolEntry`, including raw bytes and transparent outputs and spends.
 
-Without `at_epoch_id`, the server reads the canonical chain first. On a miss, it asks the writer's live mempool through ingest control, with a 15-second timeout. With `at_epoch_id`, the lookup reads only that epoch's canonical chain and never the mempool. To learn whether a transaction is pending, make an unpinned lookup.
+Without `at_epoch_id`, the server reads the canonical chain first. On a miss, it asks the writer's live mempool through ingest control, with a 15-second timeout. With `at_epoch_id`, the lookup locates the transaction in that epoch's canonical chain and skips the mempool. To learn whether a transaction is pending, make an unpinned lookup.
 
 ### Absence
 
@@ -153,14 +166,15 @@ The writer, `zinder-ingest`, owns the live mempool view. `zinder-query` forwards
 
 `MempoolSnapshot(max_entries, from_cursor)` returns one page of the current mempool:
 
-- A page holds `max_entries` entries, at most 1,024. Zero means 256.
-- `next_cursor` is set when more entries remain. Pass it as `from_cursor` for the next page.
+- A page holds at most `max_entries` entries (clamped to 1,024; zero means 256) and at most 3.5 MiB (`3,670,016` bytes) of encoded protobuf response, staying within a default 4 MiB gRPC message limit.
+- `next_cursor` is set when more entries remain, whether bounded by `max_entries` or by the response byte budget. Pass it as `from_cursor` for the next page; a multi-page walk serves from the point-in-time mempool membership anchored when the walk began (retaining up to 64 concurrent multi-page walks for 30 seconds at the active chain epoch).
+- A single mempool entry whose one-entry response exceeds the 3.5 MiB budget fails with `UNAVAILABLE` and `UNSUPPORTED_WALLET_ENCODING`.
 - `source_tip` equals `chain_view.chain_epoch.visible_tip` by height and hash. When the chain tip moves, the writer waits up to five seconds for the mempool to catch up. A view still not coherent then fails with `CHAIN_EPOCH_PIN_UNAVAILABLE`. A view with no certified generation yet, or one being rebuilt, fails with `UNAVAILABLE`. The server never returns a stale or falsely empty page.
 - `snapshot_age_millis` is the time since the current mempool view was certified.
 - `events_resume_cursor` is the same on every page of one walk. Pass it as `after_cursor` to `MempoolEvents` to follow changes after the walk. Replay from it is at-least-once, so apply events idempotently. It is empty when the writer has applied no event yet; then subscribe with `earliest_retained`.
-- A tampered page cursor fails with `SNAPSHOT_PAGE_CURSOR_INVALID`. A cursor ahead of the writer's applied events fails with `SNAPSHOT_PAGE_CURSOR_EXPIRED`.
+- A tampered page cursor fails with `SNAPSHOT_PAGE_CURSOR_INVALID`. A cursor ahead of the writer's applied events, or one whose pinned multi-page snapshot is no longer retained after the writer's applied events moved on, fails with `SNAPSHOT_PAGE_CURSOR_EXPIRED`.
 
-`MempoolEvents(start)` streams `Added`, `Invalidated`, and `Mined` envelopes with cursors. `start` works as in `ChainEvents`. `Mined` carries the mined height and block hash as the node reported them. While the writer's mempool view hydrates or rebuilds, the stream replays retained events and then ends with `UNAVAILABLE` and `NODE_UNAVAILABLE`, so silence never looks like an unchanged mempool. Resubscribe from the last delivered cursor with backoff. The stream does not end on a new block; follow `ChainEvents` for tip changes.
+`MempoolEvents(start)` streams `Added`, `Invalidated`, and `Mined` envelopes with cursors. `start` works as in `ChainEvents`. `Mined` carries the mined height and block hash as the node reported them. A new block keeps the live stream open while the replacement mempool certifies, for up to 30 seconds. If the replacement misses that bound, or its node endpoint becomes inactive, snapshot and transaction reads return `NODE_UNAVAILABLE`. While the writer awaits a certified view, the stream replays retained events and then ends with `UNAVAILABLE` and `NODE_UNAVAILABLE`, so silence never looks like an unchanged mempool. Resubscribe from the last delivered cursor with backoff. Follow `ChainEvents` for tip changes.
 
 Mempool events are retained for 60 minutes after mining and 24 hours after invalidation by default. An expired cursor fails with `MEMPOOL_EVENT_CURSOR_EXPIRED`.
 
@@ -180,9 +194,14 @@ These reads come from the wallet store that `zinder-projector` writes. Its histo
 
 The server reads the set in pages of 1,024 outputs and reads the next page only when the client has taken the previous one. It holds at most three pages per stream. A client that stops reading stalls the storage reads. Cancelling the stream releases them. A stream ends without an error only after the address's last output.
 
+Use `TransparentAddressesUnspentOutputs` to read several addresses at one epoch. The request takes 1 to 256 selectors before deduplication. The stream groups outputs by the first occurrence of each distinct address. The same page buffer serves the entire batch.
+
 An in-process caller that opens many of these streams for one request can use `WalletQueryApi::transparent_address_unspent_outputs_on_demand` instead. It returns the same outputs in the same order at the same pinned epoch, but reads nothing until the stream is first polled and never reads ahead: it reads the next page only when the caller has taken every output of the previous one. The caller chooses the first page's size, at most 1,024 outputs, from how many streams it holds. Later pages double up to 1,024 as the caller consumes them, so such a stream holds at most the page its caller is reading, and a stream not yet polled holds none.
 
-The lightwalletd adapter's `GetAddressUtxos` and `GetAddressUtxosStream` merge uses these on-demand streams, one for each distinct address, as [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#getaddressutxos-and-getaddressutxosstream) describes.
+The compatibility adapter uses one on-demand stream per distinct address.
+`TransparentAddressUnspentOutputs::next_with_tx_index` advances that same stream
+and includes the persisted block-local transaction index. The adapter uses the
+index to order one height at a time for [height-complete pages](../reference/lightwalletd-compatibility.md#getaddressutxos-and-getaddressutxosstream).
 
 ### Transaction history
 
@@ -214,7 +233,11 @@ A request with no outpoints or more than 1,024 fails with `INVALID_ARGUMENT` and
 
 ### Balance
 
-The wallet store keeps a balance for each transparent address. The compatibility runtime serves those balances through the lightwalletd `GetTaddressBalance` methods, as [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md) describes. Native wallets sum the unspent outputs they read, because the native service has no balance method. Explorer clients use `ExplorerQuery.TransparentAddressActivity`.
+Call `TransparentAddressBalances` with 1 to 256 selectors to sum confirmed unspent balances at a single epoch. Duplicate addresses count once. The response gives the total in zatoshis and the number of distinct addresses. Explorer clients use `ExplorerQuery.TransparentAddressActivity` for address activity.
+
+## Standard fee
+
+`StandardFee` returns the upstream node's recommended [ZIP 317](https://zips.z.cash/zip-0317) fee per logical action and the estimator version. The server queries only verified nodes and tries a verified fallback when an earlier node is unavailable, rate-limited, or lacks the method. Estimator version zero identifies the static estimate.
 
 ## Value pools
 

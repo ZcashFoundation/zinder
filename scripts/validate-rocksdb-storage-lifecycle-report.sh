@@ -8,11 +8,11 @@ fail() {
 
 usage() {
   echo >&2 \
-    "usage: $0 REPORT RESOURCE_EVIDENCE EXPECTED_TIP EXPECTED_IMAGE EXPECTED_REVISION EXPECTED_TRIAL EXPECTED_NETWORK EXPECTED_CPU_LIMIT_CORES EXPECTED_MEMORY_LIMIT_BYTES EXPECTED_RUNNER_ID EXPECTED_STORAGE_CLASS"
+    "usage: $0 REPORT RESOURCE_EVIDENCE EXPECTED_TIP EXPECTED_IMAGE EXPECTED_REVISION EXPECTED_TRIAL EXPECTED_NETWORK EXPECTED_CPU_LIMIT_CORES EXPECTED_MEMORY_LIMIT_BYTES EXPECTED_RUNNER_ID EXPECTED_STORAGE_CLASS [EXPECTED_TREE_STATE_CHECKPOINT_COVERAGE] [EXPECTED_CANONICAL_PUBLICATION_MODE]"
   exit 2
 }
 
-[[ "$#" -eq 11 ]] || usage
+[[ "$#" -eq 11 || "$#" -eq 12 || "$#" -eq 13 ]] || usage
 
 report_path="$1"
 resource_evidence_path="$2"
@@ -25,6 +25,8 @@ expected_cpu_limit_cores="$8"
 expected_memory_limit_bytes="$9"
 expected_runner_id="${10}"
 expected_storage_class="${11}"
+expected_tree_state_checkpoint_coverage="${12:-}"
+expected_canonical_publication_mode="${13:-}"
 
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 for evidence_file in "$report_path" "$resource_evidence_path"; do
@@ -49,6 +51,16 @@ done
   "expected runner ID is not a valid evidence identifier"
 [[ "$expected_storage_class" =~ ^[[:alnum:]][[:alnum:]._-]*$ ]] || fail \
   "expected storage class is not a valid evidence identifier"
+if [[ -n "$expected_tree_state_checkpoint_coverage" ]]; then
+  [[ "$expected_tree_state_checkpoint_coverage" == "every-block" \
+    || "$expected_tree_state_checkpoint_coverage" == "cadence-and-tip" ]] || fail \
+    "expected tree-state checkpoint coverage must be every-block or cadence-and-tip"
+fi
+if [[ -n "$expected_canonical_publication_mode" ]]; then
+  [[ "$expected_canonical_publication_mode" == "trusted-fresh" \
+    || "$expected_canonical_publication_mode" == "cold-certified" ]] || fail \
+    "expected canonical publication mode must be trusted-fresh or cold-certified"
+fi
 
 jq -e \
   --slurpfile resources "$resource_evidence_path" \
@@ -60,8 +72,20 @@ jq -e \
   --argjson expected_cpu_limit_cores "$expected_cpu_limit_cores" \
   --argjson expected_memory_limit_bytes "$expected_memory_limit_bytes" \
   --arg expected_runner_id "$expected_runner_id" \
-  --arg expected_storage_class "$expected_storage_class" '
+  --arg expected_storage_class "$expected_storage_class" \
+  --arg expected_tree_state_checkpoint_coverage "$expected_tree_state_checkpoint_coverage" \
+  --arg expected_canonical_publication_mode "$expected_canonical_publication_mode" '
   def exact_keys($expected): (keys | sort) == ($expected | sort);
+  def expected_tree_state_checkpoint_count($coverage; $first_height; $tip_height):
+    if $coverage == "every-block" then
+      ($tip_height - $first_height) + 2
+    elif $coverage == "cadence-and-tip" then
+      1
+      + (($tip_height / 100 | floor) - ((($first_height - 1) / 100) | floor))
+      + (if ($tip_height % 100) == 0 then 0 else 1 end)
+    else
+      null
+    end;
   def nonnegative_integer:
     type == "number" and . >= 0 and . == floor;
   def positive_integer:
@@ -166,6 +190,7 @@ jq -e \
     );
   def row_counts:
     exact_keys([
+      "block_hash_by_height_count",
       "reorg_undo_count",
       "transparent_address_balance_count",
       "transparent_address_transaction_count",
@@ -205,7 +230,7 @@ jq -e \
       + .cold_validation_seconds
       + .ready_publication_seconds
     )
-    and (.cold_validation_seconds as $cold_validation
+      and (.cold_validation_seconds as $cold_validation
       | [
           .cold_validation_primary_output_scan_seconds,
           .cold_validation_address_index_and_balance_readback_seconds,
@@ -213,6 +238,29 @@ jq -e \
           .cold_validation_reorg_undo_readback_seconds
         ]
       | all(. <= $cold_validation));
+  def wallet_build_stages($total_seconds):
+    type == "array"
+    and all(.[]; exact_keys(["seconds", "stage"]) and (.seconds | duration))
+    and ([.[].stage] == [
+      "store_initialization",
+      "canonical_scan",
+      "outpoint_run_spill",
+      "outpoint_sort",
+      "outpoint_drain",
+      "primary_sst_write",
+      "address_index_run_spill",
+      "address_transaction_run_spill",
+      "secondary_address_derivation",
+      "reorg_undo_write",
+      "logical_evidence",
+      "row_load",
+      "flush_and_close",
+      "cold_reopen",
+      "cold_validation_family_readback",
+      "cold_validation_reorg_undo_readback",
+      "ready_publication"
+    ])
+    and (([.[].seconds] | add) <= $total_seconds);
   def report_phase_durations:
     exact_keys([
       "canonical_cold_reopen_seconds",
@@ -262,21 +310,19 @@ jq -e \
       "wallet_storage_ready"
     ])
     and .contract_identity == "benchmark-report"
-    and .report_format_version == 4
+    and .report_format_version == 1
     and .measurement_kind == "rocksdb-storage-lifecycle"
     and (.storage_candidate
       | exact_keys([
           "canonical_engine",
           "canonical_model",
-          "diagnostic_projection_engine",
           "id",
           "topology"
         ])
       and .id == "rocksdb-storage-lifecycle"
       and .canonical_engine == "rocksdb"
       and .canonical_model == "canonical-replay-storage"
-      and .diagnostic_projection_engine == null
-      and .topology == "rocksdb-single-host")
+      and .topology == "rocksdb")
     and (.provenance
       | exact_keys([
           "benchmark_version",
@@ -344,30 +390,48 @@ jq -e \
           "wallet_value_encoding_version"
         ])
       and .canonical_store_identity == "canonical"
-      and .canonical_store_schema_version == 4
+      and .canonical_store_schema_version == 2
       and .wallet_store_identity == "wallet"
-      and .wallet_store_schema_version == 1
-      and .wallet_projection_schema_version == 1
+      and .wallet_store_schema_version == 2
+      and .wallet_projection_schema_version == 2
       and .wallet_value_encoding_version == 2)
-    and (.resource_limits
-      | exact_keys([
-          "block_prepare_concurrency",
-          "block_prepare_memory_watermark_bytes",
-          "canonical_rocksdb",
-          "max_response_bytes",
-          "request_timeout_seconds",
-          "source_fetch_max_in_flight_bytes",
-          "source_fetch_max_in_flight_requests",
-          "source_segment_max_blocks",
-          "source_segment_target_response_bytes",
-          "supported_reorg_depth",
-          "wallet_max_accounted_reorg_undo_bytes",
-          "wallet_max_outpoint_sort_memory_bytes",
-          "wallet_max_secondary_sort_memory_bytes_per_sorter",
-          "wallet_max_temporary_file_bytes_per_sorter",
-          "wallet_rocksdb",
-          "wallet_sst_target_logical_bytes"
-        ])
+    and ((.resource_limits
+      | exact_keys(
+          [
+            "block_prepare_concurrency",
+            "block_prepare_memory_watermark_bytes",
+            "canonical_rocksdb",
+            "max_response_bytes",
+            "request_timeout_seconds",
+            "source_fetch_max_in_flight_bytes",
+            "source_fetch_max_in_flight_requests",
+            "source_segment_max_blocks",
+            "source_segment_target_response_bytes",
+            "supported_reorg_depth",
+            "wallet_max_accounted_reorg_undo_bytes",
+            "wallet_max_outpoint_sort_memory_bytes",
+            "wallet_max_secondary_sort_memory_bytes_per_sorter",
+            "wallet_max_temporary_file_bytes_per_sorter",
+            "wallet_rocksdb",
+            "wallet_sst_target_logical_bytes",
+            "canonical_publication_mode",
+            "tree_state_checkpoint_coverage"
+          ]
+        )
+      and (
+          (.tree_state_checkpoint_coverage == "every-block"
+            or .tree_state_checkpoint_coverage == "cadence-and-tip")
+          and (
+            $expected_tree_state_checkpoint_coverage == ""
+            or .tree_state_checkpoint_coverage == $expected_tree_state_checkpoint_coverage
+          )
+          and (.canonical_publication_mode == "trusted-fresh"
+            or .canonical_publication_mode == "cold-certified")
+          and (
+            $expected_canonical_publication_mode == ""
+            or .canonical_publication_mode == $expected_canonical_publication_mode
+          )
+      )
       and ([
         .request_timeout_seconds,
         .max_response_bytes,
@@ -400,37 +464,67 @@ jq -e \
         134217728;
         536870912
       )
-      and (.canonical_rocksdb | resource_budget)
-      and (.wallet_rocksdb | resource_budget))
+      and (.canonical_rocksdb
+        | resource_budget
+        and .block_cache_bytes == 536870912
+        and .max_wal_bytes == 268435456
+        and .max_open_files == 512
+        and .write_buffer_bytes == 16777216
+        and .max_write_buffer_count == 2
+        and .max_background_jobs == 2
+        and .memtable_budget_bytes == 268435456)
+      and (.wallet_rocksdb
+        | resource_budget
+        and .block_cache_bytes == 268435456
+        and .max_wal_bytes == 33554432
+        and .max_open_files == 512
+        and .write_buffer_bytes == 16777216
+        and .max_write_buffer_count == 4
+        and .max_background_jobs == 2
+        and .memtable_budget_bytes == 536870912)
+      and .wallet_max_outpoint_sort_memory_bytes == 4294967296
+      and .wallet_max_secondary_sort_memory_bytes_per_sorter == 1073741824
+      and .wallet_max_temporary_file_bytes_per_sorter == 206158430208
+      and .wallet_sst_target_logical_bytes == 134217728
+      and .wallet_max_accounted_reorg_undo_bytes == 536870912)
     and (.acceptance
       | exact_keys(["canonical_storage_ready", "wallet_storage_ready"])
       and (.canonical_storage_ready | acceptance("canonical-storage-ready"))
       and (.wallet_storage_ready | acceptance("wallet-storage-ready")))
-    and (.phase_durations | report_phase_durations)
+    and (.phase_durations
+      | report_phase_durations
+      and (
+        if $report.resource_limits.canonical_publication_mode == "trusted-fresh" then
+          .canonical_cold_validation_seconds == 0
+        else
+          true
+        end
+      ))
     and (.canonical_storage_ready
-      | exact_keys([
-          "block_count",
-          "cold_reopen_evidence_match",
-          "database_io_mode",
-          "first_retained_block",
-          "logical_replay_bytes",
-          "logical_storage_bytes",
-          "physical_store_bytes",
-          "replay_format_version",
-          "scope",
-          "sequence_digest",
-          "source_tip_checkpoint_authenticated",
-          "sst_file_bytes",
-          "sst_file_count",
-          "subtree_root_count",
-          "transaction_count",
-          "visible_epoch_id",
-          "visible_event_sequence",
-          "visible_tip",
-          "workload"
-        ])
+      | exact_keys(
+          [
+            "block_count",
+            "cold_reopen_evidence_match",
+            "database_io_mode",
+            "first_retained_block",
+            "logical_replay_bytes",
+            "logical_storage_bytes",
+            "physical_store_bytes",
+            "replay_format_version",
+            "scope",
+            "sequence_digest",
+            "source_tip_checkpoint_authenticated",
+            "sst_file_bytes",
+            "sst_file_count",
+            "subtree_root_count",
+            "transaction_count",
+            "visible_epoch_id",
+            "visible_event_sequence",
+            "visible_tip",
+            "tree_state_checkpoint_count"
+          ]
+        )
       and .scope == "canonical-storage-ready"
-      and .workload == "wallet"
       and (.first_retained_block | block_id)
       and .first_retained_block.height == 1
       and (.visible_tip | block_id)
@@ -440,6 +534,14 @@ jq -e \
       and (.block_count | positive_integer)
       and .block_count == .visible_tip.height
       and (.transaction_count | positive_integer)
+      and (
+          (.tree_state_checkpoint_count | positive_integer)
+          and .tree_state_checkpoint_count == expected_tree_state_checkpoint_count(
+            $report.resource_limits.tree_state_checkpoint_coverage;
+            .first_retained_block.height;
+            .visible_tip.height
+          )
+      )
       and (.subtree_root_count | nonnegative_integer)
       and .replay_format_version == 1
       and (.sequence_digest | sequence_digest)
@@ -451,9 +553,10 @@ jq -e \
       and (.physical_store_bytes | positive_integer)
       and (.database_io_mode | type == "string" and length > 0)
       and .source_tip_checkpoint_authenticated == true
-      and .cold_reopen_evidence_match == true)
+      and .cold_reopen_evidence_match == true))
     and (.wallet_storage_ready
       | exact_keys([
+          "build_stages",
           "canonical_fence_match",
           "cold_reopen_evidence_match",
           "construction",
@@ -487,6 +590,7 @@ jq -e \
           + (2 * .row_counts.transparent_spent_output_count))
       and .row_counts.reorg_undo_count
         == ([.scanned_block_count, $report.resource_limits.supported_reorg_depth] | min)
+      and .row_counts.block_hash_by_height_count == .scanned_block_count
       and (.utxo_summary
         | exact_keys([
             "commitment_accumulator_hex",
@@ -498,7 +602,8 @@ jq -e \
         and (.utxo_count | nonnegative_integer)
         and .utxo_count == $report.wallet_storage_ready.row_counts.transparent_unspent_output_count
         and (.total_value_zat | nonnegative_integer)
-        and .commitment_scheme == "lthash16"
+        and .commitment_scheme
+          == "lthash16-chacha12"
         and (.commitment_accumulator_hex | hex_bytes(2048))
         and (.commitment_display_digest_hex | hex_bytes(32)))
       and .scanned_block_count == $report.canonical_storage_ready.block_count
@@ -554,6 +659,7 @@ jq -e \
         and (.sst_file_count | positive_integer))
       and (.phase_durations | wallet_phase_durations)
       and .phase_durations.total_seconds == $report.phase_durations.wallet_build_seconds
+      and (.build_stages | wallet_build_stages($report.wallet_storage_ready.phase_durations.total_seconds))
       and (.physical_store_bytes | positive_integer)
       and .cold_reopen_evidence_match == true
       and .canonical_fence_match == true)

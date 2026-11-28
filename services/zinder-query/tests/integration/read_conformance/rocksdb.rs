@@ -13,15 +13,15 @@ use zinder_query::{
     read_on_blocking_thread,
 };
 use zinder_store::{
-    ArtifactFamily, BlockHashLookup, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
-    RocksDbResourceBudget,
+    ArtifactFamily, BlockHashLookup, RocksDbCanonicalSecondary, RocksDbResourceBudget,
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, sample_regtest_upgrade_activations,
 };
 
 use super::{
-    ReaderHarness, WalletReaderHarness, canonical_reader_conformance, wallet_reader_conformance,
+    ReaderHarness, WalletReaderHarness, canonical_reader_conformance,
+    stateless_serving_conformance, wallet_reader_conformance,
 };
 
 /// A production canonical primary, with readers opened as `RocksDB`
@@ -46,8 +46,14 @@ impl ReaderHarness for RocksDbReaderHarness {
         })
     }
 
-    fn append_live_block(&mut self, chain: &ChainFixture) -> eyre::Result<()> {
-        self.writer.append_live_block(chain).map(drop)
+    fn append_live_block(
+        &mut self,
+        chain: &ChainFixture,
+        settled_tip: BlockId,
+    ) -> eyre::Result<()> {
+        self.writer
+            .append_live_block_with_settled_tip(chain, settled_tip)
+            .map(drop)
     }
 
     fn replace_live_blocks(
@@ -86,8 +92,9 @@ impl RocksDbReaderHarness {
                     .path()
                     .join(format!("canonical-{}", self.readers_opened)),
                 primary.network(),
-                CanonicalStoreWorkload::Wallet,
-                primary.raw_blob_retention(),
+                zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                    primary.raw_blob_retention(),
+                ),
                 primary.reorg_policy(),
                 RocksDbResourceBudget::for_local_tests(),
             )?,
@@ -196,8 +203,8 @@ fn delete_compact_block_row(
     let families = rust_rocksdb::DB::list_cf(&options, canonical_primary_path)?;
     let db = rust_rocksdb::DB::open_cf(&options, canonical_primary_path, &families)?;
     let family = db
-        .cf_handle("compact_block")
-        .ok_or_else(|| eyre!("the canonical primary has no compact-block family"))?;
+        .cf_handle("live_tail_block")
+        .ok_or_else(|| eyre!("the canonical primary has no live-tail-block family"))?;
     db.delete_cf(&family, encode_height_key_ascending(height))?;
     db.flush_cf(&family)?;
     Ok(())
@@ -220,4 +227,8 @@ mod canonical_cases {
 
 mod wallet_cases {
     super::wallet_reader_conformance!(super::RocksDbReaderHarness);
+}
+
+mod stateless_serving_cases {
+    super::stateless_serving_conformance!(super::RocksDbReaderHarness);
 }

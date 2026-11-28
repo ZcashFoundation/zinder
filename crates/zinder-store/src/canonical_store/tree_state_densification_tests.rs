@@ -13,15 +13,16 @@ use zinder_core::{
 };
 
 use super::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, TreeStateCheckpointSelection, TreeStateStride,
+    CanonicalReorgPolicy, CanonicalStoreError, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    TreeStateCheckpointSelection, TreeStateStride,
     block_load::{encode_block_position, encode_tree_state_checkpoint},
     live_replacement_tests::{
         published_fork_store, published_note_commitment_store, published_store,
     },
+    live_tail::{LiveTailBlockRecord, LiveTailEncodeOptions},
     publication::column_family,
     rocksdb::{
-        BLOCK_HEADER_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
+        BLOCK_HEADER_COLUMN_FAMILY, LIVE_TAIL_BLOCK_COLUMN_FAMILY,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
     test_network_upgrade_activations,
@@ -237,7 +238,7 @@ fn an_undecodable_compact_block_is_a_stride_failure_in_replay_and_in_a_budget_sc
     let temporary = TempDir::new()?;
     let store = densification_store(&temporary, BlockHeight::new(TIP_HEIGHT))?;
     let activations = activations()?;
-    let family = column_family(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     store.bounded_open.db.put_cf(
         &family,
         encode_block_position(BlockHeight::new(99)),
@@ -756,8 +757,7 @@ fn reopen_primary(
     Ok(RocksDbCanonicalStore::open_ready(
         temporary.path().join("canonical"),
         activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)
@@ -771,8 +771,7 @@ fn open_secondary(
         temporary.path().join("canonical"),
         temporary.path().join("canonical-secondary"),
         activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)
@@ -859,12 +858,19 @@ fn break_parent_link(store: &RocksDbCanonicalStore, height: BlockHeight) -> Test
         original.transactions().to_vec(),
         original.chain_metadata(),
     )?;
-    let family = column_family(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
-    store.bounded_open.db.put_cf(
-        &family,
-        encode_block_position(height),
-        crate::encode_compact_block_artifact(&damaged),
+    let (encoded, _) = LiveTailBlockRecord::encode_from_compact_block_v1(
+        &damaged,
+        None,
+        LiveTailEncodeOptions {
+            include_supplement: true,
+            retain_canonical_facts: false,
+        },
     )?;
+    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    store
+        .bounded_open
+        .db
+        .put_cf(&family, encode_block_position(height), encoded)?;
     Ok(())
 }
 
@@ -944,7 +950,7 @@ fn a_bounded_scan_stops_after_the_stride_that_reaches_its_read_budget_and_report
     assert!(second.reached_unsettled);
 
     break_parent_link(&store, BlockHeight::new(20))?;
-    let family = column_family(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     store.bounded_open.db.put_cf(
         &family,
         encode_block_position(BlockHeight::new(99)),

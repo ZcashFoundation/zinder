@@ -12,7 +12,8 @@ use zinder_bench::{
     BenchError,
     canonical_fixture_replay::{
         CanonicalFixtureRocksDbReplayConfig, CanonicalFixtureRocksDbReplayOutcome,
-        replay_canonical_fixture_into_rocksdb, replay_canonical_fixture_transport_into_rocksdb,
+        TreeStateCheckpointCoverage, replay_canonical_fixture_into_rocksdb,
+        replay_canonical_fixture_transport_into_rocksdb,
     },
     fixture::FixtureManifest,
     recorder::install_recorder,
@@ -110,6 +111,15 @@ pub(crate) struct RocksDbCanonicalFixtureReplayArgs {
     /// Aggregate canonical preparation memory watermark.
     #[arg(long = "block-prepare-memory-watermark-bytes")]
     block_prepare_memory_watermark_bytes: Option<u64>,
+    /// Threads hashing the ordered loader's commitment trees.
+    #[arg(long = "tree-hashing-workers")]
+    tree_hashing_workers: Option<u32>,
+    /// Tree-state checkpoint coverage persisted during canonical construction.
+    #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Commitment threshold for commitment-budget coverage. Defaults to the ingest threshold.
+    #[arg(long)]
+    tree_state_commitment_budget: Option<NonZeroU32>,
     /// Write the JSON report to this path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -128,6 +138,8 @@ struct ValidatedReplayArgs {
     pipeline_limits: CanonicalPipelineLimits,
     supported_reorg_depth: u32,
     source_segment_delay: Duration,
+    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    tree_state_commitment_budget: Option<NonZeroU32>,
     block_source: CanonicalFixtureBlockSource,
     json_rpc_addr: Option<String>,
     indexer_grpc_addr: Option<String>,
@@ -167,9 +179,11 @@ pub(crate) async fn run_rocksdb_canonical_fixture_replay(
         request_timeout: validated.request_timeout,
         pipeline_limits: validated.pipeline_limits,
         resource_budget,
-        raw_blob_retention: RawBlobRetention::Transactions,
+        raw_blob_retention: RawBlobRetention::None,
         supported_reorg_depth: validated.supported_reorg_depth,
         source_segment_delay: validated.source_segment_delay,
+        tree_state_checkpoint_coverage: validated.tree_state_checkpoint_coverage,
+        tree_state_commitment_budget: validated.tree_state_commitment_budget,
     };
     let outcome = replay_with_block_source(&validated, &manifest, replay_config).await?;
     let total_seconds = replay_started.elapsed().as_secs_f64();
@@ -242,6 +256,12 @@ impl RocksDbCanonicalFixtureReplayArgs {
             pipeline_limits,
             supported_reorg_depth: supported_reorg_depth.get(),
             source_segment_delay: Duration::from_millis(self.source_segment_delay_millis),
+            tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
+            tree_state_commitment_budget: TreeStateCheckpointCoverage::from_selection(
+                self.tree_state_checkpoint_coverage
+                    .resolve(self.tree_state_commitment_budget)?,
+            )?
+            .1,
             block_source: self.block_source,
             json_rpc_addr: block_source_args.json_rpc_addr,
             indexer_grpc_addr: block_source_args.indexer_grpc_addr,
@@ -376,6 +396,7 @@ fn json_rpc_source(
             request_timeout: validated.request_timeout,
             max_response_bytes: validated.pipeline_limits.max_response_bytes,
             broadcast_timeout: None,
+            ..ZebraJsonRpcSourceOptions::default()
         },
     )?)
 }
@@ -408,6 +429,9 @@ fn apply_pipeline_overrides(
         limits.block_prepare_memory_watermark_bytes =
             require_nonzero_u64(bytes, "block-prepare-memory-watermark-bytes")?;
     }
+    if let Some(workers) = args.tree_hashing_workers {
+        limits.tree_hashing_workers = require_nonzero_u32(workers, "tree-hashing-workers")?;
+    }
     Ok(())
 }
 
@@ -417,12 +441,15 @@ fn replay_measurements(
 ) -> RocksDbCanonicalFixtureReplayMeasurements {
     let source_load = source_load_summary(&measured.outcome);
     let canonical_ready = ready_summary(&measured.outcome);
+    let resource_limits = resource_limits(validated, &measured.outcome, measured.resource_budget);
     RocksDbCanonicalFixtureReplayMeasurements {
         replay_plan_fixture_manifest_sha256: measured.outcome.fixture_manifest_digest_sha256,
         replay_plan_digest_sha256: measured.outcome.replay_plan_digest_sha256,
-        resource_limits: resource_limits(validated, measured.resource_budget),
+        resource_limits,
         publication_proof_provenance: "trusted-fresh-writer",
         total_seconds: measured.total_seconds,
+        ready_seconds: measured.outcome.ready_duration.as_secs_f64(),
+        reopen_seconds: measured.outcome.reopen_duration.as_secs_f64(),
         source_load,
         canonical_ready,
         physical_store_bytes: measured.physical_store_bytes,
@@ -434,6 +461,7 @@ fn replay_measurements(
 
 fn resource_limits(
     validated: &ValidatedReplayArgs,
+    outcome: &CanonicalFixtureRocksDbReplayOutcome,
     resource_budget: RocksDbResourceBudget,
 ) -> RocksDbCanonicalFixtureReplayResourceLimits {
     RocksDbCanonicalFixtureReplayResourceLimits {
@@ -464,9 +492,12 @@ fn resource_limits(
             .pipeline_limits
             .block_prepare_memory_watermark_bytes
             .get(),
+        tree_hashing_workers: validated.pipeline_limits.tree_hashing_workers.get(),
         supported_reorg_depth: validated.supported_reorg_depth,
         source_segment_delay_millis: u64::try_from(validated.source_segment_delay.as_millis())
             .unwrap_or(u64::MAX),
+        tree_state_checkpoint_coverage: outcome.tree_state_checkpoint_coverage,
+        tree_state_commitment_budget: outcome.tree_state_commitment_budget,
         canonical_rocksdb: resource_budget.into(),
     }
 }
@@ -483,14 +514,19 @@ fn source_load_summary(
         transaction_count: load.transaction_count,
         block_header_count: load.block_header_count,
         block_hash_index_count: load.block_hash_index_count,
-        block_replay_count: load.block_replay_count,
-        compact_block_count: load.compact_block_count,
+        settled_segment_index_count: load.settled_segment_index_count,
+        live_tail_block_count: load.live_tail_block_count,
         transaction_location_count: load.transaction_location_count,
         transaction_blob_count: load.transaction_blob_count,
         block_blob_count: load.block_blob_count,
         tree_state_checkpoint_count: load.tree_state_checkpoint_count,
-        block_final_note_commitment_roots_count: load.block_final_note_commitment_roots_count,
+        tree_state_checkpoint_logical_bytes: load.tree_state_checkpoint_logical_bytes,
+        tree_state_checkpoint_sst_bytes: load.tree_state_checkpoint_sst_bytes,
         subtree_root_count: outcome.subtree_root_load_evidence.subtree_root_count,
+        logical_replay_bytes: load.logical_replay_bytes,
+        settled_segment_index_logical_bytes: load.settled_segment_index_logical_bytes,
+        live_tail_block_logical_bytes: load.live_tail_block_logical_bytes,
+        live_tail_raw_block_logical_bytes: load.live_tail_raw_block_logical_bytes,
         logical_bytes: load.logical_bytes,
         sst_file_bytes: load.sst_file_bytes,
         sst_file_count: load.sst_file_count,
@@ -510,7 +546,6 @@ fn ready_summary(
     let fence = outcome.event_fence;
     RocksDbCanonicalFixtureReadySummary {
         scope: "canonical-fixture-ready",
-        workload: "wallet",
         first_retained_block: block_id(reopened.first_retained_block),
         visible_tip: block_id(reopened.visible_tip),
         visible_epoch_id: reopened.visible_epoch.value(),
@@ -664,6 +699,28 @@ mod tests {
                 .get(),
             CANONICAL_FIXTURE_REPLAY_PROFILE_MEMORY_BYTES / 64
         );
+        assert_eq!(
+            validated.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::CadenceAndTip
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_state_checkpoint_coverage_accepts_every_block_and_rejects_unknown()
+    -> Result<(), Box<dyn Error>> {
+        let cli = TestCli::try_parse_from(arguments(&[
+            "--tree-state-checkpoint-coverage",
+            "every-block",
+        ]))?;
+        assert_eq!(
+            cli.replay.validate()?.tree_state_checkpoint_coverage,
+            super::TreeStateCheckpointCoverage::EveryBlock
+        );
+        assert!(
+            TestCli::try_parse_from(arguments(&["--tree-state-checkpoint-coverage", "sparse"]))
+                .is_err()
+        );
         Ok(())
     }
 
@@ -684,6 +741,8 @@ mod tests {
             "7",
             "--block-prepare-memory-watermark-bytes",
             "268435456",
+            "--tree-hashing-workers",
+            "3",
         ]))?;
         let limits = cli.replay.validate()?.pipeline_limits;
 
@@ -700,6 +759,7 @@ mod tests {
             limits.block_prepare_memory_watermark_bytes.get(),
             268_435_456
         );
+        assert_eq!(limits.tree_hashing_workers.get(), 3);
         Ok(())
     }
 
@@ -715,6 +775,7 @@ mod tests {
             "--source-fetch-max-in-flight-bytes",
             "--block-prepare-concurrency",
             "--block-prepare-memory-watermark-bytes",
+            "--tree-hashing-workers",
         ] {
             let cli = TestCli::try_parse_from(arguments(&[flag, "0"]))?;
             let error = cli

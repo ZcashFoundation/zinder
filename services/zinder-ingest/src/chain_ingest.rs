@@ -30,6 +30,8 @@ const FETCH_RETRY_FAILURE_BUDGET: u32 = 100;
 pub enum NodeSourceKind {
     /// Zebra JSON-RPC source.
     ZebraJsonRpc,
+    /// Zebra binary indexer gRPC block source paired with a JSON-RPC control plane.
+    ZebraIndexerGrpc,
 }
 
 /// Error returned by ingestion operations.
@@ -192,7 +194,7 @@ where
         let stats = segment.stats();
         metrics::counter!("zinder_ingest_source_segment_connected_blocks_total")
             .increment(u64::from(stats.connected_blocks()));
-        metrics::histogram!("zinder_ingest_source_segment_max_blocks")
+        metrics::histogram!("zinder_ingest_source_segment_updates")
             .record(usize_to_u32_saturating(segment.len()));
         metrics::histogram!("zinder_ingest_source_segment_response_payload_bytes")
             .record(u64_to_f64(stats.response_payload_bytes()));
@@ -269,15 +271,19 @@ fn next_fetch_retry_backoff(current_backoff: Duration) -> Duration {
 ///
 /// Per-call retry handles the failure classes where retrying the *same
 /// request* can plausibly succeed: transient transport
-/// ([`SourceFailureClass::NodeUnreachable`]) and short-lived subscription
-/// failures ([`SourceFailureClass::StreamDisconnected`]). View-stale
+/// ([`SourceFailureClass::NodeUnreachable`]), an HTTP 429 from a node at its
+/// connection limit ([`SourceFailureClass::NodeRateLimited`]), and
+/// short-lived subscription failures
+/// ([`SourceFailureClass::StreamDisconnected`]). View-stale
 /// failures ([`SourceFailureClass::UpstreamViewChanged`]) and structural
 /// failures are bubbled up to the loop, which re-observes the upstream
 /// before issuing dependent requests.
 fn per_call_retry_permitted(error: &SourceError) -> bool {
     matches!(
         error.upstream_classification(),
-        SourceFailureClass::NodeUnreachable | SourceFailureClass::StreamDisconnected,
+        SourceFailureClass::NodeUnreachable
+            | SourceFailureClass::NodeRateLimited
+            | SourceFailureClass::StreamDisconnected,
     )
 }
 

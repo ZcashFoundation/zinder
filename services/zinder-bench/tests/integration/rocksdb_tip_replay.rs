@@ -45,9 +45,9 @@ use zinder_source::{
     SourceError,
 };
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_testkit::{
     P2pkhSpendArgs, TRANSPARENT_BROADCAST_TEST_SEED, TransparentTestKey,
@@ -214,12 +214,11 @@ async fn publish_canonical(
         &inputs.activations,
         first_block.block_time_seconds.saturating_sub(1),
         tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         inputs.canonical_store(),
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -378,7 +377,7 @@ fn run_tip_replay(inputs: &TipReplayInputs, fixture: &Path, extra: &[&str]) -> R
 }
 
 fn tip_replay_command(inputs: &TipReplayInputs, fixture: &Path, extra: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-bench"));
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-bench"));
     command
         .arg("rocksdb-tip-replay")
         .arg("--fixture")
@@ -397,7 +396,7 @@ fn tip_replay_command(inputs: &TipReplayInputs, fixture: &Path, extra: &[&str]) 
 }
 
 fn compare_reports(baseline: &Path, candidate: &Path, comparison: &Path) -> Result<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
+    Ok(Command::new(zinder_testkit::bin_exe!("zinder-bench"))
         .arg("compare-tip-replay-reports")
         .arg("--baseline")
         .arg(baseline)
@@ -460,8 +459,7 @@ fn rebuilt_wallet_digest(inputs: &TipReplayInputs, canonical_store: &Path) -> Re
     let canonical = RocksDbCanonicalStore::open_ready(
         canonical_store,
         &inputs.activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -692,7 +690,7 @@ async fn tip_replay_reports_the_requested_io_modes_and_wallet_statistics_deltas(
 
     let report = read_json(&report_path)?;
 
-    assert_eq!(report["report_format_version"], 2);
+    assert_eq!(report["report_format_version"], 1);
     let io_mode = &report["configuration"]["rocksdb_io_mode"];
     assert_eq!(io_mode["requested"]["canonical"], "buffered");
     assert_eq!(io_mode["requested"]["wallet"], "buffered");
@@ -1209,8 +1207,7 @@ impl SpendLinks {
                 .path()
                 .join(format!("{name}-links-secondary")),
             &inputs.activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1276,7 +1273,7 @@ fn tip_reorg_command(
     reorg_window_blocks: u32,
     extra: &[&str],
 ) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-bench"));
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-bench"));
     command
         .arg("rocksdb-tip-reorg")
         .arg("--fixture")

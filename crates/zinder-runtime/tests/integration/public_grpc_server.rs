@@ -16,10 +16,7 @@ use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message as _;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
-use tokio_stream::{
-    Stream, StreamExt as _,
-    wrappers::{ReceiverStream, TcpListenerStream},
-};
+use tokio_stream::{Stream, StreamExt as _, wrappers::ReceiverStream};
 use tonic::{
     Code, Request, Status,
     body::Body,
@@ -62,7 +59,7 @@ struct TestServer {
     address: SocketAddr,
     channel: Channel,
     health: HealthReporter,
-    _server: JoinHandle<Result<(), tonic::transport::Error>>,
+    _server: JoinHandle<Result<(), std::io::Error>>,
 }
 
 impl TestServer {
@@ -106,7 +103,7 @@ async fn serve_with(
         )
         .add_service(health_server.max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES))
         .add_service(reflection)
-        .serve_with_incoming(TcpListenerStream::new(listener)),
+        .serve_with_incoming(listener),
     );
     let channel = Endpoint::new(format!("http://{address}"))?
         .connect()
@@ -216,6 +213,18 @@ fn list_services() -> ServerReflectionRequest {
 async fn requests_past_the_receive_slots_are_refused_until_one_returns() -> Result<()> {
     let server = serve(1, Duration::from_secs(30)).await?;
     let stalled = hold_the_request_slot(&server).await?;
+    let refusal = check(&server.channel)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("request exceeded receive slots without refusal"))?;
+    assert_eq!(refusal.code(), Code::Unavailable);
+    let delay = refusal
+        .metadata()
+        .get("grpc-retry-pushback-ms")
+        .ok_or_else(|| eyre!("missing retry pushback"))?
+        .to_str()?
+        .parse::<i32>()?;
+    assert!((500..=1500).contains(&delay));
 
     stalled.abort();
     let channel = server.channel.clone();
@@ -373,8 +382,8 @@ async fn a_reflection_stream_whose_client_stops_reading_ends_and_returns_its_slo
     })
     .await?;
 
-    // Reading again delivers what the transport already held, then the
-    // stream ends with DEADLINE_EXCEEDED instead of further answers.
+    // Reading again delivers what reached the client before the server reset
+    // the stream, then the reset, which the client sees as CANCELLED.
     let mut answers = 0;
     let ended_with = loop {
         match within_wait_limit(stalled.next()).await? {
@@ -386,8 +395,49 @@ async fn a_reflection_stream_whose_client_stops_reading_ends_and_returns_its_slo
     assert!(answers < 3, "the stalled stream delivered every answer");
     assert_eq!(
         ended_with.map(|status| status.code()),
-        Some(Code::DeadlineExceeded)
+        Some(Code::Cancelled)
     );
+    drop(sender);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stalled_reflection_stream_waiting_for_its_next_request_returns_its_slot() -> Result<()> {
+    let server = serve(1, Duration::from_secs(30)).await?;
+    let channel = small_stream_window_connection(&server).await?;
+    let (sender, receiver) = mpsc::channel(1);
+    let _answers = ServerReflectionClient::new(channel.clone())
+        .server_reflection_info(ReceiverStream::new(receiver))
+        .await?
+        .into_inner();
+    // One answer larger than the window: reflection hands it on and waits
+    // for the next request, which never comes.
+    sender
+        .send(ServerReflectionRequest {
+            host: "x".repeat(256 * 1024),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        })
+        .await?;
+
+    // Well before the 30-second receive timeout, the reset ends the request
+    // stream too, so reflection lets go of the only client-stream slot.
+    wait_until("the stalled reflection stream returns its slot", || {
+        let channel = channel.clone();
+        async move {
+            match ServerReflectionClient::new(channel)
+                .server_reflection_info(tokio_stream::once(list_services()))
+                .await
+            {
+                Ok(probe) => probe
+                    .into_inner()
+                    .next()
+                    .await
+                    .is_some_and(|reply| reply.is_ok()),
+                Err(_) => false,
+            }
+        }
+    })
+    .await?;
     drop(sender);
     Ok(())
 }
@@ -504,6 +554,72 @@ async fn unread_reflection_answers(
             .await?;
     }
     Ok((sender, answers))
+}
+
+const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const HEADERS_FRAME: u8 = 0x1;
+const SETTINGS_FRAME: u8 = 0x4;
+const GOAWAY_FRAME: u8 = 0x7;
+const END_STREAM_AND_HEADERS: u8 = 0x1 | 0x4;
+const ENHANCE_YOUR_CALM: u32 = 0xb;
+/// An HPACK block holding only `:method: POST`. A request without `:scheme`
+/// and `:path` is malformed, so the server resets its stream.
+const METHOD_ONLY_HEADER_BLOCK: &[u8] = &[0x83];
+
+fn http2_frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Result<Vec<u8>> {
+    let length = u32::try_from(payload.len())?.to_be_bytes();
+    let mut frame = Vec::with_capacity(9 + payload.len());
+    frame.extend_from_slice(length.get(1..).unwrap_or_default());
+    frame.extend_from_slice(&[kind, flags]);
+    frame.extend_from_slice(&stream_id.to_be_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+/// Reads frames until the server sends `GOAWAY`, and returns its error code.
+async fn goaway_error_code(connection: &mut tokio::net::TcpStream) -> Result<u32> {
+    use tokio::io::AsyncReadExt as _;
+
+    loop {
+        let mut header = [0; 9];
+        connection.read_exact(&mut header).await?;
+        let [l0, l1, l2, kind, ..] = header;
+        let length = u32::from_be_bytes([0, l0, l1, l2]);
+        let mut payload = vec![0; usize::try_from(length)?];
+        connection.read_exact(&mut payload).await?;
+        if kind == GOAWAY_FRAME {
+            let code = payload
+                .get(4..8)
+                .and_then(|code| <[u8; 4]>::try_from(code).ok())
+                .ok_or_else(|| eyre!("GOAWAY frame without an error code"))?;
+            return Ok(u32::from_be_bytes(code));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_client_whose_protocol_errors_keep_resetting_streams_loses_its_connection() -> Result<()>
+{
+    use tokio::io::AsyncWriteExt as _;
+
+    let server = serve(1, Duration::from_secs(30)).await?;
+    let mut connection = tokio::net::TcpStream::connect(server.address).await?;
+    let mut frames = HTTP2_PREFACE.to_vec();
+    frames.extend(http2_frame(SETTINGS_FRAME, 0, 0, &[])?);
+    let malformed_requests = u32::try_from(zinder_runtime::HTTP2_MAX_LOCAL_ERROR_RESETS)? + 16;
+    for request in 0..malformed_requests {
+        frames.extend(http2_frame(
+            HEADERS_FRAME,
+            END_STREAM_AND_HEADERS,
+            2 * request + 1,
+            METHOD_ONLY_HEADER_BLOCK,
+        )?);
+    }
+    connection.write_all(&frames).await?;
+
+    let code = within_wait_limit(goaway_error_code(&mut connection)).await??;
+    assert_eq!(code, ENHANCE_YOUR_CALM);
+    Ok(())
 }
 
 #[tokio::test]
@@ -684,10 +800,8 @@ async fn a_supervised_wallet_listener_tells_clients_behind_a_trusted_proxy_apart
     )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listener_address = listener.local_addr()?;
-    let _server = tokio::spawn(router.serve_with_incoming_shutdown(
-        TcpListenerStream::new(listener),
-        runtime.grpc_server_shutdown(),
-    ));
+    let _server =
+        tokio::spawn(router.serve_with_incoming_shutdown(listener, runtime.grpc_server_shutdown()));
     let proxy = spawn_proxy(listener_address).await?;
     let attacker = connect_through(proxy).await?;
     let victim = connect_through(proxy).await?;

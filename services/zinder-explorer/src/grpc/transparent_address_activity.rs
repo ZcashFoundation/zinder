@@ -718,14 +718,16 @@ mod tests {
         let script_hash = TransparentAddressScriptHash::from_bytes([0x11; 32]);
         for (height, seed) in [(103, 3_u8), (102, 2_u8), (101, 1_u8)] {
             let record = TransparentAddressActivityRecord {
-                transaction_id: format!("{seed:02x}").repeat(32),
+                transaction_id: encode_internal_transaction_id(TransactionId::from_bytes(
+                    [seed; 32],
+                ))
+                .to_vec(),
                 block_time_unix_seconds: i64::from(height),
                 net_value_zat: Some(i64::from(seed)),
                 input_count: 0,
                 output_count: 1,
                 prevout_resolution_status:
                     zinder_proto::v1::explorer::PrevoutResolutionStatus::Resolved as i32,
-                internal_transaction_id: Vec::new(),
             };
             store.put_consumer(
                 TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
@@ -757,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_reads_transaction_ids_in_either_stored_encoding() -> TestResult {
+    fn activity_renders_binary_transaction_ids_in_rpc_byte_order() -> TestResult {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
@@ -772,19 +774,19 @@ mod tests {
         let mut internal_bytes = [0x44; 32];
         internal_bytes[0] = 0x01;
         let internal = TransactionId::from_bytes(internal_bytes);
-        let legacy = TransactionId::from_bytes([0x22; 32]);
+        let second_id = TransactionId::from_bytes([0x22; 32]);
         for (height, record) in [
             (
                 102,
                 TransparentAddressActivityRecord {
-                    internal_transaction_id: encode_internal_transaction_id(internal).to_vec(),
+                    transaction_id: encode_internal_transaction_id(internal).to_vec(),
                     ..TransparentAddressActivityRecord::default()
                 },
             ),
             (
                 101,
                 TransparentAddressActivityRecord {
-                    transaction_id: encode_rpc_transaction_id_hex(legacy),
+                    transaction_id: encode_internal_transaction_id(second_id).to_vec(),
                     ..TransparentAddressActivityRecord::default()
                 },
             ),
@@ -819,7 +821,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 encode_rpc_transaction_id_hex(internal).as_str(),
-                encode_rpc_transaction_id_hex(legacy).as_str(),
+                encode_rpc_transaction_id_hex(second_id).as_str(),
             ]
         );
         Ok(())

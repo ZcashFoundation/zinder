@@ -7,7 +7,6 @@ use std::{net::SocketAddr, sync::Arc};
 
 use eyre::Result;
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Code;
 use tonic_health::pb::health_check_response::ServingStatus;
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
@@ -38,10 +37,9 @@ const HEALTH_SERVICE: &str = "grpc.health.v1.Health";
 /// check health while the listener still answers.
 #[tokio::test]
 async fn wallet_mode_listener_health_follows_readyz_through_readiness_and_shutdown() -> Result<()> {
-    let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(
         &ChainFixture::new(Network::ZcashRegtest).extend_blocks(1),
-        &activations,
+        &sample_regtest_upgrade_activations(),
     )?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let wallet_query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(
@@ -61,10 +59,7 @@ async fn wallet_mode_listener_health_follows_readyz_through_readiness_and_shutdo
     )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listener_address = listener.local_addr()?;
-    let server = router.serve_with_incoming_shutdown(
-        TcpListenerStream::new(listener),
-        runtime.grpc_server_shutdown(),
-    );
+    let server = router.serve_with_incoming_shutdown(listener, runtime.grpc_server_shutdown());
     let shutdown = runtime.shutdown_request();
     let supervised = tokio::spawn({
         let serving_readiness = serving_readiness.clone();
@@ -83,10 +78,17 @@ async fn wallet_mode_listener_health_follows_readyz_through_readiness_and_shutdo
         ServingStatus::NotServing
     );
     let refused = streamer.get_latest_block(ChainSpec {}).await;
-    assert_eq!(
-        refused.err().map(|status| status.code()),
-        Some(Code::Unavailable)
-    );
+    let refusal = refused
+        .err()
+        .ok_or_else(|| eyre::eyre!("not-ready listener accepted a call"))?;
+    assert_eq!(refusal.code(), Code::Unavailable);
+    let delay = refusal
+        .metadata()
+        .get("grpc-retry-pushback-ms")
+        .ok_or_else(|| eyre::eyre!("missing retry pushback"))?
+        .to_str()?
+        .parse::<i32>()?;
+    assert!((500..=1500).contains(&delay));
     let reflected = probe.reflected_services().await?;
     assert!(
         reflected.iter().any(|name| name == STREAMER_SERVICE)
@@ -122,7 +124,7 @@ async fn wallet_mode_listener_health_follows_readyz_through_readiness_and_shutdo
     Ok(())
 }
 
-async fn spawn_readyz(readiness: &Readiness) -> Result<(SocketAddr, OpsEndpointHandle)> {
+pub(super) async fn spawn_readyz(readiness: &Readiness) -> Result<(SocketAddr, OpsEndpointHandle)> {
     let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
     let ops_address = reservation.local_addr()?;
     drop(reservation);

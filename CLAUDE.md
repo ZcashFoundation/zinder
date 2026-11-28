@@ -13,6 +13,11 @@ Zinder is a service-oriented Zcash indexer. Architecture, vocabulary, and bounda
 - [docs/architecture/chain-ingestion.md](docs/architecture/chain-ingestion.md): the canonical commit pipeline.
 - [docs/adrs/README.md](docs/adrs/README.md): the decision records, indexed by domain. [ADR-0003](docs/adrs/0003-epoch-bound-reads-and-storage-roles.md) covers epoch-bound reads and the writer and reader storage roles.
 - [.changes/README.md](.changes/README.md): the pull request release-note workflow and fragment-writing guidance.
+- [deploy/README.md](deploy/README.md) and [scripts/README.md](scripts/README.md): consolidated zero-TOML deployment manifests (`docker-compose.yml`, `kubernetes/statefulset.yaml`, `systemd/zinder.service`, `bench/`) and the repository script inventory.
+
+## Unified Binary & Release Packaging
+
+`services/zinder` provides the unified `zinder` CLI (`zinder serve`, `zinder index`, `zinder run <role>`, `zinder snapshot`, `zinder backup`, `zinder config <print|validate>`, and `zinder healthcheck`). Release packaging emits one archive binary (`bin/zinder`) and one distroless OCI image (`ghcr.io/zcashfoundation/zinder`, `USER 10001:10001`). Runtime presets are `light-wallet`, `wallet` (default), and `explorer` (with optional `--full-blocks` / `storage.full_blocks = true`). Individual role crates (`zinder-ingest`, `zinder-projector`, `zinder-query`, `zinder-compat-lightwalletd`, `zinder-explorer`, `zinder-compat-cipherscan`) remain as libraries and thin binary wrappers. Deployment uses zero-TOML `ZINDER_*` environment variables (`[storage].data_dir` path derivation, inline `*_PEM` TLS, auto-persisted `build_owner_hex`), with optional `--config` TOML files tolerating sibling service sections.
 
 Before changing public types, storage layouts, protocol bytes, or service boundaries, read the relevant doc above and amend it in the same change.
 
@@ -25,6 +30,7 @@ cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --profile=ci
+scripts/test-nextest-selectors.sh
 cargo nextest run --profile=ci-parity
 cargo nextest run --profile=ci-perf
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
@@ -49,15 +55,38 @@ cargo mutants --workspace --all-features --cap-lints true \
   --file crates/zinder-store/src/canonical_store/event_lifecycle.rs \
   --file crates/zinder-store/src/format/stream_cursor.rs \
   --file crates/zinder-store/src/canonical_store/rocksdb.rs \
+  --file crates/zinder-store/src/canonical_store/block_replay.rs \
   --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
   --file crates/zinder-store/src/canonical_store/control.rs \
+  --file crates/zinder-store/src/canonical_store/block_load/codec.rs \
+  --file crates/zinder-store/src/canonical_store/reader.rs \
   --file crates/zinder-store/src/canonical_store/served_tree_state.rs \
   --file crates/zinder-store/src/canonical_store/tree_state_replay.rs \
   --file crates/zinder-store/src/canonical_store/tree_state_densification.rs \
   --file crates/zinder-core/src/network_upgrade_activations.rs \
   --file crates/zinder-source/src/source_block.rs \
+  --file crates/zinder-source/src/source_transaction.rs \
+  --file crates/zinder-store/src/canonical_store/encoded_compact_range.rs \
+  --file crates/zinder-store/src/settled_shielded_segment/wire_projection.rs \
   --file services/zinder-ingest/src/artifact_builder.rs \
-  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer|framed_tree_size|skip_framed_node|read_tree_state_checkpoint_at|lookup_tree_state|find_tree_state|replay_tree_state|refuse_unadmitted_activations|reconstruct|required_seed_height|replay_compact_blocks|append_compact_block_commitments|requires_checkpoint|after_seed|scan_tree_state_strides|stride_ending_at_satisfied|next_tree_state_stride|first_seed_at_or_above|stride_satisfies|stored_heights_through_end|stored_tree_sizes|densify_tree_state_stride|replay_stride|append_stored_block|commitment_count|recorded_tree_sizes|commit_tree_state_stride|StoredStrideRows::read|StoredStrideRows::at|ReplayedTrees::append_block|ReplayedTrees::canonical_block_time|ReplayedTrees::checkpoint'
+  --file crates/zinder-rocksdb-bulk-load/src/bulk_load/variable_value_sort.rs \
+  --file crates/zinder-wallet-rocksdb/src/accumulator_hashing.rs \
+  --file crates/zinder-wallet-rocksdb/src/projection_load.rs \
+  --file crates/zinder-wallet-rocksdb/src/store.rs \
+  --file crates/zinder-core/src/utxo_set_commitment.rs \
+  --file crates/zinder-wallet-projection/src/digest.rs \
+  --file crates/zinder-core/src/lthash16.rs \
+  --re 'encoded_compact_range\.rs:.*\b(stream_ascending|stream_descending|read_settled_segment_step|verify_step_linkage|project_live_wire)\b' \
+  --re 'wire_projection\.rs:.*\b(project_shielded_block_wire_into|validate_shielded_block_wire|project_compact_tx_wire|extract_action_nullifier_wire)\b' \
+  --re 'variable_value_sort\.rs:.*\b(next_record|RunReader|SortedRunSource|remove_runs|merge_group|merge_run_group|read_run_head|ParallelVariableValueSorter|VariableValueSortShard|SharedRunBudget)\b' \
+  --re 'block_replay\.rs:.*\b(CanonicalReplaySliceSource|CanonicalReplaySliceScan|expected_visible_block_count)\b' \
+  --re 'projection_load\.rs:.*\b(partition_settled_height_chunks|parallel_scan_worker_count|verify_completed_chunks|scan_one_settled_chunk|spawn_canonical_scan_worker)\b' \
+  --re 'accumulator_hashing\.rs:.*\b(append_row|insert_unspent_output|settle|make_room|submit|spawn|drain|combine|push_row|push_unspent_output|hash_partial|HashingWorkers::start)\b' \
+  --re 'zinder-wallet-rocksdb/src/store\.rs:.*\b(hash_prefix_key_ranges|HashPrefixKeyRange|scan_range_count|primary_output_scan_range_count|address_transaction_scan_range_count|read_back_primary_output_rows|scan_primary_output_range|read_back_address_transaction_rows|scan_address_transaction_range|AddressTransactionTotals|PrimaryOutputTotals|PrimaryScanRange|SharedExpectedReorgUndoSuffix|spawn_validation_scan)\b' \
+  --re '(utxo_set_commitment|zinder-wallet-projection/src/digest)\.rs:.*\b(combine|fold_lanes)\b' \
+  --re '(artifact_builder|source_transaction)\.rs:.*\b(parse_source_block|bytes_consumed|validate_transaction_byte_layout|transaction_identifiers|witnessed_transaction_identifiers)\b' \
+  --re 'lthash16\.rs:.*\bexpand_lthash16_element\b' \
+  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer|read_stored_final_note_commitment_roots_in_range|decode_stored_tree_state_roots|decode_checked_stored_roots|resolve_stored_roots_headers|framed_tree_size|skip_framed_node|read_tree_state_checkpoint_at|lookup_tree_state|find_tree_state|replay_tree_state|refuse_unadmitted_activations|reconstruct|required_seed_height|replay_compact_blocks|append_compact_block_commitments|requires_checkpoint|after_seed|scan_tree_state_strides|stride_ending_at_satisfied|next_tree_state_stride|first_seed_at_or_above|stride_satisfies|stored_heights_through_end|stored_tree_sizes|densify_tree_state_stride|replay_stride|append_stored_block|commitment_count|recorded_tree_sizes|commit_tree_state_stride|StoredStrideRows::read|StoredStrideRows::at|ReplayedTrees::append_block|ReplayedTrees::canonical_block_time|ReplayedTrees::checkpoint'
 ```
 
 Single-test execution under nextest: `cargo nextest run -p <crate> -E 'test(<test_name>)'`. Tier filter: `-E 'test(/^integration::cli::/)'`. Integration tests live in each crate's `tests/{integration,live,perf}/` submodules; the per-crate binary is `tests/acceptance.rs`.
@@ -66,14 +95,22 @@ Single-test execution under nextest: `cargo nextest run -p <crate> -E 'test(<tes
 
 The pull request workflows cancel a superseded run when the pull request gets a
 new push, give every job a timeout, and write Rust caches only from `main`.
+`ci-pr` builds the workspace tests once as a nextest archive, runs them in four
+shards and a tiers job, and reports one `ci gate` check. Its Rust jobs skip
+only pull requests that change nothing but prose no test reads.
 Tools such as `cargo-nextest`, `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`,
 and `cargo-mutants` are never compiled from source in CI. `scripts/install-ci-tool.sh <name>`
 installs the prebuilt release asset pinned in `.github/ci-tools.lock` after
 verifying its sha256; change a tool's version, URL, and checksum together
-there. Keep the workflow-level `env` block identical across jobs that share a
-`Swatinem/rust-cache` key, because the action hashes `CARGO_*` and `RUST*`
-variables into it. The [Testing Runbook](docs/runbooks/testing.md#continuous-integration)
-describes the full policy.
+there. Every external action, including those in `.github/actions/`, is pinned
+to a full commit SHA. Keep the `CARGO_*` workflow-level variables identical in
+`ci-pr.yml`, `live-tests.yml`, and `protocol-contracts.yml`, because they share
+the `test` `Swatinem/rust-cache` key and the action hashes `CARGO_*` and
+`RUST*` variables into it. Release image and archive builds restore
+third-party crates through `.github/actions/buildkit-cargo-cache`, which only
+`binary-archives` saves, from `main`; leave `release.yml` uncached. The
+[Testing Runbook](docs/runbooks/testing.md#continuous-integration) describes the
+full policy.
 
 ## Pull Request Release Notes
 
@@ -238,6 +275,16 @@ artifacts and add a generated message round-trip test in
 ## Local Storage Conventions
 
 `.gitignore` excludes `target/`, `.tmp/`, `*.rocksdb/`, `*.zinder-store/`, `*.profraw`, and `lcov.info`. Use `.tmp/` for ad-hoc TOML configs, scratch stores, and fixture captures. Per-network store paths must be distinct (`zcash-mainnet`, `zcash-testnet`, `zcash-regtest`); a store opened for one `Network` rejects commits from another.
+
+Durable local investigation artifacts live in the main checkout's ignored `docs/investigations/`, shared across git worktrees so results survive ephemeral worktree removal. Resolve that directory from either the main checkout or any worktree with:
+
+```bash
+investigations="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/docs/investigations"
+```
+
+- Keep transient scratch files, ad-hoc configs, fixtures, scratch stores, and Rust build directories in the active worktree's `.tmp/`.
+- Place durable benchmark results, performance profiles, metrics datasets, charts, and investigation reports in a dedicated subdirectory per campaign under `docs/investigations/` (`<YYYY-MM-DD>-<slug>/`, following any local `README.md` or catalog scripts present there).
+- Never copy compiled binaries, `*.rocksdb` or `*.zinder-store` stores, `target/` directories, or cloned repositories into `docs/investigations/`, and never commit `docs/investigations/`.
 
 ## Doc Maintenance Rule
 

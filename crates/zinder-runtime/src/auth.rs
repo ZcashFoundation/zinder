@@ -1,4 +1,4 @@
-//! Shared-secret bearer-token authentication for private gRPC control planes.
+//! Shared-secret bearer-token authentication for private gRPC endpoints.
 //!
 //! The `IngestControl` gRPC service exposes mempool state and chain events
 //! to colocated projector and native query processes.
@@ -8,9 +8,9 @@
 //!
 //! - [`BearerToken`] wraps the secret string in [`secrecy::SecretString`]
 //!   so it never appears in logs, debug output, or panic messages.
-//! - The token is loaded from a file path at startup; environment-variable
-//!   sourcing is intentionally not supported because env vars leak into
-//!   process listings and debugger snapshots.
+//! - The token can be loaded from a file path at startup (`*_path`) or
+//!   injected inline (e.g. from `ZINDER_*` environment variables in 12-factor
+//!   deployments); `--print-config` redacts secret material to `[REDACTED]`.
 //! - Server-side validation uses constant-time comparison so a remote
 //!   attacker cannot extract the token through timing analysis.
 //! - [`BearerTokenServerInterceptor`] and
@@ -185,10 +185,12 @@ impl tonic::service::Interceptor for BearerTokenServerInterceptor {
 }
 
 /// Tonic interceptor that attaches `authorization: Bearer <token>` to
-/// outgoing gRPC requests. When `token` is `None`, no metadata is added.
+/// outgoing gRPC requests when a token is configured. OTLP-enabled runtimes
+/// also forward W3C Trace Context from the current span.
 #[derive(Clone)]
 pub struct BearerTokenClientInterceptor {
     metadata_value: Option<tonic::metadata::AsciiMetadataValue>,
+    propagate_trace_context: bool,
 }
 
 impl std::fmt::Debug for BearerTokenClientInterceptor {
@@ -196,6 +198,7 @@ impl std::fmt::Debug for BearerTokenClientInterceptor {
         formatter
             .debug_struct("BearerTokenClientInterceptor")
             .field("token_attached", &self.metadata_value.is_some())
+            .field("propagate_trace_context", &self.propagate_trace_context)
             .finish()
     }
 }
@@ -207,12 +210,18 @@ impl BearerTokenClientInterceptor {
             Some(token) => Some(bearer_metadata(token)?),
             None => None,
         };
-        Ok(Self { metadata_value })
+        Ok(Self {
+            metadata_value,
+            propagate_trace_context: crate::logging::trace_export_enabled(),
+        })
     }
 }
 
 impl tonic::service::Interceptor for BearerTokenClientInterceptor {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        if self.propagate_trace_context {
+            crate::logging::inject_trace_context(request.metadata_mut());
+        }
         if let Some(metadata) = self.metadata_value.as_ref() {
             request
                 .metadata_mut()

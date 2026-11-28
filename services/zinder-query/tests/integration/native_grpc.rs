@@ -28,7 +28,7 @@ use zinder_proto::capabilities::{
 };
 use zinder_proto::v1::{
     ingest::{
-        MempoolTransactionRequest, WriterPhase, WriterStatusRequest, WriterStatusResponse,
+        self, MempoolTransactionRequest, WriterPhase, WriterStatusRequest, WriterStatusResponse,
         ingest_control_server::{IngestControl, IngestControlServer},
     },
     ops,
@@ -269,24 +269,28 @@ async fn ingest_control_admission_rejects_a_different_network() -> eyre::Result<
 
 #[tokio::test]
 async fn ingest_control_admission_rejects_a_different_contract_revision() -> eyre::Result<()> {
-    let ingest_control =
-        StaticIngestControl::new().with_contract_revision(zinder_proto::CONTRACT_REVISION + 1);
-    let (ingest_control_addr, cancel, server_handle) =
-        spawn_ingest_control_server(ingest_control).await?;
+    for revision in [12, zinder_proto::CONTRACT_REVISION + 1] {
+        let ingest_control = StaticIngestControl::new().with_contract_revision(revision);
+        let (ingest_control_addr, cancel, server_handle) =
+            spawn_ingest_control_server(ingest_control).await?;
 
-    let outcome = AdmittedIngestControl::connect(
-        &format!("http://{ingest_control_addr}"),
-        None,
-        Network::ZcashRegtest,
-    )
-    .await;
+        let outcome = AdmittedIngestControl::connect(
+            &format!("http://{ingest_control_addr}"),
+            None,
+            Network::ZcashRegtest,
+        )
+        .await;
 
-    assert!(matches!(
-        outcome,
-        Err(IngestControlAdmissionError::ContractRevisionMismatch { .. })
-    ));
-    cancel.cancel();
-    server_handle.await??;
+        assert!(matches!(
+            outcome,
+            Err(IngestControlAdmissionError::ContractRevisionMismatch {
+                expected: zinder_proto::CONTRACT_REVISION,
+                actual,
+            }) if actual == revision
+        ));
+        cancel.cancel();
+        server_handle.await??;
+    }
     Ok(())
 }
 
@@ -445,6 +449,7 @@ async fn native_grpc_service_checks_range_limit_before_opening_reader() -> eyre:
             start_height: 1,
             end_height: over_limit,
             at_epoch_id: None,
+            pool_types: Vec::new(),
         }),
     )
     .await
@@ -681,6 +686,200 @@ async fn history_floor_miss_still_reports_a_pending_transaction() -> eyre::Resul
     cancel.cancel();
     server_task.await??;
     Ok(())
+}
+
+/// A store without transaction bodies verifies its node before the mempool.
+///
+/// A node that is down never yields an absence, and an epoch-pinned lookup
+/// stays a canonical read that never calls the node.
+#[tokio::test]
+async fn lean_wallet_transaction_miss_verifies_the_forwarding_node_before_the_mempool()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::None)
+        .extend_blocks(1);
+    let tip = chain
+        .blocks()
+        .last()
+        .ok_or_else(|| eyre!("missing fixture tip"))?;
+    let schedule = one_upgrade_per_height()?;
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+    let node = verifiable_node(&schedule, tip.hash)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?);
+    let chain_epoch = pair.chain_epoch();
+    let ingest_control = StaticIngestControl::new();
+    ingest_control.set_mempool_transaction_miss(
+        TransactionAbsence::at_epoch(chain_epoch, true).into_status("not in the test mempool"),
+    );
+    let mempool = ingest_control.clone();
+    let (ingest_control_addr, cancel, server_task) =
+        spawn_ingest_control_server(ingest_control).await?;
+    let admitted = AdmittedIngestControl::connect(
+        &format!("http://{ingest_control_addr}"),
+        None,
+        Network::ZcashRegtest,
+    )
+    .await?;
+    let source = zinder_source::ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        node.url(),
+        zinder_source::NodeAuth::None,
+        Duration::from_secs(2),
+    )?;
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(pair),
+        admitted,
+    )
+    .with_node_broadcast(Some(OrderedBroadcaster::new(source, [])))
+    .with_verified_cold_transactions(zinder_query::ForwardedReadLimit::default());
+    assert!(query.has_verified_cold_tx_source());
+    let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
+    let missing = TransactionId::from_bytes([0x49; 32]);
+
+    // A verified node lets the mempool complete the absence.
+    let absent = transaction_status(&adapter, missing, None).await?;
+    assert_eq!(
+        TransactionAbsence::from_status(&absent)?,
+        Some(TransactionAbsence::at_epoch(chain_epoch, true))
+    );
+    assert_eq!(mempool.mempool_transaction_call_count(), 1);
+
+    // A pinned lookup consults neither the mempool nor the node.
+    drop(node);
+    let pinned = transaction_status(&adapter, missing, Some(chain_epoch.id)).await?;
+    assert_eq!(
+        TransactionAbsence::from_status(&pinned)?,
+        Some(TransactionAbsence::at_epoch(chain_epoch, false))
+    );
+    assert_eq!(mempool.mempool_transaction_call_count(), 1);
+
+    // An unreachable node is `UNAVAILABLE`, and the mempool is not consulted.
+    let unverified = transaction_status(&adapter, missing, None).await?;
+    assert_eq!(unverified.code(), Code::Unavailable, "{unverified:?}");
+    assert_eq!(TransactionAbsence::from_status(&unverified)?, None);
+    assert_eq!(mempool.mempool_transaction_call_count(), 1);
+
+    cancel.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+/// An unpinned lookup below the history floor of a lean store verifies the
+/// forwarding node first, so a stopped node is `UNAVAILABLE` and the mempool
+/// is never consulted.
+#[tokio::test]
+async fn lean_wallet_history_floor_miss_verifies_the_forwarding_node_first() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::None)
+        .extend_blocks(3);
+    let tip = chain
+        .blocks()
+        .last()
+        .ok_or_else(|| eyre!("missing fixture tip"))?;
+    let schedule = one_upgrade_per_height()?;
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(2)),
+        &schedule,
+    )?;
+    let mut store_fixture = writer.into_serving_store_fixture()?;
+    let node = verifiable_node(&schedule, tip.hash)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?);
+    let ingest_control = StaticIngestControl::new();
+    let mempool = ingest_control.clone();
+    let (ingest_control_addr, cancel, server_task) =
+        spawn_ingest_control_server(ingest_control).await?;
+    let admitted = AdmittedIngestControl::connect(
+        &format!("http://{ingest_control_addr}"),
+        None,
+        Network::ZcashRegtest,
+    )
+    .await?;
+    let source = zinder_source::ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        node.url(),
+        zinder_source::NodeAuth::None,
+        Duration::from_secs(2),
+    )?;
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(pair),
+        admitted,
+    )
+    .with_node_broadcast(Some(OrderedBroadcaster::new(source, [])))
+    .with_verified_cold_transactions(zinder_query::ForwardedReadLimit::default());
+    let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
+    let unknown = TransactionId::from_bytes([0x4a; 32]);
+
+    drop(node);
+    let unverified = transaction_status(&adapter, unknown, None).await?;
+    assert_eq!(unverified.code(), Code::Unavailable, "{unverified:?}");
+    assert_eq!(mempool.mempool_transaction_call_count(), 0);
+
+    cancel.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+fn one_upgrade_per_height() -> eyre::Result<zinder_core::NetworkUpgradeActivations> {
+    Ok(zinder_core::NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        sample_regtest_upgrade_activations()
+            .activations()
+            .iter()
+            .zip(1..)
+            .map(
+                |(activation, height)| zinder_core::NetworkUpgradeActivation {
+                    activation_height: BlockHeight::new(height),
+                    ..activation.clone()
+                },
+            )
+            .collect(),
+    )?)
+}
+
+/// A node double that passes served-tip verification for a pair serving
+/// `schedule` with `tip_hash` at its tip.
+fn verifiable_node(
+    schedule: &zinder_core::NetworkUpgradeActivations,
+    tip_hash: zinder_core::BlockHash,
+) -> eyre::Result<zinder_testkit::JsonRpcTestServer> {
+    use zinder_core::wire::encode_branch_id_hex;
+    use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
+
+    let upgrades: serde_json::Map<String, serde_json::Value> = schedule
+        .activations()
+        .iter()
+        .map(|activation| {
+            (
+                encode_branch_id_hex(activation.branch_id),
+                serde_json::json!({
+                    "name": activation.name,
+                    "activationheight": activation.activation_height.value(),
+                    "status": "active",
+                }),
+            )
+        })
+        .collect();
+    JsonRpcTestServer::start([
+        method("rpc.discover").reply_with(|_| {
+            RpcReply::result(serde_json::json!({
+                "openrpc": "1.3.2",
+                "methods": [{"name": "rpc.discover"}, {"name": "sendrawtransaction"}],
+            }))
+        }),
+        method("getblockchaininfo")
+            .reply_with(move |_| RpcReply::result(serde_json::json!({ "upgrades": upgrades }))),
+        method("getblockhash").reply_with(move |_| {
+            RpcReply::result(serde_json::json!(encode_rpc_block_hash_hex(tip_hash)))
+        }),
+    ])
 }
 
 fn assert_history_floor(status: &Status, first_available_height: BlockHeight) -> eyre::Result<()> {
@@ -939,12 +1138,12 @@ async fn native_grpc_service_honors_request_epoch_pin() -> eyre::Result<()> {
 )]
 async fn native_serving_pair_capabilities_and_calls_follow_raw_blob_retention() -> eyre::Result<()>
 {
-    for raw_blob_retention in [
-        RawBlobRetention::None,
-        RawBlobRetention::Transactions,
-        RawBlobRetention::All,
+    for (retention, minimum) in [
+        (RawBlobRetention::None, RawBlobRetention::None),
+        (RawBlobRetention::All, RawBlobRetention::All),
+        (RawBlobRetention::All, RawBlobRetention::None),
     ] {
-        assert_native_retention_case(raw_blob_retention).await?;
+        assert_native_retention_case(retention, minimum).await?;
     }
     Ok(())
 }
@@ -953,10 +1152,12 @@ async fn native_serving_pair_capabilities_and_calls_follow_raw_blob_retention() 
     clippy::too_many_lines,
     reason = "one retention case proves its capability descriptor and every canonical, live, pinned, snapshot, and full-block outcome as one contract"
 )]
-async fn assert_native_retention_case(raw_blob_retention: RawBlobRetention) -> eyre::Result<()> {
+async fn assert_native_retention_case(
+    raw_blob_retention: RawBlobRetention,
+    minimum: RawBlobRetention,
+) -> eyre::Result<()> {
     let (expect_transaction_bytes, expect_full_blocks) = match raw_blob_retention {
         RawBlobRetention::None => (false, false),
-        RawBlobRetention::Transactions => (true, false),
         RawBlobRetention::All => (true, true),
     };
     let mined_transaction_id = TransactionId::from_bytes([0x78; 32]);
@@ -982,20 +1183,37 @@ async fn assert_native_retention_case(raw_blob_retention: RawBlobRetention) -> e
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(raw_blob_retention)
         .extend_blocks(1);
-    let block = chain
+    let pre_tx_block = chain
         .blocks()
         .first()
         .cloned()
         .ok_or_else(|| eyre!("retention fixture omitted its canonical block"))?;
     let chain = chain.with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
         mined_transaction_id,
-        block.height,
-        block.hash,
+        pre_tx_block.height,
+        pre_tx_block.hash,
         0,
         mined_raw_transaction_bytes.clone(),
     ));
-    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
-    let (canonical, wallet) = store_fixture.take_readers()?;
+    let block = chain
+        .blocks()
+        .first()
+        .cloned()
+        .ok_or_else(|| eyre!("retention fixture omitted its canonical block"))?;
+    let mut writer =
+        CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
+    let mut store_fixture = writer.serving_store_fixture()?;
+    let (matching_canonical, wallet) = store_fixture.take_readers()?;
+    let scratch = tempfile::tempdir()?;
+    let canonical = zinder_store::RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        writer.canonical_primary_path(),
+        scratch.path(),
+        Network::ZcashRegtest,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(minimum),
+        matching_canonical.reorg_policy(),
+        zinder_store::RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(canonical.raw_blob_retention(), raw_blob_retention);
     let serving_pair = Arc::new(WalletServingReadPair::new(
         Arc::new(RocksDbCanonicalReader::new(canonical)?),
         Arc::new(RocksDbWalletReader::new(wallet)),
@@ -1031,6 +1249,14 @@ async fn assert_native_retention_case(raw_blob_retention: RawBlobRetention) -> e
         has_capability(&server_info, WALLET_READ_FULL_BLOCK_AT_V1),
         expect_full_blocks,
         "{raw_blob_retention} retention advertised incorrect full-block support"
+    );
+
+    assert_eq!(
+        has_capability(
+            &server_info,
+            zinder_proto::capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1
+        ),
+        expect_full_blocks,
     );
 
     let mempool_snapshot = WalletQueryService::mempool_snapshot(
@@ -1285,6 +1511,8 @@ async fn stalled_native_mempool_event_stream_establishment_is_bounded() -> eyre:
 
 #[tokio::test]
 async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()> {
+    use zinder_proto::capabilities::WALLET_READ_STANDARD_FEE_V1;
+
     let (read_only_adapter, _read_only_store, _read_only_ingest) = native_adapter().await?;
     let read_only_info = WalletQueryService::server_info(
         &read_only_adapter,
@@ -1300,6 +1528,16 @@ async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()>
         &read_only_info,
         WALLET_BROADCAST_TRANSACTION_V1
     ));
+    assert!(!has_capability(
+        &read_only_info,
+        WALLET_READ_STANDARD_FEE_V1
+    ));
+    assert_standard_fee_refusal(
+        &read_only_adapter,
+        Code::FailedPrecondition,
+        ops::ErrorReason::EndpointCapabilityUnavailable,
+    )
+    .await?;
 
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(
@@ -1340,7 +1578,79 @@ async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()>
         Some(wallet::NodeCapabilitiesDescriptor::default()),
         "an unverified node reports no capabilities"
     );
+    assert!(has_capability(&broadcast_info, WALLET_READ_STANDARD_FEE_V1));
+    assert_standard_fee_refusal(
+        &broadcast_adapter,
+        Code::Unavailable,
+        ops::ErrorReason::NodeUnavailable,
+    )
+    .await?;
 
+    Ok(())
+}
+
+async fn assert_standard_fee_refusal(
+    adapter: &impl WalletQueryService,
+    code: Code,
+    reason: ops::ErrorReason,
+) -> eyre::Result<()> {
+    let status =
+        WalletQueryService::standard_fee(adapter, Request::new(wallet::StandardFeeRequest {}))
+            .await
+            .err()
+            .ok_or_else(|| eyre!("expected native standard fee refusal"))?;
+    assert_eq!(status.code(), code, "{status:?}");
+    assert_native_error_reason(&status, reason)
+}
+
+fn assert_native_error_reason(status: &Status, reason: ops::ErrorReason) -> eyre::Result<()> {
+    let details = status.get_error_details();
+    let error = details
+        .error_info()
+        .ok_or_else(|| eyre!("missing ErrorInfo: {status:?}"))?;
+    assert_eq!(error.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+    assert_eq!(error.reason, reason.as_str_name());
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_balance_batch_refuses_unavailable_epoch_and_invalid_selector_counts()
+-> eyre::Result<()> {
+    let (adapter, _store, _ingest) = native_adapter().await?;
+    let address = wallet::AddressLookup {
+        selector: Some(wallet::address_lookup::Selector::ScriptHash(vec![0x51; 32])),
+    };
+    let status = WalletQueryService::transparent_address_balances(
+        &adapter,
+        Request::new(wallet::TransparentAddressBalancesRequest {
+            addresses: vec![address.clone()],
+            at_epoch_id: Some(u64::MAX),
+        }),
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("accepted unavailable epoch"))?;
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_native_error_reason(&status, ops::ErrorReason::ChainEpochPinUnavailable)?;
+
+    for addresses in [
+        Vec::new(),
+        vec![address; zinder_core::MAX_TRANSPARENT_ADDRESSES_PER_BATCH + 1],
+    ] {
+        let count = addresses.len();
+        let status = WalletQueryService::transparent_address_balances(
+            &adapter,
+            Request::new(wallet::TransparentAddressBalancesRequest {
+                addresses,
+                at_epoch_id: None,
+            }),
+        )
+        .await
+        .err()
+        .ok_or_else(|| eyre!("accepted {count} selectors"))?;
+        assert_eq!(status.code(), Code::InvalidArgument, "{count} selectors");
+        assert!(status.message().contains("selectors"), "{status:?}");
+    }
     Ok(())
 }
 
@@ -1368,6 +1678,7 @@ async fn read_wallet_grpc_responses(
             start_height: 1,
             end_height: 1,
             at_epoch_id: None,
+            pool_types: Vec::new(),
         }),
     )
     .await?
@@ -1813,7 +2124,7 @@ async fn native_serving_adapter_with_ingest_control(
     ingest_control: StaticIngestControl,
 ) -> eyre::Result<NativeServingAdapterFixture> {
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(1);
     let store_fixture =
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
@@ -1901,5 +2212,431 @@ async fn served_chain_epochs_report_the_server_info_artifact_schema_version() ->
         server_info.schema_version,
         u32::from(zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value())
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn mempool_snapshot_preserves_oversized_entry_error_reason_over_real_grpc() -> eyre::Result<()>
+{
+    let oversized_status = zinder_proto::status_for_reason(
+        ops::ErrorReason::UnsupportedWalletEncoding,
+        "mempool entry exceeds gRPC response budget",
+    );
+    let (grpc_adapter, _store_fixture, cancel, server_task) =
+        native_serving_adapter_with_ingest_control(
+            StaticIngestControl::new().with_mempool_snapshot_status(oversized_status),
+        )
+        .await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    let wallet_cancel = CancellationToken::new();
+    let wallet_shutdown = wallet_cancel.clone();
+    let wallet_server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(grpc_adapter.into_server())
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                wallet_shutdown.cancelled_owned(),
+            )
+            .await
+    });
+    let mut client =
+        wallet::wallet_query_client::WalletQueryClient::connect(format!("http://{listen_addr}"))
+            .await?;
+
+    let status = client
+        .mempool_snapshot(Request::new(wallet::MempoolSnapshotRequest {
+            max_entries: 1_024,
+            from_cursor: Vec::new(),
+        }))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expected oversized mempool snapshot refusal"))?;
+    assert_eq!(status.code(), Code::Unavailable);
+    let details = status.get_error_details();
+    let error_detail = details
+        .error_info()
+        .ok_or_else(|| eyre!("missing ErrorInfo on forwarded status"))?;
+    assert_eq!(error_detail.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+    assert_eq!(
+        error_detail.reason,
+        ops::ErrorReason::UnsupportedWalletEncoding.as_str_name()
+    );
+
+    drop(client);
+    wallet_cancel.cancel();
+    wallet_server.await??;
+    cancel.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_balance_batch_deduplicates_selectors_at_a_retained_epoch() -> eyre::Result<()> {
+    let chain = balance_chain()?;
+    let activations = sample_regtest_upgrade_activations();
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).through(BlockHeight::new(2)),
+        &activations,
+    )?;
+    let temporary = tempfile::tempdir()?;
+    let config = balance_pair_config(&writer, temporary.path())?;
+    let mut wallet_primary = zinder_wallet_rocksdb::build_wallet_from_canonical(
+        writer.canonical_primary()?,
+        &config.wallet_primary_path,
+        zinder_wallet_rocksdb::RocksDbWalletBuildOptions::for_local_tests(),
+    )?;
+    let cancel = CancellationToken::new();
+    let (writer_status, writer_endpoint, control_task) =
+        serve_balance_writer_status(writer.canonical_primary()?, cancel.clone()).await?;
+    let (publisher, slot) =
+        zinder_query::WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+            config.clone(),
+            zinder_query::WalletServingReadiness::pair_only(zinder_runtime::Readiness::new(
+                zinder_runtime::ReadinessState::starting(),
+            )),
+            &writer_endpoint,
+            None,
+        )
+        .await?;
+    let drained = CancellationToken::new();
+    let publisher_task = publisher.spawn(cancel.clone(), drained.clone());
+    let (mut client, wallet_task, _ingest) =
+        serve_balance_query(slot.clone(), cancel.clone()).await?;
+
+    let old_epoch = slot.capture_ephemeral().chain_epoch();
+    let current = client
+        .transparent_address_balances(balance_batch(None))
+        .await?
+        .into_inner();
+    assert_balance_batch(&current, old_epoch, 18);
+
+    let mut publication = slot.subscribe_publications();
+    let fence = writer.append_live_block(&chain)?;
+    project_balance_epoch(
+        &mut wallet_primary,
+        &config,
+        &activations,
+        writer.canonical_primary()?,
+    )?;
+
+    writer_status.send_replace(balance_writer_status(writer.canonical_primary()?));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while slot.capture_ephemeral().chain_epoch().id != fence.chain_epoch_id() {
+            publication.changed().await?;
+        }
+        Ok::<(), tokio::sync::watch::error::RecvError>(())
+    })
+    .await??;
+
+    let new_epoch = slot.capture_ephemeral().chain_epoch();
+    assert_ne!(new_epoch.id, old_epoch.id);
+    let current = client
+        .transparent_address_balances(balance_batch(None))
+        .await?
+        .into_inner();
+    assert_balance_batch(&current, new_epoch, 39);
+    let pinned = client
+        .transparent_address_balances(balance_batch(Some(old_epoch.id)))
+        .await?
+        .into_inner();
+    assert_balance_batch(&pinned, old_epoch, 18);
+
+    drop(client);
+    drop(slot);
+    cancel.cancel();
+    wallet_task.await??;
+    drained.cancel();
+    publisher_task.await??;
+    control_task.await??;
+    Ok(())
+}
+
+fn project_balance_epoch(
+    wallet_primary: &mut zinder_wallet_rocksdb::RocksDbWalletBuildOutcome,
+    config: &zinder_query::WalletServingPairConfig,
+    activations: &zinder_core::NetworkUpgradeActivations,
+    canonical_primary: &zinder_store::RocksDbCanonicalStore,
+) -> eyre::Result<()> {
+    let anchor = canonical_primary.append_anchor()?;
+    let fence = anchor.event_fence();
+    let source = wallet_primary.report.canonical_source_identity();
+    let replay = zinder_store::RocksDbCanonicalSecondary::open_ready(
+        &config.canonical_primary_path,
+        config
+            .canonical_secondary_root
+            .with_file_name("projector-secondary"),
+        activations,
+        config.canonical_requirements.clone(),
+        config.canonical_reorg_policy,
+        config.canonical_resource_budget,
+    )?;
+    let replay_range = zinder_core::BlockHeightRange::inclusive(
+        fence.visible_tip().height,
+        fence.visible_tip().height,
+    );
+    let cursor = source.source_position().event_cursor.as_bytes();
+    let events = replay.canonical_event_history(
+        zinder_store::CanonicalEventHistoryRequest::new(Some(&cursor), std::num::NonZeroU32::MIN),
+    )?;
+    wallet_primary.store.reconcile_canonical_event_sequence(
+        source,
+        &events,
+        fence,
+        anchor.settled_tip(),
+        None,
+        replay_range,
+        std::num::NonZeroU64::MIN.saturating_add(1024 * 1024 - 1),
+        replay.scan_canonical_replay_range(replay_range)?,
+    )?;
+
+    Ok(())
+}
+
+fn balance_chain() -> eyre::Result<ChainFixture> {
+    use zinder_core::{
+        TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
+    };
+
+    let mut chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    for (height, address, amount) in [(1, 0x51, 5), (2, 0x52, 13), (3, 0x51, 21)] {
+        let block = chain
+            .block_at(BlockHeight::new(height))
+            .ok_or_else(|| eyre!("missing block {height}"))?;
+        let output = TransparentUnspentOutput::new(
+            TransparentAddressScriptHash::from_bytes([address; 32]),
+            vec![address],
+            TransparentOutPoint::new(TransactionId::from_bytes([u8::try_from(height)?; 32]), 0),
+            amount,
+            block.height,
+            block.hash,
+        );
+        chain = chain.with_address_output_index(output);
+    }
+    Ok(chain)
+}
+
+fn balance_batch(at_epoch_id: Option<ChainEpochId>) -> wallet::TransparentAddressBalancesRequest {
+    wallet::TransparentAddressBalancesRequest {
+        addresses: [0x52, 0x51, 0x52]
+            .into_iter()
+            .map(|address| wallet::AddressLookup {
+                selector: Some(wallet::address_lookup::Selector::ScriptHash(vec![
+                    address;
+                    32
+                ])),
+            })
+            .collect(),
+        at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+    }
+}
+
+fn assert_balance_batch(
+    balance: &wallet::TransparentAddressBalancesResponse,
+    epoch: ChainEpoch,
+    confirmed_zat: u64,
+) {
+    assert_eq!(balance.address_count, 2);
+    assert_eq!(balance.confirmed_zat, confirmed_zat);
+    assert_eq!(
+        balance.chain_view,
+        Some(zinder_store::chain_view_message(epoch))
+    );
+}
+
+fn balance_pair_config(
+    writer: &CanonicalWriterFixture,
+    directory: &std::path::Path,
+) -> eyre::Result<zinder_query::WalletServingPairConfig> {
+    Ok(zinder_query::WalletServingPairConfig {
+        canonical_primary_path: writer.canonical_primary_path().to_owned(),
+        canonical_secondary_root: directory.join("canonical-secondaries"),
+        wallet_primary_path: directory.join("wallet-primary"),
+        wallet_secondary_root: directory.join("wallet-secondaries"),
+        network: Network::ZcashRegtest,
+        canonical_requirements: zinder_store::CanonicalStoreRequirements::for_blob_retention(
+            RawBlobRetention::None,
+        ),
+        canonical_reorg_policy: writer.canonical_primary()?.reorg_policy(),
+        canonical_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        wallet_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        catchup_interval: Duration::from_millis(10),
+        convergence_timeout: Duration::from_secs(2),
+        convergence_attempts: std::num::NonZeroU8::MIN.saturating_add(3),
+        replica_lag_threshold_chain_epochs: 4,
+        serving_pair_staleness_ceiling: Duration::from_secs(30),
+        epoch_pin_retention: zinder_query::EpochPinRetention::default(),
+    })
+}
+
+async fn serve_balance_query(
+    slot: WalletServingPairSlot,
+    cancel: CancellationToken,
+) -> eyre::Result<(
+    wallet::wallet_query_client::WalletQueryClient<tonic::transport::Channel>,
+    GrpcServerTask,
+    zinder_testkit::IngestControlFixture,
+)> {
+    let (ingest, ingest_fixture) = crate::common::admitted_ingest_control_fixture().await?;
+    let adapter = WalletQueryGrpcAdapter::new(
+        WalletServingQuery::from_admitted_native_serving_pair(slot, ingest),
+        WalletEndpointMetadata::default(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(
+        Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                cancel.cancelled_owned(),
+            ),
+    );
+    Ok((
+        wallet::wallet_query_client::WalletQueryClient::connect(endpoint).await?,
+        server,
+        ingest_fixture,
+    ))
+}
+
+type GrpcServerTask = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
+
+async fn serve_balance_writer_status(
+    store: &zinder_store::RocksDbCanonicalStore,
+    cancel: CancellationToken,
+) -> eyre::Result<(
+    tokio::sync::watch::Sender<ingest::CanonicalWriterStatusResponse>,
+    String,
+    GrpcServerTask,
+)> {
+    use ingest::canonical_control_server::CanonicalControlServer;
+
+    let (status, current) = tokio::sync::watch::channel(balance_writer_status(store));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(
+        Server::builder()
+            .add_service(CanonicalControlServer::new(BalanceWriterStatus(current)))
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                cancel.cancelled_owned(),
+            ),
+    );
+    Ok((status, endpoint, server))
+}
+
+fn balance_writer_status(
+    store: &zinder_store::RocksDbCanonicalStore,
+) -> ingest::CanonicalWriterStatusResponse {
+    use ingest::{CanonicalWriterFence, CanonicalWriterStatusResponse};
+
+    let fence = store.event_fence();
+    CanonicalWriterStatusResponse {
+        network_name: zinder_core::wire::encode_zinder_native_chain_name(Network::ZcashRegtest)
+            .to_owned(),
+        fence: Some(CanonicalWriterFence {
+            chain_epoch_id: fence.chain_epoch_id().value(),
+            event_sequence: fence.chain_event_sequence(),
+            visible_tip_height: fence.visible_tip().height.value(),
+            visible_tip_hash: fence.visible_tip().hash.as_bytes().to_vec(),
+            visible_block_count: fence.sequence_digest().block_count(),
+            canonical_sequence_digest: fence.sequence_digest().as_bytes().to_vec(),
+        }),
+        oldest_retained_event_sequence: 1,
+        network_upgrade_schedule: store.network_upgrade_schedule().map(|schedule| {
+            zinder_proto::wire::encode_canonical_network_upgrade_schedule(
+                schedule.activations(),
+                schedule.revision(),
+            )
+        }),
+        ..CanonicalWriterStatusResponse::default()
+    }
+}
+
+struct BalanceWriterStatus(tokio::sync::watch::Receiver<ingest::CanonicalWriterStatusResponse>);
+
+#[tonic::async_trait]
+impl ingest::canonical_control_server::CanonicalControl for BalanceWriterStatus {
+    async fn writer_status(
+        &self,
+        _: Request<ingest::CanonicalWriterStatusRequest>,
+    ) -> Result<Response<ingest::CanonicalWriterStatusResponse>, Status> {
+        Ok(Response::new(self.0.borrow().clone()))
+    }
+
+    async fn event_page(
+        &self,
+        _: Request<ingest::CanonicalEventPageRequest>,
+    ) -> Result<Response<ingest::CanonicalEventPageResponse>, Status> {
+        Err(Status::unimplemented("fixture only serves writer status"))
+    }
+
+    async fn create_owner_checkpoint(
+        &self,
+        _: Request<ingest::CreateCanonicalOwnerCheckpointRequest>,
+    ) -> Result<Response<ingest::CreateCanonicalOwnerCheckpointResponse>, Status> {
+        Err(Status::unimplemented("fixture only serves writer status"))
+    }
+
+    async fn readmit_owner_checkpoint(
+        &self,
+        _: Request<ingest::ReadmitCanonicalOwnerCheckpointRequest>,
+    ) -> Result<Response<ingest::CreateCanonicalOwnerCheckpointResponse>, Status> {
+        Err(Status::unimplemented("fixture only serves writer status"))
+    }
+
+    async fn acquire_projection_build_lease(
+        &self,
+        _: Request<ingest::AcquireCanonicalProjectionBuildLeaseRequest>,
+    ) -> Result<Response<ingest::CanonicalProjectionBuildLeaseResponse>, Status> {
+        Err(Status::unimplemented("fixture only serves writer status"))
+    }
+
+    async fn renew_projection_build_lease(
+        &self,
+        _: Request<ingest::RenewCanonicalProjectionBuildLeaseRequest>,
+    ) -> Result<Response<ingest::CanonicalProjectionBuildLeaseResponse>, Status> {
+        Err(Status::unimplemented("fixture only serves writer status"))
+    }
+
+    async fn release_projection_build_lease(
+        &self,
+        _: Request<ingest::ReleaseCanonicalProjectionBuildLeaseRequest>,
+    ) -> Result<Response<ingest::ReleaseCanonicalProjectionBuildLeaseResponse>, Status> {
+        Err(Status::unimplemented("fixture only serves writer status"))
+    }
+}
+
+#[test]
+fn query_config_resolves_and_prints_bounded_epoch_pin_retention() -> eyre::Result<()> {
+    use zinder_query::runtime::{
+        QueryConfigOverrides, load_query_config_with_env, query_config_toml,
+    };
+
+    let load = |seconds: Option<&str>| {
+        let environment = [
+            ("ZINDER_NETWORK__NAME", "zcash-regtest"),
+            ("ZINDER_INGEST_CONTROL__ADDR", "http://127.0.0.1:9101"),
+        ]
+        .into_iter()
+        .chain(seconds.map(|seconds| ("ZINDER_QUERY__EPOCH_PIN_RETENTION_SECONDS", seconds)))
+        .map(|(key, setting)| (key.to_owned(), setting.to_owned()));
+        load_query_config_with_env(None, QueryConfigOverrides::default(), environment)
+    };
+
+    assert_eq!(load(None)?.epoch_pin_retention.seconds(), 60);
+    let configured = load(Some("180"))?;
+    assert_eq!(configured.epoch_pin_retention.seconds(), 180);
+    assert!(query_config_toml(&configured)?.contains("epoch_pin_retention_seconds = 180"));
+    for outside_bound in ["59", "301"] {
+        let error = load(Some(outside_bound))
+            .err()
+            .ok_or_else(|| eyre!("accepted an invalid retention"))?;
+        assert!(
+            error
+                .to_string()
+                .contains("query.epoch_pin_retention_seconds")
+        );
+    }
     Ok(())
 }

@@ -11,6 +11,7 @@ use thiserror::Error;
 use tonic::Status;
 use zinder_proto::v1::ops::ErrorReason;
 use zinder_proto::{BoundaryError, status_for_reason};
+use zinder_runtime::RetryPushback;
 
 /// Explorer-plane failure category.
 ///
@@ -108,7 +109,12 @@ impl BoundaryError for ExplorerError {
 
 impl From<ExplorerError> for Status {
     fn from(error: ExplorerError) -> Self {
-        status_for_reason(error.error_reason(), error.to_string())
+        let status = status_for_reason(error.error_reason(), error.to_string());
+        if matches!(error, ExplorerError::UpstreamUnreachable(_)) {
+            RetryPushback::Backoff.apply(status)
+        } else {
+            status
+        }
     }
 }
 

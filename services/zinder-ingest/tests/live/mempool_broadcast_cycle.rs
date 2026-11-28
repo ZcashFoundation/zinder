@@ -335,6 +335,7 @@ fn zebra_source(env: &zinder_testkit::live::LiveTestEnv) -> Result<ZebraJsonRpcS
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?)
 }

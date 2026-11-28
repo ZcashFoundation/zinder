@@ -11,6 +11,7 @@ members = [
     "crates/zinder-testkit",
     "crates/zinder-wallet-projection",
     "crates/zinder-wallet-rocksdb",
+    "services/zinder",
     "services/zinder-bench",
     "services/zinder-compat-lightwalletd",
     "services/zinder-compat-cipherscan",
@@ -24,7 +25,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.19.0"
+version = "0.29.0"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -35,16 +36,24 @@ rust-version = "1.100"
 arc-swap = "1.9.5"
 async-trait = "0.1.92"
 blake2b_simd = "1.0.5"
+chacha20 = { version = "0.10.2", default-features = false, features = ["cipher"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+base16ct = "1.0.0"
 # Zinder uses the scalar engines; avoid Base64 0.23's default `simd-unsafe` feature.
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 bytes = "1.12.2"
 clap = "4.6.8"
 color-eyre = { version = "0.6.5", default-features = false, features = ["track-caller"] }
-config = { version = "0.15.27", default-features = false, features = ["toml"] }
+composefs-ioctls = "0.10.0"
+const-hex = "1.19.3"
 eyre = "0.6.14"
+flate2 = "1.1.11"
+fs-verity = "0.2.0"
+fastrand = "2.5.0"
+futures-core = "0.3.34"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = { version = "0.4.3", features = ["std"] }
+h2 = "0.4.20"
 hex = "0.4.3"
 hmac = "0.13.0"
 http = "1.5.0"
@@ -52,18 +61,34 @@ http-body = "1.1.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["client", "client-legacy", "http1", "server", "service", "tokio"] }
+ipnet = "2.12.2"
 incrementalmerkletree = "0.9.0"
 jsonrpsee = { version = "0.26.2", default-features = false, features = ["http-client", "server"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 parking_lot = "0.13.0"
 orchard = { version = "0.16.0", default-features = false }
+# Pin the Pasta field-arithmetic crate so `--features pasta_curves/asm` selects
+# the version already locked transitively through `orchard`. Release archives,
+# Docker images, and Compose builds enable `asm` by default (`ZINDER_PASTA_ASM=1`;
+# see `deploy/Dockerfile`), while Cargo leaves it opt-in and excluded from
+# `--all-features` so `cargo test` and CI `pasta-parity` can test both the
+# portable and assembly backends.
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["grpc-tonic", "trace", "tls-ring", "tls-roots"] }
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic", "trace"] }
+pasta_curves = { version = "=0.6.3", default-features = false }
 prost = "0.14.6"
 prost-types = "0.14.6"
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+raw-cpuid = "11.6.0"
+rayon = "1.12.0"
+x86_64 = { version = "0.15.5", default-features = false, features = ["instructions"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 rust-rocksdb = { version = "0.54.1", features = ["multi-threaded-cf"] }
+ring = "0.17.14"
 rustix = { version = "1.1.6", default-features = false, features = ["fs", "std"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
 rustls-native-certs = "0.8.5"
@@ -88,7 +113,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
 tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }
 toml = "1.2.1"
-tonic = { version = "0.14.9", features = ["tls-ring", "tls-native-roots"] }
+tonic = { version = "0.14.9", features = ["tls-ring", "tls-native-roots", "gzip", "zstd"] }
 tonic-health = "0.14.9"
 tonic-prost = "0.14.9"
 tonic-prost-build = "0.14.9"
@@ -98,6 +123,7 @@ tonic-web = "0.14.9"
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.11", default-features = false }
 tracing = "0.1.44"
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "smallvec", "std", "tracing-log"] }
 url = "2.5.8"
 # These protocol crates share concrete types with Zebra. Keep them on the
@@ -109,13 +135,17 @@ zcash_protocol = { version = "0.11.0", default-features = false }
 zcash_transparent = { version = "0.11.1", default-features = false }
 zebra-chain = "16.0.0"
 zip32 = "0.3.0"
-zinder-core = { version = "0.19.0", path = "crates/zinder-core" }
+zstd = "0.13"
+zinder-core = { version = "0.29.0", path = "crates/zinder-core" }
 zinder-rocksdb-bulk-load = { path = "crates/zinder-rocksdb-bulk-load" }
-zinder-client = { version = "0.19.0", path = "crates/zinder-client" }
+zinder-client = { version = "0.29.0", path = "crates/zinder-client" }
+zinder-compat-cipherscan = { path = "services/zinder-compat-cipherscan" }
 zinder-compat-lightwalletd = { path = "services/zinder-compat-lightwalletd" }
+zinder-explorer = { path = "services/zinder-explorer" }
 zinder-materialized-views = { path = "crates/zinder-materialized-views" }
 zinder-ingest = { path = "services/zinder-ingest" }
-zinder-proto = { version = "0.19.0", path = "crates/zinder-proto" }
+zinder-projector = { path = "services/zinder-projector" }
+zinder-proto = { version = "0.29.0", path = "crates/zinder-proto" }
 zinder-query = { path = "services/zinder-query" }
 zinder-runtime = { path = "crates/zinder-runtime" }
 zinder-source = { path = "crates/zinder-source" }

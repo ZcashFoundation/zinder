@@ -4,6 +4,7 @@
 //! do not hand-write protocol-shaped payload structs.
 
 pub mod capabilities;
+mod encoded_block_range;
 pub mod error_policy;
 pub mod wire;
 pub use capabilities::{
@@ -21,7 +22,11 @@ pub use error_policy::{
 /// existing wire surface are revised in place. Consumers require the minimum
 /// revision they implement and may accept newer revisions when the server's
 /// advertised capabilities satisfy their requirements.
-pub const CONTRACT_REVISION: u32 = 9;
+pub const CONTRACT_REVISION: u32 = 16;
+
+/// Milliseconds an ingest-control caller can wait for `MempoolEvents` response
+/// headers. Unlike a gRPC deadline, this budget ends once the stream opens.
+pub const MEMPOOL_EVENTS_OPEN_TIMEOUT_MS_HEADER: &str = "x-zinder-mempool-events-open-timeout-ms";
 
 /// Encoded descriptor set for native Zinder v1 protobuf services.
 ///
@@ -36,6 +41,12 @@ pub const ZINDER_V1_FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(
 pub const LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/generated/lightwalletd_compat_descriptor.bin"
+));
+
+/// Encoded descriptor set for Darkside test control and its wallet message imports.
+pub const DARKSIDE_FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/generated/darkside_descriptor.bin"
 ));
 
 /// Native Zinder protocol modules.
@@ -147,6 +158,12 @@ pub mod compat {
             missing_docs,
             reason = "Generated protobuf code mirrors vendored schemas."
         )]
+
+        pub use crate::encoded_block_range::{
+            BoundedChunkRetention, EncodedBlock, EncodedBlockBatcher, EncodedBlockFrame,
+            EncodedBlockFrameStream, EncodedBlockRange, EncodedBlockRangeNullifiers,
+            EncodedBlockRangeStream, EncodedUnaryBlocks, InvalidEncodedBlock,
+        };
 
         /// Upstream `lightwallet-protocol` commit served by this compatibility pin.
         pub const LIGHTWALLETD_PROTOCOL_COMMIT: &str = include_str!(concat!(

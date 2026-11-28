@@ -55,7 +55,6 @@ define_error_reasons! {
     TransparentBalanceAddressCountExceeded => "TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED",
     SnapshotPageCursorInvalid => "SNAPSHOT_PAGE_CURSOR_INVALID",
     BroadcastTransactionTooLarge => "BROADCAST_TRANSACTION_TOO_LARGE",
-    BroadcastDisabled => "BROADCAST_DISABLED",
     ChainEventCursorExpired => "CHAIN_EVENT_CURSOR_EXPIRED",
     MempoolEventCursorExpired => "MEMPOOL_EVENT_CURSOR_EXPIRED",
     SnapshotPageCursorExpired => "SNAPSHOT_PAGE_CURSOR_EXPIRED",
@@ -94,6 +93,10 @@ define_error_reasons! {
     TreeStateReplayLimitReached => "TREE_STATE_REPLAY_LIMIT_REACHED",
     BroadcastBudgetExhausted => "BROADCAST_BUDGET_EXHAUSTED",
     CompactBlockStreamLimitReached => "COMPACT_BLOCK_STREAM_LIMIT_REACHED",
+    BlockRangeAdmissionRefused => "BLOCK_RANGE_ADMISSION_REFUSED",
+    NodeRateLimited => "NODE_RATE_LIMITED",
+    ForwardedReadLimitReached => "FORWARDED_READ_LIMIT_REACHED",
+    ServedTipMismatch => "SERVED_TIP_MISMATCH",
 }
 
 #[cfg(all(test, feature = "remote"))]
@@ -120,7 +123,6 @@ mod tests {
             WireErrorReason::TransparentBalanceAddressCountExceeded,
             WireErrorReason::SnapshotPageCursorInvalid,
             WireErrorReason::BroadcastTransactionTooLarge,
-            WireErrorReason::BroadcastDisabled,
             WireErrorReason::ChainEventCursorExpired,
             WireErrorReason::MempoolEventCursorExpired,
             WireErrorReason::SnapshotPageCursorExpired,
@@ -159,6 +161,10 @@ mod tests {
             WireErrorReason::TreeStateReplayLimitReached,
             WireErrorReason::BroadcastBudgetExhausted,
             WireErrorReason::CompactBlockStreamLimitReached,
+            WireErrorReason::BlockRangeAdmissionRefused,
+            WireErrorReason::NodeRateLimited,
+            WireErrorReason::ForwardedReadLimitReached,
+            WireErrorReason::ServedTipMismatch,
         ];
 
         for generated in generated_reasons {

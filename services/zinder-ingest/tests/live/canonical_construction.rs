@@ -23,8 +23,7 @@ use zinder_ingest::{
 use zinder_source::NodeSource;
 use zinder_store::{
     CanonicalBlockLoadEvidence, CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreError,
-    CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbIoMode,
-    RocksDbResourceBudget,
+    RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbIoMode, RocksDbResourceBudget,
 };
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 
@@ -68,7 +67,7 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
         &activations,
         checkpoint,
         fixed_tip,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let temporary = tempdir()?;
@@ -77,12 +76,8 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
     let config = live_construction_config(&env, activations.clone())?;
 
     let construction_started_at = Instant::now();
-    let builder = RocksDbCanonicalBuilder::create_fresh(
-        &store_path,
-        CanonicalStoreWorkload::Wallet,
-        build_plan.clone(),
-        resource_budget,
-    )?;
+    let builder =
+        RocksDbCanonicalBuilder::create_fresh(&store_path, build_plan.clone(), resource_budget)?;
     let outcome = load_fresh_canonical_blocks(builder, &source, &config).await?;
     let elapsed = construction_started_at.elapsed();
     let evidence = outcome.evidence;
@@ -94,8 +89,7 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
         resource_budget,
     )
@@ -144,6 +138,7 @@ fn live_construction_config(
                 .ok_or_else(|| eyre!("invalid prepare concurrency"))?,
             block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * MIB)
                 .ok_or_else(|| eyre!("invalid prepare byte watermark"))?,
+            tree_hashing_workers: NonZeroU32::MIN,
         },
         network_upgrade_activations: activations,
     })
@@ -185,13 +180,22 @@ fn assert_and_record_live_evidence(
     );
     assert_eq!(evidence.block_header_count, evidence.block_count);
     assert_eq!(evidence.block_hash_index_count, evidence.block_count);
-    assert_eq!(evidence.block_replay_count, evidence.block_count);
-    assert_eq!(evidence.compact_block_count, evidence.block_count);
+    assert!(evidence.logical_replay_bytes > 0);
+    assert!(evidence.live_tail_block_count > 0);
+    assert!(evidence.live_tail_block_count <= evidence.block_count);
+    assert!(evidence.settled_segment_index_count <= evidence.block_count);
+    assert!(evidence.live_tail_block_logical_bytes > 0);
+    if evidence.settled_segment_index_count == 0 {
+        assert_eq!(evidence.live_tail_block_count, evidence.block_count);
+        assert_eq!(evidence.settled_segment_index_logical_bytes, 0);
+    } else {
+        assert!(evidence.settled_segment_index_logical_bytes > 0);
+    }
     assert_eq!(
         evidence.transaction_location_count,
         evidence.transaction_count
     );
-    assert_eq!(evidence.transaction_blob_count, evidence.transaction_count);
+    assert_eq!(evidence.transaction_blob_count, 0);
     assert_eq!(evidence.block_blob_count, 0);
     assert_eq!(evidence.tip_height, fixed_tip.height);
     assert_eq!(evidence.tip_hash, fixed_tip.hash);
@@ -219,22 +223,26 @@ fn assert_and_record_live_evidence(
         eprintln!(
             "canonical_blocks_live_evidence network={} checkpoint_height={} checkpoint_hash={} \
              tip_height={} tip_hash={} block_count={} transaction_count={} \
+             logical_replay_bytes={} settled_segment_index_count={} live_tail_block_count={} \
+             settled_segment_index_evidence_logical_bytes={} \
+             live_tail_block_evidence_logical_bytes={} \
              block_header_rows={} block_header_logical_bytes={} block_header_sst_bytes={} \
              block_header_sst_files={} block_hash_index_rows={} \
              block_hash_index_logical_bytes={} block_hash_index_sst_bytes={} \
-             block_hash_index_sst_files={} block_replay_rows={} block_replay_logical_bytes={} \
-             block_replay_sst_bytes={} block_replay_sst_files={} compact_block_rows={} \
-             compact_block_logical_bytes={} compact_block_sst_bytes={} compact_block_sst_files={} \
-             transaction_location_rows={} transaction_location_logical_bytes={} \
-             transaction_location_sst_bytes={} transaction_location_sst_files={} \
-             transaction_blob_rows={} transaction_blob_logical_bytes={} transaction_blob_sst_bytes={} \
-             transaction_blob_sst_files={} block_blob_rows={} block_blob_logical_bytes={} \
-             block_blob_sst_bytes={} block_blob_sst_files={} logical_bytes={} sst_file_bytes={} \
-             sst_file_count={} sequence_digest={} tip_sapling_tree_size={} \
-             tip_orchard_tree_size={} tip_ironwood_tree_size={} elapsed_milliseconds={} \
-             blocks_per_second={} logical_mib_per_second={} io_mode={io_mode:?} \
-             persisted_readback_milliseconds={} persisted_readback=metadata_and_boundary_samples \
-             build_state=BUILDING ready_admission=REFUSED",
+             block_hash_index_sst_files={} settled_segment_index_rows={} \
+             settled_segment_index_logical_bytes={} settled_segment_index_sst_bytes={} \
+             settled_segment_index_sst_files={} live_tail_block_rows={} \
+             live_tail_block_logical_bytes={} live_tail_block_sst_bytes={} \
+             live_tail_block_sst_files={} transaction_location_rows={} \
+             transaction_location_logical_bytes={} transaction_location_sst_bytes={} \
+             transaction_location_sst_files={} transaction_blob_count={} \
+             transaction_blob_logical_bytes={} block_blob_count={} block_blob_logical_bytes={} \
+             logical_bytes={} sst_file_bytes={} sst_file_count={} sequence_digest={} \
+             tip_sapling_tree_size={} tip_orchard_tree_size={} tip_ironwood_tree_size={} \
+             elapsed_milliseconds={} blocks_per_second={} logical_mib_per_second={} \
+             io_mode={io_mode:?} persisted_readback_milliseconds={} \
+             persisted_readback=metadata_and_boundary_samples build_state=BUILDING \
+             ready_admission=REFUSED",
             encode_zinder_native_chain_name(build_plan.network()),
             checkpoint.height.value(),
             encode_rpc_block_hash_hex(checkpoint.hash),
@@ -242,6 +250,11 @@ fn assert_and_record_live_evidence(
             encode_rpc_block_hash_hex(fixed_tip.hash),
             evidence.block_count,
             evidence.transaction_count,
+            evidence.logical_replay_bytes,
+            evidence.settled_segment_index_count,
+            evidence.live_tail_block_count,
+            evidence.settled_segment_index_logical_bytes,
+            evidence.live_tail_block_logical_bytes,
             persisted.block_header.row_count,
             persisted.block_header.prepared_logical_bytes,
             persisted.block_header.sst_file_bytes,
@@ -250,26 +263,22 @@ fn assert_and_record_live_evidence(
             persisted.block_hash_index.prepared_logical_bytes,
             persisted.block_hash_index.sst_file_bytes,
             persisted.block_hash_index.sst_file_count,
-            persisted.block_replay.row_count,
-            persisted.block_replay.prepared_logical_bytes,
-            persisted.block_replay.sst_file_bytes,
-            persisted.block_replay.sst_file_count,
-            persisted.compact_block.row_count,
-            persisted.compact_block.prepared_logical_bytes,
-            persisted.compact_block.sst_file_bytes,
-            persisted.compact_block.sst_file_count,
+            persisted.settled_segment_index.row_count,
+            persisted.settled_segment_index.prepared_logical_bytes,
+            persisted.settled_segment_index.sst_file_bytes,
+            persisted.settled_segment_index.sst_file_count,
+            persisted.live_tail_block.row_count,
+            persisted.live_tail_block.prepared_logical_bytes,
+            persisted.live_tail_block.sst_file_bytes,
+            persisted.live_tail_block.sst_file_count,
             persisted.transaction_location.row_count,
             persisted.transaction_location.prepared_logical_bytes,
             persisted.transaction_location.sst_file_bytes,
             persisted.transaction_location.sst_file_count,
-            persisted.transaction_blob.row_count,
-            persisted.transaction_blob.prepared_logical_bytes,
-            persisted.transaction_blob.sst_file_bytes,
-            persisted.transaction_blob.sst_file_count,
-            persisted.block_blob.row_count,
-            persisted.block_blob.prepared_logical_bytes,
-            persisted.block_blob.sst_file_bytes,
-            persisted.block_blob.sst_file_count,
+            evidence.transaction_blob_count,
+            evidence.transaction_blob_logical_bytes,
+            evidence.block_blob_count,
+            evidence.block_blob_logical_bytes,
             evidence.logical_bytes,
             evidence.sst_file_bytes,
             evidence.sst_file_count,

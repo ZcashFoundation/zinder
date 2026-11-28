@@ -1,0 +1,16 @@
+groups:
+  - name: zinder-smoke-targets
+    labels: {stack: zinder-local}
+    rules:
+      - record: zinder:expected_target
+        expr: vector(1)
+        labels: {service: zinder-ingest, job: zinder-ingest, instance: "host.docker.internal:9190"}
+      - record: zinder:expected_target
+        expr: vector(1)
+        labels: {service: zinder-projector, job: zinder-projector, instance: "host.docker.internal:9194"}
+      - record: zinder:expected_target
+        expr: vector(1)
+        labels: {service: zinder-query, job: zinder-query, instance: "host.docker.internal:9193"}
+      - record: zinder:expected_target
+        expr: vector(1)
+        labels: {service: zinder-compat-lightwalletd, job: zinder-compat-lightwalletd, instance: "host.docker.internal:9192"}

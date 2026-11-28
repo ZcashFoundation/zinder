@@ -34,6 +34,17 @@ pub const WALLET_READ_COMPACT_BLOCK_AT_V2: &str = "wallet.read.compact_block_at_
 /// Since contract revision 7, the stream sends one leading `ChainView` header
 /// and then one bare compact block per requested height.
 pub const WALLET_READ_COMPACT_BLOCK_RANGE_V2: &str = "wallet.read.compact_block_range_v2";
+/// Descending ranges and pool selection on `WalletQuery.CompactBlocksInRange`.
+pub const WALLET_READ_COMPACT_BLOCK_RANGE_V3: &str = "wallet.read.compact_block_range_v3";
+/// Capability advertised for `WalletQuery.CompactNullifiersInRange`.
+pub const WALLET_READ_COMPACT_NULLIFIER_RANGE_V1: &str = "wallet.read.compact_nullifier_range_v1";
+/// Capability advertised for `WalletQuery.StandardFee`.
+pub const WALLET_READ_STANDARD_FEE_V1: &str = "wallet.read.standard_fee_v1";
+/// Capability advertised for `WalletQuery.TransparentAddressBalances`.
+pub const WALLET_ADDRESS_TRANSPARENT_BALANCES_V1: &str = "wallet.address.transparent_balances_v1";
+/// Capability advertised for `WalletQuery.TransparentAddressesUnspentOutputs`.
+pub const WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1: &str =
+    "wallet.address.transparent_batch_unspent_outputs_v1";
 /// Field capability gating native `ironwood_actions` and
 /// `ironwood_commitment_tree_size` structured compact-block fields.
 ///
@@ -86,7 +97,7 @@ pub const WALLET_READ_TRANSACTION_BY_ID_V2: &str = "wallet.read.transaction_by_i
 ///
 /// A composition may advertise this only together with
 /// [`WALLET_READ_TRANSACTION_BY_ID_V2`] and when its admitted store retains
-/// transaction blobs (ingest `raw_blob_policy` in `{transactions, all}`).
+/// transaction blobs or the query has a verified node byte source.
 /// When absent the field is `None`; clients branch on presence rather than
 /// empty-vs-populated bytes.
 pub const WALLET_READ_TRANSACTION_BYTES_V1: &str = "wallet.read.transaction_bytes_v1";
@@ -481,6 +492,8 @@ pub enum CapabilitySurface {
 pub enum AdvertisePolicy {
     /// No additional deployment requirement.
     AlwaysOn,
+    /// No runtime produces the data for this capability.
+    Unserved,
     /// Wallet: requires a configured transaction broadcaster.
     RequiresBroadcaster,
     /// Wallet: requires a served chain-event stream.
@@ -489,7 +502,8 @@ pub enum AdvertisePolicy {
     ///
     /// Ingest resolves this against the source handle's
     /// `NodeCapability::ChainValuePools`; wallet compositions require the
-    /// corresponding admitted upstream read path.
+    /// corresponding admitted upstream read path. Explorer requires the wallet
+    /// endpoint to advertise [`Capability::ChainValuePools`].
     RequiresChainValuePools,
     /// Explorer: advertised when a `WalletQuery` endpoint is wired.
     RequiresWalletQuery,
@@ -521,8 +535,8 @@ pub enum AdvertisePolicy {
     /// Wallet: requires a store that retains full block blobs (ingest
     /// `raw_blob_policy = all`).
     RequiresBlockBlobs,
-    /// Wallet: requires a store that retains transaction blobs
-    /// (ingest `raw_blob_policy` in `{transactions, all}`).
+    /// Wallet: requires a store that retains transaction and block blobs
+    /// (ingest `raw_blob_policy = all`).
     RequiresTransactionBlobs,
     /// Wallet: requires an available transparent-address history projection.
     RequiresTransparentAddressHistory,
@@ -535,9 +549,25 @@ impl AdvertisePolicy {
     /// `WalletQuery`-endpoint precondition.
     #[must_use]
     pub fn explorer_satisfied(self, readiness: ExplorerReadiness) -> bool {
+        self.explorer_satisfied_with_wallet(readiness, None)
+    }
+
+    /// Resolves an Explorer capability using the connected wallet's advertised
+    /// methods. An absent descriptor leaves wallet capability claims unconfirmed.
+    #[must_use]
+    pub fn explorer_satisfied_with_wallet(
+        self,
+        readiness: ExplorerReadiness,
+        wallet: Option<&WalletServerInfo>,
+    ) -> bool {
         match self {
             Self::AlwaysOn => true,
             Self::RequiresWalletQuery => readiness.wallet_query_online,
+            Self::RequiresChainValuePools => {
+                readiness.wallet_query_online
+                    && wallet
+                        .is_some_and(|descriptor| descriptor.supports(Capability::ChainValuePools))
+            }
             Self::RequiresCanonicalStore => readiness.canonical_store_online,
             Self::RequiresMaterializedViewStore => readiness.materialized_view_store_online,
             Self::RequiresWalletQueryAndCanonicalStore => {
@@ -563,7 +593,7 @@ impl AdvertisePolicy {
             }
             Self::RequiresBroadcaster
             | Self::RequiresChainEvents
-            | Self::RequiresChainValuePools
+            | Self::Unserved
             | Self::RequiresBlockBlobs
             | Self::RequiresTransactionBlobs
             | Self::RequiresTransparentAddressHistory => false,
@@ -579,7 +609,8 @@ impl AdvertisePolicy {
         match self {
             Self::AlwaysOn => true,
             Self::RequiresChainValuePools => chain_value_pools_supported,
-            Self::RequiresBroadcaster
+            Self::Unserved
+            | Self::RequiresBroadcaster
             | Self::RequiresChainEvents
             | Self::RequiresCanonicalStore
             | Self::RequiresMaterializedViewStore
@@ -706,6 +737,36 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         WALLET_READ_COMPACT_BLOCK_RANGE_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.CompactBlocksInRange"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_COMPACT_BLOCK_RANGE_V3,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.CompactBlocksInRange"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_COMPACT_NULLIFIER_RANGE_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.CompactNullifiersInRange"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_STANDARD_FEE_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.StandardFee"),
+        AdvertisePolicy::RequiresBroadcaster,
+    ),
+    CapabilitySpec::new(
+        WALLET_ADDRESS_TRANSPARENT_BALANCES_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.TransparentAddressBalances"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.TransparentAddressesUnspentOutputs"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
@@ -940,7 +1001,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_PAID_FEE_DISTRIBUTION_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.PaidFeeDistribution"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
+        AdvertisePolicy::Unserved,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2,
@@ -958,7 +1019,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_VALUE_POOL_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolSummary"),
-        AdvertisePolicy::RequiresWalletQuery,
+        AdvertisePolicy::RequiresChainValuePools,
     ),
     CapabilitySpec::new(
         EXPLORER_NETWORK_UPGRADE_STATUS_V1,
@@ -1000,7 +1061,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolBalanceHistory"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
+        AdvertisePolicy::Unserved,
     ),
     CapabilitySpec::new(
         EXPLORER_CHAIN_REORG_HISTORY_V1,
@@ -1024,7 +1085,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.MempoolEventCounts"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
+        AdvertisePolicy::Unserved,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_FEES_V1,

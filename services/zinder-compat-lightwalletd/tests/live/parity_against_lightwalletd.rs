@@ -42,8 +42,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eyre::{Result, eyre};
+use eyre::{Result, ensure, eyre};
 use tonic::{Code, Status, transport::Endpoint};
+use tonic_types::StatusExt as _;
 use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
@@ -62,7 +63,12 @@ use zinder_testkit::{
     ZIP317_FEE_ONE_IN_ONE_OUT_ZATS, local_network_from_activations,
 };
 
-const PARITY_BLOCK_RANGE_END: u64 = 5;
+use crate::common::nullifier_parity::{
+    assert_nullifier_compact_block_matches, assert_nullifier_range_matches,
+};
+
+// Both CI nodes switch from the shielded-prefix miner to the transparent miner at 11.
+const FIRST_TRANSPARENT_MINER_HEIGHT: u64 = 11;
 const DEFAULT_PARITY_TRANSPARENT_ADDRESS: &str = "tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx";
 const MEMPOOL_OBSERVE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -190,7 +196,7 @@ async fn block_lookup_matches_reference_for_known_height() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
-async fn compact_block_range_matches_reference_for_first_blocks() -> Result<()> {
+async fn compact_block_range_matches_reference_for_default_and_explicit_pools() -> Result<()> {
     let _guard = init();
     let Some(_env) = require_live()? else {
         return Ok(());
@@ -199,32 +205,28 @@ async fn compact_block_range_matches_reference_for_first_blocks() -> Result<()> 
         return Ok(());
     };
 
-    let request = || BlockRange {
-        start: Some(BlockId {
-            height: 1,
-            hash: Vec::new(),
-        }),
-        end: Some(BlockId {
-            height: PARITY_BLOCK_RANGE_END,
-            hash: Vec::new(),
-        }),
-        pool_types: Vec::new(),
-    };
-    let zinder_blocks = drain_block_range(zinder.get_block_range(request()).await?.into_inner())
-        .await
-        .map_err(|error| eyre!("zinder block-range stream failed: {error}"))?;
-    let reference_blocks =
-        drain_block_range(reference.get_block_range(request()).await?.into_inner())
-            .await
-            .map_err(|error| eyre!("reference block-range stream failed: {error}"))?;
-
-    assert_eq!(
-        zinder_blocks.len(),
-        reference_blocks.len(),
-        "compact block count diverges across shims",
-    );
-    for (zinder_block, reference_block) in zinder_blocks.iter().zip(reference_blocks.iter()) {
-        assert_compact_block_identity_matches(zinder_block, reference_block);
+    for pool in [
+        None,
+        Some(lightwalletd::PoolType::Transparent),
+        Some(lightwalletd::PoolType::Ironwood),
+    ] {
+        let request = miner_prefix_request(pool);
+        let zinder_blocks =
+            drain_block_range(zinder.get_block_range(request.clone()).await?.into_inner()).await?;
+        let reference_blocks =
+            drain_block_range(reference.get_block_range(request).await?.into_inner()).await?;
+        assert_miner_prefix_heights(&reference_blocks, pool)?;
+        ensure!(
+            zinder_blocks.len() == reference_blocks.len(),
+            "block range length differs for pool {pool:?}"
+        );
+        for (zinder, reference) in zinder_blocks.into_iter().zip(reference_blocks) {
+            ensure!(
+                zinder == reference,
+                "compact block differs at height {} for pool {pool:?}",
+                reference.height
+            );
+        }
     }
     Ok(())
 }
@@ -496,34 +498,34 @@ async fn accepted_send_transaction_surfaces_in_non_empty_mempool_methods() -> Re
     let broadcast_txid = decode_rpc_transaction_id_hex(&send_response.error_message)
         .map_err(|error| eyre!("SendTransaction success message was not a txid: {error}"))?;
 
-    let zinder_raw =
-        wait_for_mempool_stream_snapshot_transaction(&mut zinder, &raw_transaction, "Zinder")
-            .await?;
-    let reference_raw =
-        wait_for_mempool_stream_snapshot_transaction(&mut reference, &raw_transaction, "reference")
-            .await?;
-    assert_eq!(zinder_raw.height, 0, "Zinder mempool RawTransaction height");
-    assert_eq!(
-        reference_raw.height, 0,
-        "reference mempool RawTransaction height"
-    );
-
-    assert_pending_transaction_matches_reference(
-        &mut zinder,
+    let expected = accepted_mempool_transaction(
         &mut reference,
         broadcast_txid,
         &raw_transaction,
+        "reference",
     )
     .await?;
-
-    let zinder_compact =
-        wait_for_compact_mempool_transaction(&mut zinder, broadcast_txid, "Zinder").await?;
-    let reference_compact =
-        wait_for_compact_mempool_transaction(&mut reference, broadcast_txid, "reference").await?;
+    let observed =
+        accepted_mempool_transaction(&mut zinder, broadcast_txid, &raw_transaction, "Zinder")
+            .await?;
     assert_eq!(
-        zinder_compact, reference_compact,
-        "transparent mempool CompactTx diverged after accepted send",
+        observed, expected,
+        "transparent mempool CompactTx diverged after accepted send"
     );
+    if let Some(addr) = optional_env("ZINDER_TEST_LIGHT_WALLET_RETAINED_ADDR")? {
+        let mut retained = CompactTxStreamerClient::new(Endpoint::new(addr)?.connect().await?);
+        let observed = accepted_mempool_transaction(
+            &mut retained,
+            broadcast_txid,
+            &raw_transaction,
+            "retained light-wallet",
+        )
+        .await?;
+        assert_eq!(
+            observed, expected,
+            "retained light-wallet mempool CompactTx diverged"
+        );
+    }
     Ok(())
 }
 
@@ -533,7 +535,7 @@ async fn accepted_send_transaction_surfaces_in_non_empty_mempool_methods() -> Re
     deprecated,
     reason = "GetBlockNullifiers is deprecated in the lightwalletd contract but the single-block redaction parity must still hold for the wallets that call it."
 )]
-async fn block_nullifiers_omit_commitment_tree_sizes_like_reference() -> Result<()> {
+async fn block_nullifiers_retain_the_same_transactions_and_nullifiers_as_reference() -> Result<()> {
     let _guard = init();
     let Some(_env) = require_live()? else {
         return Ok(());
@@ -542,18 +544,18 @@ async fn block_nullifiers_omit_commitment_tree_sizes_like_reference() -> Result<
         return Ok(());
     };
 
-    let request = || BlockId {
-        height: 1,
-        hash: Vec::new(),
-    };
-    let zinder_block = zinder.get_block_nullifiers(request()).await?.into_inner();
-    let reference_block = reference
-        .get_block_nullifiers(request())
-        .await?
-        .into_inner();
-
-    assert_nullifier_response_redacts_non_nullifier_payloads(&zinder_block);
-    assert_nullifier_response_redacts_non_nullifier_payloads(&reference_block);
+    for height in [1, 6, FIRST_TRANSPARENT_MINER_HEIGHT] {
+        let request = BlockId {
+            height,
+            hash: Vec::new(),
+        };
+        let zinder_block = zinder
+            .get_block_nullifiers(request.clone())
+            .await?
+            .into_inner();
+        let reference_block = reference.get_block_nullifiers(request).await?.into_inner();
+        assert_nullifier_compact_block_matches(&zinder_block, &reference_block)?;
+    }
     Ok(())
 }
 
@@ -563,7 +565,7 @@ async fn block_nullifiers_omit_commitment_tree_sizes_like_reference() -> Result<
     deprecated,
     reason = "GetBlockRangeNullifiers is deprecated in the lightwalletd contract but the redaction parity must still hold for the wallets that call it."
 )]
-async fn block_range_nullifiers_omit_commitment_tree_sizes_like_reference() -> Result<()> {
+async fn block_range_nullifiers_match_reference_for_default_and_ironwood_pools() -> Result<()> {
     let _guard = init();
     let Some(_env) = require_live()? else {
         return Ok(());
@@ -572,38 +574,24 @@ async fn block_range_nullifiers_omit_commitment_tree_sizes_like_reference() -> R
         return Ok(());
     };
 
-    let request = || BlockRange {
-        start: Some(BlockId {
-            height: 1,
-            hash: Vec::new(),
-        }),
-        end: Some(BlockId {
-            height: PARITY_BLOCK_RANGE_END,
-            hash: Vec::new(),
-        }),
-        pool_types: Vec::new(),
-    };
-    let zinder_blocks = drain_block_range(
-        zinder
-            .get_block_range_nullifiers(request())
-            .await?
-            .into_inner(),
-    )
-    .await
-    .map_err(|error| eyre!("zinder nullifier-range stream failed: {error}"))?;
-    let reference_blocks = drain_block_range(
-        reference
-            .get_block_range_nullifiers(request())
-            .await?
-            .into_inner(),
-    )
-    .await
-    .map_err(|error| eyre!("reference nullifier-range stream failed: {error}"))?;
-
-    for blocks in [&zinder_blocks, &reference_blocks] {
-        for block in blocks {
-            assert_nullifier_response_redacts_non_nullifier_payloads(block);
-        }
+    for pool in [None, Some(lightwalletd::PoolType::Ironwood)] {
+        let request = miner_prefix_request(pool);
+        let zinder_blocks = drain_block_range(
+            zinder
+                .get_block_range_nullifiers(request.clone())
+                .await?
+                .into_inner(),
+        )
+        .await?;
+        let reference_blocks = drain_block_range(
+            reference
+                .get_block_range_nullifiers(request)
+                .await?
+                .into_inner(),
+        )
+        .await?;
+        assert_miner_prefix_heights(&reference_blocks, pool)?;
+        assert_nullifier_range_matches(&zinder_blocks, &reference_blocks)?;
     }
     Ok(())
 }
@@ -760,17 +748,172 @@ async fn tree_state_matches_reference_between_checkpoints() -> Result<()> {
     let reference_tip = reference.get_latest_block(ChainSpec {}).await?.into_inner();
     let shared_tip = zinder_tip.height.min(reference_tip.height);
 
-    for height in TREE_STATE_PARITY_HEIGHTS
+    let activation = reference
+        .get_lightd_info(Empty {})
+        .await?
+        .into_inner()
+        .sapling_activation_height;
+    let heights = TREE_STATE_PARITY_HEIGHTS
         .into_iter()
+        .chain([activation.saturating_sub(1), activation]);
+    for height in heights
+        .filter(|height| *height > 0)
         .filter(|height| *height <= shared_tip)
     {
         let request = || BlockId {
             height,
             hash: Vec::new(),
         };
+        if height < activation {
+            let zinder_status = zinder
+                .get_tree_state(request())
+                .await
+                .err()
+                .ok_or_else(|| eyre!("Zinder accepted a pre-Sapling tree state"))?;
+            let reference_status = reference
+                .get_tree_state(request())
+                .await
+                .err()
+                .ok_or_else(|| eyre!("reference accepted a pre-Sapling tree state"))?;
+            assert_eq!(zinder_status.code(), tonic::Code::InvalidArgument);
+            assert_eq!(zinder_status.code(), reference_status.code());
+            let hash = zinder.get_block(request()).await?.into_inner().hash;
+            let by_hash = BlockId {
+                height: 0,
+                hash: hash.into_iter().rev().collect(),
+            };
+            assert_eq!(
+                zinder
+                    .get_tree_state(by_hash.clone())
+                    .await
+                    .err()
+                    .map(|status| status.code()),
+                Some(tonic::Code::InvalidArgument)
+            );
+            assert_eq!(
+                reference
+                    .get_tree_state(by_hash)
+                    .await
+                    .err()
+                    .map(|status| status.code()),
+                Some(tonic::Code::InvalidArgument)
+            );
+            continue;
+        }
         let zinder_tree_state = zinder.get_tree_state(request()).await?.into_inner();
         let reference_tree_state = reference.get_tree_state(request()).await?.into_inner();
         assert_tree_state_identity_matches(&zinder_tree_state, &reference_tree_state);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
+async fn tree_state_by_hash_matches_reference() -> Result<()> {
+    let _guard = init();
+    let Some(_env) = require_live()? else {
+        return Ok(());
+    };
+    let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
+        return Ok(());
+    };
+
+    let height = common_latest_height(&mut zinder, &mut reference).await?;
+    let height_request = BlockId {
+        height,
+        hash: Vec::new(),
+    };
+    let by_height = reference
+        .get_tree_state(height_request.clone())
+        .await?
+        .into_inner();
+    let zinder_by_height = zinder.get_tree_state(height_request).await?.into_inner();
+    let by_hash = BlockId {
+        height: 0,
+        hash: hex::decode(&by_height.hash)?,
+    };
+    let reference_state = reference
+        .get_tree_state(by_hash.clone())
+        .await?
+        .into_inner();
+    let zinder_state = zinder.get_tree_state(by_hash).await?.into_inner();
+    assert_eq!(reference_state, by_height);
+    assert_eq!(zinder_state, zinder_by_height);
+    assert_tree_state_identity_matches(&zinder_state, &reference_state);
+
+    let height_with_unrelated_hash = BlockId {
+        height,
+        hash: vec![0xff; 32],
+    };
+    assert_eq!(
+        reference
+            .get_tree_state(height_with_unrelated_hash.clone())
+            .await?
+            .into_inner(),
+        by_height
+    );
+    assert_eq!(
+        zinder
+            .get_tree_state(height_with_unrelated_hash)
+            .await?
+            .into_inner(),
+        zinder_by_height
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
+async fn unknown_tree_state_queries_match_reference_status() -> Result<()> {
+    let _guard = init();
+    let Some(_env) = require_live()? else {
+        return Ok(());
+    };
+    let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
+        return Ok(());
+    };
+
+    for (case, request) in [
+        (
+            "unspecified zero block identifier",
+            BlockId {
+                height: 0,
+                hash: Vec::new(),
+            },
+        ),
+        (
+            "unknown block hash",
+            BlockId {
+                height: 0,
+                hash: vec![0xff; 32],
+            },
+        ),
+        (
+            "future block height",
+            BlockId {
+                height: future_height_above_both_shims(&mut zinder, &mut reference).await?,
+                hash: Vec::new(),
+            },
+        ),
+    ] {
+        let zinder_status = error_status(
+            zinder.get_tree_state(request.clone()).await,
+            "Zinder GetTreeState",
+            case,
+        )?;
+        let reference_status = error_status(
+            reference.get_tree_state(request).await,
+            "reference GetTreeState",
+            case,
+        )?;
+        assert_matching_status_code(
+            &zinder_status,
+            &reference_status,
+            Code::InvalidArgument,
+            "GetTreeState",
+            case,
+        );
     }
     Ok(())
 }
@@ -1052,48 +1195,61 @@ async fn address_utxos_respect_max_entries_for_miner_address() -> Result<()> {
     };
     let address = parity_transparent_address()?;
 
-    let request = || lightwalletd::GetAddressUtxosArg {
+    let request = |max_entries| lightwalletd::GetAddressUtxosArg {
         addresses: vec![address.clone()],
         start_height: 1,
-        max_entries: 1,
+        max_entries,
     };
-    let zinder_list = zinder.get_address_utxos(request()).await?.into_inner();
-    let reference_list = reference.get_address_utxos(request()).await?.into_inner();
-    let zinder_stream = drain_address_utxos(
-        zinder
-            .get_address_utxos_stream(request())
-            .await?
-            .into_inner(),
-    )
-    .await?;
-    let reference_stream = drain_address_utxos(
-        reference
-            .get_address_utxos_stream(request())
-            .await?
-            .into_inner(),
-    )
-    .await?;
+    let baseline = reference.get_address_utxos(request(0)).await?.into_inner();
+    let first = baseline
+        .address_utxos
+        .first()
+        .ok_or_else(|| eyre!("miner address {address} has no confirmed outputs"))?;
+    let height = first.height;
+    let first_height: Vec<_> = baseline
+        .address_utxos
+        .into_iter()
+        .filter(|reply| reply.height == height)
+        .collect();
+    let count = u32::try_from(first_height.len())?;
 
+    if count > 1 {
+        let unary = zinder
+            .get_address_utxos(request(1))
+            .await
+            .err()
+            .ok_or_else(|| eyre!("admitted an oversized first height"))?;
+        let streaming =
+            match zinder.get_address_utxos_stream(request(1)).await {
+                Ok(response) => response.into_inner().message().await.err().ok_or_else(|| {
+                    eyre!("oversized first height did not fail before sending rows")
+                })?,
+                Err(status) => status,
+            };
+        for status in [unary, streaming] {
+            assert_eq!(status.code(), Code::FailedPrecondition);
+            let details = status.get_error_details();
+            let detail = details
+                .error_info()
+                .ok_or_else(|| eyre!("missing pagination detail"))?;
+            assert_eq!(detail.reason, "MAX_ENTRIES_EXCEEDED_AT_HEIGHT");
+            assert_eq!(detail.domain, "cash.z.wallet.sdk.rpc");
+            assert_eq!(detail.metadata.get("height"), Some(&height.to_string()));
+            assert_eq!(detail.metadata.get("count"), Some(&count.to_string()));
+        }
+    }
+    let unary = zinder.get_address_utxos(request(count)).await?.into_inner();
+    let streamed = drain_address_utxos(
+        zinder
+            .get_address_utxos_stream(request(count))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    assert_eq!(unary.address_utxos, streamed);
     assert_eq!(
-        zinder_list.address_utxos, zinder_stream,
-        "Zinder max-entry GetAddressUtxos list and stream diverge",
-    );
-    assert_eq!(
-        reference_list.address_utxos, reference_stream,
-        "reference max-entry GetAddressUtxos list and stream diverge",
-    );
-    assert_eq!(
-        normalize_address_utxos(&zinder_stream),
-        normalize_address_utxos(&reference_stream),
-        "max-entry transparent UTXOs diverge for miner address {address}",
-    );
-    assert!(
-        zinder_stream.len() <= 1,
-        "Zinder returned more UTXOs than max_entries for miner address {address}",
-    );
-    assert!(
-        reference_stream.len() <= 1,
-        "reference returned more UTXOs than max_entries for miner address {address}",
+        normalize_address_utxos(&streamed),
+        normalize_address_utxos(&first_height)
     );
     Ok(())
 }
@@ -1728,33 +1884,32 @@ fn assert_tree_field_matches_when_reference_has_value(
     );
 }
 
-fn assert_nullifier_response_redacts_non_nullifier_payloads(block: &lightwalletd::CompactBlock) {
-    // The reference emits an all-zero `chainMetadata` message here while
-    // Zinder omits the field entirely; both withhold the witness-construction
-    // tree sizes, so the parity contract is "no non-zero tree size leaks", not
-    // strict field absence.
-    let leaks_tree_sizes = block.chain_metadata.as_ref().is_some_and(|metadata| {
-        metadata.sapling_commitment_tree_size != 0
-            || metadata.orchard_commitment_tree_size != 0
-            || metadata.ironwood_commitment_tree_size != 0
-    });
-    assert!(
-        !leaks_tree_sizes,
-        "nullifiers-only responses must not leak commitment-tree sizes at height {}",
-        block.height,
-    );
-    for transaction in &block.vtx {
-        assert!(
-            transaction.vin.is_empty() && transaction.vout.is_empty(),
-            "nullifiers-only transparent data must be cleared at height {}",
-            block.height,
-        );
-        assert!(
-            transaction.outputs.is_empty(),
-            "nullifiers-only Sapling outputs must be cleared at height {}",
-            block.height,
-        );
+fn miner_prefix_request(pool: Option<lightwalletd::PoolType>) -> BlockRange {
+    BlockRange {
+        start: Some(BlockId {
+            height: 1,
+            hash: Vec::new(),
+        }),
+        end: Some(BlockId {
+            height: FIRST_TRANSPARENT_MINER_HEIGHT,
+            hash: Vec::new(),
+        }),
+        pool_types: pool.into_iter().map(|pool| pool as i32).collect(),
     }
+}
+
+fn assert_miner_prefix_heights(
+    reference: &[lightwalletd::CompactBlock],
+    pool: Option<lightwalletd::PoolType>,
+) -> Result<()> {
+    ensure!(
+        reference
+            .iter()
+            .map(|block| block.height)
+            .eq(1..=FIRST_TRANSPARENT_MINER_HEIGHT),
+        "reference range skipped or reordered requested heights for pool {pool:?}"
+    );
+    Ok(())
 }
 
 fn normalize_address_utxos(
@@ -1800,7 +1955,7 @@ fn normalize_compact_transactions(
     normalized
 }
 
-fn parity_transparent_address() -> Result<String> {
+pub(super) fn parity_transparent_address() -> Result<String> {
     Ok(optional_env("ZINDER_TEST_PARITY_TRANSPARENT_ADDRESS")?
         .unwrap_or_else(|| DEFAULT_PARITY_TRANSPARENT_ADDRESS.to_owned()))
 }
@@ -1823,6 +1978,7 @@ async fn transparent_broadcast_test_key(env: &LiveTestEnv) -> Result<Transparent
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?;
     let schedule = source
@@ -1910,33 +2066,35 @@ async fn select_spendable_lightwalletd_utxo(
 
 /// Both servers answer `GetTransaction` for a pending transaction with its
 /// bytes at height 0, the protocol's "in the mempool" sentinel.
-async fn assert_pending_transaction_matches_reference(
-    zinder: &mut CompactTxStreamerClient<tonic::transport::Channel>,
-    reference: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+async fn accepted_mempool_transaction(
+    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     transaction_id: TransactionId,
     raw_transaction: &[u8],
-) -> Result<()> {
-    let pending_filter = || TxFilter {
-        block: None,
-        index: 0,
-        hash: encode_internal_transaction_id(transaction_id).to_vec(),
-    };
-    let zinder_pending = zinder.get_transaction(pending_filter()).await?.into_inner();
-    let reference_pending = reference
-        .get_transaction(pending_filter())
+    source_name: &str,
+) -> Result<lightwalletd::CompactTx> {
+    let streamed =
+        wait_for_mempool_stream_snapshot_transaction(client, raw_transaction, source_name).await?;
+    assert_eq!(
+        streamed.height, 0,
+        "{source_name} mempool RawTransaction height"
+    );
+    let pending = client
+        .get_transaction(TxFilter {
+            block: None,
+            index: 0,
+            hash: encode_internal_transaction_id(transaction_id).to_vec(),
+        })
         .await?
         .into_inner();
     assert_eq!(
-        zinder_pending.height, 0,
-        "Zinder pending GetTransaction height"
+        pending.height, 0,
+        "{source_name} pending GetTransaction height"
     );
     assert_eq!(
-        reference_pending.height, 0,
-        "reference pending GetTransaction height"
+        pending.data, raw_transaction,
+        "{source_name} pending GetTransaction bytes"
     );
-    assert_eq!(zinder_pending.data, raw_transaction);
-    assert_eq!(zinder_pending.data, reference_pending.data);
-    Ok(())
+    wait_for_compact_mempool_transaction(client, transaction_id, source_name).await
 }
 
 async fn wait_for_mempool_stream_snapshot_transaction(
@@ -2118,7 +2276,7 @@ fn assert_matching_status_code(
     );
 }
 
-async fn open_parity_clients() -> Result<
+pub(super) async fn open_parity_clients() -> Result<
     Option<(
         CompactTxStreamerClient<tonic::transport::Channel>,
         CompactTxStreamerClient<tonic::transport::Channel>,

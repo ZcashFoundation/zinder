@@ -3,6 +3,7 @@
 use std::{
     ffi::OsString,
     fs,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -11,10 +12,11 @@ use zinder_core::{
     BlockId, CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion, Network,
     UnixTimestampMillis,
 };
-use zinder_rocksdb_bulk_load::VariableValueSortEvidence;
+use zinder_rocksdb_bulk_load::{VariableValueSortDurations, VariableValueSortEvidence};
 use zinder_store::{
-    CanonicalReplayScan, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalReplayScan, CanonicalReplaySliceSource, CanonicalStoreError,
+    CanonicalStoreReadyEvidence, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionAccumulator, WalletProjectionBuildLease,
@@ -27,12 +29,23 @@ use crate::{
     RocksDbWalletBuildStore, RocksDbWalletError, RocksDbWalletStore,
     build_lock::WalletBuildLock,
     projection_load::{
-        PreparedWalletProjectionLoad, WalletProjectionLoadConfig, write_projection_ssts,
+        DEFAULT_CANONICAL_SCAN_CHUNK_BLOCKS, PreparedWalletProjectionLoad,
+        WalletProjectionLoadConfig, write_projection_ssts_from_source,
     },
-    store::{RocksDbWalletBuilder, WalletColdValidationConfig},
+    store::{MIN_ROWS_PER_SCAN_RANGE, RocksDbWalletBuilder, WalletColdValidationConfig},
 };
 
 const DEFAULT_BUILD_LEASE_DURATION_MILLIS: u64 = 60 * 60 * 1000;
+const AUTOMATIC_ACCUMULATOR_HASHING_WORKERS_CEILING: u32 = 4;
+
+/// Most accumulator hashing threads a wallet build uses.
+///
+/// Cold validation reads the primary output and address-transaction families
+/// in at most this many key ranges each as well, so the setting also bounds
+/// its threads. A build that asks for more is refused before it creates any
+/// wallet state.
+pub const MAX_ACCUMULATOR_HASHING_WORKERS: u32 = 64;
+const BUILD_STAGE_DURATION_METRIC: &str = "zinder_wallet_projection_build_stage_duration_seconds";
 
 /// Read-only canonical source sufficient for one fixed-tip wallet projection build.
 ///
@@ -48,6 +61,12 @@ pub trait WalletProjectionReplaySource {
 
     /// Opens the canonical replay scan used for the fixed-tip projection build.
     fn wallet_projection_scan(&self) -> Result<CanonicalReplayScan<'_>, CanonicalStoreError>;
+
+    /// Returns a `Sync` slice source for concurrent height-chunk canonical
+    /// replay scanning, or `None` to fall back to [`Self::wallet_projection_scan`].
+    fn wallet_projection_slice_source(&self) -> Option<CanonicalReplaySliceSource<'_>> {
+        None
+    }
 }
 
 /// Observable boundary at which a long-running fixed-tip build may renew its lease.
@@ -171,6 +190,10 @@ impl WalletProjectionReplaySource for RocksDbCanonicalStore {
     fn wallet_projection_scan(&self) -> Result<CanonicalReplayScan<'_>, CanonicalStoreError> {
         self.scan_canonical_replay()
     }
+
+    fn wallet_projection_slice_source(&self) -> Option<CanonicalReplaySliceSource<'_>> {
+        Some(self.canonical_replay_slice_source())
+    }
 }
 
 impl WalletProjectionReplaySource for RocksDbCanonicalSecondary {
@@ -184,6 +207,10 @@ impl WalletProjectionReplaySource for RocksDbCanonicalSecondary {
 
     fn wallet_projection_scan(&self) -> Result<CanonicalReplayScan<'_>, CanonicalStoreError> {
         self.scan_canonical_replay()
+    }
+
+    fn wallet_projection_slice_source(&self) -> Option<CanonicalReplaySliceSource<'_>> {
+        Some(self.canonical_replay_slice_source())
     }
 }
 
@@ -205,7 +232,9 @@ where
             observed: canonical_store.wallet_projection_network(),
         });
     }
-    let observed = canonical_source_identity(&canonical_store.wallet_projection_ready_evidence());
+    let ready = canonical_store.wallet_projection_ready_evidence();
+    validate_canonical_schema(&ready)?;
+    let observed = canonical_source_identity(&ready);
     if observed != lease.pinned_canonical_anchor() {
         return Err(RocksDbWalletError::CanonicalSourceFenceMismatch {
             reason: "canonical source changed before wallet READY promotion",
@@ -221,7 +250,10 @@ pub struct RocksDbWalletBuildOptions {
     pub resource_budget: RocksDbResourceBudget,
     /// Accounted memory ceiling for the outpoint event sorter.
     pub max_outpoint_sort_memory_bytes: u64,
-    /// Accounted memory ceiling applied independently to each secondary sorter.
+    /// Accounted memory ceiling applied to the address-unspent sorter and
+    /// minimum floor for the address-transaction sorter (which may recycle up
+    /// to half of `max_outpoint_sort_memory_bytes` once `outpoint_sorter` has
+    /// flushed and freed its buffers).
     pub max_secondary_sort_memory_bytes_per_sorter: u64,
     /// Temporary-run byte ceiling applied independently to each external sorter.
     pub max_temporary_file_bytes_per_sorter: u64,
@@ -231,10 +263,28 @@ pub struct RocksDbWalletBuildOptions {
     pub max_accounted_reorg_undo_bytes: u64,
     /// Number of exact tip undo records retained for reorg handling.
     pub supported_reorg_depth: u32,
+    /// Threads that hash wallet rows into the projection accumulator and the
+    /// UTXO set commitment, scan the settled canonical replay in height chunks,
+    /// and read output and address-transaction families back during cold
+    /// validation.
+    ///
+    /// One runs all work on the build's own thread. More scan settled canonical
+    /// replay chunks in parallel into sharded outpoint sorters (splitting
+    /// `max_outpoint_sort_memory_bytes` across workers while sharing
+    /// `max_temporary_file_bytes_per_sorter`), hash bounded batches of rows on
+    /// that many threads while the build thread drains the sorters and writes
+    /// SST files, and read the unspent and spent output families and the
+    /// address-transaction family back in up to this many hash-prefix key
+    /// ranges at once.
+    /// The published rows, sequence digest, and accumulators do not change. At
+    /// most [`MAX_ACCUMULATOR_HASHING_WORKERS`].
+    pub accumulator_hashing_workers: NonZeroU32,
 }
 
 impl RocksDbWalletBuildOptions {
     /// Small deterministic limits for unit and deployment-smoke fixtures.
+    ///
+    /// They hash on two threads, so fixtures cover the parallel path.
     #[must_use]
     pub const fn for_local_tests() -> Self {
         Self {
@@ -245,16 +295,40 @@ impl RocksDbWalletBuildOptions {
             sst_target_logical_bytes: 1024 * 1024,
             max_accounted_reorg_undo_bytes: 16 * 1024 * 1024,
             supported_reorg_depth: 100,
+            accumulator_hashing_workers: NonZeroU32::MIN.saturating_add(1),
         }
     }
+
+    /// Returns one accumulator hashing thread per logical CPU this process
+    /// may use, at most 4, or one thread when the count cannot be detected.
+    ///
+    /// Beyond about three workers the build thread, which decodes, sorts, and
+    /// writes every row, limits the drains instead of hashing.
+    #[must_use]
+    pub fn automatic_accumulator_hashing_workers() -> NonZeroU32 {
+        accumulator_hashing_workers_for(
+            std::thread::available_parallelism()
+                .ok()
+                .and_then(|cpus| NonZeroU32::new(u32::try_from(cpus.get()).unwrap_or(u32::MAX))),
+        )
+    }
+}
+
+fn accumulator_hashing_workers_for(detected_logical_cpus: Option<NonZeroU32>) -> NonZeroU32 {
+    let ceiling =
+        NonZeroU32::new(AUTOMATIC_ACCUMULATOR_HASHING_WORKERS_CEILING).unwrap_or(NonZeroU32::MIN);
+    detected_logical_cpus.map_or(NonZeroU32::MIN, |cpus| cpus.min(ceiling))
 }
 
 /// Wall-clock duration of each family scan inside cold validation.
 ///
 /// Cold validation reads every durable row once, in stored key order. The
 /// primary output, address-index, and address-transaction scans run
-/// concurrently, so these durations overlap: each is the wall time of its own
-/// scan and none exceeds [`WalletBuildPhaseDurations::cold_validation`].
+/// concurrently, so their three durations overlap: each is the wall time of
+/// its own scan, and `concurrent_family_readback` is the wall time of all
+/// three together. The primary output and address-transaction scans each read
+/// their hash-prefix key ranges concurrently, and each duration covers all of
+/// them. The reorg-undo scan runs after them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WalletColdValidationPhaseDurations {
     /// Merged scan of the unspent and spent primary output families.
@@ -263,8 +337,62 @@ pub struct WalletColdValidationPhaseDurations {
     pub address_index_and_balance_readback: Duration,
     /// Scan of the address-transaction family.
     pub address_transaction_readback: Duration,
+    /// Wall time of the three concurrent family scans above, start to last join.
+    pub concurrent_family_readback: Duration,
     /// Scan of the retained reorg-undo suffix.
     pub reorg_undo_readback: Duration,
+}
+
+/// Steps of [`WalletBuildPhaseDurations::secondary_row_derivation`].
+///
+/// The address-unspent index/balance derivation and the address-transaction
+/// history derivation run sequentially when `accumulator_hashing_workers` is 1
+/// and concurrently when it is above 1; [`Self::reorg_undo_write`] runs after
+/// address-transaction derivation finishes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalletSecondaryRowDerivationPhaseDurations {
+    /// Final sort of the address-unspent index rows.
+    pub address_index_sort: Duration,
+    /// Address-unspent index and address-balance rows drained into SST files.
+    pub address_index_drain: Duration,
+    /// Final sort of the address-transaction rows.
+    pub address_transaction_sort: Duration,
+    /// Address-transaction rows deduplicated and drained into SST files.
+    pub address_transaction_drain: Duration,
+    /// Wall time spent sorting and draining address-index, address-balance, and
+    /// address-transaction rows.
+    pub concurrent_address_derivation: Duration,
+    /// Retained reorg-undo rows encoded and written to SST files.
+    pub reorg_undo_write: Duration,
+}
+
+/// Wall time spent inside the ordered SST writers, by the phase that drove them.
+///
+/// Each value covers row encoding, file rotation, and the final file close,
+/// and is part of the phase named on its field.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalletSstWriteDurations {
+    /// Unspent and spent output writers, inside
+    /// [`WalletBuildPhaseDurations::outpoint_merge`].
+    pub primary_outputs: Duration,
+    /// Address-unspent index and address-balance writers, inside
+    /// [`WalletSecondaryRowDerivationPhaseDurations::address_index_drain`].
+    pub address_index_and_balance: Duration,
+    /// Address-transaction writer, inside
+    /// [`WalletSecondaryRowDerivationPhaseDurations::address_transaction_drain`].
+    pub address_transaction: Duration,
+    /// Reorg-undo writer, inside
+    /// [`WalletSecondaryRowDerivationPhaseDurations::reorg_undo_write`].
+    pub reorg_undo: Duration,
+}
+
+/// Sequential steps of [`WalletBuildPhaseDurations::flush_and_cold_reopen`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalletColdReopenPhaseDurations {
+    /// Blocking memtable flush, WAL sync, and close of the BUILDING store.
+    pub flush_and_close: Duration,
+    /// Reopen of the closed store and its identity and control checks.
+    pub cold_reopen: Duration,
 }
 
 /// Wall-clock duration of each observable fresh-build phase.
@@ -272,7 +400,7 @@ pub struct WalletColdValidationPhaseDurations {
 pub struct WalletBuildPhaseDurations {
     /// Fresh path creation and durable BUILDING publication.
     pub store_initialization: Duration,
-    /// Authenticated canonical replay scan and event staging.
+    /// Authenticated canonical replay scan, event staging, and block-hash SST flush.
     pub canonical_scan: Duration,
     /// External run finalization and merge for outpoint events.
     pub outpoint_sort: Duration,
@@ -280,12 +408,18 @@ pub struct WalletBuildPhaseDurations {
     pub outpoint_merge: Duration,
     /// Secondary sorting, deduplication, balances, history, and retained undo.
     pub secondary_row_derivation: Duration,
+    /// Breakdown of `secondary_row_derivation` into its sequential steps.
+    pub secondary_row_derivation_phases: WalletSecondaryRowDerivationPhaseDurations,
+    /// SST writer time inside `outpoint_merge` and the secondary steps.
+    pub sst_write: WalletSstWriteDurations,
     /// Row-count and full order-independent accumulator finalization.
     pub logical_evidence: Duration,
     /// External SST ingestion into the unpublished BUILDING store.
     pub row_load: Duration,
     /// Blocking flush, close, and cold BUILDING reopen.
     pub flush_and_cold_reopen: Duration,
+    /// Breakdown of `flush_and_cold_reopen` into close and reopen.
+    pub flush_and_cold_reopen_phases: WalletColdReopenPhaseDurations,
     /// Digest and row-count readback against the candidate READY evidence.
     pub cold_validation: Duration,
     /// Breakdown of `cold_validation` by scanned row family.
@@ -329,6 +463,12 @@ pub struct RocksDbWalletBuildReport {
     pub address_index_sort: VariableValueSortEvidence,
     /// Exact bounded-work evidence for the address-history secondary sorter.
     pub address_transaction_sort: VariableValueSortEvidence,
+    /// Run spill, final flush, and merge time of the outpoint event sorter.
+    pub outpoint_sort_durations: VariableValueSortDurations,
+    /// Run spill, final flush, and merge time of the address-unspent sorter.
+    pub address_index_sort_durations: VariableValueSortDurations,
+    /// Run spill, final flush, and merge time of the address-history sorter.
+    pub address_transaction_sort_durations: VariableValueSortDurations,
     /// Highest explicitly accounted retained reorg-undo footprint.
     pub peak_accounted_reorg_undo_bytes: u64,
     /// Caller-supplied retained reorg-undo ceiling.
@@ -349,6 +489,15 @@ pub struct RocksDbWalletBuildReport {
     pub phase_durations: WalletBuildPhaseDurations,
 }
 
+/// One named, non-overlapping stage of a fresh wallet build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WalletBuildStageDuration {
+    /// Stable stage name, also the `stage` label of the build-stage histogram.
+    pub stage: &'static str,
+    /// Wall time spent in the stage.
+    pub duration: Duration,
+}
+
 impl RocksDbWalletBuildReport {
     /// Returns the exact source identity required to reopen this wallet store.
     #[must_use]
@@ -358,6 +507,73 @@ impl RocksDbWalletBuildReport {
             self.source_sequence_digest,
             self.settled_tip,
         )
+    }
+
+    /// Returns the build's non-overlapping stages in execution order.
+    ///
+    /// Sorter run spills and SST writer time are taken out of the phase they
+    /// ran inside and reported as stages of their own, so no interval counts
+    /// twice and the sum never exceeds [`WalletBuildPhaseDurations::total`].
+    /// The difference from the total is untimed bookkeeping between stages.
+    /// The three concurrent cold-validation family scans form one stage, their
+    /// combined wall time.
+    #[must_use]
+    pub fn stage_durations(&self) -> Vec<WalletBuildStageDuration> {
+        let phases = self.phase_durations;
+        let secondary = phases.secondary_row_derivation_phases;
+        let sst_write = phases.sst_write;
+        let reopen = phases.flush_and_cold_reopen_phases;
+        let validation = phases.cold_validation_phases;
+        let outpoint_spill = self.outpoint_sort_durations.initial_run_spill;
+        let address_index_spill = self.address_index_sort_durations.initial_run_spill;
+        let address_transaction_spill = self.address_transaction_sort_durations.initial_run_spill;
+        let outpoint_drain = phases
+            .outpoint_merge
+            .saturating_sub(sst_write.primary_outputs)
+            .saturating_sub(address_index_spill)
+            .saturating_sub(address_transaction_spill);
+        [
+            ("store_initialization", phases.store_initialization),
+            (
+                "canonical_scan",
+                phases.canonical_scan.saturating_sub(outpoint_spill),
+            ),
+            ("outpoint_run_spill", outpoint_spill),
+            ("outpoint_sort", phases.outpoint_sort),
+            ("outpoint_drain", outpoint_drain),
+            ("primary_sst_write", sst_write.primary_outputs),
+            ("address_index_run_spill", address_index_spill),
+            ("address_transaction_run_spill", address_transaction_spill),
+            (
+                "secondary_address_derivation",
+                secondary.concurrent_address_derivation,
+            ),
+            ("reorg_undo_write", secondary.reorg_undo_write),
+            ("logical_evidence", phases.logical_evidence),
+            ("row_load", phases.row_load),
+            ("flush_and_close", reopen.flush_and_close),
+            ("cold_reopen", reopen.cold_reopen),
+            (
+                "cold_validation_family_readback",
+                validation.concurrent_family_readback,
+            ),
+            (
+                "cold_validation_reorg_undo_readback",
+                validation.reorg_undo_readback,
+            ),
+            ("ready_publication", phases.ready_publication),
+        ]
+        .into_iter()
+        .map(|(stage, duration)| WalletBuildStageDuration { stage, duration })
+        .collect()
+    }
+}
+
+/// Records each completed build stage once in the build-stage histogram.
+fn record_build_stage_durations(report: &RocksDbWalletBuildReport) {
+    for stage in report.stage_durations() {
+        metrics::histogram!(BUILD_STAGE_DURATION_METRIC, "stage" => stage.stage)
+            .record(stage.duration.as_secs_f64());
     }
 }
 
@@ -375,7 +591,7 @@ pub struct RocksDbWalletBuildOutcome {
 /// delegates authorization to its compare-exact lease boundary. A stale owner,
 /// generation, or expiry therefore cannot clear a lease acquired by another
 /// build after a recovery race.
-struct FailedWalletBuildLeaseCleanup {
+pub(crate) struct FailedWalletBuildLeaseCleanup {
     wallet_path: PathBuf,
     network: Network,
     resource_budget: RocksDbResourceBudget,
@@ -384,7 +600,7 @@ struct FailedWalletBuildLeaseCleanup {
 }
 
 impl FailedWalletBuildLeaseCleanup {
-    fn new(
+    pub(crate) fn new(
         wallet_path: &Path,
         network: Network,
         resource_budget: RocksDbResourceBudget,
@@ -399,7 +615,7 @@ impl FailedWalletBuildLeaseCleanup {
         }
     }
 
-    fn arm(&mut self, lease: WalletProjectionBuildLease, now: UnixTimestampMillis) {
+    pub(crate) fn arm(&mut self, lease: WalletProjectionBuildLease, now: UnixTimestampMillis) {
         self.lease = Some(lease);
         self.now = now;
     }
@@ -440,7 +656,7 @@ impl FailedWalletBuildLeaseCleanup {
     }
 }
 
-fn finish_failed_wallet_build<T>(
+pub(crate) fn finish_failed_wallet_build<T>(
     cleanup: &mut FailedWalletBuildLeaseCleanup,
     build_error: RocksDbWalletError,
 ) -> Result<T, RocksDbWalletError> {
@@ -547,11 +763,18 @@ where
     let lease_request = execution.lease_request();
     let now = execution.initial_now();
     let total_started = Instant::now();
+    if options.accumulator_hashing_workers.get() > MAX_ACCUMULATOR_HASHING_WORKERS {
+        return Err(RocksDbWalletError::AccumulatorHashingWorkersOutOfRange {
+            workers: options.accumulator_hashing_workers.get(),
+            maximum: MAX_ACCUMULATOR_HASHING_WORKERS,
+        });
+    }
+    let canonical_ready = canonical_store.wallet_projection_ready_evidence();
+    validate_canonical_schema(&canonical_ready)?;
     let wallet_path = wallet_path.as_ref();
     let build_lock = WalletBuildLock::acquire(wallet_path)?;
     remove_abandoned_build_paths(wallet_path, &build_lock)?;
     let staging = FreshWalletProjectionStaging::create(projection_staging_path(wallet_path))?;
-    let canonical_ready = canonical_store.wallet_projection_ready_evidence();
     let source_position = WalletProjectionSourcePosition::new(
         canonical_ready.visible_epoch,
         canonical_ready.visible_tip,
@@ -590,7 +813,7 @@ where
         lease_cleanup.arm(builder.lease(), initialized_heartbeat.now());
 
         let column_family_options = builder.column_family_options();
-        let mut prepared = write_projection_ssts(
+        let mut prepared = write_projection_ssts_from_source(
             WalletProjectionLoadConfig {
                 staging_path: staging.path(),
                 options: &column_family_options,
@@ -604,10 +827,10 @@ where
                 max_temporary_file_bytes_per_sorter: options.max_temporary_file_bytes_per_sorter,
                 sst_target_logical_bytes: options.sst_target_logical_bytes,
                 max_accounted_reorg_undo_bytes: options.max_accounted_reorg_undo_bytes,
+                accumulator_hashing_workers: options.accumulator_hashing_workers,
+                scan_chunk_blocks: DEFAULT_CANONICAL_SCAN_CHUNK_BLOCKS,
             },
-            canonical_store
-                .wallet_projection_scan()
-                .map_err(|source| RocksDbWalletError::CanonicalReplay { source })?,
+            canonical_store,
         )?;
         let replay_heartbeat = heartbeat(
             WalletBuildLeasePhase::CanonicalReplayComplete,
@@ -634,6 +857,9 @@ where
         let outpoint_sort = prepared.outpoint_sort_evidence;
         let address_index_sort = prepared.address_index_sort_evidence;
         let address_transaction_sort = prepared.address_transaction_sort_evidence;
+        let outpoint_sort_durations = prepared.outpoint_sort_durations;
+        let address_index_sort_durations = prepared.address_index_sort_durations;
+        let address_transaction_sort_durations = prepared.address_transaction_sort_durations;
         let logical_row_bytes = prepared.logical_row_bytes;
         let sst_file_bytes = prepared.sst_file_bytes;
         let sst_file_count = prepared.sst_file_count;
@@ -650,7 +876,7 @@ where
         lease_cleanup.arm(builder.lease(), loaded_heartbeat.now());
 
         let phase_started = Instant::now();
-        let cold_build = builder.reopen_for_validation()?;
+        let (cold_build, flush_and_cold_reopen_phases) = builder.reopen_for_validation()?;
         let flush_and_cold_reopen = phase_started.elapsed();
 
         let phase_started = Instant::now();
@@ -658,6 +884,8 @@ where
             ready_evidence,
             WalletColdValidationConfig {
                 max_accounted_reorg_undo_bytes: options.max_accounted_reorg_undo_bytes,
+                family_scan_ranges: options.accumulator_hashing_workers,
+                min_rows_per_scan_range: MIN_ROWS_PER_SCAN_RANGE,
             },
         )?;
         let cold_validation = phase_started.elapsed();
@@ -702,6 +930,9 @@ where
             outpoint_sort,
             address_index_sort,
             address_transaction_sort,
+            outpoint_sort_durations,
+            address_index_sort_durations,
+            address_transaction_sort_durations,
             peak_accounted_reorg_undo_bytes: counters.peak_accounted_reorg_undo_bytes,
             max_accounted_reorg_undo_bytes: counters.max_accounted_reorg_undo_bytes,
             cold_validation_peak_accounted_reorg_undo_bytes: validation_evidence
@@ -718,15 +949,19 @@ where
                 outpoint_sort: load_durations.outpoint_sort,
                 outpoint_merge: load_durations.outpoint_merge,
                 secondary_row_derivation: load_durations.secondary_row_derivation,
+                secondary_row_derivation_phases: load_durations.secondary_row_derivation_phases,
+                sst_write: load_durations.sst_write,
                 logical_evidence: load_durations.logical_evidence,
                 row_load,
                 flush_and_cold_reopen,
+                flush_and_cold_reopen_phases,
                 cold_validation,
                 cold_validation_phases: validation_evidence.phase_durations,
                 ready_publication,
                 total,
             },
         };
+        record_build_stage_durations(&report);
         Ok(RocksDbWalletBuildOutcome { store, report })
     })();
 
@@ -762,6 +997,17 @@ fn default_build_owner(now: UnixTimestampMillis) -> WalletProjectionBuildOwner {
     owner[..8].copy_from_slice(&now.value().to_be_bytes());
     owner[8..12].copy_from_slice(&std::process::id().to_be_bytes());
     WalletProjectionBuildOwner::from_bytes(owner)
+}
+
+fn validate_canonical_schema(
+    ready: &CanonicalStoreReadyEvidence,
+) -> Result<(), RocksDbWalletError> {
+    if ready.schema_version != zinder_wallet_projection::REQUIRED_CANONICAL_STORE_SCHEMA_VERSION {
+        return Err(RocksDbWalletError::CanonicalSourceFenceMismatch {
+            reason: "canonical store schema version differs from the wallet projection contract",
+        });
+    }
+    Ok(())
 }
 
 fn validate_canonical_fence(
@@ -902,6 +1148,18 @@ mod tests {
             default_build_lease_heartbeat(now, current_expires_at),
             WalletBuildLeaseHeartbeat::renew(now, expected_expires_at)
         );
+    }
+
+    #[test]
+    fn automatic_accumulator_hashing_follows_the_cpu_count_up_to_four() {
+        let workers = |cpus: Option<u32>| {
+            accumulator_hashing_workers_for(cpus.and_then(NonZeroU32::new)).get()
+        };
+        assert_eq!(workers(None), 1);
+        assert_eq!(workers(Some(1)), 1);
+        assert_eq!(workers(Some(2)), 2);
+        assert_eq!(workers(Some(4)), 4);
+        assert_eq!(workers(Some(32)), 4);
     }
 
     #[test]

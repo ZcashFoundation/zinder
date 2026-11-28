@@ -15,21 +15,69 @@ fail() {
 producer_report_format_version="$(sed -n \
   's/^pub const REPORT_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
   "$repository_root/services/zinder-bench/src/report.rs")"
-[[ "$producer_report_format_version" =~ ^[1-9][0-9]*$ ]] ||
-  fail "could not resolve the producer report format version"
+[[ "$producer_report_format_version" == "1" ]] ||
+  fail "canonical-replay-storage producer report format version must stay v1"
+producer_canonical_fixture_report_format_version="$(sed -n \
+  's/^pub const ROCKSDB_CANONICAL_FIXTURE_REPLAY_REPORT_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
+  "$repository_root/services/zinder-bench/src/report.rs")"
+[[ "$producer_canonical_fixture_report_format_version" == "1" ]] ||
+  fail "rocksdb-canonical-fixture-replay producer report format version must be v1"
+producer_lifecycle_report_format_version="$(sed -n \
+  's/^pub const ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
+  "$repository_root/services/zinder-bench/src/report.rs")"
+[[ "$producer_lifecycle_report_format_version" == "1" ]] ||
+  fail "rocksdb-storage-lifecycle producer report format version must be v1"
+producer_segmented_report_format_version="$(sed -n \
+  's/^pub const POSTGRES_SEGMENTED_REPORT_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
+  "$repository_root/services/zinder-bench/src/report.rs")"
+[[ "$producer_segmented_report_format_version" == "1" ]] ||
+  fail "postgres-segmented-storage producer report format version must be v1"
+grep -Fq ".report_format_version == $producer_segmented_report_format_version" \
+  "$validator" ||
+  fail "$(basename "$validator") does not require segmented report format $producer_segmented_report_format_version"
 producer_fixture_format_version="$(sed -n \
   's/^pub const FIXTURE_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
   "$repository_root/services/zinder-bench/src/fixture.rs")"
-[[ "$producer_fixture_format_version" == "3" ]] ||
-  fail "producer fixture format version must be the exact v3 campaign contract"
-for report_validator in "$validator" "$storage_lifecycle_validator"; do
-  grep -Fq ".report_format_version == $producer_report_format_version" \
-    "$report_validator" ||
-    fail "$(basename "$report_validator") does not require producer report format $producer_report_format_version"
-done
+[[ "$producer_fixture_format_version" == "1" ]] ||
+  fail "producer fixture format version must be the exact v1 campaign contract"
+grep -Fq ".report_format_version == $producer_report_format_version" \
+  "$validator" ||
+  fail "$(basename "$validator") does not require producer report format $producer_report_format_version"
+grep -Fq ".report_format_version == $producer_lifecycle_report_format_version" \
+  "$storage_lifecycle_validator" ||
+  fail "$(basename "$storage_lifecycle_validator") does not support producer report format $producer_lifecycle_report_format_version"
 grep -Fq ".fixture.fixture_format_version == $producer_fixture_format_version" \
   "$validator" ||
   fail "campaign validator does not require producer fixture format $producer_fixture_format_version"
+
+producer_store_version() {
+  local constant="$1" source="$2"
+  sed -nE "s/^pub const ${constant}: u16 = ([A-Z0-9_]+);$/\1/p" "$repository_root/$source"
+}
+
+check_lifecycle_pin() {
+  local field="$1" expected="$2" pinned
+  [[ "$expected" =~ ^[0-9]+$ ]] || fail "could not resolve producer version for $field"
+  pinned="$(sed -nE \
+    -e "s/^[[:space:]]+and [.]$field == ([0-9]+)[)]?[[:space:]]*$/\1/p" \
+    "$storage_lifecycle_validator")"
+  [[ "$pinned" == "$expected" ]] ||
+    fail "lifecycle validator pins $field to ${pinned:-<missing>}, producer requires $expected"
+}
+
+projection_source=crates/zinder-wallet-projection/src/lib.rs
+projection_schema="$(producer_store_version WALLET_PROJECTION_SCHEMA_VERSION "$projection_source")"
+wallet_schema="$(producer_store_version WALLET_ROCKSDB_SCHEMA_VERSION crates/zinder-wallet-rocksdb/src/store.rs)"
+if [[ "$wallet_schema" == "WALLET_PROJECTION_SCHEMA_VERSION" ]]; then
+  wallet_schema="$projection_schema"
+fi
+
+check_lifecycle_pin canonical_store_schema_version \
+  "$(producer_store_version CANONICAL_STORE_SCHEMA_VERSION crates/zinder-store/src/canonical_store/mod.rs)"
+check_lifecycle_pin wallet_store_schema_version "$wallet_schema"
+check_lifecycle_pin wallet_projection_schema_version "$projection_schema"
+check_lifecycle_pin wallet_value_encoding_version \
+  "$(producer_store_version WALLET_PROJECTION_VALUE_ENCODING_VERSION "$projection_source")"
 
 write_report() {
   local candidate="$1"
@@ -107,7 +155,7 @@ write_report() {
     ($candidate == "rocksdb-canonical-replay-storage") as $is_rocksdb
     | {
         contract_identity: "benchmark-report",
-        report_format_version: 4,
+        report_format_version: 1,
         measurement_kind: "canonical-replay-storage",
         provenance: {
           benchmark_version: "0.1.0",
@@ -130,8 +178,8 @@ write_report() {
         },
         fixture: {
           contract_identity: "canonical-fixture",
-          fixture_format_version: 3,
-          canonical_artifact_schema_version: 18,
+          fixture_format_version: 1,
+          canonical_artifact_schema_version: 1,
           canonical_block_facts_digest_evidence: {
             block_digest_version: 1,
             sequence_digest_version: 1,
@@ -152,7 +200,7 @@ write_report() {
           canonical_engine: (if $is_rocksdb then "rocksdb" else "postgres" end),
           canonical_model: "block-granular-canonical-replays",
           diagnostic_projection_engine: null,
-          topology: (if $is_rocksdb then "rocksdb-single-host" else "postgres-scale-out" end)
+          topology: (if $is_rocksdb then "rocksdb" else "postgres-diagnostic" end)
         },
         round_trip: {
           scope: "block-local-canonical-replay",
@@ -580,7 +628,7 @@ wrong_topology_campaign="$scratch_directory/wrong-topology"
 cp -R "$valid_campaign" "$wrong_topology_campaign"
 mutate_report \
   "$wrong_topology_campaign/postgres-canonical-replay-storage-trial-04.json" \
-  '.storage_candidate.topology = "rocksdb-single-host"'
+  '.storage_candidate.topology = "rocksdb"'
 expect_failure "wrong topology" "$wrong_topology_campaign"
 
 null_configuration_campaign="$scratch_directory/null-configuration"
@@ -868,5 +916,563 @@ mutate_json_artifact \
   "$unalignable_campaign/postgres-canonical-replay-storage-database-trial-01.resources.json" \
   '.samples |= map(select(.observed_at_unix_millis != 112040))'
 expect_failure "unalignable PostgreSQL resource samples" "$unalignable_campaign"
+
+write_lifecycle_evidence() {
+  local directory="$1"
+  local report_format_version="$2"
+  local coverage="$3"
+  local checkpoint_count="$4"
+  local publication_mode="$5"
+  local cold_validation_seconds="$6"
+  mkdir -p "$directory"
+  jq -n \
+    --argjson report_format_version "$report_format_version" \
+    --arg coverage "$coverage" \
+    --argjson checkpoint_count "$checkpoint_count" \
+    --arg publication_mode "$publication_mode" \
+    --argjson cold_validation_seconds "$cold_validation_seconds" '
+    def canonical_budget: {
+      block_cache_bytes: 536870912,
+      max_wal_bytes: 268435456,
+      max_open_files: 512,
+      write_buffer_bytes: 16777216,
+      max_write_buffer_count: 2,
+      max_background_jobs: 2,
+      memtable_budget_bytes: 268435456,
+      statistics_level: "tickers"
+    };
+    def wallet_budget: {
+      block_cache_bytes: 268435456,
+      max_wal_bytes: 33554432,
+      max_open_files: 512,
+      write_buffer_bytes: 16777216,
+      max_write_buffer_count: 4,
+      max_background_jobs: 2,
+      memtable_budget_bytes: 536870912,
+      statistics_level: "tickers"
+    };
+    def empty_sort($mem): {
+      record_count: 0,
+      initial_run_count: 0,
+      merge_pass_count: 0,
+      peak_accounted_sort_memory_bytes: 0,
+      max_accounted_sort_memory_bytes: $mem,
+      peak_temporary_file_bytes: 0,
+      max_temporary_file_bytes: 206158430208,
+      final_run_file_bytes: 0
+    };
+    {
+      contract_identity: "benchmark-report",
+      report_format_version: $report_format_version,
+      measurement_kind: "rocksdb-storage-lifecycle",
+      provenance: {
+        benchmark_version: "0.22.0",
+        software_revision: ("0" * 40),
+        run: {
+          trial_id: "trial-lifecycle-01",
+          fixture_cache_policy: null,
+          started_at_unix_millis: 100000,
+          completed_at_unix_millis: 101000
+        },
+        runner: {
+          id: "local-docker-desktop",
+          cpu_limit_cores: 10,
+          memory_limit_bytes: 10737418240,
+          storage_class: "local-nvme"
+        },
+        image_reference: ("sha256:" + ("a" * 64)),
+        target_os: "linux",
+        target_arch: "x86_64"
+      },
+      storage_candidate: {
+        id: "rocksdb-storage-lifecycle",
+        canonical_engine: "rocksdb",
+        canonical_model: "canonical-replay-storage",
+        topology: "rocksdb"
+      },
+      source: {
+        family: "zebra-json-rpc",
+        network: "zcash-testnet",
+        network_upgrade_activation_count: 11,
+        network_upgrade_activations_fingerprint_version: 1,
+        network_upgrade_activations_fingerprint_hex: ("b" * 64),
+        source_tip_at_freeze: {height: 205, hash_hex: ("c" * 64)},
+        fixed_build_tip: {height: 205, hash_hex: ("c" * 64)},
+        source_tip_after_canonical_load: {height: 205, hash_hex: ("c" * 64)}
+      },
+      contracts: {
+        canonical_store_identity: "canonical",
+        canonical_store_schema_version: 2,
+        wallet_store_identity: "wallet",
+        wallet_store_schema_version: 2,
+        wallet_projection_schema_version: 2,
+        wallet_value_encoding_version: 2
+      },
+      resource_limits: (
+        {
+          request_timeout_seconds: 30,
+          max_response_bytes: 67108864,
+          source_segment_target_response_bytes: 33554432,
+          source_segment_max_blocks: 64,
+          source_fetch_max_in_flight_requests: 12,
+          source_fetch_max_in_flight_bytes: 167772160,
+          block_prepare_concurrency: 10,
+          block_prepare_memory_watermark_bytes: 167772160,
+          canonical_rocksdb: canonical_budget,
+          wallet_rocksdb: wallet_budget,
+          supported_reorg_depth: 100,
+          wallet_max_outpoint_sort_memory_bytes: 4294967296,
+          wallet_max_secondary_sort_memory_bytes_per_sorter: 1073741824,
+          wallet_max_temporary_file_bytes_per_sorter: 206158430208,
+          wallet_sst_target_logical_bytes: 134217728,
+          wallet_max_accounted_reorg_undo_bytes: 536870912,
+          tree_state_checkpoint_coverage: $coverage,
+          canonical_publication_mode: $publication_mode
+        }
+      ),
+      acceptance: {
+        canonical_storage_ready: {
+          scope: "canonical-storage-ready",
+          wall_clock_seconds: 6.0,
+          thresholds: null
+        },
+        wallet_storage_ready: {
+          scope: "wallet-storage-ready",
+          wall_clock_seconds: 3.0,
+          thresholds: null
+        }
+      },
+      phase_durations: {
+        source_discovery_seconds: 0.5,
+        canonical_store_initialization_seconds: 0.5,
+        canonical_source_load_seconds: 2.0,
+        canonical_cold_validation_seconds: $cold_validation_seconds,
+        canonical_ready_publication_seconds: 0.5,
+        canonical_cold_reopen_seconds: 0.5,
+        wallet_build_seconds: 2.0,
+        final_cold_reopen_seconds: 0.5,
+        total_seconds: 9.5
+      },
+      canonical_storage_ready: (
+        {
+          scope: "canonical-storage-ready",
+          first_retained_block: {height: 1, hash_hex: ("d" * 64)},
+          visible_tip: {height: 205, hash_hex: ("c" * 64)},
+          visible_epoch_id: 1,
+          visible_event_sequence: 1,
+          block_count: 205,
+          transaction_count: 205,
+          subtree_root_count: 0,
+          replay_format_version: 1,
+          sequence_digest: {
+            block_digest_version: 1,
+            sequence_digest_version: 1,
+            block_count: 205,
+            sha256: ("e" * 64)
+          },
+          logical_replay_bytes: 10000,
+          logical_storage_bytes: 20000,
+          sst_file_bytes: 12000,
+          sst_file_count: 6,
+          physical_store_bytes: 15000,
+          database_io_mode: "buffered",
+          source_tip_checkpoint_authenticated: true,
+          cold_reopen_evidence_match: true,
+          tree_state_checkpoint_count: $checkpoint_count
+        }
+      ),
+      wallet_storage_ready: {
+        scope: "wallet-storage-ready",
+        source_epoch_id: 1,
+        source_tip: {height: 205, hash_hex: ("c" * 64)},
+        source_event_sequence: 1,
+        source_sequence_digest: {
+          block_digest_version: 1,
+          sequence_digest_version: 1,
+          block_count: 205,
+          sha256: ("e" * 64)
+        },
+        wallet_projection_digest_hex: ("f" * 64),
+        row_counts: {
+          transparent_unspent_output_count: 0,
+          transparent_unspent_output_by_address_count: 0,
+          transparent_spent_output_count: 0,
+          transparent_address_transaction_count: 0,
+          transparent_address_balance_count: 0,
+          reorg_undo_count: 100,
+          block_hash_by_height_count: 205
+        },
+        utxo_summary: {
+          utxo_count: 0,
+          total_value_zat: 0,
+          commitment_scheme: "lthash16-chacha12",
+          commitment_accumulator_hex: ("00" * 2048),
+          commitment_display_digest_hex: ("1" * 64)
+        },
+        scanned_block_count: 205,
+        scanned_transaction_count: 205,
+        historical_prevout_read_count: 0,
+        construction: {
+          outpoint_sort: empty_sort(4294967296),
+          address_index_sort: empty_sort(1073741824),
+          address_transaction_sort: empty_sort(1073741824),
+          peak_accounted_reorg_undo_bytes: 1024,
+          max_accounted_reorg_undo_bytes: 536870912,
+          cold_validation_peak_accounted_reorg_undo_bytes: 1024,
+          cold_validation_max_accounted_reorg_undo_bytes: 536870912,
+          cold_validation_random_read_count: 0,
+          logical_row_bytes: 2048,
+          sst_file_bytes: 1024,
+          sst_file_count: 2
+        },
+        phase_durations: {
+          store_initialization_seconds: 0.1,
+          canonical_scan_seconds: 0.2,
+          outpoint_sort_seconds: 0.1,
+          outpoint_merge_seconds: 0.1,
+          secondary_row_derivation_seconds: 0.1,
+          logical_evidence_seconds: 0.1,
+          row_load_seconds: 0.1,
+          flush_and_cold_reopen_seconds: 0.1,
+          cold_validation_seconds: 0.2,
+          cold_validation_primary_output_scan_seconds: 0.05,
+          cold_validation_address_index_and_balance_readback_seconds: 0.05,
+          cold_validation_address_transaction_readback_seconds: 0.05,
+          cold_validation_reorg_undo_readback_seconds: 0.05,
+          ready_publication_seconds: 0.1,
+          total_seconds: 2.0
+        },
+        build_stages: [
+          {stage: "store_initialization", seconds: 0.1},
+          {stage: "canonical_scan", seconds: 0.2},
+          {stage: "outpoint_run_spill", seconds: 0.05},
+          {stage: "outpoint_sort", seconds: 0.1},
+          {stage: "outpoint_drain", seconds: 0.05},
+          {stage: "primary_sst_write", seconds: 0.05},
+          {stage: "address_index_run_spill", seconds: 0.02},
+          {stage: "address_transaction_run_spill", seconds: 0.03},
+          {stage: "secondary_address_derivation", seconds: 0.08},
+          {stage: "reorg_undo_write", seconds: 0.02},
+          {stage: "logical_evidence", seconds: 0.1},
+          {stage: "row_load", seconds: 0.1},
+          {stage: "flush_and_close", seconds: 0.05},
+          {stage: "cold_reopen", seconds: 0.05},
+          {stage: "cold_validation_family_readback", seconds: 0.15},
+          {stage: "cold_validation_reorg_undo_readback", seconds: 0.05},
+          {stage: "ready_publication", seconds: 0.1}
+        ],
+        physical_store_bytes: 4096,
+        cold_reopen_evidence_match: true,
+        canonical_fence_match: true
+      },
+      benchmark_client_peak_rss: {
+        bytes: 1048576,
+        source: "proc_status_vmhwm"
+      }
+    }
+  ' >"$directory/report.json"
+
+  jq -n '
+    {
+      evidence_format_version: 1,
+      measurement_kind: "container-resource-observation",
+      component_id: "rocksdb-storage-lifecycle",
+      trial_id: "trial-lifecycle-01",
+      sample_interval_seconds: 1,
+      started_at: "1970-01-01T00:00:00Z",
+      started_at_unix_millis: 99000,
+      completed_at: "1970-01-01T00:00:02Z",
+      completed_at_unix_millis: 102000,
+      child_exit_status: 0,
+      peak_memory_bytes: 104857600,
+      sampled_memory_current_peak_bytes: 100000000,
+      sampled_storage_peak_bytes: 32768,
+      sources: {
+        cgroup_namespace: {
+          support: "verified-private",
+          kind: "proc-self-cgroup-v2",
+          path: "/proc/self/cgroup"
+        },
+        memory_peak: {
+          support: "exact",
+          kind: "cgroup-v2-memory.peak",
+          path: "/sys/fs/cgroup/memory.peak"
+        },
+        memory_current: {
+          support: "exact",
+          kind: "cgroup-v2-memory.current",
+          path: "/sys/fs/cgroup/memory.current"
+        },
+        storage: {
+          support: "sampled",
+          kind: "du-allocated-kibibytes",
+          path: "/var/lib/zinder"
+        }
+      },
+      samples: [
+        {observed_at_unix_millis: 99500, memory_current_bytes: 50000000, storage_bytes: 16384},
+        {observed_at_unix_millis: 101500, memory_current_bytes: 100000000, storage_bytes: 32768}
+      ]
+    }
+  ' >"$directory/resources.json"
+}
+
+validate_lifecycle_case() {
+  local directory="$1"
+  shift
+  "$storage_lifecycle_validator" \
+    "$directory/report.json" \
+    "$directory/resources.json" \
+    205 \
+    "sha256:$(printf 'a%.0s' {1..64})" \
+    "$(printf '0%.0s' {1..40})" \
+    "trial-lifecycle-01" \
+    "zcash-testnet" \
+    10 \
+    10737418240 \
+    "local-docker-desktop" \
+    "local-nvme" \
+    "$@"
+}
+
+lifecycle_every_block="$scratch_directory/lifecycle-every-block"
+write_lifecycle_evidence "$lifecycle_every_block" 1 "every-block" 206 "trusted-fresh" 0
+validate_lifecycle_case "$lifecycle_every_block" >/dev/null \
+  || fail "valid v1 every-block trusted-fresh lifecycle report was rejected without explicit args"
+validate_lifecycle_case "$lifecycle_every_block" "every-block" >/dev/null \
+  || fail "valid v1 every-block trusted-fresh lifecycle report was rejected with matching coverage arg"
+validate_lifecycle_case "$lifecycle_every_block" "every-block" "trusted-fresh" >/dev/null \
+  || fail "valid v1 every-block trusted-fresh lifecycle report was rejected with matching mode arg"
+if validate_lifecycle_case "$lifecycle_every_block" "cadence-and-tip" >/dev/null 2>&1; then
+  fail "every-block lifecycle report was accepted when cadence-and-tip was expected"
+fi
+if validate_lifecycle_case "$lifecycle_every_block" "every-block" "cold-certified" >/dev/null 2>&1; then
+  fail "trusted-fresh lifecycle report was accepted when cold-certified was expected"
+fi
+
+lifecycle_sparse="$scratch_directory/lifecycle-sparse"
+write_lifecycle_evidence "$lifecycle_sparse" 1 "cadence-and-tip" 4 "trusted-fresh" 0
+validate_lifecycle_case "$lifecycle_sparse" >/dev/null \
+  || fail "valid v1 cadence-and-tip trusted-fresh lifecycle report was rejected without explicit args"
+validate_lifecycle_case "$lifecycle_sparse" "cadence-and-tip" >/dev/null \
+  || fail "valid v1 cadence-and-tip trusted-fresh lifecycle report was rejected with matching coverage arg"
+validate_lifecycle_case "$lifecycle_sparse" "cadence-and-tip" "trusted-fresh" >/dev/null \
+  || fail "valid v1 cadence-and-tip trusted-fresh lifecycle report was rejected with matching mode arg"
+if validate_lifecycle_case "$lifecycle_sparse" "every-block" >/dev/null 2>&1; then
+  fail "cadence-and-tip lifecycle report was accepted when every-block was expected"
+fi
+
+lifecycle_cold_certified="$scratch_directory/lifecycle-cold-certified"
+write_lifecycle_evidence "$lifecycle_cold_certified" 1 "every-block" 206 "cold-certified" 1.0
+validate_lifecycle_case "$lifecycle_cold_certified" >/dev/null \
+  || fail "valid v1 cold-certified lifecycle report was rejected without explicit args"
+validate_lifecycle_case "$lifecycle_cold_certified" "every-block" >/dev/null \
+  || fail "valid v1 cold-certified lifecycle report was rejected with matching coverage arg"
+validate_lifecycle_case "$lifecycle_cold_certified" "every-block" "cold-certified" >/dev/null \
+  || fail "valid v1 cold-certified lifecycle report was rejected with matching mode arg"
+if validate_lifecycle_case "$lifecycle_cold_certified" "every-block" "trusted-fresh" >/dev/null 2>&1; then
+  fail "cold-certified lifecycle report was accepted when trusted-fresh was expected"
+fi
+
+lifecycle_trusted_nonzero_cold="$scratch_directory/lifecycle-trusted-nonzero-cold"
+write_lifecycle_evidence "$lifecycle_trusted_nonzero_cold" 1 "every-block" 206 "trusted-fresh" 1.0
+if validate_lifecycle_case "$lifecycle_trusted_nonzero_cold" >/dev/null 2>&1; then
+  fail "v1 trusted-fresh lifecycle report with nonzero canonical_cold_validation_seconds was accepted"
+fi
+if validate_lifecycle_case "$lifecycle_trusted_nonzero_cold" "every-block" "trusted-fresh" >/dev/null 2>&1; then
+  fail "v1 trusted-fresh lifecycle report with nonzero canonical_cold_validation_seconds was accepted with explicit mode"
+fi
+
+lifecycle_invalid_mode="$scratch_directory/lifecycle-invalid-mode"
+write_lifecycle_evidence "$lifecycle_invalid_mode" 1 "every-block" 206 "unknown-mode" 0
+if validate_lifecycle_case "$lifecycle_invalid_mode" >/dev/null 2>&1; then
+  fail "v1 lifecycle report with invalid canonical_publication_mode was accepted"
+fi
+
+lifecycle_missing_mode="$scratch_directory/lifecycle-missing-mode"
+write_lifecycle_evidence "$lifecycle_missing_mode" 1 "every-block" 206 "trusted-fresh" 0
+mutate_report "$lifecycle_missing_mode/report.json" 'del(.resource_limits.canonical_publication_mode)'
+if validate_lifecycle_case "$lifecycle_missing_mode" >/dev/null 2>&1; then
+  fail "v1 lifecycle report missing canonical_publication_mode was accepted"
+fi
+
+lifecycle_mismatched_count="$scratch_directory/lifecycle-mismatched-count"
+write_lifecycle_evidence "$lifecycle_mismatched_count" 1 "every-block" 4 "trusted-fresh" 0
+if validate_lifecycle_case "$lifecycle_mismatched_count" "every-block" >/dev/null 2>&1; then
+  fail "every-block lifecycle report with sparse checkpoint count was accepted"
+fi
+
+lifecycle_missing_count="$scratch_directory/lifecycle-missing-count"
+write_lifecycle_evidence "$lifecycle_missing_count" 1 "every-block" 206 "trusted-fresh" 0
+mutate_report "$lifecycle_missing_count/report.json" 'del(.canonical_storage_ready.tree_state_checkpoint_count)'
+if validate_lifecycle_case "$lifecycle_missing_count" >/dev/null 2>&1; then
+  fail "v1 lifecycle report omitting tree_state_checkpoint_count was accepted"
+fi
+
+expect_lifecycle_rejected() {
+  local name="$1" mutation="$2"
+  local directory="$scratch_directory/lifecycle-$name"
+  write_lifecycle_evidence "$directory" 1 "every-block" 206 "trusted-fresh" 0
+  mutate_report "$directory/report.json" "$mutation"
+  if validate_lifecycle_case "$directory" >/dev/null 2>&1; then
+    fail "lifecycle report $name was accepted"
+  fi
+}
+expect_lifecycle_rejected wrong-canonical-store-schema '.contracts.canonical_store_schema_version = 1'
+expect_lifecycle_rejected wrong-store-schema '.contracts.wallet_store_schema_version = 1'
+expect_lifecycle_rejected wrong-commitment-scheme '.wallet_storage_ready.utxo_summary.commitment_scheme = "lthash16"'
+expect_lifecycle_rejected wrong-projection-schema '.contracts.wallet_projection_schema_version = 1'
+expect_lifecycle_rejected wrong-value-encoding '.contracts.wallet_value_encoding_version = 1'
+expect_lifecycle_rejected missing-block-hash-row-count 'del(.wallet_storage_ready.row_counts.block_hash_by_height_count)'
+expect_lifecycle_rejected wrong-block-hash-row-count '.wallet_storage_ready.row_counts.block_hash_by_height_count = 204'
+expect_lifecycle_rejected legacy-diagnostic-projection-engine '.storage_candidate.diagnostic_projection_engine = null'
+expect_lifecycle_rejected missing-build-stages 'del(.wallet_storage_ready.build_stages)'
+expect_lifecycle_rejected reordered-build-stages '.wallet_storage_ready.build_stages |= (.[0:1] + [.[2], .[1]] + .[3:])'
+expect_lifecycle_rejected unknown-build-stage '.wallet_storage_ready.build_stages[0].stage = "unexpected_stage"'
+expect_lifecycle_rejected excess-build-stages-total '.wallet_storage_ready.build_stages[0].seconds = 5.0'
+expect_lifecycle_rejected legacy-wallet-wal-budget '.resource_limits.wallet_rocksdb.max_wal_bytes = 268435456'
+expect_lifecycle_rejected legacy-canonical-cache-budget '.resource_limits.canonical_rocksdb.block_cache_bytes = 67108864'
+expect_lifecycle_rejected legacy-sorter-temp-budget '.resource_limits.wallet_max_temporary_file_bytes_per_sorter = 68719476736 | .wallet_storage_ready.construction.outpoint_sort.max_temporary_file_bytes = 68719476736 | .wallet_storage_ready.construction.address_index_sort.max_temporary_file_bytes = 68719476736 | .wallet_storage_ready.construction.address_transaction_sort.max_temporary_file_bytes = 68719476736'
+for obsolete_version in 4 5 6; do
+  expect_lifecycle_rejected "obsolete-version-$obsolete_version" ".report_format_version = $obsolete_version"
+done
+
+segmented_valid_report="$scratch_directory/segmented-valid.json"
+cat >"$segmented_valid_report" <<'JSON'
+{
+  "contract_identity": "benchmark-report",
+  "measurement_kind": "postgres-segmented-storage",
+  "report_format_version": 1,
+  "storage_candidate": {
+    "id": "postgres-segmented-storage",
+    "canonical_engine": "postgres",
+    "canonical_model": "settled-segments-with-bounded-live-tail",
+    "topology": "postgres-segmented"
+  },
+  "fixture": {
+    "contract_identity": "canonical-fixture",
+    "fixture_format_version": 1,
+    "canonical_block_facts_digest_evidence": {
+      "block_digest_version": 1,
+      "sequence_digest_version": 1,
+      "block_count": 10,
+      "sequence_digest_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "from_height": 1,
+    "to_height": 10,
+    "block_count": 10,
+    "tip_hash_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "server_settings": {
+    "fsync": true,
+    "full_page_writes": true,
+    "synchronous_commit": "on",
+    "wal_level": "replica"
+  },
+  "provenance": {
+    "runner": {
+      "cpu_limit_cores": 8.0,
+      "memory_limit_bytes": 17179869184
+    }
+  },
+  "runtime_evidence": {
+    "client_cpu_limit_cores": 1.5,
+    "client_memory_limit_bytes": 8053063680,
+    "database_cpu_limit_cores": 6.0,
+    "database_memory_limit_bytes": 8589934592,
+    "pooler_cpu_limit_cores": 0.5,
+    "pooler_memory_limit_bytes": 536870912
+  },
+  "configuration": {
+    "schema_version": 2,
+    "reader_mode": "pgbouncer-transaction",
+    "max_segment_bytes": 268435456,
+    "live_tail_max_blocks": 4,
+    "concurrent_readers": 4,
+    "bulk_block_count": 6,
+    "tip_follow_block_count": 4,
+    "total_block_count": 10
+  },
+  "validation": {
+    "first_height": 1,
+    "tip_height": 10,
+    "tip_hash_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "persisted_sequence_digest_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "fixture_sequence_digest_match": true,
+    "fresh_reader_validated": true
+  },
+  "timings": {
+    "wall_clock_seconds": 1.5,
+    "prepare_seconds": 0.2,
+    "tip_prepare_seconds": 0.05,
+    "schema_create_seconds": 0.1,
+    "wallet_projection_seconds": 0.1,
+    "seal_seconds": 0.2,
+    "bulk_copy_seconds": 0.3,
+    "finalize_seconds": 0.2,
+    "bulk_build_seconds": 1.1,
+    "streaming_blocks_per_second": 42.0
+  },
+  "tip_follow": {
+    "uncontended_commit_latencies_ms": { "sample_count": 2, "max_ms": 8.0 },
+    "contended_commit_latencies_ms": { "sample_count": 2, "max_ms": 12.0 }
+  },
+  "reader_workload": {
+    "ready_workers": 4,
+    "overlapping_workers": 4,
+    "completed_transactions": 20,
+    "per_reader_blocks_per_second_mean": 42.0,
+    "per_reader_bytes_per_second_mean": 16384.0
+  },
+  "footprint": {
+    "canonical_storage_bytes": 80000,
+    "wallet_storage_bytes": 20000,
+    "total_storage_bytes": 100000,
+    "max_segment_byte_len": 4096,
+    "live_tail_rows": 2
+  },
+  "adr0004_gate_evaluation": {
+    "tip_commit_latency_under_2s": true,
+    "max_segment_bytes_respected": true,
+    "live_tail_bounded": true,
+    "concurrent_readers_zero_errors": true
+  }
+}
+JSON
+
+"$validator" --segmented-report "$segmented_valid_report" >/dev/null ||
+  fail "valid postgres-segmented-storage report was rejected"
+
+expect_segmented_rejected() {
+  local name="$1" mutation="$2"
+  local mutated="$scratch_directory/segmented-$name.json"
+  jq "$mutation" "$segmented_valid_report" >"$mutated"
+  if "$validator" --segmented-report "$mutated" >/dev/null 2>&1; then
+    fail "segmented report $name was accepted"
+  fi
+}
+
+expect_segmented_rejected corrupt-digest '.validation.fixture_sequence_digest_match = false'
+expect_segmented_rejected altered-persisted-digest '.validation.persisted_sequence_digest_hex = "9999999999999999999999999999999999999999999999999999999999999999"'
+expect_segmented_rejected missing-persisted-digest 'del(.validation.persisted_sequence_digest_hex)'
+expect_segmented_rejected missing-fixture-digest 'del(.fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256)'
+expect_segmented_rejected malformed-digest '.validation.persisted_sequence_digest_hex = "abcd" | .fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256 = "abcd"'
+expect_segmented_rejected uppercase-digest '.validation.persisted_sequence_digest_hex = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" | .fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"'
+expect_segmented_rejected bulk-build-seconds-mismatch '.timings.bulk_build_seconds = 5.0'
+expect_segmented_rejected build-ratio-with-tip-follow '.adr0004_gate_evaluation.build_time_ratio_vs_rocksdb = 1.5'
+expect_segmented_rejected unready-reader-workers '.reader_workload.ready_workers = 3'
+expect_segmented_rejected non-overlapping-reader-workers '.reader_workload.overlapping_workers = 3'
+expect_segmented_rejected non-durable-fsync '.server_settings.fsync = false'
+expect_segmented_rejected oversized-segment '.footprint.max_segment_byte_len = 268435457'
+expect_segmented_rejected unbounded-live-tail '.footprint.live_tail_rows = 5'
+expect_segmented_rejected wrong-report-version '.report_format_version = 2'
+expect_segmented_rejected zero-reader-throughput '.reader_workload.per_reader_blocks_per_second_mean = 0'
+expect_segmented_rejected storage-mismatch '.footprint.total_storage_bytes = 999'
+expect_segmented_rejected zero-tip-samples-claiming-pass '.tip_follow.contended_commit_latencies_ms.sample_count = 0'
+expect_segmented_rejected over-threshold-contended-latency '.tip_follow.contended_commit_latencies_ms.max_ms = 2500.0'
+expect_segmented_rejected threshold-boundary-uncontended-latency '.tip_follow.uncontended_commit_latencies_ms.max_ms = 2000.0'
+expect_segmented_rejected missing-pooler-cpu-budget '.runtime_evidence.pooler_cpu_limit_cores = null'
+expect_segmented_rejected pooler-memory-budget-mismatch '.runtime_evidence.pooler_memory_limit_bytes = 1073741824'
+expect_segmented_rejected missing-wallet-projection-timing 'del(.timings.wallet_projection_seconds)'
 
 printf 'storage benchmark campaign validator tests passed\n'

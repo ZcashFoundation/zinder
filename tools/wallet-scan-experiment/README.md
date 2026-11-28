@@ -8,7 +8,7 @@ An incorrect hint can be a valid Pallas point and still hide a payment. Before t
 
 ## Replaying a range
 
-The exporter opens a read-only secondary of a wallet-serving Testnet canonical store with the default reorg window and a recorded upgrade schedule. The exporter expects the writer’s `storage.raw_blob_policy` to be `transactions` by default. Pass `--raw-blob-retention all` for a full-block store. It checks the height and parent hash of each block. This command repeats the mixed-range measurement.
+The exporter opens a read-only secondary of a schema v2 Testnet canonical store with the default reorg window and a recorded upgrade schedule. It accepts stores with or without full blocks by default. Pass `--raw-blob-retention all` to require a full-block store. The exporter checks the height and parent hash of each block. This command repeats the mixed-range measurement.
 
 ```sh
 cargo run --locked --release -p wallet-scan-experiment --bin export-wallet-scan-corpus -- \

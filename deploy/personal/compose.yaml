@@ -1,0 +1,70 @@
+name: zinder-personal-${ZINDER_NETWORK__NAME:-zcash-mainnet}
+
+services:
+  zebra:
+    image: docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba
+    restart: unless-stopped
+    mem_limit: 4g
+    environment:
+      ZEBRA_NETWORK__NETWORK: ${ZEBRA_NETWORK__NETWORK:-Mainnet}
+      ZEBRA_STATE__CACHE_DIR: /var/lib/zebra
+      ZEBRA_RPC__LISTEN_ADDR: "0.0.0.0:8232"
+      ZEBRA_RPC__ENABLE_COOKIE_AUTH: "true"
+      ZEBRA_RPC__COOKIE_DIR: /var/run/zebra-auth
+    volumes:
+      - zebra-data:/var/lib/zebra
+      - zebra-auth:/var/run/zebra-auth
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test -s /var/run/zebra-auth/.cookie &&
+          printf 'user = "%s"\n' "$$(cat /var/run/zebra-auth/.cookie)" |
+          curl --config - --silent --fail --header 'Content-Type: application/json'
+          --data '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}'
+          http://127.0.0.1:8232 |
+          grep -Eq '"result"[[:space:]]*:[[:space:]]*[0-9]+'
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  zinder:
+    image: ${DEPLOY_IMAGE:-ghcr.io/zcashfoundation/zinder:${DEPLOY_VERSION:?set the Zinder release tag}}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: ${DEPLOY_SERVE_MEMORY_LIMIT:-8g}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    depends_on:
+      zebra:
+        condition: service_healthy
+    command: ["serve"]
+    environment:
+      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_DEPLOYMENT__PROFILE:-light-wallet}
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
+      ZINDER_NODE__AUTH__METHOD: cookie
+      ZINDER_NODE__AUTH__PATH: /var/run/zebra-auth/.cookie
+      ZINDER_STORAGE__DATA_DIR: /var/lib/zinder
+      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
+      ZINDER_COMPAT__LISTEN_ADDR: "[::]:9067"
+      ZINDER_OPS__LISTEN_ADDR: "[::]:9108"
+    volumes:
+      - zinder-data:/var/lib/zinder
+      - zebra-auth:/var/run/zebra-auth:ro
+    ports:
+      - "127.0.0.1:9067:9067"
+      - "127.0.0.1:9108:9108"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/zinder", "healthcheck", "--addr", "127.0.0.1:9108"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  zebra-data:
+  zebra-auth:
+  zinder-data:

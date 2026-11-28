@@ -9,14 +9,20 @@ use std::{
 };
 
 use thiserror::Error;
+use tokio::sync::OnceCell;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
-use zinder_core::{BlockId, ChainEpoch, Network, NetworkUpgradeActivations};
-use zinder_store::{CanonicalActivationSchedule, CanonicalEventFence};
+use zinder_core::{BlockHeight, BlockId, ChainEpoch, Network, NetworkUpgradeActivations};
+use zinder_store::{
+    ArtifactFamily, CanonicalActivationSchedule, CanonicalEventFence, ServedTreeState,
+};
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionReadyEvidence, WalletProjectionSourcePosition,
 };
 
-use crate::{CanonicalReader, QueryError, WalletProjectionReader};
+use crate::{
+    ArtifactKey, CanonicalReader, QueryError, WalletProjectionReader,
+    tree_state_replay_limit::{CachedTreeState, ReadyState, StoredTreeState},
+};
 
 /// Typed reason why canonical and wallet readers cannot form one serving pair.
 ///
@@ -102,6 +108,9 @@ pub struct WalletServingReadPair {
     chain_epoch: ChainEpoch,
     reads_revoked: CancellationToken,
     table_file_missing: AtomicBool,
+    observed_for_epoch_pin: AtomicBool,
+    tip_block_time: OnceCell<i64>,
+    latest_tree_state_checkpoint: OnceCell<Arc<CachedTreeState>>,
 }
 
 impl WalletServingReadPair {
@@ -135,6 +144,9 @@ impl WalletServingReadPair {
             wallet,
             reads_revoked: CancellationToken::new(),
             table_file_missing: AtomicBool::new(false),
+            observed_for_epoch_pin: AtomicBool::new(false),
+            tip_block_time: OnceCell::new(),
+            latest_tree_state_checkpoint: OnceCell::new(),
         })
     }
 
@@ -165,7 +177,9 @@ impl WalletServingReadPair {
             canonical_epoch.visible_tip_height,
             canonical_epoch.visible_tip_hash,
         );
-        if canonical_epoch.network != canonical.network
+        if canonical_fence.schema_version()
+            != zinder_wallet_projection::REQUIRED_CANONICAL_STORE_SCHEMA_VERSION
+            || canonical_epoch.network != canonical.network
             || canonical_epoch.id != canonical_fence.chain_epoch_id()
             || canonical_visible_tip != canonical_fence.visible_tip()
         {
@@ -197,6 +211,12 @@ impl WalletServingReadPair {
     #[must_use]
     pub fn canonical(&self) -> &(dyn CanonicalReader + 'static) {
         self.canonical.as_ref()
+    }
+
+    /// Returns a cloned handle to the frozen canonical reader for detached tasks.
+    #[must_use]
+    pub(crate) fn canonical_arc(&self) -> Arc<dyn CanonicalReader> {
+        Arc::clone(&self.canonical)
     }
 
     /// Returns the wallet reader frozen for this pair's entire lifetime.
@@ -258,6 +278,133 @@ impl WalletServingReadPair {
     /// Reports whether a read found one of this pair's table files deleted.
     pub(crate) fn has_missing_table_file(&self) -> bool {
         self.table_file_missing.load(Ordering::Acquire)
+    }
+
+    /// Marks this pair as one whose chain epoch a request may have exposed,
+    /// so the slot keeps it readable for pins once it is replaced.
+    ///
+    /// Only the slot calls this, while it holds its transition lock.
+    pub(crate) fn mark_observed_for_epoch_pin(&self) {
+        self.observed_for_epoch_pin.store(true, Ordering::Release);
+    }
+
+    /// Reports whether a request may have exposed this pair's chain epoch.
+    pub(crate) fn is_observed_for_epoch_pin(&self) -> bool {
+        self.observed_for_epoch_pin.load(Ordering::Acquire)
+    }
+
+    /// Clears the observation mark, so a test can replay the first
+    /// observation of a pair.
+    #[cfg(test)]
+    pub(crate) fn clear_observation_for_test(&self) {
+        self.observed_for_epoch_pin.store(false, Ordering::Release);
+    }
+
+    /// Returns the cached visible-tip block time if a prior read on this pair
+    /// has already loaded it.
+    pub(crate) fn cached_tip_block_time(&self) -> Option<i64> {
+        self.tip_block_time.get().copied()
+    }
+
+    /// Reads the block time of this pair's visible tip once and keeps it, so
+    /// the frequent single-shot tip calls read a header once per pair.
+    pub(crate) async fn visible_tip_block_time(&self) -> Result<i64, QueryError> {
+        self.tip_block_time
+            .get_or_try_init(|| async {
+                self.canonical
+                    .block_header_at(self.chain_epoch.visible_tip_height)
+                    .await
+                    .map_err(QueryError::canonical_read)?
+                    .ok_or(QueryError::BlockNotInBestChain)
+                    .map(|stored| stored.into_header().block_time)
+            })
+            .await
+            .copied()
+    }
+
+    /// Returns the cached latest tree-state checkpoint if a prior read on this
+    /// pair has already loaded it.
+    pub(crate) fn cached_latest_tree_state_checkpoint(&self) -> Option<&Arc<CachedTreeState>> {
+        self.latest_tree_state_checkpoint.get()
+    }
+
+    /// Reads the newest tree-state checkpoint at or below this pair's visible
+    /// tip once and keeps it for the life of the pair.
+    ///
+    /// Storage failures are never cached, so an invalidated reader can be
+    /// retired and retried cleanly on its replacement pair.
+    pub(crate) async fn latest_tree_state_checkpoint(
+        &self,
+    ) -> Result<&Arc<CachedTreeState>, QueryError> {
+        self.latest_tree_state_checkpoint
+            .get_or_try_init(|| async {
+                let checkpoint = self
+                    .canonical
+                    .tree_state_checkpoint_at_or_before(self.chain_epoch.visible_tip_height)
+                    .await
+                    .map_err(QueryError::canonical_read)?
+                    .ok_or(QueryError::ArtifactUnavailable {
+                        family: ArtifactFamily::TreeState,
+                        key: ArtifactKey::BlockHeight(self.chain_epoch.visible_tip_height),
+                    })?;
+                Ok(Arc::new(CachedTreeState::new(checkpoint)))
+            })
+            .await
+    }
+
+    /// Returns a cached [`ReadyState`] when this pair's cached latest
+    /// checkpoint sits at `height` within retained history.
+    pub(crate) fn cached_latest_tree_state_at(&self, height: BlockHeight) -> Option<ReadyState> {
+        let cached = self.latest_tree_state_checkpoint.get()?;
+        if cached.state().block_id().height != height
+            || height > self.chain_epoch.visible_tip_height
+            || self
+                .canonical
+                .history_bounds()
+                .preceding_checkpoint()
+                .is_some_and(|block| height < block.height)
+        {
+            return None;
+        }
+        Some(ReadyState::Cached(Arc::clone(cached)))
+    }
+
+    /// Shares a freshly loaded stored checkpoint at this pair's visible tip
+    /// with future `GetLatestTreeState` and `GetTreeState(tip)` calls.
+    pub(crate) fn remember_tip_ready_state(&self, ready: ReadyState) -> ReadyState {
+        match ready {
+            ReadyState::Stored(StoredTreeState::Owned(state))
+                if state.block_id().height == self.chain_epoch.visible_tip_height =>
+            {
+                ReadyState::Stored(StoredTreeState::Shared(self.share_latest_checkpoint(state)))
+            }
+            ReadyState::Stored(StoredTreeState::Shared(cached))
+                if cached.state().block_id().height == self.chain_epoch.visible_tip_height =>
+            {
+                let shared = match self.latest_tree_state_checkpoint.set(Arc::clone(&cached)) {
+                    Ok(()) => cached,
+                    Err(_) => self
+                        .latest_tree_state_checkpoint
+                        .get()
+                        .cloned()
+                        .unwrap_or(cached),
+                };
+                ReadyState::Stored(StoredTreeState::Shared(shared))
+            }
+            other @ (ReadyState::Cached(_) | ReadyState::Stored(_)) => other,
+        }
+    }
+
+    fn share_latest_checkpoint(&self, state: ServedTreeState) -> Arc<CachedTreeState> {
+        let cached = Arc::new(CachedTreeState::new(state));
+        match self.latest_tree_state_checkpoint.set(Arc::clone(&cached)) {
+            Ok(()) => cached,
+            Err(_) => self
+                .latest_tree_state_checkpoint
+                .get()
+                .cloned()
+                .unwrap_or(cached),
+        }
     }
 
     /// Returns the failure a revoked read ends with: its epoch is no longer

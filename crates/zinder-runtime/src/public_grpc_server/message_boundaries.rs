@@ -1,4 +1,4 @@
-//! Finds where gRPC messages end in a request body that arrives in chunks.
+//! Finds where gRPC messages end in a body split across transport frames.
 //!
 //! Each gRPC message on the wire is a 1-byte compression flag, a 4-byte
 //! big-endian length, and that many bytes. A client stream counts as active
@@ -16,15 +16,14 @@ pub(super) struct MessageBoundaries {
 }
 
 impl MessageBoundaries {
-    /// Consumes the next chunk of the body and returns whether at least one
-    /// message finished arriving in it.
-    pub(super) fn completes_a_message(&mut self, mut chunk: &[u8]) -> bool {
-        let mut completed = false;
+    /// Consumes the next chunk of the body and returns the number of complete messages.
+    pub(super) fn completed_messages(&mut self, mut chunk: &[u8]) -> u32 {
+        let mut completed = 0_u32;
         while !chunk.is_empty() {
             if self.payload_remaining > 0 {
                 let taken = self.payload_remaining.min(chunk.len());
                 self.payload_remaining -= taken;
-                completed |= self.payload_remaining == 0;
+                completed = completed.saturating_add(u32::from(self.payload_remaining == 0));
                 chunk = &chunk[taken..];
                 continue;
             }
@@ -39,7 +38,7 @@ impl MessageBoundaries {
                 let [_, length @ ..] = self.prefix;
                 self.payload_remaining =
                     usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
-                completed |= self.payload_remaining == 0;
+                completed = completed.saturating_add(u32::from(self.payload_remaining == 0));
             }
         }
         completed
@@ -62,14 +61,14 @@ mod tests {
     #[test]
     fn a_whole_message_in_one_chunk_completes() -> Result<()> {
         let mut boundaries = MessageBoundaries::default();
-        assert!(boundaries.completes_a_message(&message(b"hello")?));
+        assert_eq!(boundaries.completed_messages(&message(b"hello")?), 1);
         Ok(())
     }
 
     #[test]
     fn an_empty_message_completes_at_its_prefix() -> Result<()> {
         let mut boundaries = MessageBoundaries::default();
-        assert!(boundaries.completes_a_message(&message(b"")?));
+        assert_eq!(boundaries.completed_messages(&message(b"")?), 1);
         Ok(())
     }
 
@@ -81,9 +80,9 @@ mod tests {
             .ok_or_else(|| eyre!("a framed message is never empty"))?;
         let mut boundaries = MessageBoundaries::default();
         for byte in earlier {
-            assert!(!boundaries.completes_a_message(std::slice::from_ref(byte)));
+            assert_eq!(boundaries.completed_messages(std::slice::from_ref(byte)), 0);
         }
-        assert!(boundaries.completes_a_message(std::slice::from_ref(last)));
+        assert_eq!(boundaries.completed_messages(std::slice::from_ref(last)), 1);
         Ok(())
     }
 
@@ -93,15 +92,18 @@ mod tests {
         stream.extend(message(b"second")?);
         let (head, tail) = stream.split_at(8);
         let mut boundaries = MessageBoundaries::default();
-        assert!(!boundaries.completes_a_message(head));
-        assert!(boundaries.completes_a_message(tail));
-        assert!(!boundaries.completes_a_message(&[0, 0, 0]));
+        assert_eq!(boundaries.completed_messages(head), 0);
+        assert_eq!(boundaries.completed_messages(tail), 2);
+        assert_eq!(boundaries.completed_messages(&[0, 0, 0]), 0);
         Ok(())
     }
 
     #[test]
     fn a_prefix_announcing_a_payload_does_not_complete() {
         let mut boundaries = MessageBoundaries::default();
-        assert!(!boundaries.completes_a_message(&[0, 0, 0, 0, 100, 1, 2, 3]));
+        assert_eq!(
+            boundaries.completed_messages(&[0, 0, 0, 0, 100, 1, 2, 3]),
+            0
+        );
     }
 }

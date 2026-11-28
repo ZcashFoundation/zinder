@@ -1,23 +1,21 @@
 //! Structured startup-phase vocabulary.
 //!
-//! Every Zinder service binary follows the same ordered sequence of startup
-//! phases ([Service operations §Startup
-//! Phases](../../../docs/architecture/service-operations.md#startup-phases)).
+//! Each runtime reports its applicable [startup phases](../../../docs/architecture/service-operations.md#startup-phases).
 //! [`StartupPhase`] names the phases and [`StartupPhaseGuard`] emits one
 //! structured tracing event when a phase begins and one when it ends. The
 //! exit event carries an explicit `outcome` (`ok`, `failed`, or `aborted`)
 //! so a stuck or crashing startup is visible from a `PaaS` log viewer without
 //! `ssh`.
 //!
-//! ```ignore
+//! ```
 //! use zinder_runtime::StartupPhase;
+//! # fn open_storage() -> std::io::Result<()> { Ok(()) }
 //!
 //! let phase = StartupPhase::OpenStorage.start();
-//! open_storage().map_err(|error| {
-//!     phase.fail(&error);
-//!     error
-//! })?;
-//! phase.complete();
+//! match open_storage() {
+//!     Ok(()) => phase.complete(),
+//!     Err(error) => phase.fail(&error),
+//! }
 //! ```
 //!
 //! Drop-without-`complete`-or-`fail` emits `outcome="aborted"` so a panic
@@ -28,16 +26,13 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-/// Ordered startup phases shared by every Zinder service binary.
+/// Shared vocabulary for the startup phases a Zinder service performs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum StartupPhase {
-    /// Load merged configuration from defaults, file, env vars, and CLI flags.
+    /// Load and validate merged configuration from defaults, file, env vars, and CLI flags.
     LoadConfig,
-    /// Validate the merged configuration (required fields, value bounds,
-    /// network-specific rules).
-    ValidateConfig,
     /// Open the canonical or secondary storage handle.
     OpenStorage,
     /// Verify the schema version against the storage handle.
@@ -52,9 +47,9 @@ pub enum StartupPhase {
     AdmitIngestControl,
     /// Recover in-flight state (replay pending epochs, hydrate mempool, etc.).
     RecoverState,
-    /// Start the public API surface (gRPC, ops endpoint).
+    /// Start an API listener, including operational and owner-control endpoints.
     StartApi,
-    /// Service is ready to accept traffic.
+    /// The runtime reached its startup readiness condition.
     Ready,
 }
 
@@ -64,7 +59,6 @@ impl StartupPhase {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::LoadConfig => "load_config",
-            Self::ValidateConfig => "validate_config",
             Self::OpenStorage => "open_storage",
             Self::CheckSchema => "check_schema",
             Self::ConnectNode => "connect_node",
@@ -186,7 +180,6 @@ mod tests {
     #[test]
     fn as_str_returns_canonical_phase_names() {
         assert_eq!(StartupPhase::LoadConfig.as_str(), "load_config");
-        assert_eq!(StartupPhase::ValidateConfig.as_str(), "validate_config");
         assert_eq!(StartupPhase::OpenStorage.as_str(), "open_storage");
         assert_eq!(StartupPhase::CheckSchema.as_str(), "check_schema");
         assert_eq!(StartupPhase::ConnectNode.as_str(), "connect_node");

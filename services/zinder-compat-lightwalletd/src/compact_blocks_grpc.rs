@@ -2,22 +2,30 @@
 //! of lightwalletd `CompactTxStreamer` from the canonical reader of each
 //! compact-blocks generation alone.
 
-use std::{num::NonZeroU32, sync::Arc, time::Duration, time::Instant};
+use std::{
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use arc_swap::ArcSwap;
-use tonic::{Request, Response, Status};
+use tokio::sync::watch;
+use tonic::{Request, Response, Status, codec::CompressionEncoding};
 use zinder_core::{ChainEpoch, CompactBlockArtifact, NetworkUpgradeActivations};
-use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
+use zinder_proto::compat::lightwalletd::{self, EncodedBlock, compact_tx_streamer_server};
 use zinder_query::{
-    ArtifactKey, CanonicalReader, QueryError, RocksDbCanonicalReader, StorageReadError,
-    read_on_blocking_thread, status_from_query_error,
+    ArtifactKey, CanonicalReader, EncodedCompactBlockLookup, QueryError, RocksDbCanonicalReader,
+    StorageReadError, read_on_blocking_thread, status_from_query_error,
 };
 use zinder_runtime::RepeatedFieldGuard;
-use zinder_store::ArtifactFamily;
+use zinder_store::{ArtifactFamily, CompactBlockSpliceSelection, EncodedCompactBlockRangeRequest};
 
 use crate::block_methods::{
-    self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
-    CompactBlockReads, RequestedBlock, view_reaches,
+    BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView, CompactBlockReads,
+    EncodedChunkReadOutcome, RequestedBlock, view_reaches,
 };
 use crate::compact_block_messages::CompactBlockShape;
 use crate::grpc::GrpcStream;
@@ -25,6 +33,7 @@ use crate::node_tip_witness::NodeTipWitness;
 use crate::ping::LightwalletdPing;
 use crate::request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;
 use crate::stale_tip::StaleTipLimit;
+use crate::tip_wait::TipWait;
 
 /// The canonical reader compact-blocks serving answers from, which its owner
 /// replaces with the reader of each newer generation.
@@ -38,6 +47,8 @@ use crate::stale_tip::StaleTipLimit;
 #[derive(Clone)]
 pub struct CanonicalReaderSlot {
     current: Arc<ArcSwap<RocksDbCanonicalReader>>,
+    /// Changes on every publication, so a read can wait for a newer reader.
+    publication: Arc<watch::Sender<()>>,
 }
 
 impl CanonicalReaderSlot {
@@ -46,6 +57,7 @@ impl CanonicalReaderSlot {
     pub fn new(reader: Arc<RocksDbCanonicalReader>) -> Self {
         Self {
             current: Arc::new(ArcSwap::from(reader)),
+            publication: Arc::new(watch::Sender::new(())),
         }
     }
 
@@ -55,11 +67,28 @@ impl CanonicalReaderSlot {
         self.current.load_full()
     }
 
+    /// Returns whether `reader` is still the generation currently published in
+    /// this slot, without cloning or dropping its reference count.
+    #[must_use]
+    pub fn is_current(&self, reader: &Arc<RocksDbCanonicalReader>) -> bool {
+        let current = self.current.load();
+        Arc::ptr_eq(&current, reader)
+    }
+
+    /// Returns the visible tip height of the currently published reader without
+    /// cloning or dropping its reference count.
+    #[must_use]
+    pub fn peek_visible_tip_height(&self) -> zinder_core::BlockHeight {
+        self.current.load().chain_epoch().visible_tip_height
+    }
+
     /// Serves `reader` from now on and returns the reader it replaces, which
     /// requests that captured it may still hold.
     #[must_use]
     pub fn publish(&self, reader: Arc<RocksDbCanonicalReader>) -> Arc<RocksDbCanonicalReader> {
-        self.current.swap(reader)
+        let replaced = self.current.swap(reader);
+        self.publication.send_replace(());
+        replaced
     }
 }
 
@@ -72,6 +101,16 @@ impl CompactBlockReads for CanonicalReaderSlot {
         &self,
     ) -> impl Future<Output = Result<Arc<RocksDbCanonicalReader>, Status>> + Send {
         std::future::ready(Ok(self.capture()))
+    }
+
+    fn subscribe_publications(&self) -> Option<watch::Receiver<()>> {
+        Some(self.publication.subscribe())
+    }
+
+    fn peek_visible_tip_height(
+        &self,
+    ) -> impl Future<Output = Result<zinder_core::BlockHeight, Status>> + Send {
+        std::future::ready(Ok(Self::peek_visible_tip_height(self)))
     }
 
     fn view_chain_epoch(view: &Arc<RocksDbCanonicalReader>) -> ChainEpoch {
@@ -126,6 +165,70 @@ impl CompactBlockReads for CanonicalReaderSlot {
         }
     }
 
+    async fn read_encoded_compact_block(
+        &self,
+        view: &Arc<RocksDbCanonicalReader>,
+        block: RequestedBlock,
+        selection: CompactBlockSpliceSelection,
+    ) -> Result<Option<EncodedBlock>, Status> {
+        let lookup = match block {
+            RequestedBlock::Height(height) => view
+                .encoded_compact_block_at(height, selection)
+                .await
+                .map_err(storage_status)?,
+            // The reader resolves the hash and splices its block in one storage read.
+            RequestedBlock::Hash(block_hash) => view
+                .encoded_compact_block_by_hash(block_hash, selection)
+                .await
+                .map_err(storage_status)?,
+        };
+        match lookup {
+            EncodedCompactBlockLookup::Block(encoded) => Ok(Some(encoded)),
+            EncodedCompactBlockLookup::NotFound => Err(match block {
+                RequestedBlock::Height(height) => {
+                    status_from_query_error(&QueryError::ArtifactUnavailable {
+                        family: ArtifactFamily::CompactBlock,
+                        key: ArtifactKey::BlockHeight(height),
+                    })
+                }
+                RequestedBlock::Hash(_) => {
+                    status_from_query_error(&QueryError::BlockNotInBestChain)
+                }
+            }),
+            EncodedCompactBlockLookup::Unsupported => Ok(None),
+        }
+    }
+
+    async fn read_encoded_compact_block_chunk(
+        &self,
+        view: ChunkView<Self::View>,
+        request: EncodedCompactBlockRangeRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> EncodedChunkReadOutcome<Self::View> {
+        if cancel.load(Ordering::Acquire) {
+            return EncodedChunkReadOutcome::Failed {
+                read_duration: None,
+                failure: ChunkReadFailure::Failed(Status::cancelled(
+                    "block-range stream cancelled",
+                )),
+            };
+        }
+        let slot = self.clone();
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            span.in_scope(|| read_encoded_chunk_on_this_thread(&slot, view, request, &cancel))
+        })
+        .await
+        .unwrap_or_else(|error| EncodedChunkReadOutcome::Failed {
+            read_duration: None,
+            failure: ChunkReadFailure::Failed(status_from_query_error(
+                &QueryError::BlockingTaskFailed {
+                    reason: error.to_string(),
+                },
+            )),
+        })
+    }
+
     async fn read_compact_block_chunk<Output, Convert>(
         &self,
         read: ChunkRead<Arc<RocksDbCanonicalReader>>,
@@ -168,7 +271,13 @@ fn read_chunk_on_this_thread<Output>(
         order,
         max_bytes,
         view,
+        cancel,
     } = read;
+    if cancel.is_cancelled() {
+        return ChunkReadOutcome::unread(ChunkReadFailure::Failed(Status::cancelled(
+            "block-range stream cancelled",
+        )));
+    }
     let reader = match view {
         ChunkView::Captured(reader) => reader,
         ChunkView::Current => slot.capture(),
@@ -182,11 +291,94 @@ fn read_chunk_on_this_thread<Output>(
         read_on_blocking_thread(reader.compact_blocks_in_range_up_to(chunk, order, max_bytes));
     let read_duration = started_at.elapsed();
     drop(reader);
+    if cancel.is_cancelled() {
+        return ChunkReadOutcome {
+            read_duration: Some(read_duration),
+            converted: Err(ChunkReadFailure::Failed(Status::cancelled(
+                "block-range stream cancelled",
+            ))),
+        };
+    }
     ChunkReadOutcome {
         read_duration: Some(read_duration),
         converted: blocks
             .map(|blocks| convert(read_at, blocks))
             .map_err(|error| ChunkReadFailure::Failed(storage_status(error))),
+    }
+}
+
+/// Reads one encoded chunk on the calling blocking thread.
+///
+/// Captures the current generation inside the blocking worker for later encoded
+/// chunks so waiting in a saturated blocking pool does not retain a retired
+/// generation, then drops the reader before returning.
+fn read_encoded_chunk_on_this_thread(
+    slot: &CanonicalReaderSlot,
+    view: ChunkView<Arc<RocksDbCanonicalReader>>,
+    request: EncodedCompactBlockRangeRequest,
+    cancel: &Arc<AtomicBool>,
+) -> EncodedChunkReadOutcome<Arc<RocksDbCanonicalReader>> {
+    if cancel.load(Ordering::Acquire) {
+        return EncodedChunkReadOutcome::Failed {
+            read_duration: None,
+            failure: ChunkReadFailure::Failed(Status::cancelled("block-range stream cancelled")),
+        };
+    }
+    let (reader, was_captured) = match view {
+        ChunkView::Captured(reader) => (reader, true),
+        ChunkView::Current => (slot.capture(), false),
+    };
+    let read_at = reader.chain_epoch();
+    if !view_reaches(&read_at, request.range) {
+        drop(reader);
+        return EncodedChunkReadOutcome::Failed {
+            read_duration: None,
+            failure: ChunkReadFailure::TipBelowChunk(read_at),
+        };
+    }
+    let started_at = Instant::now();
+    let outcome = read_on_blocking_thread(
+        reader.encoded_compact_block_range_up_to(request, Some(Arc::clone(cancel))),
+    );
+    let read_duration = started_at.elapsed();
+    match outcome {
+        Ok(Some(range)) => {
+            drop(reader);
+            if cancel.load(Ordering::Acquire) {
+                EncodedChunkReadOutcome::Failed {
+                    read_duration: Some(read_duration),
+                    failure: ChunkReadFailure::Failed(Status::cancelled(
+                        "block-range stream cancelled",
+                    )),
+                }
+            } else {
+                EncodedChunkReadOutcome::Direct {
+                    read_at,
+                    range,
+                    read_duration,
+                }
+            }
+        }
+        Ok(None) => {
+            if was_captured {
+                EncodedChunkReadOutcome::Fallback(ChunkView::Captured(reader))
+            } else {
+                drop(reader);
+                EncodedChunkReadOutcome::Fallback(ChunkView::Current)
+            }
+        }
+        Err(error) => {
+            drop(reader);
+            let status = if matches!(error, StorageReadError::Cancelled) {
+                Status::cancelled("block-range stream cancelled")
+            } else {
+                storage_status(error)
+            };
+            EncodedChunkReadOutcome::Failed {
+                read_duration: Some(read_duration),
+                failure: ChunkReadFailure::Failed(status),
+            }
+        }
     }
 }
 
@@ -263,6 +455,20 @@ impl CompactBlocksGrpcAdapter {
         self
     }
 
+    /// Lets a block read that names a height just past the visible tip wait
+    /// briefly for that height instead of failing at once.
+    ///
+    /// Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`,
+    /// `GetBlockRangeNullifiers`, the encoded range methods, and, where this
+    /// adapter serves it, `GetTreeState`, when they select by height. The
+    /// adapter defaults to [`TipWait::disabled`]; the
+    /// `zinder-compat-lightwalletd` binary sets the configured wait.
+    #[must_use]
+    pub fn with_tip_wait(mut self, tip_wait: TipWait) -> Self {
+        self.block_methods = self.block_methods.with_tip_wait(tip_wait);
+        self
+    }
+
     /// Sets how this adapter answers `Ping`. The default refuses it with
     /// `FAILED_PRECONDITION`, as lightwalletd does without
     /// `--ping-very-insecure`.
@@ -280,9 +486,14 @@ impl CompactBlocksGrpcAdapter {
     ) -> RepeatedFieldGuard<compact_tx_streamer_server::CompactTxStreamerServer<Self>> {
         RepeatedFieldGuard::new(
             compact_tx_streamer_server::CompactTxStreamerServer::new(self)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .send_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Zstd)
                 .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES),
             COMPACT_TX_STREAMER_FIELD_LIMITS,
         )
+        .with_request_compression()
     }
 }
 
@@ -293,7 +504,76 @@ fn unsupported(method: &'static str) -> Status {
 }
 
 #[tonic::async_trait]
+impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
+    async fn get_encoded_block_range(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.slot, "get_encoded_block_range", &request)
+            .await?;
+        self.block_methods
+            .encoded_block_range(&self.slot, &request, CompactBlockShape::for_range)
+            .await
+            .map(Response::new)
+    }
+
+    fn supports_encoded_frames(&self) -> bool {
+        true
+    }
+
+    async fn get_encoded_block_range_frames(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockFrameStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.slot, "get_encoded_block_range", &request)
+            .await?;
+        self.block_methods
+            .encoded_block_range_frames(&self.slot, &request, CompactBlockShape::for_range)
+            .await
+            .map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
+impl lightwalletd::EncodedUnaryBlocks for CompactBlocksGrpcAdapter {
+    async fn get_encoded_block(
+        &self,
+        request: Request<lightwalletd::BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status> {
+        self.block_methods
+            .unary_block(
+                &self.slot,
+                "get_block",
+                request.get_ref(),
+                CompactBlockShape::FULL_BLOCK,
+            )
+            .await?
+            .into_encoded()
+            .map(Response::new)
+    }
+
+    async fn get_encoded_block_nullifiers(
+        &self,
+        _request: Request<lightwalletd::BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status> {
+        Err(unsupported("GetBlockNullifiers"))
+    }
+}
+
+#[tonic::async_trait]
 impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter {
+    fn encoded_unary_blocks(&self) -> Option<&dyn lightwalletd::EncodedUnaryBlocks> {
+        Some(self)
+    }
+
+    fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
+        Some(self)
+    }
+
     type GetBlockRangeStream = GrpcStream<lightwalletd::CompactBlock>;
     type GetBlockRangeNullifiersStream = GrpcStream<lightwalletd::CompactBlock>;
     type GetTaddressTxidsStream = GrpcStream<lightwalletd::RawTransaction>;
@@ -327,13 +607,16 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter 
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        block_methods::compact_block(
-            &self.slot,
-            &request.into_inner(),
-            CompactBlockShape::FULL_BLOCK,
-        )
-        .await
-        .map(Response::new)
+        self.block_methods
+            .unary_block(
+                &self.slot,
+                "get_block",
+                request.get_ref(),
+                CompactBlockShape::FULL_BLOCK,
+            )
+            .await?
+            .into_message()
+            .map(Response::new)
     }
 
     async fn get_block_range(
@@ -341,9 +624,11 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter 
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
         let request = request.into_inner();
-        let shape = CompactBlockShape::for_range(&request.pool_types)?;
         self.block_methods
-            .block_range(&self.slot, &request, shape)
+            .await_range_tip(&self.slot, "get_block_range", &request)
+            .await?;
+        self.block_methods
+            .block_range(&self.slot, &request, CompactBlockShape::for_range)
             .await
             .map(Response::new)
     }

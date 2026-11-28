@@ -1,6 +1,0 @@
-kind: added
-body: "`zinder-query` and both `zinder-compat-lightwalletd` serving modes now serve the standard `grpc.health.v1` service on their wallet listeners, so gRPC load balancers and Kubernetes `grpc` probes can check a listener directly. `Check` and `Watch` report `SERVING` exactly when `/readyz` admits traffic, report `NOT_SERVING` once shutdown begins, and need no bearer token. Reflection lists the service."
-time: 2026-11-20T05:30:00.000000000Z
-custom:
-    Bump: minor
-    PR: "340"

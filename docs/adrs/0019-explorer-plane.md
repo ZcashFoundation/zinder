@@ -23,19 +23,8 @@ cannot prove that every block in a wall-clock interval was included.
 
 ## Decision
 
-1. **The Explorer is its own optional runtime.** `zinder-explorer` serves
-   `ExplorerQuery`. Its binary, `[explorer]` config section,
-   `ZINDER_EXPLORER__*` variables, `explorer.*` capabilities, and
-   `zinder_explorer_*` metrics share one name. The reusable view library keeps
-   `MaterializedView*` names, because it describes a pattern rather than this
-   product ([ADR-0020](0020-materialized-views.md)).
-2. **Canonical data is the only authority.** The Explorer reads canonical
-   facts through `WalletQuery` and through materialized views that ingest
-   derives from canonical events. Its own node use is limited to parsing
-   transaction bytes and optionally observing node health for freshness. It
-   never follows the chain itself and never falls back to the node when a
-   canonical fact is missing. A view that needs a new fact extends the node
-   and canonical boundaries first.
+1. **The Explorer is its own optional runtime enabled cleanly by the `explorer` preset.** `zinder-explorer` serves `ExplorerQuery` (and pairs with `zinder-compat-cipherscan` when `zinder serve --preset explorer` runs). Its role, `[explorer]` config section, `ZINDER_EXPLORER__*` variables, `explorer.*` capabilities, and `zinder_explorer_*` metrics share one name. The reusable view library keeps `MaterializedView*` names, because it describes a pattern rather than this product ([ADR-0020](0020-materialized-views.md)).
+2. **Canonical data is the only authority.** `zinder-explorer` reads core block, transaction, commitment-root, and displaced-block facts directly from its read-only canonical secondary (`RocksDbCanonicalSecondary`), composes wallet reads through `WalletQuery`, and reads optional materialized views (`ingest.explorer_views = true`, enabled automatically under `--preset explorer`) for search, fee distributions, value-pool flows, and rankings. Its own node use is limited to parsing transaction bytes and optionally observing node health for freshness. It never follows the chain itself and never falls back to the node when a canonical fact is missing. A view that needs a new fact extends the node and canonical boundaries first.
 3. **Every response states its freshness on independent axes.** A shared
    `ChainView` carries the chain epoch, the views' indexed tip, the node's
    observed tip, and view replay health. An absent axis means unknown or not

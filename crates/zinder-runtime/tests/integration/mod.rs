@@ -1,11 +1,13 @@
-mod dashboard_metric_names;
 mod env_diagnostics;
 mod env_var_docs;
 mod http_listener;
+mod node_health_config;
 mod ops_endpoint;
 mod ops_healthcheck;
 mod proxy_client_address_contract;
+mod proxy_protocol;
 mod public_grpc_health;
 mod public_grpc_server;
 mod runtime_supervision;
+mod stalled_streams;
 mod startup_phase;

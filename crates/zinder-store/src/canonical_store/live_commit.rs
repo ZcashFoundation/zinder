@@ -6,16 +6,17 @@ use zinder_core::{
     ShieldedProtocol, SubtreeRootArtifact, TransactionLocation, UnixTimestampMillis,
 };
 
+use crate::StoreRole;
+
 use super::{
     CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalSequenceCheckpoint,
-    CanonicalStoreError, CanonicalStoreReadyEvidence, RocksDbCanonicalStore,
+    CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoredSet, RocksDbCanonicalStore,
     block_load::{
-        encode_block_final_note_commitment_roots, encode_block_hash_location, encode_block_header,
-        encode_block_position, encode_transaction_location, encode_transaction_position,
-        encode_tree_state_checkpoint, read_persisted_tip_checkpoint, read_persisted_tip_metadata,
-        validate_live_block,
+        encode_block_hash_location, encode_block_header, encode_block_position,
+        encode_transaction_location, encode_tree_state_checkpoint, read_persisted_tip_checkpoint,
+        read_persisted_tip_metadata, validate_live_block,
     },
-    block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, resume_persisted_sequence_checkpoint},
+    block_replay::resume_persisted_sequence_checkpoint,
     control::encode_ready_store_control_with_revisions,
     publication::{
         advance_ready_replay_tail, column_family, encode_live_append_event,
@@ -24,15 +25,24 @@ use super::{
     },
     replay_tail::AuthenticatedReplayTail,
     rocksdb::{
-        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
         BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
-        CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY, STORE_CONTROL_KEY,
-        TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
-        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        CHAIN_EVENT_COLUMN_FAMILY, LIVE_TAIL_BLOCK_COLUMN_FAMILY,
+        LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY, SETTLED_SEGMENT_INDEX_COLUMN_FAMILY, STORE_CONTROL_KEY,
+        TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
-    subtree_load::{
-        encode_subtree_root_key, encode_subtree_root_value, required_subtree_root_ranges,
+    settled_segments::{
+        layout::{SettledSegmentIndexEntry, aligned_segment_end_height},
+        sealer::{
+            DEFAULT_SETTLED_SEGMENT_BLOCKS, SettledSegmentBlockInput, SettledSegmentSealer,
+            SettledSegmentSealerConfig,
+        },
+        store_access::{
+            self, SegmentStoreContext, encode_split_live_tail_from_build_block,
+            live_tail_raw_block_from_blobs, segment_modules_for_stored_set,
+        },
     },
+    stored_set::required_subtree_root_ranges,
+    subtree_load::{encode_subtree_root_key, encode_subtree_root_value},
 };
 
 /// One block-local append prepared for an atomic READY canonical transition.
@@ -72,6 +82,7 @@ impl CanonicalLiveAppend {
 /// Authenticated canonical source fence for projection construction and following.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalEventFence {
+    schema_version: u16,
     chain_epoch_id: ChainEpochId,
     chain_event_sequence: u64,
     visible_tip: BlockId,
@@ -93,6 +104,7 @@ impl CanonicalEventFence {
         sequence_digest: CanonicalBlockFactsSequenceDigest,
     ) -> Self {
         Self {
+            schema_version: super::CANONICAL_STORE_SCHEMA_VERSION,
             chain_epoch_id,
             chain_event_sequence,
             visible_tip,
@@ -108,6 +120,7 @@ impl CanonicalEventFence {
         sequence_digest: [u8; 32],
     ) -> Self {
         Self {
+            schema_version: super::CANONICAL_STORE_SCHEMA_VERSION,
             chain_epoch_id,
             chain_event_sequence,
             visible_tip,
@@ -118,6 +131,12 @@ impl CanonicalEventFence {
             ),
         }
     }
+    /// Returns the canonical store schema version admitted at this position.
+    #[must_use]
+    pub const fn schema_version(self) -> u16 {
+        self.schema_version
+    }
+
     /// Returns the durable epoch containing this transition.
     #[must_use]
     pub const fn chain_epoch_id(self) -> ChainEpochId {
@@ -186,10 +205,17 @@ impl RocksDbCanonicalStore {
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<(Self, CanonicalEventFence), CanonicalStoreError> {
         let prepared = PreparedLiveAppendCommit::new(&self, append, network_upgrade_activations)?;
+        let corpus_growth = (!prepared.newly_sealed_entries.is_empty())
+            .then(|| {
+                self.segment_cache
+                    .prepare_corpus_growth(&prepared.newly_sealed_entries)
+            })
+            .transpose()?;
         let mut batch = WriteBatch::default();
         prepared
             .block_rows
             .put_into(&self.bounded_open.db, &mut batch)?;
+        write_newly_sealed_entries_and_deletions(&self.bounded_open.db, &mut batch, &prepared)?;
         batch.put_cf(
             &column_family(&self.bounded_open.db, CHAIN_EPOCH_COLUMN_FAMILY)?,
             prepared.outcome.chain_epoch_id.value().to_be_bytes(),
@@ -215,20 +241,34 @@ impl RocksDbCanonicalStore {
                 },
             )?;
         super::crash_point("canonical.live_commit.after_atomic_write");
+        let mut candidate_sealed_segments = self.sealed_segments.clone();
+        candidate_sealed_segments.extend(prepared.newly_sealed_entries.iter().cloned());
         let reorg_policy = self.reorg_policy();
-        validate_live_commit_readback(
-            &self.bounded_open.db,
-            reorg_policy,
-            &mut self.replay_tail,
-            &prepared,
-        )
-        .map_err(
-            |source| CanonicalStoreError::LiveCommitCompletedButUnverified {
-                path: self.bounded_open.db.path().to_path_buf(),
-                reason: source.to_string(),
-            },
-        )?;
+        let ctx = SegmentStoreContext {
+            db: &self.bounded_open.db,
+            segment_cache: Some(&self.segment_cache),
+            sealed_segments: Some(&candidate_sealed_segments),
+        };
+        validate_live_commit_readback(ctx, reorg_policy, &mut self.replay_tail, &prepared)
+            .map_err(
+                |source| CanonicalStoreError::LiveCommitCompletedButUnverified {
+                    path: self.bounded_open.db.path().to_path_buf(),
+                    reason: source.to_string(),
+                },
+            )?;
         self.ready_evidence = prepared.ready_evidence;
+        self.sealed_segments = candidate_sealed_segments;
+        if let Some(growth) = corpus_growth {
+            store_access::sync_segments_manifest_from_db(&self.bounded_open.db, self.network())
+                .map_err(
+                    |source| CanonicalStoreError::LiveCommitCompletedButUnverified {
+                        path: self.bounded_open.db.path().to_path_buf(),
+                        reason: source.to_string(),
+                    },
+                )?;
+            self.segment_cache
+                .admit_corpus_growth(growth, StoreRole::CanonicalPrimary);
+        }
         Ok((self, prepared.outcome))
     }
 
@@ -250,7 +290,7 @@ impl RocksDbCanonicalStore {
         }
         let tip_checkpoint = read_persisted_tip_checkpoint(&self.bounded_open.db, visible_tip)?;
         if tip_checkpoint.tip_metadata()
-            != read_persisted_tip_metadata(&self.bounded_open.db, visible_tip)?
+            != read_persisted_tip_metadata(self.segment_context(), visible_tip)?
         {
             return Err(CanonicalStoreError::live_commit(
                 "visible-tip checkpoint differs from persisted compact-block tree positions",
@@ -266,6 +306,8 @@ impl RocksDbCanonicalStore {
 
 struct PreparedLiveAppendCommit {
     block_rows: PreparedLiveBlockRows,
+    newly_sealed_entries: Vec<SettledSegmentIndexEntry>,
+    deleted_live_tail_heights: Vec<BlockHeight>,
     encoded_epoch: Vec<u8>,
     encoded_event: Vec<u8>,
     encoded_control: Vec<u8>,
@@ -291,11 +333,7 @@ impl PreparedLiveAppendCommit {
                 "expected canonical event fence is stale",
             ));
         }
-        validate_live_block(
-            store.workload,
-            store.build_plan.raw_blob_retention(),
-            &append.block,
-        )?;
+        validate_live_block(&store.stored_set, &append.block)?;
         let visible_tip = validate_live_block_extension(&store.ready_evidence, &append.block)?;
         validate_live_checkpoint_transition(&anchor, &append.block, network_upgrade_activations)?;
         let tip_metadata = append.block.tip_metadata;
@@ -308,7 +346,7 @@ impl PreparedLiveAppendCommit {
         };
         validate_live_settled_tip(&store.bounded_open.db, &store.ready_evidence, settlement)?;
         let sequence_checkpoint = advance_settled_sequence_checkpoint(
-            &store.bounded_open.db,
+            store.segment_context(),
             &store.ready_evidence,
             settlement,
             &append.block,
@@ -327,19 +365,24 @@ impl PreparedLiveAppendCommit {
             ..store.ready_evidence
         };
         let encoded_control = encode_ready_store_control_with_revisions(
-            store.workload,
             &store.build_plan,
             store.cursor_auth_key,
             &ready_evidence,
             store.control_revisions(),
         )
         .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
-        Ok(Self {
-            block_rows: PreparedLiveBlockRows::from_block(
+        let (block_rows, newly_sealed_entries, deleted_live_tail_heights) =
+            prepare_live_rows_and_staging(
+                store,
                 append.block,
                 anchor.tip_checkpoint().tip_metadata(),
                 append.subtree_roots,
-            )?,
+                append.settled_tip.height,
+            )?;
+        Ok(Self {
+            block_rows,
+            newly_sealed_entries,
+            deleted_live_tail_heights,
             encoded_epoch: encode_live_chain_epoch(
                 visible_tip,
                 append.settled_tip,
@@ -448,6 +491,7 @@ pub(super) fn event_fence_from_ready(
     ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> CanonicalEventFence {
     CanonicalEventFence {
+        schema_version: ready_evidence.schema_version,
         chain_epoch_id: ready_evidence.visible_epoch,
         chain_event_sequence: ready_evidence.visible_event_sequence,
         visible_tip: ready_evidence.visible_tip,
@@ -600,7 +644,7 @@ struct LiveSettlementTransition {
 }
 
 fn advance_settled_sequence_checkpoint(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     ready_evidence: &CanonicalStoreReadyEvidence,
     transition: LiveSettlementTransition,
     block: &CanonicalBuildBlock,
@@ -617,7 +661,7 @@ fn advance_settled_sequence_checkpoint(
     }
     let persisted_through = settled_tip.height.min(ready_evidence.visible_tip.height);
     let mut checkpoint = resume_persisted_sequence_checkpoint(
-        db,
+        ctx,
         previous,
         persisted_through,
         reorg_policy.reorg_window_blocks(),
@@ -656,6 +700,210 @@ fn advance_settled_sequence_checkpoint(
     Ok(checkpoint)
 }
 
+fn prepare_live_rows_and_staging(
+    store: &RocksDbCanonicalStore,
+    block: CanonicalBuildBlock,
+    previous_tip_metadata: zinder_core::ChainTipMetadata,
+    subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
+    new_settled_height: BlockHeight,
+) -> Result<
+    (
+        PreparedLiveBlockRows,
+        Vec<SettledSegmentIndexEntry>,
+        Vec<BlockHeight>,
+    ),
+    CanonicalStoreError,
+> {
+    let seal_plan =
+        compute_live_seal_plan(store, new_settled_height, block.facts.block_header.height)?;
+    let write_live_tail_for_new_block = seal_plan
+        .as_ref()
+        .is_none_or(|plan| block.facts.block_header.height > plan.ceiling);
+    let new_block_sealer_input = seal_plan
+        .as_ref()
+        .filter(|plan| block.facts.block_header.height <= plan.ceiling)
+        .map(|_| sealer_input_from_build_block(&block, store.stored_set))
+        .transpose()?;
+    let block_rows = PreparedLiveBlockRows::from_block(
+        block,
+        store.stored_set,
+        previous_tip_metadata,
+        subtree_roots,
+        write_live_tail_for_new_block,
+    )?;
+    let (newly_sealed_entries, deleted_live_tail_heights) =
+        stage_newly_settled_strides(store, seal_plan, new_block_sealer_input)?;
+    Ok((block_rows, newly_sealed_entries, deleted_live_tail_heights))
+}
+
+struct LiveSealPlan {
+    unsealed_start: BlockHeight,
+    ceiling: BlockHeight,
+    new_block_height: BlockHeight,
+}
+
+fn compute_live_seal_plan(
+    store: &RocksDbCanonicalStore,
+    new_settled_height: BlockHeight,
+    new_block_height: BlockHeight,
+) -> Result<Option<LiveSealPlan>, CanonicalStoreError> {
+    let unsealed_start = match store.sealed_segments.last() {
+        Some(last) => last.end_block.height.next().ok_or_else(|| {
+            CanonicalStoreError::live_commit("settled segment end height overflows u32")
+        })?,
+        None => store.ready_evidence.first_retained_block.height,
+    };
+    let mut seal_ceiling: Option<BlockHeight> = None;
+    let mut scan_start = unsealed_start;
+    loop {
+        let aligned_end = aligned_segment_end_height(scan_start, DEFAULT_SETTLED_SEGMENT_BLOCKS)?;
+        if aligned_end > new_settled_height {
+            break;
+        }
+        seal_ceiling = Some(aligned_end);
+        let Some(next_start) = aligned_end.next() else {
+            break;
+        };
+        scan_start = next_start;
+    }
+    Ok(seal_ceiling.map(|ceiling| LiveSealPlan {
+        unsealed_start,
+        ceiling,
+        new_block_height,
+    }))
+}
+
+/// Stages completed aligned settled strides before the atomic `RocksDB` write.
+///
+/// Builds, verifies, fsyncs, and promotes any newly completed aligned settled
+/// strides into `<store_root>/segments/` before the atomic `RocksDB` `WriteBatch`
+/// commits `settled_segment_index` and deletes those heights from
+/// `live_tail_block` + `live_tail_raw_block`.
+fn stage_newly_settled_strides(
+    store: &RocksDbCanonicalStore,
+    seal_plan: Option<LiveSealPlan>,
+    mut new_block_sealer_input: Option<SettledSegmentBlockInput>,
+) -> Result<(Vec<SettledSegmentIndexEntry>, Vec<BlockHeight>), CanonicalStoreError> {
+    let Some(plan) = seal_plan else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let config = SettledSegmentSealerConfig::new(
+        store.network(),
+        super::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+        segment_modules_for_stored_set(store.stored_set),
+    );
+    let prior_checkpoint = store
+        .sealed_segments
+        .last()
+        .map(|entry| entry.end_sequence_checkpoint);
+    let mut sealer =
+        SettledSegmentSealer::new(store.bounded_open.db.path(), config, prior_checkpoint)?;
+    let mut newly_sealed = Vec::new();
+    let mut deleted_heights = Vec::new();
+    for raw_height in plan.unsealed_start.value()..=plan.ceiling.value() {
+        let height = BlockHeight::new(raw_height);
+        let input = if height == plan.new_block_height {
+            new_block_sealer_input.take().ok_or_else(|| {
+                CanonicalStoreError::live_commit("missing staged live block sealer input")
+            })?
+        } else {
+            deleted_heights.push(height);
+            sealer_input_from_live_tail(&store.bounded_open.db, store.stored_set, height)?
+        };
+        newly_sealed.extend(sealer.push_block(input)?);
+    }
+    if sealer.pending_len() != 0 {
+        return Err(CanonicalStoreError::live_commit(
+            "unsealed blocks remained in live settled segment sealer",
+        ));
+    }
+    Ok((newly_sealed, deleted_heights))
+}
+
+fn sealer_input_from_build_block(
+    block: &CanonicalBuildBlock,
+    stored_set: CanonicalStoredSet,
+) -> Result<SettledSegmentBlockInput, CanonicalStoreError> {
+    let raw_block = live_tail_raw_block_from_blobs(
+        &block.facts,
+        block.block_blob.as_ref(),
+        &block.transaction_blobs,
+        stored_set.raw_blob_retention(),
+    )?;
+    let native_bytes = crate::proto_codec::encoded_compact_block_artifact_len(&block.compact_block);
+    Ok(SettledSegmentBlockInput {
+        compact_block: block.compact_block.clone(),
+        native_bytes,
+        canonical_facts: block.facts.clone(),
+        raw_block,
+    })
+}
+
+fn sealer_input_from_live_tail(
+    db: &DB,
+    stored_set: CanonicalStoredSet,
+    height: BlockHeight,
+) -> Result<SettledSegmentBlockInput, CanonicalStoreError> {
+    let record = store_access::read_live_tail_record(db, height)?.ok_or_else(|| {
+        CanonicalStoreError::live_commit(format!(
+            "live_tail_block row at settled stride height {} is absent",
+            height.value()
+        ))
+    })?;
+    let compact_block = record.reconstruct_compact_block()?;
+    let canonical_facts = record.canonical_facts.ok_or_else(|| {
+        CanonicalStoreError::live_commit(format!(
+            "live_tail_block row at height {} is missing canonical facts",
+            height.value()
+        ))
+    })?;
+    let raw_block = if stored_set.raw_blob_retention().full_blocks() {
+        Some(
+            store_access::read_live_tail_raw_block(db, height)?.ok_or_else(|| {
+                CanonicalStoreError::live_commit(format!(
+                    "live_tail_raw_block row at height {} is absent under full_blocks retention",
+                    height.value()
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
+    let native_bytes = crate::proto_codec::encoded_compact_block_artifact_len(&compact_block);
+    Ok(SettledSegmentBlockInput {
+        compact_block,
+        native_bytes,
+        canonical_facts,
+        raw_block,
+    })
+}
+
+fn write_newly_sealed_entries_and_deletions(
+    db: &DB,
+    batch: &mut WriteBatch,
+    prepared: &PreparedLiveAppendCommit,
+) -> Result<(), CanonicalStoreError> {
+    if prepared.newly_sealed_entries.is_empty() && prepared.deleted_live_tail_heights.is_empty() {
+        return Ok(());
+    }
+    let settled_index_cf = column_family(db, SETTLED_SEGMENT_INDEX_COLUMN_FAMILY)?;
+    for entry in &prepared.newly_sealed_entries {
+        batch.put_cf(
+            &settled_index_cf,
+            encode_block_position(entry.start_height),
+            entry.encode_v1()?,
+        );
+    }
+    let live_tail_cf = column_family(db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    let live_raw_cf = column_family(db, LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY)?;
+    for height in &prepared.deleted_live_tail_heights {
+        let key = encode_block_position(*height);
+        batch.delete_cf(&live_tail_cf, key);
+        batch.delete_cf(&live_raw_cf, key);
+    }
+    Ok(())
+}
+
 pub(super) struct PreparedLiveBlockRows {
     pub(super) rows: Vec<PreparedLiveRow>,
 }
@@ -663,65 +911,55 @@ pub(super) struct PreparedLiveBlockRows {
 impl PreparedLiveBlockRows {
     pub(super) fn from_block(
         block: CanonicalBuildBlock,
+        stored_set: CanonicalStoredSet,
         previous_tip_metadata: zinder_core::ChainTipMetadata,
         subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
+        write_live_tail: bool,
     ) -> Result<Self, CanonicalStoreError> {
+        let split_live_tail = if write_live_tail {
+            Some(encode_split_live_tail_from_build_block(&block, stored_set)?)
+        } else {
+            None
+        };
         let CanonicalBuildBlock {
             facts,
-            replay_envelope,
-            compact_block,
             tip_metadata,
             tree_state_checkpoint,
-            block_final_note_commitment_roots,
-            transaction_blobs,
-            block_blob,
             ..
         } = block;
         let height = facts.block_header.height;
         let height_key = encode_block_position(height).to_vec();
-        let mut rows = vec![
-            PreparedLiveRow::new(
-                BLOCK_HEADER_COLUMN_FAMILY,
+        let mut rows = vec![PreparedLiveRow::new(
+            BLOCK_HEADER_COLUMN_FAMILY,
+            height_key.clone(),
+            encode_block_header(&facts.block_header).to_vec(),
+        )];
+        if let Some(split) = split_live_tail {
+            rows.push(PreparedLiveRow::new(
+                LIVE_TAIL_BLOCK_COLUMN_FAMILY,
                 height_key.clone(),
-                encode_block_header(&facts.block_header).to_vec(),
-            ),
-            PreparedLiveRow::new(
-                BLOCK_REPLAY_COLUMN_FAMILY,
-                height_key.clone(),
-                replay_envelope.into_bytes(),
-            ),
-            PreparedLiveRow::new(
-                COMPACT_BLOCK_COLUMN_FAMILY,
-                height_key.clone(),
-                crate::encode_compact_block_artifact(&compact_block),
-            ),
-        ];
+                split.block_bytes,
+            ));
+            if let Some(raw_bytes) = split.raw_block_bytes {
+                rows.push(PreparedLiveRow::new(
+                    LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY,
+                    height_key.clone(),
+                    raw_bytes,
+                ));
+            }
+        }
         let block_hash_record = encode_block_hash_location(facts.block_header.block_hash, height);
         rows.push(PreparedLiveRow::new(
             BLOCK_HASH_INDEX_COLUMN_FAMILY,
             block_hash_record[..32].to_vec(),
             block_hash_record[32..].to_vec(),
         ));
-        append_transaction_rows(&mut rows, &facts, transaction_blobs)?;
-        if let Some(block_blob) = block_blob {
-            rows.push(PreparedLiveRow::new(
-                BLOCK_BLOB_COLUMN_FAMILY,
-                height_key.clone(),
-                block_blob.raw_block_bytes,
-            ));
-        }
+        append_transaction_location_rows(&mut rows, &facts)?;
         if let Some(checkpoint) = tree_state_checkpoint {
             rows.push(PreparedLiveRow::new(
                 TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-                height_key.clone(),
-                encode_tree_state_checkpoint(checkpoint.block_time_seconds, &checkpoint.frontiers),
-            ));
-        }
-        if let Some(roots) = block_final_note_commitment_roots {
-            rows.push(PreparedLiveRow::new(
-                BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
                 height_key,
-                encode_block_final_note_commitment_roots(&roots),
+                encode_tree_state_checkpoint(checkpoint.block_time_seconds, &checkpoint.frontiers),
             ));
         }
         PreparedLiveSubtreeRoots {
@@ -768,10 +1006,9 @@ impl PreparedLiveBlockRows {
     }
 }
 
-fn append_transaction_rows(
+fn append_transaction_location_rows(
     rows: &mut Vec<PreparedLiveRow>,
     facts: &zinder_core::CanonicalBlockFacts,
-    transaction_blobs: Vec<zinder_core::TransactionBlobArtifact>,
 ) -> Result<(), CanonicalStoreError> {
     let height = facts.block_header.height;
     for (transaction_index, transaction) in facts.transactions.iter().enumerate() {
@@ -781,29 +1018,19 @@ fn append_transaction_rows(
                 height.value()
             ))
         })?;
-        let location_record = encode_transaction_location(TransactionLocation::new(
-            transaction.public_facts.transaction_id,
-            height,
-            facts.block_header.block_hash,
-            transaction_index,
-        ));
+        let location_record = encode_transaction_location(
+            TransactionLocation::new(
+                transaction.public_facts.transaction_id,
+                height,
+                facts.block_header.block_hash,
+                transaction_index,
+            ),
+            transaction.serialized_bytes_digest.as_bytes(),
+        );
         rows.push(PreparedLiveRow::new(
             TRANSACTION_LOCATION_COLUMN_FAMILY,
             location_record[..32].to_vec(),
             location_record[32..].to_vec(),
-        ));
-    }
-    for (transaction_index, transaction_blob) in transaction_blobs.into_iter().enumerate() {
-        let transaction_index = u32::try_from(transaction_index).map_err(|_| {
-            CanonicalStoreError::live_commit(format!(
-                "block {} transaction blob count exceeds u32::MAX",
-                height.value()
-            ))
-        })?;
-        rows.push(PreparedLiveRow::new(
-            TRANSACTION_BLOB_COLUMN_FAMILY,
-            encode_transaction_position(height, transaction_index).to_vec(),
-            transaction_blob.raw_transaction_bytes,
         ));
     }
     Ok(())
@@ -909,12 +1136,14 @@ impl PreparedLiveRow {
 }
 
 fn validate_live_commit_readback(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     reorg_policy: super::CanonicalReorgPolicy,
     replay_tail: &mut AuthenticatedReplayTail,
     prepared: &PreparedLiveAppendCommit,
 ) -> Result<(), CanonicalStoreError> {
+    let db = ctx.db;
     prepared.block_rows.validate_readback(db)?;
+    validate_sealed_entries_and_pruned_tail_readback(db, prepared)?;
     let observed_epoch = db
         .get_cf(
             &column_family(db, CHAIN_EPOCH_COLUMN_FAMILY)?,
@@ -947,7 +1176,7 @@ fn validate_live_commit_readback(
             "epoch, event, or READY control differs after atomic live write",
         ));
     }
-    validate_live_append_publication(db, &prepared.ready_evidence, prepared.previous_epoch_id)?;
+    validate_live_append_publication(ctx, &prepared.ready_evidence, prepared.previous_epoch_id)?;
     let previous_visible_height = prepared
         .ready_evidence
         .visible_tip
@@ -957,12 +1186,63 @@ fn validate_live_commit_readback(
         .map(BlockHeight::new)
         .ok_or_else(|| CanonicalStoreError::live_commit("live append height has no parent"))?;
     advance_ready_replay_tail(
-        db,
+        ctx,
         reorg_policy,
         &prepared.ready_evidence,
         previous_visible_height,
         replay_tail,
     )
+}
+
+fn validate_sealed_entries_and_pruned_tail_readback(
+    db: &DB,
+    prepared: &PreparedLiveAppendCommit,
+) -> Result<(), CanonicalStoreError> {
+    if !prepared.newly_sealed_entries.is_empty() {
+        let settled_index_cf = column_family(db, SETTLED_SEGMENT_INDEX_COLUMN_FAMILY)?;
+        for entry in &prepared.newly_sealed_entries {
+            let expected = entry.encode_v1()?;
+            let observed = db
+                .get_cf(&settled_index_cf, encode_block_position(entry.start_height))
+                .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                    operation: "settled_segment_index live readback",
+                    source,
+                })?;
+            if observed.as_deref() != Some(expected.as_slice()) {
+                return Err(CanonicalStoreError::live_commit(
+                    "settled_segment_index entry differs after atomic live write",
+                ));
+            }
+        }
+    }
+    if !prepared.deleted_live_tail_heights.is_empty() {
+        let live_tail_cf = column_family(db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+        let live_raw_cf = column_family(db, LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY)?;
+        for height in &prepared.deleted_live_tail_heights {
+            let key = encode_block_position(*height);
+            if db
+                .get_cf(&live_tail_cf, key)
+                .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                    operation: "live_tail_block pruning readback",
+                    source,
+                })?
+                .is_some()
+                || db
+                    .get_cf(&live_raw_cf, key)
+                    .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                        operation: "live_tail_raw_block pruning readback",
+                        source,
+                    })?
+                    .is_some()
+            {
+                return Err(CanonicalStoreError::live_commit(format!(
+                    "pruned live-tail height {} still present after segment sealing",
+                    height.value()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

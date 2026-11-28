@@ -15,8 +15,10 @@ mod memory_pressure;
 mod mempool;
 mod node_failover;
 mod phase;
+pub mod runtime;
 mod runtime_config;
 mod source_recovery;
+mod subtree_verification;
 mod transaction_component_backfill;
 mod tree_state_densification;
 mod tree_state_verification;
@@ -26,7 +28,7 @@ mod writer;
 pub use artifact_builder::{
     BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
     PositionedCanonicalBlock, PreparedCanonicalBlock, RawBlobPolicy, RetainedRawBlobs,
-    position_canonical_block, prepare_canonical_block,
+    compact_transaction_data, position_canonical_block, prepare_canonical_block,
 };
 pub use canonical_block_context::{
     CanonicalBlockContextReader, PrevoutCache, require_genesis_complete_history,
@@ -98,10 +100,11 @@ pub use writer::follow::{
 pub use writer::ingest_control::{
     CanonicalIngestControlGrpcAdapter,
     MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE as CANONICAL_WRITER_MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE,
+    MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES as CANONICAL_WRITER_MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES,
 };
 pub use writer::{
     CanonicalWriterConfig, CanonicalWriterError, admit_canonical_store,
-    follow_admitted_canonical_store, read_ready_store_summary, run_canonical_writer,
-    run_canonical_writer_with_control,
+    configured_first_available_height, follow_admitted_canonical_store, read_ready_store_summary,
+    run_canonical_writer, run_canonical_writer_with_control,
 };
 pub use zinder_runtime::container_memory_budget_bytes;

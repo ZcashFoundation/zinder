@@ -4,16 +4,124 @@ This page tells you how to connect a client to Zinder: which endpoint to use, th
 
 ## Choose a path
 
+You make two independent choices: which protocol your client speaks, and which Zcash network it reads.
+
+### Choose a protocol
+
+Zinder serves two wallet protocols on separate endpoints. A client speaks one of them.
+
+- **You have a lightwalletd wallet or SDK.** Keep it. It speaks `CompactTxStreamer`, and `zinder-compat-lightwalletd` serves that protocol unchanged.
+- **You are writing a new client.** Use the native `zinder.v1.wallet.WalletQuery` API, served by `zinder-query`. It adds reads pinned to one chain snapshot and a resumable event stream, which [Use cases](../use-cases.md) describes for wallets, backends, and payment tracking. The Rust `zinder-client` crate is a typed wrapper over this same API, so it needs a native endpoint.
+
 | You have | Use | Service | Compose port |
 | --- | --- | --- | --- |
 | An existing lightwalletd client or SDK | `CompactTxStreamer` | `zinder-compat-lightwalletd` | 9067 |
 | A browser wallet using lightwalletd | gRPC-Web on the same `CompactTxStreamer` endpoint | `zinder-compat-lightwalletd` | 9067 |
 | A new native application or backend | Native `zinder.v1.wallet.WalletQuery` gRPC | `zinder-query` | 9102 |
+| A new browser wallet or dashboard | gRPC-Web on the configured `WalletQuery` or `ExplorerQuery` listener | `zinder-query` or `zinder-explorer` | 9102 or 9068 |
 | A Rust application | The `zinder-client` crate over `WalletQuery` | `zinder-query` | 9102 |
-| An explorer or analytics backend | `zinder.v1.explorer.ExplorerQuery`, plus `WalletQuery` | `zinder-explorer` | 9068 |
+| An explorer or analytics backend | `zinder.v1.explorer.ExplorerQuery`, plus `WalletQuery` | `zinder-explorer` (`--preset explorer`) | 9068 |
+| A Cipherscan frontend | Cipherscan-compatible REST and WebSocket | `zinder-compat-cipherscan` (`--preset explorer`) | 9070 |
 | A server-side wallet | `zinder-client` plus a wallet library such as librustzcash | `zinder-query` | 9102 |
 
-The ports are the defaults in `deploy/docker-compose.yml` and `deploy/docker-compose.explorer.yml`, bound to host loopback. Your operator may publish different ones.
+All four client ports (`9067`, `9068`, `9070`, `9102`) are published on host loopback by `deploy/docker-compose.yml` (`zinder-serve` listens on `[::]:9070` with `ZINDER_CIPHERSCAN__LISTEN_ADDR` and `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`; set `ZINDER_DEPLOYMENT__PROFILE=explorer` in `zinder.env`, or pass `--preset explorer` on standalone CLI runs, to start Explorer and Cipherscan compat alongside wallet serving). Your operator may publish different ports.
+
+#### Generate bindings from a pinned release
+
+Pin a Zinder tag whose `zinder-api-docs-<tag>.tar.gz` contains a root
+`buf.yaml`. Record the tag and your generator versions in your build. Download
+the archive and its signed checksum manifest in an empty directory. Replace
+`vX.Y.Z` with your chosen tag. These commands use GitHub CLI, Cosign, and
+`sha256sum`.
+
+```bash
+tag=vX.Y.Z
+archive="zinder-api-docs-${tag}.tar.gz"
+gh release download "$tag" --repo ZcashFoundation/zinder \
+  --pattern "$archive" \
+  --pattern SHA256SUMS \
+  --pattern SHA256SUMS.sigstore.json
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity "https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/${tag}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS &&
+  awk -v asset="$archive" '$2 == asset' SHA256SUMS | sha256sum --check --strict
+```
+
+After verification succeeds, extract the archive and run Buf from its root.
+The included generation template uses the `protoc` on your `PATH` to generate
+Python message bindings for all schemas. Zinder CI uses Buf 1.75.0 and
+protoc 36.2.
+
+```bash
+mkdir contract
+tar -xzf "$archive" -C contract
+cd contract
+buf build
+buf generate
+```
+
+For example, install `grpcio-tools` at your project's pinned version in a
+Python environment. Generate the `WalletQuery` client and its messages from
+the extracted archive.
+
+```bash
+mkdir -p gen/grpc-python
+python -m grpc_tools.protoc -I proto \
+  --python_out=gen/grpc-python --grpc_python_out=gen/grpc-python \
+  proto/zinder/v1/ops/server_info.proto proto/zinder/v1/wallet/wallet.proto
+```
+
+For other languages, pin the Protobuf and gRPC plugins in your own template
+and pass it to `buf generate --template`. Use `--path proto/zinder` to limit
+generation to native Zinder. With `protoc`, use `-I proto` for native Zinder,
+`-I proto/compat/lightwalletd` for lightwalletd, `-I proto/compat/darkside` for
+Darkside, and `-I proto/external/zebra` for Zebra. When compiling multiple
+schema families together, list the vendored include paths before `-I proto`.
+
+`darkside.proto` is a commit-pinned schema for wallet test drivers. It shares
+lightwalletd's `cash.z.wallet.sdk.rpc` package and imports its `service.proto`,
+so pass both compatibility include paths when generating Darkside bindings.
+Keep `LICENSE`, `UPSTREAM.md`, and `COMMIT` alongside any vendored schemas you
+redistribute, plus `VERSION` for lightwalletd and Zebra.
+
+The archive includes `zinder.contract.descriptor.bin` for native and vendored
+schemas and `zinder.v1.descriptor.bin` for native-only tooling. For an upgrade,
+verify and extract the new tag into a separate directory. From the new
+directory, compare the full descriptors.
+
+```bash
+buf breaking zinder.contract.descriptor.bin \
+  --against ../old-contract/zinder.contract.descriptor.bin --config buf.yaml
+```
+
+Regenerate with your pinned tools, review the generated changes and release
+notes, and test against the server versions you support. Check `ServerInfo`
+capabilities before using newly added native behavior.
+
+### Choose a network
+
+Each endpoint serves one Zcash network, and the two networks are separate chains with separate funds.
+
+- **Mainnet** carries real ZEC. Use it for production chain data.
+- **Testnet** is its own chain with test coins that have no value. Use it to build and test an integration.
+
+Regtest is a private chain for local development and exists only on a Zinder you run yourself.
+
+### Endpoints
+
+Use the endpoint that matches both choices. On your own deployment, that is the Compose port from the protocol table. Compose adds 10000 to each port on Testnet and 20000 on Regtest. [Deploying Zinder](../runbooks/deploying.md) starts a deployment beside your own node.
+
+The Zcash Foundation runs these public endpoints, which any client can use:
+
+| Protocol | Mainnet | Testnet |
+| --- | --- | --- |
+| lightwalletd `CompactTxStreamer` | `https://lwd.zfnd.org:443` | `https://testnet.lwd.zfnd.org:443` |
+| Native `WalletQuery`, including `zinder-client` | `https://zinder.zfnd.org:443` | `https://testnet.zinder.zfnd.org:443` |
+
+Give these TLS endpoints to a gRPC client, such as a wallet, `grpcurl`, or `zinder-client`. A browser application needs a gRPC-Web client and an origin enabled by the operator.
+
+On the Foundation's Mainnet endpoints, wallets behind one public IPv4 address share bandwidth, and `GetBlockRangeNullifiers` has burst/rate limits. NGINX admission refusals return trailers-only gRPC `UNAVAILABLE` (14) without a numeric retry delay on current configs. Retry **read** RPCs with exponential backoff (honoring `grpc-retry-pushback-ms` if a response includes it), and **do not automatically retry transaction submission (`SendTransaction` or `BroadcastTransaction`)** without first checking transaction status or idempotency.
 
 ## What every client must handle
 
@@ -24,38 +132,58 @@ The ports are the defaults in `deploy/docker-compose.yml` and `deploy/docker-com
 **Capability discovery.** On connect, call `ServerInfo` and check three things:
 
 1. `network` is exactly `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`, matching what you expect.
-2. `contract_revision` is at least the revision your client was built for. `zinder-client` requires 8.
+2. `contract_revision` is at least the revision your client was built for. `zinder-client` requires 8 (v0.26.0 native servers advertise 15).
 3. Every capability string your client depends on is present. Strings match exactly. [Capabilities](capabilities.md) lists them.
 
 On `zinder-query`, a method whose capability is absent fails with `FAILED_PRECONDITION` and `ENDPOINT_CAPABILITY_UNAVAILABLE`. On `zinder-explorer`, a method whose backing store or `WalletQuery` endpoint is not configured fails with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED`. The `node` field describes the node that broadcasts transactions and can change while the server runs, so read it from a fresh `ServerInfo` instead of caching it.
 
-**Errors.** Most native failures carry a `google.rpc.ErrorInfo` with `domain = "zinder.dev"` and a stable reason string. Branch on the reason, not the message. Some rejections carry only a gRPC status code. Listener overload returns `UNAVAILABLE`; retry it with backoff. Malformed request fields, such as a missing block selector or an oversized repeated field, return `INVALID_ARGUMENT`. Handle a status without `ErrorInfo` by its code. [Error vocabulary](error-vocabulary.md) gives each reason's status code and retry rule.
+**Message compression.** Native gRPC clients of `CompactTxStreamer`, `WalletQuery`, and `ExplorerQuery` can send `gzip` or `zstd` requests and advertise supported response encodings in `grpc-accept-encoding`. With an omitted header or only `identity`, responses are uncompressed. Each compressed request must fit the [request message limits](configuration.md#public-grpc-listeners).
+
+**Errors.** Most native failures carry a `google.rpc.ErrorInfo` with `domain = "zinder.dev"` and a stable reason string. Branch on the reason, not the message. Some rejections carry only a gRPC status code. Listener overload returns `UNAVAILABLE` with [retry pushback metadata](error-vocabulary.md#retry-pushback). Malformed request fields, such as a missing block selector or an oversized repeated field, return `INVALID_ARGUMENT`. Handle a status without `ErrorInfo` by its code. [Error vocabulary](error-vocabulary.md) gives each reason's status code and retry rule.
 
 **Consistent reads.** Native responses carry the chain epoch they read. Pin related reads to one epoch with `at_epoch_id`, and restart the workflow when a pin fails with `CHAIN_EPOCH_PIN_UNAVAILABLE`. [Wallet data plane](../architecture/wallet-data-plane.md) explains the rules.
 
 ## Lightwalletd clients
 
-Point the client's server address at the compatibility endpoint. The client keeps the `CompactTxStreamer` protocol; nothing else changes on the client side. Check the endpoint with `grpcurl`, which works without proto files because the server exposes gRPC reflection:
+Point the client's server address at the compatibility endpoint. Wallet, light-wallet, and compact-blocks serving support native gRPC reflection v1 and v1alpha. Clients using either version can discover `CompactTxStreamer` and its message types without local proto files. Use `grpcurl` to request server information.
 
 ```bash
 grpcurl -plaintext -d '{}' 127.0.0.1:9067 \
   cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
 ```
 
-A wallet-serving endpoint answers with `"taddrSupport": true`. An endpoint in compact-blocks mode answers `false` and serves block reads. Method-by-method behavior, limits, and differences from Go lightwalletd are in [Lightwalletd compatibility](lightwalletd-compatibility.md). A named wallet is supported once it passes end-to-end certification, as the [claim boundary](lightwalletd-compatibility.md#claim-boundary) states.
+Wallet and light-wallet endpoints answer with `"taddrSupport": true`. Compact-blocks endpoints answer `false` and serve block reads. Light-wallet forwards selected wallet calls, so a node outage can interrupt those calls while the endpoint still serves local data. See [Lightwalletd compatibility](lightwalletd-compatibility.md) for method behavior and [During a node outage](readiness.md#during-a-node-outage) for retry conditions. A named wallet is supported once it passes end-to-end certification, as the [claim boundary](lightwalletd-compatibility.md#claim-boundary) states.
 
 ### Browser wallets
 
-Give your browser wallet the same HTTPS lightwalletd URL as a native wallet. The operator [enables your wallet site's origin](../runbooks/exposing-over-tls.md#enable-browser-wallets) on that endpoint. For example, once your application has initialized WebZjs, read the Testnet tip using your operator's Testnet URL:
+Give your browser wallet the same HTTPS lightwalletd URL as a native wallet. The operator [enables your wallet site's origin](../runbooks/exposing-over-tls.md#enable-browser-clients) on that endpoint. For example, once your application has initialized WebZjs, read the Testnet tip using your operator's Testnet URL:
 
 ```javascript
 const wallet = new WebWallet("test", "https://lightwalletd.example.org", 1, 1);
 const tip = await wallet.get_latest_block();
 ```
 
-Use a wallet-serving endpoint for sync. A compact-blocks endpoint can stream blocks, but wallet sync also needs subtree roots and tree state. Browser clients can call unary and server-streaming RPCs. For transparent balances, use `GetTaddressBalance`, which takes the address list in one request. Read a stream through its terminal gRPC status before treating the result as complete.
+Use a wallet or light-wallet endpoint for sync, which needs subtree roots and tree state as well as blocks. Browser clients can call unary and server-streaming RPCs. For transparent balances, use `GetTaddressBalance`, which takes the address list in one request. Read a stream through its terminal gRPC status before treating the result as complete.
 
 WebZjs requests binary gRPC-Web by default. If your SDK supports binary server streaming, use `application/grpc-web+proto` for block ranges. Text mode base64-encodes the same frames, adding about a third to the response body before HTTP compression.
+
+## Browser clients for the native APIs
+
+Generate a gRPC-Web client from the `WalletQuery` or `ExplorerQuery` protobuf
+definitions. Point it at the same HTTPS URL as native gRPC after the operator
+[enables your site's origin](../runbooks/exposing-over-tls.md#enable-browser-clients).
+Use binary or text gRPC-Web for unary RPCs. For server streams such as
+WalletQuery's `CompactBlocksInRange` and `ChainEvents` or ExplorerQuery's
+`RecentTransactions`, choose an encoding your client supports for streaming.
+Read through the terminal gRPC status before treating a stream as complete.
+
+If your gRPC-Web client supports message compression, it can advertise
+`gzip` or `zstd` in `grpc-accept-encoding`. Read the exposed
+`grpc-encoding` response header to identify the selected codec.
+
+On settled `ChainEvents` streams, browsers can read the
+`zinder-chain-event-family` response header. If ExplorerQuery requires a
+bearer token, send it in the RPC's `authorization` metadata.
 
 ## Native gRPC clients
 
@@ -86,56 +214,150 @@ Then:
 
 ## Rust applications
 
-`zinder-client` is the typed Rust SDK. It hides generated protobuf types and `tonic::Status` behind `ChainIndex`, `EndpointBackedIndex`, `ServerInfo`, and `IndexerError`. Releases publish `zinder-core`, `zinder-proto`, and `zinder-client` to crates.io at the product version. They need Rust 1.100 or later.
+`zinder-client` is the typed Rust SDK. It hides generated protobuf types and `tonic::Status` behind `ChainIndex`, `EndpointBackedIndex`, `ServerInfo`, and `IndexerError`. Releases publish `zinder-core`, `zinder-proto`, and `zinder-client` to crates.io at the product version.
 
-Add the client and an async runtime to your crate:
+Before a wallet read that requires an advertised extension, the SDK allows up to 10 seconds for capability discovery. A timeout returns `IndexerError::ServiceUnavailable`.
 
-```bash
-cargo add zinder-client
-cargo add tokio --features macros,rt-multi-thread
+### Quickstart
+
+This quickstart builds a small program that connects to a native endpoint, confirms the server and its network, and prints the chain tip from one pinned snapshot. You need Rust 1.100 or later and the address of a `zinder-query` endpoint.
+
+1. Create the project and add the client and an async runtime:
+
+   ```bash
+   cargo new zinder-quickstart
+   cd zinder-quickstart
+   cargo add 'zinder-client@=0.26.0'
+   cargo add tokio --features macros,rt-multi-thread
+   ```
+
+2. Replace `src/main.rs` with this program:
+
+   ```rust
+   use std::env;
+   use std::error::Error;
+
+   use zinder_client::{
+       ChainIndex, EndpointBackedIndex, Network, RemoteChainIndex, RemoteOpenOptions,
+   };
+
+   #[tokio::main]
+   async fn main() -> Result<(), Box<dyn Error>> {
+       let mut args = env::args().skip(1);
+       let (Some(endpoint), Some(network_name)) = (args.next(), args.next()) else {
+           return Err("usage: zinder-quickstart <endpoint> <mainnet|testnet|regtest>".into());
+       };
+       let network = match network_name.as_str() {
+           "mainnet" => Network::ZcashMainnet,
+           "testnet" => Network::ZcashTestnet,
+           "regtest" => Network::ZcashRegtest,
+           other => return Err(format!("unknown network: {other}").into()),
+       };
+
+       // No connection opens here. The first call below connects.
+       let index = RemoteChainIndex::connect(RemoteOpenOptions { endpoint, network })?;
+
+       // Fails with `IndexerError::NetworkMismatch` if the server is on another network.
+       let info = index.server_info().await?;
+       println!(
+           "{} {} on {:?}, contract revision {}",
+           info.service_name, info.service_version, info.network, info.contract_revision
+       );
+
+       // Every read through `snapshot` comes from this one chain epoch.
+       let snapshot = index.snapshot().await?;
+       let epoch = snapshot.chain_epoch();
+       let tip = snapshot.visible_tip_block().await?;
+       println!("chain epoch {}", epoch.id.value());
+       println!("visible tip height {}", tip.height.value());
+       println!("settled tip height {}", epoch.settled_tip_height.value());
+       Ok(())
+   }
+   ```
+
+3. Run it with the endpoint and the network you expect it to serve. Against the Foundation's public Testnet endpoint:
+
+   ```bash
+   cargo run -- https://testnet.zinder.zfnd.org:443 testnet
+   ```
+
+   Against a Zinder you run with the [Compose quickstart](../runbooks/deploying.md#quickstart-with-docker-compose) on Testnet:
+
+   ```bash
+   cargo run -- http://127.0.0.1:19102 testnet
+   ```
+
+   The program prints the server identity and three values from one snapshot. This output is from a Mainnet endpoint:
+
+   ```text
+   zinder-query 0.26.0 on ZcashMainnet, contract revision 15
+   chain epoch 1499
+   visible tip height 3604138
+   settled tip height 3603138
+   ```
+
+### Endpoint and network
+
+The endpoint and the network are separate arguments, and the client checks that they agree. Pass the network the endpoint serves. When they differ, the first call fails before your program reads any chain data:
+
+```text
+Error: NetworkMismatch { expected: ZcashTestnet, actual: "zcash-mainnet" }
 ```
 
-This program prints nothing. It connects to a native `WalletQuery` endpoint, checks one capability, and reads the visible tip at a pinned epoch:
+For a local endpoint, pass the network of your own deployment. For a Foundation endpoint, pass `Network::ZcashMainnet` or `Network::ZcashTestnet` to match the column you took the address from in [Endpoints](#endpoints).
 
-```rust
-use zinder_client::{
-    Capability, CapabilityDescriptor, ChainIndex, EndpointBackedIndex, IndexerError, Network,
-    RemoteChainIndex, RemoteOpenOptions,
-};
+### TLS
 
-async fn read_visible_tip(endpoint: String) -> Result<(), IndexerError> {
-    let index = RemoteChainIndex::connect(RemoteOpenOptions {
-        endpoint,
-        network: Network::ZcashMainnet,
-    })?;
-    let info = index.server_info().await?;
-    if !info.supports(Capability::TransparentAddressUnspentOutputs) {
-        // Fall back or report that this endpoint cannot serve the feature.
-    }
-    let snapshot = index.snapshot().await?;
-    let visible_tip = snapshot.visible_tip_block().await?;
-    let _ = visible_tip;
-    Ok(())
-}
+The URL scheme selects the transport. An `http://` endpoint uses plaintext HTTP/2, which fits a Zinder on the same host or private network. An `https://` endpoint uses TLS, and the client verifies the server certificate against the operating system's trusted root certificates. Install your system's CA certificate package in a minimal container image. For a private trust store, see [Remote client settings](#remote-client-settings).
 
-#[tokio::main]
-async fn main() -> Result<(), IndexerError> {
-    read_visible_tip("http://127.0.0.1:9102".to_owned()).await
-}
-```
+### Remote client settings
 
-An `https://` endpoint makes the client use TLS with the system's root certificates. The connection opens on the first call.
+Use `RemoteChainIndex::connect_with_options` with `RemoteClientOptions` to
+configure transport and retries. The default uses system TLS roots for HTTPS,
+a direct connection, and one attempt per RPC.
 
-- `ChainIndex` holds stored reads. `snapshot()` captures one chain epoch and pins every later read through the snapshot to it. `OwnedChainSnapshot` does the same over an `Arc` for a view that must be cloneable and `'static`.
+- `with_tls_ca_pem` accepts a PEM bundle. `with_tls_ca_der` accepts a collection
+  of DER certificates. Either replaces system roots.
+- `with_tls_domain_name` overrides the verified server name and the HTTP/2
+  authority host. The endpoint URI still determines where the client connects.
+- `with_tls_spki_pin` requires a 32-byte SHA-256 digest of the server's leaf
+  certificate `SubjectPublicKeyInfo` in DER form. The client also verifies the
+  certificate chain and server name. All TLS overrides require HTTPS.
+- `with_socks5_proxy` accepts an unauthenticated `socks5h://host:port` or
+  `socks5://host:port` URI. Both send destination hostnames, including
+  `.onion` addresses, to the proxy for resolution. Every reconnect uses the
+  proxy. A named proxy can itself require local DNS.
+- `with_read_retries` allows up to four attempts for an idempotent read RPC
+  that fails with `RetryPolicy::RetryWithBackoff`. The client uses jittered
+  exponential backoff or the server's `grpc-retry-pushback-ms` delay.
+  Negative, malformed, duplicate, or greater-than-two-second pushback ends
+  the retry sequence. Dropping the read future cancels pending retry waits.
+  Range and history streams can retry their opening request. The caller
+  handles failures after the stream opens and resumes event subscriptions
+  from a cursor. Broadcast makes one attempt.
+
+For domain types, codecs, and `ChainIndex` without the native gRPC adapter,
+depend on `zinder-client` with `default-features = false`. This configuration
+builds for `wasm32-unknown-unknown` and leaves transport to the caller.
+
+### A native endpoint is not a lightwalletd endpoint
+
+`zinder-client` speaks the native `zinder.v1.wallet.WalletQuery` protocol, which `zinder-query` serves. It does not speak lightwalletd's `CompactTxStreamer` protocol, which `zinder-compat-lightwalletd` serves on a different address. A lightwalletd URL does not work with `zinder-client`, and a lightwalletd client does not work against a native endpoint. If you have an existing lightwalletd client, keep it and follow [Lightwalletd clients](#lightwalletd-clients).
+
+### Beyond the quickstart
+
+- `ChainIndex` holds stored reads. `snapshot()` issues a `VisibleTipBlock` RPC to capture one chain epoch and pins every later read through the snapshot to it (`OwnedChainSnapshot` wraps an `Arc` for a cloneable, `'static` view).
+- `CompactBlocksInRange` caps each stream at 1,000 blocks on v0.26.0 (`BLOCK_RANGE_TOO_LARGE` when wider). Pinned epochs stay readable for about 60 seconds after replacement, so long range walks must split into bounded chunks and refresh the snapshot from the start when `ChainEpochPinUnavailable` / `RetryPolicy::RefreshChainEpoch` occurs.
 - `EndpointBackedIndex` holds calls that need a live endpoint: `server_info`, broadcast, chain events, and mempool reads. Bound a generic handle as `T: ChainIndex + EndpointBackedIndex` when you need both.
-- Every `IndexerError` has a `retry_policy()`: `RefreshChainEpoch`, `RestartFromEarliestRetained`, `RetryWithBackoff`, `OperatorActionRequired`, or `ClientError`. Act on the policy rather than on the error text.
+- Every `IndexerError` has a `retry_policy()`: `RefreshChainEpoch`, `RestartFromEarliestRetained`, `RefreshMempoolSnapshot`, `RetryWithBackoff`, `OperatorActionRequired`, or `ClientError`. Act on the policy rather than on the error text.
 - The client checks the server's streams. A stream that breaks its contract, such as a repeated event cursor or a missing range header, fails with `IndexerError::MalformedResponse`. Reconnect from the last accepted cursor.
 
-The crate's examples in `crates/zinder-client/examples/`, `observe_transparent_address.rs` and `observe_mempool_to_confirmed.rs`, show the snapshot, subscribe, and reconnect pattern end to end. Run one from a Zinder checkout against a running query endpoint, with the endpoint, the network, and a transparent address to watch:
+To follow the chain, open a `ChainEvents` stream, store the cursor from each event, and resume from it after a disconnect. [Chain events](../architecture/chain-events.md#resume-with-a-cursor) describes the contract. The crate's examples in `crates/zinder-client/examples/`, `observe_transparent_address.rs` and `observe_mempool_to_confirmed.rs`, show the snapshot, subscribe, and reconnect pattern end to end. Run one from a Zinder checkout against a running query endpoint. It takes the endpoint, the network as `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`, and a transparent address to watch. This command uses the Compose Regtest port. Set `ADDRESS` to your own address first:
 
 ```bash
+ADDRESS='your-transparent-address'
 cargo run -p zinder-client --example observe_transparent_address -- \
-    http://127.0.0.1:9102 zcash-regtest <t-address>
+    http://127.0.0.1:29102 zcash-regtest "$ADDRESS"
 ```
 
 ## Explorer and analytics backends

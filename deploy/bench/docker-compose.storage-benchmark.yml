@@ -1,0 +1,370 @@
+# Resource-bounded storage environment for canonical-replay-storage measurements.
+#
+# This file stays separate from deploy/docker-compose.yml. The application
+# deployment owns long-running Zinder services; this topology owns disposable
+# benchmark state, fixed resource limits, and local-only database credentials.
+name: ${ZINDER_BENCH_PROJECT_NAME:-zinder-storage-benchmark}
+
+services:
+  rocksdb-canonical-replay-storage:
+    image: ${ZINDER_BENCH_IMAGE:?set ZINDER_BENCH_IMAGE to an immutable image ID or digest-pinned reference}
+    profiles: [rocksdb, comparison]
+    restart: "no"
+    init: true
+    cgroup: private
+    cpus: ${ZINDER_BENCH_ROCKSDB_REPLAY_CPUS:-8.0}
+    mem_limit: ${ZINDER_BENCH_ROCKSDB_REPLAY_MEMORY_LIMIT_BYTES:-17179869184}
+    networks: [storage-benchmark]
+    environment:
+      ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/rocksdb-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
+      ZINDER_BENCH_RESOURCE_COMPONENT_ID: rocksdb-canonical-replay-storage-client
+      ZINDER_BENCH_RESOURCE_TRIAL_ID: ${ZINDER_BENCH_TRIAL_ID}
+      # Includes the sibling benchmark-store.external-sst staging directory.
+      ZINDER_BENCH_RESOURCE_STORAGE_PATH: /var/lib/zinder
+      ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS: ${ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS:-1}
+      ZINDER_BENCH_RESOURCE_REQUIRE_EXACT_MEMORY: "true"
+      ZINDER_BENCH_RESOURCE_REQUIRE_SAMPLED_STORAGE: "true"
+      ZINDER_BENCH_RESOURCE_REQUIRE_PRIVATE_CGROUP_NAMESPACE: "true"
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    volumes:
+      - type: bind
+        source: ${ZINDER_BENCH_FIXTURE_PATH:-../../fixtures/mainnet-150k-200k}
+        target: /benchmark/fixture
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_BENCH_RESULTS_PATH:-../../benchmark-results}
+        target: /benchmark/results
+        bind:
+          create_host_path: false
+      - type: volume
+        # A fresh named-volume root is initialized for UID 10001 by the
+        # runbook before the measured command starts.
+        source: rocksdb-canonical-replay-storage-store
+        target: /var/lib/zinder
+        volume:
+          nocopy: true
+    command:
+      - canonical-replay-storage
+      - rocksdb
+      - --fixture
+      - /benchmark/fixture
+      - --store
+      - /var/lib/zinder/benchmark-store
+      - --block-prepare-concurrency
+      - ${ZINDER_BENCH_BLOCK_PREPARE_CONCURRENCY:-16}
+      - --software-revision
+      - ${ZINDER_BENCH_SOFTWARE_REVISION:?set ZINDER_BENCH_SOFTWARE_REVISION to the exact tested revision}
+      - --trial-id
+      - ${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}
+      - --fixture-cache-policy
+      - ${ZINDER_BENCH_FIXTURE_CACHE_POLICY:?set ZINDER_BENCH_FIXTURE_CACHE_POLICY to warm or cold}
+      - --runner-id
+      - ${ZINDER_BENCH_RUNNER_ID:?set ZINDER_BENCH_RUNNER_ID to the immutable hardware, storage, and resource profile identity}
+      - --cpu-limit-cores
+      - ${ZINDER_BENCH_ROCKSDB_REPLAY_CPUS:-8.0}
+      - --memory-limit-bytes
+      - ${ZINDER_BENCH_ROCKSDB_REPLAY_MEMORY_LIMIT_BYTES:-17179869184}
+      - --storage-class
+      - ${ZINDER_BENCH_STORAGE_CLASS:?set ZINDER_BENCH_STORAGE_CLASS to the measured volume and host storage class}
+      - --image-reference
+      - ${ZINDER_BENCH_IMAGE}
+      - --report
+      - /benchmark/results/rocksdb-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
+
+  postgres-canonical-replay-storage:
+    image: ${ZINDER_BENCH_IMAGE:?set ZINDER_BENCH_IMAGE to an immutable image ID or digest-pinned reference}
+    profiles: [postgres, comparison]
+    restart: "no"
+    init: true
+    cgroup: private
+    cpus: ${ZINDER_BENCH_POSTGRES_CLIENT_CPUS:-2.0}
+    mem_limit: ${ZINDER_BENCH_POSTGRES_CLIENT_MEMORY_LIMIT_BYTES:-8589934592}
+    networks: [storage-benchmark]
+    depends_on:
+      postgres-database:
+        condition: service_healthy
+    environment:
+      ZINDER_BENCH_POSTGRES_DATABASE_URL: "postgresql://${ZINDER_BENCH_POSTGRES_USER:-zinder_bench}:${ZINDER_BENCH_POSTGRES_PASSWORD:-zinder_bench_local_only}@postgres-database:5432/${ZINDER_BENCH_POSTGRES_DATABASE:-zinder_bench}"
+      ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/postgres-canonical-replay-storage-client-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
+      ZINDER_BENCH_RESOURCE_COMPONENT_ID: postgres-canonical-replay-storage-client
+      ZINDER_BENCH_RESOURCE_TRIAL_ID: ${ZINDER_BENCH_TRIAL_ID}
+      ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS: ${ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS:-1}
+      ZINDER_BENCH_RESOURCE_REQUIRE_EXACT_MEMORY: "true"
+      ZINDER_BENCH_RESOURCE_REQUIRE_PRIVATE_CGROUP_NAMESPACE: "true"
+    volumes:
+      - type: bind
+        source: ${ZINDER_BENCH_FIXTURE_PATH:-../../fixtures/mainnet-150k-200k}
+        target: /benchmark/fixture
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_BENCH_RESULTS_PATH:-../../benchmark-results}
+        target: /benchmark/results
+        bind:
+          create_host_path: false
+    command:
+      - canonical-replay-storage
+      - postgres
+      - --fixture
+      - /benchmark/fixture
+      - --database-url-env
+      - ZINDER_BENCH_POSTGRES_DATABASE_URL
+      - --block-prepare-concurrency
+      - ${ZINDER_BENCH_BLOCK_PREPARE_CONCURRENCY:-16}
+      - --software-revision
+      - ${ZINDER_BENCH_SOFTWARE_REVISION:?set ZINDER_BENCH_SOFTWARE_REVISION to the exact tested revision}
+      - --trial-id
+      - ${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}
+      - --fixture-cache-policy
+      - ${ZINDER_BENCH_FIXTURE_CACHE_POLICY:?set ZINDER_BENCH_FIXTURE_CACHE_POLICY to warm or cold}
+      - --runner-id
+      - ${ZINDER_BENCH_RUNNER_ID:?set ZINDER_BENCH_RUNNER_ID to the immutable hardware, storage, and resource profile identity}
+      - --cpu-limit-cores
+      - ${ZINDER_BENCH_POSTGRES_TOTAL_CPUS:-8.0}
+      - --memory-limit-bytes
+      - ${ZINDER_BENCH_POSTGRES_TOTAL_MEMORY_LIMIT_BYTES:-17179869184}
+      - --client-cpu-limit-cores
+      - ${ZINDER_BENCH_POSTGRES_CLIENT_CPUS:-2.0}
+      - --client-memory-limit-bytes
+      - ${ZINDER_BENCH_POSTGRES_CLIENT_MEMORY_LIMIT_BYTES:-8589934592}
+      - --database-cpu-limit-cores
+      - ${ZINDER_BENCH_POSTGRES_DATABASE_CPUS:-6.0}
+      - --database-memory-limit-bytes
+      - ${ZINDER_BENCH_POSTGRES_DATABASE_MEMORY_LIMIT_BYTES:-8589934592}
+      - --database-image-reference
+      - ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402}
+      - --storage-class
+      - ${ZINDER_BENCH_STORAGE_CLASS:?set ZINDER_BENCH_STORAGE_CLASS to the measured volume and host storage class}
+      - --image-reference
+      - ${ZINDER_BENCH_IMAGE}
+      - --report
+      - /benchmark/results/postgres-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
+
+  postgres-database:
+    image: ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402}
+    profiles: [postgres, comparison, postgres-segmented]
+    restart: "no"
+    cgroup: private
+    cpus: ${ZINDER_BENCH_POSTGRES_DATABASE_CPUS:-6.0}
+    mem_limit: ${ZINDER_BENCH_POSTGRES_DATABASE_MEMORY_LIMIT_BYTES:-8589934592}
+    shm_size: ${ZINDER_BENCH_POSTGRES_SHARED_MEMORY_SIZE:-2g}
+    stop_grace_period: 2m
+    networks: [storage-benchmark, postgres-host-access]
+    # The server and client emit independent peaks. A PostgreSQL whole-arm peak
+    # is derived by time-aligning their memory.current samples, never by summing
+    # their independently observed memory.peak values.
+    entrypoint:
+      - /usr/local/bin/zinder-capture-container-resource-evidence
+      - /usr/local/bin/docker-entrypoint.sh
+    environment:
+      # These credentials are public and valid only for this local environment.
+      POSTGRES_DB: ${ZINDER_BENCH_POSTGRES_DATABASE:-zinder_bench}
+      POSTGRES_USER: ${ZINDER_BENCH_POSTGRES_USER:-zinder_bench}
+      POSTGRES_PASSWORD: ${ZINDER_BENCH_POSTGRES_PASSWORD:-zinder_bench_local_only}
+      POSTGRES_INITDB_ARGS: --data-checksums --encoding=UTF8 --locale=C --auth-host=scram-sha-256
+      PGDATA: /var/lib/postgresql/18/docker
+      ZINDER_BENCH_RESOURCE_EVIDENCE_PATH: /benchmark/results/postgres-canonical-replay-storage-database-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.resources.json
+      ZINDER_BENCH_RESOURCE_COMPONENT_ID: postgres-canonical-replay-storage-database
+      ZINDER_BENCH_RESOURCE_TRIAL_ID: ${ZINDER_BENCH_TRIAL_ID}
+      ZINDER_BENCH_RESOURCE_STORAGE_PATH: /var/lib/postgresql
+      ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS: ${ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS:-1}
+      ZINDER_BENCH_RESOURCE_REQUIRE_EXACT_MEMORY: "true"
+      ZINDER_BENCH_RESOURCE_REQUIRE_SAMPLED_STORAGE: "true"
+      ZINDER_BENCH_RESOURCE_REQUIRE_PRIVATE_CGROUP_NAMESPACE: "true"
+    ports:
+      - "127.0.0.1:${ZINDER_BENCH_POSTGRES_HOST_PORT:-55432}:5432"
+    volumes:
+      - type: bind
+        source: ../capture-container-resource-evidence.sh
+        target: /usr/local/bin/zinder-capture-container-resource-evidence
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_BENCH_RESULTS_PATH:-../../benchmark-results}
+        target: /benchmark/results
+        bind:
+          create_host_path: false
+      - type: volume
+        source: postgres-data
+        target: /var/lib/postgresql
+        volume:
+          nocopy: true
+    tmpfs:
+      - /tmp:size=${ZINDER_BENCH_POSTGRES_TMPFS_SIZE:-512m},mode=1777
+    command:
+      - postgres
+      - -c
+      - max_connections=${ZINDER_BENCH_POSTGRES_MAX_CONNECTIONS:-50}
+      - -c
+      - shared_buffers=${ZINDER_BENCH_POSTGRES_SHARED_BUFFERS:-2GB}
+      - -c
+      - effective_cache_size=${ZINDER_BENCH_POSTGRES_EFFECTIVE_CACHE_SIZE:-6GB}
+      - -c
+      - maintenance_work_mem=${ZINDER_BENCH_POSTGRES_MAINTENANCE_WORK_MEM:-1GB}
+      - -c
+      - work_mem=${ZINDER_BENCH_POSTGRES_WORK_MEM:-64MB}
+      - -c
+      - max_wal_size=${ZINDER_BENCH_POSTGRES_MAX_WAL_SIZE:-16GB}
+      - -c
+      - min_wal_size=${ZINDER_BENCH_POSTGRES_MIN_WAL_SIZE:-2GB}
+      - -c
+      - checkpoint_timeout=${ZINDER_BENCH_POSTGRES_CHECKPOINT_TIMEOUT:-15min}
+      - -c
+      - checkpoint_completion_target=${ZINDER_BENCH_POSTGRES_CHECKPOINT_COMPLETION_TARGET:-0.9}
+      - -c
+      - wal_compression=${ZINDER_BENCH_POSTGRES_WAL_COMPRESSION:-on}
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - max_worker_processes=${ZINDER_BENCH_POSTGRES_MAX_WORKER_PROCESSES:-6}
+      - -c
+      - max_parallel_workers=${ZINDER_BENCH_POSTGRES_MAX_PARALLEL_WORKERS:-6}
+      - -c
+      - max_parallel_maintenance_workers=${ZINDER_BENCH_POSTGRES_MAX_PARALLEL_MAINTENANCE_WORKERS:-4}
+      - -c
+      - track_io_timing=on
+      - -c
+      - huge_pages=off
+      - -c
+      - fsync=on
+      - -c
+      - full_page_writes=on
+      - -c
+      - synchronous_commit=on
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready --username "$${POSTGRES_USER}" --dbname "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 30
+
+  postgres-pgbouncer:
+    image: ${ZINDER_BENCH_PGBOUNCER_IMAGE:-edoburu/pgbouncer:v1.24.1-p1@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e}
+    profiles: [postgres-segmented]
+    restart: "no"
+    cpus: ${ZINDER_BENCH_PGBOUNCER_CPUS:-0.5}
+    mem_limit: ${ZINDER_BENCH_PGBOUNCER_MEMORY_LIMIT_BYTES:-536870912}
+    networks: [storage-benchmark]
+    depends_on:
+      postgres-database:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres-database
+      DB_PORT: "5432"
+      DB_USER: ${ZINDER_BENCH_POSTGRES_USER:-zinder_bench}
+      DB_PASSWORD: ${ZINDER_BENCH_POSTGRES_PASSWORD:-zinder_bench_local_only}
+      DB_NAME: ${ZINDER_BENCH_POSTGRES_DATABASE:-zinder_bench}
+      POOL_MODE: transaction
+      AUTH_TYPE: scram-sha-256
+      MAX_PREPARED_STATEMENTS: "200"
+      DEFAULT_POOL_SIZE: ${ZINDER_BENCH_PGBOUNCER_DEFAULT_POOL_SIZE:-32}
+      MAX_CLIENT_CONN: ${ZINDER_BENCH_PGBOUNCER_MAX_CLIENT_CONN:-256}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $${DB_USER} -d $${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      start_period: 5s
+      retries: 15
+
+  postgres-segmented-storage:
+    image: ${ZINDER_BENCH_IMAGE:?set ZINDER_BENCH_IMAGE to an immutable image ID or digest-pinned reference}
+    profiles: [postgres-segmented]
+    restart: "no"
+    init: true
+    cgroup: private
+    cpus: ${ZINDER_BENCH_SEGMENTED_CLIENT_CPUS:-1.5}
+    mem_limit: ${ZINDER_BENCH_SEGMENTED_CLIENT_MEMORY_LIMIT_BYTES:-8053063680}
+    networks: [storage-benchmark]
+    depends_on:
+      postgres-database:
+        condition: service_healthy
+      postgres-pgbouncer:
+        condition: service_healthy
+    environment:
+      ZINDER_BENCH_POSTGRES_DATABASE_URL: "postgresql://${ZINDER_BENCH_POSTGRES_USER:-zinder_bench}:${ZINDER_BENCH_POSTGRES_PASSWORD:-zinder_bench_local_only}@postgres-database:5432/${ZINDER_BENCH_POSTGRES_DATABASE:-zinder_bench}"
+      ZINDER_BENCH_POSTGRES_READER_DATABASE_URL: "postgresql://${ZINDER_BENCH_POSTGRES_USER:-zinder_bench}:${ZINDER_BENCH_POSTGRES_PASSWORD:-zinder_bench_local_only}@postgres-pgbouncer:5432/${ZINDER_BENCH_POSTGRES_DATABASE:-zinder_bench}"
+    volumes:
+      - type: bind
+        source: ${ZINDER_BENCH_FIXTURE_PATH:-../../fixtures/mainnet-150k-200k}
+        target: /benchmark/fixture
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_BENCH_RESULTS_PATH:-../../benchmark-results}
+        target: /benchmark/results
+        bind:
+          create_host_path: false
+    command:
+      - postgres-segmented
+      - --fixture
+      - /benchmark/fixture
+      - --database-url-env
+      - ZINDER_BENCH_POSTGRES_DATABASE_URL
+      - --reader-database-url-env
+      - ZINDER_BENCH_POSTGRES_READER_DATABASE_URL
+      - --reader-mode
+      - pgbouncer-transaction
+      - --concurrent-readers
+      - ${ZINDER_BENCH_SEGMENTED_CONCURRENT_READERS:-4}
+      - --settled-segment-blocks
+      - ${ZINDER_BENCH_SEGMENTED_SETTLED_BLOCKS:-1000}
+      - --live-tail-max-blocks
+      - ${ZINDER_BENCH_SEGMENTED_LIVE_TAIL_MAX_BLOCKS:-128}
+      - --software-revision
+      - ${ZINDER_BENCH_SOFTWARE_REVISION:?set ZINDER_BENCH_SOFTWARE_REVISION to the exact tested revision}
+      - --trial-id
+      - ${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}
+      - --fixture-cache-policy
+      - ${ZINDER_BENCH_FIXTURE_CACHE_POLICY:?set ZINDER_BENCH_FIXTURE_CACHE_POLICY to warm or cold}
+      - --runner-id
+      - ${ZINDER_BENCH_RUNNER_ID:?set ZINDER_BENCH_RUNNER_ID to the immutable hardware, storage, and resource profile identity}
+      - --cpu-limit-cores
+      - ${ZINDER_BENCH_POSTGRES_TOTAL_CPUS:-8.0}
+      - --memory-limit-bytes
+      - ${ZINDER_BENCH_POSTGRES_TOTAL_MEMORY_LIMIT_BYTES:-17179869184}
+      - --client-cpu-limit-cores
+      - ${ZINDER_BENCH_SEGMENTED_CLIENT_CPUS:-1.5}
+      - --client-memory-limit-bytes
+      - ${ZINDER_BENCH_SEGMENTED_CLIENT_MEMORY_LIMIT_BYTES:-8053063680}
+      - --database-cpu-limit-cores
+      - ${ZINDER_BENCH_POSTGRES_DATABASE_CPUS:-6.0}
+      - --database-memory-limit-bytes
+      - ${ZINDER_BENCH_POSTGRES_DATABASE_MEMORY_LIMIT_BYTES:-8589934592}
+      - --database-image-reference
+      - ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402}
+      - --pooler-cpu-limit-cores
+      - ${ZINDER_BENCH_PGBOUNCER_CPUS:-0.5}
+      - --pooler-memory-limit-bytes
+      - ${ZINDER_BENCH_PGBOUNCER_MEMORY_LIMIT_BYTES:-536870912}
+      - --pooler-image-reference
+      - ${ZINDER_BENCH_PGBOUNCER_IMAGE:-edoburu/pgbouncer:v1.24.1-p1@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e}
+      - --storage-class
+      - ${ZINDER_BENCH_STORAGE_CLASS:?set ZINDER_BENCH_STORAGE_CLASS to the measured volume and host storage class}
+      - --image-reference
+      - ${ZINDER_BENCH_IMAGE}
+      - --report
+      - /benchmark/results/postgres-segmented-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
+
+networks:
+  storage-benchmark:
+    internal: true
+  # Docker does not publish host ports for containers attached only to an
+  # internal network. This ordinary bridge makes the loopback-bound local
+  # driver gate reachable; benchmark clients continue to use the internal
+  # `storage-benchmark` network. The runbook documents the resulting database
+  # egress boundary explicitly.
+  postgres-host-access:
+
+volumes:
+  rocksdb-canonical-replay-storage-store:
+  postgres-data:

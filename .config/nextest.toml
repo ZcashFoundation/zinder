@@ -25,6 +25,23 @@ final-status-level = "fail"
 junit = { path = "target/nextest/junit.xml" }
 
 [[profile.default.overrides]]
+# Concurrent canonical and wallet fixture builds stall on filesystem journal
+# commits. Each replay then copies and syncs both stores and opens a secondary.
+# Limit overlapping fixtures. Even two can cross 20s when other suites share
+# the disk, so report slow tests at 20s and terminate them at 60s.
+filter = "package(=zinder-bench) & test(/^integration::rocksdb_tip_replay::/)"
+test-group = "rocksdb-tip-replay"
+slow-timeout = { period = "20s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+# Active-writer publication tests build canonical and wallet stores across a
+# 4,096-block segment boundary, clone them into three matched modes, and drive
+# concurrent RocksDB writers, projector, and gRPC readers.
+filter = "package(=zinder-bench) & test(/^integration::active_writer_publication::/)"
+test-group = "rocksdb-tip-replay"
+slow-timeout = { period = "30s", terminate-after = 3 }
+
+[[profile.default.overrides]]
 # Process-crash tests spawn child processes that abort at a crash point, then
 # reopen the store. Each abort plus RocksDB reopen costs seconds where the host
 # collects core dumps, which exceeds the 20s default kill window under
@@ -33,12 +50,16 @@ filter = "test(publication_crashes_preserve_the_atomic_build_state) | test(live_
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
-# These tests build a wallet store holding thousands of unspent outputs, for
-# one address whose production-sized stream spans several 1,024-output pages,
-# or for the 60 busy addresses the lightwalletd merge bound is checked
-# across. The build takes seconds alone and more under full-workspace
-# parallelism, which crosses the 20s default kill window.
-filter = "test(abandoned_and_stalled_unspent_output_reads_do_not_stop_publication) | test(cancelling_an_unspent_output_stream_stops_its_storage_reads_and_releases_its_pair) | test(address_utxos_bound_the_outputs_held_across_many_addresses)"
+# These tests build wallet stores with thousands of unspent outputs to
+# exercise reader retention, backpressure, and page bounds. The largest
+# fixture contains 100,002 outputs. Builds can exceed the default kill
+# window under full-workspace parallelism.
+filter = """
+test(abandoned_and_stalled_unspent_output_reads_do_not_stop_publication)
+| test(cancelling_an_unspent_output_stream_stops_its_storage_reads_and_releases_its_pair)
+| test(address_utxos_bound_the_outputs_held_across_many_addresses)
+| test(wallet_utxo_pages_continue_past_the_response_row_limit)
+"""
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
@@ -46,7 +67,7 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # then compact the files away under a secondary. Each takes about a second
 # alone, but under full-workspace parallelism every flush waits on a contended
 # disk, and they take 10-20s, which reaches the 20s default kill window.
-filter = "test(/table_file/) | test(a_stream_ends_with_its_epoch_unavailable_when_its_replacement_serves_a_newer_epoch) | test(a_corrupt_store_control_row_refuses_admission)"
+filter = "test(/table_file/) | test(a_stream_ends_with_its_epoch_unavailable_when_its_replacement_serves_a_newer_epoch) | test(a_corrupt_store_control_row_refuses_admission) | test(a_bounded_read_its_first_block_fills_fetches_only_that_block) | test(publisher_exports_live_sst_size_for_newest_published_pair_without_per_file_properties)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
@@ -89,6 +110,28 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = "test(production_tip_change_publisher_observes_a_post_wait_canonical_event)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+[[profile.default.overrides]]
+# This test builds two 6,100-block canonical and wallet store fixtures (each
+# sealing a 4,096-block settled segment). It takes ~10-11s alone in a debug
+# build and crosses the 20s default kill window under 4-vCPU CI shard
+# parallelism.
+filter = "package(=zinder-compat-lightwalletd) & test(=integration::lightwalletd_grpc::canonical_range::descending_gap_retry_delivers_every_previously_checked_retained_block)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+# These qualification tests pass 100,000 UTXOs through JSON-RPC to exercise
+# the node's actual page limit. The cutoff proof can read a full page more
+# than once for each node. Each RPC has its own 30s timeout.
+filter = """
+package(=zinder-compat-lightwalletd) & (
+  test(cap_sized_first_height_reports_the_count_and_accepts_an_exact_retry)
+  | test(cap_sized_multi_height_prefix_stays_bounded_and_ordered)
+  | test(later_outputs_can_prevent_proving_a_full_cutoff_height)
+  | test(forwarded_utxo_pages_continue_past_the_response_row_limit)
+)
+"""
+slow-timeout = { period = "30s", terminate-after = 2 }
+
 [profile.ci-perf]
 default-filter = "test(/^perf::/)"
 slow-timeout = { period = "5m", terminate-after = 1 }
@@ -99,7 +142,7 @@ junit = { path = "target/nextest/perf.xml" }
 # a fresh disposable PostgreSQL database. CI supplies that database and runs
 # this profile with --run-ignored=all.
 [profile.ci-postgres]
-default-filter = "test(/^integration::postgres_canonical_replay::/)"
+default-filter = "test(/^integration::postgres_canonical_replay::/) | test(/^integration::postgres_segmented::/)"
 slow-timeout = { period = "60s", terminate-after = 1 }
 junit = { path = "target/nextest/postgres.xml" }
 
@@ -118,12 +161,14 @@ default-filter = "test(/^parity::/)"
 slow-timeout = { period = "60s", terminate-after = 1 }
 junit = { path = "target/nextest/parity.xml" }
 
+[test-groups]
+rocksdb-tip-replay = { max-threads = 2 }
+
 # Live tests that mutate node state share a single Docker container.
 # Read-only live tests (capability probes, tip fetches, broadcast-rejection
 # classification) run in parallel under the default group unless they share a
 # fixture with a mutating test. The lightwalletd parity file serializes as a
 # unit because accepted-send parity mutates the shared regtest mempool.
-[test-groups]
 node-mutating = { max-threads = 1 }
 
 [[profile.ci-live.overrides]]
@@ -160,11 +205,9 @@ retries = { count = 0, backoff = "fixed", delay = "0s" }
 # serialize through `node-mutating`. The Zebra indexer gRPC port is a single
 # upstream resource: any test that opens an indexer stream races with the
 # destructive container-restart test, so all indexer consumers join here.
-# `ingest_control_tip_change_publisher_fires_when_zebra_mines_block` mutates
-# regtest chain state via `generate`, so it joins too.
 # `source_blocks_reencode_to_node_bytes_across_the_chain` reads every block up
 # to the tip it observed, which a concurrent reorg test could invalidate.
-filter = "test(live::deep_chain) or test(live::cli) or test(/live::broadcast_fallback::/) or test(/live::zebra_indexer_mempool::/) or test(/live::mempool_broadcast_cycle::/) or test(/live::parity_against_lightwalletd::/) or test(/live::zingolib::/) or test(/live::reorg_sweep::/) or test(/live::nu7_activation::/) or test(mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state) or test(ingest_control_tip_change_publisher_fires_when_zebra_mines_block) or test(source_blocks_reencode_to_node_bytes_across_the_chain)"
+filter = "test(live::deep_chain) or test(live::cli) or test(/live::broadcast_fallback::/) or test(/live::zebra_indexer_mempool::/) or test(/live::mempool_broadcast_cycle::/) or test(/live::parity_against_lightwalletd::/) or test(/live::zingolib::/) or test(/live::reorg_sweep::/) or test(/live::nu7_activation::/) or test(source_blocks_reencode_to_node_bytes_across_the_chain)"
 test-group = "node-mutating"
 
 [[profile.ci-live.overrides]]
@@ -172,5 +215,5 @@ filter = "test(standalone_wallet_query_serves_native_contract)"
 slow-timeout = { period = "15s", terminate-after = 1 }
 
 [[profile.ci-live.overrides]]
-filter = "test(backfills_last_1000_blocks_from_checkpoint) or test(canonical_replay_loads_1000_blocks_from_fixed_checkpoint)"
+filter = "test(canonical_blocks_load_requested_range_from_fixed_checkpoint)"
 slow-timeout = { period = "5m", terminate-after = 1 }

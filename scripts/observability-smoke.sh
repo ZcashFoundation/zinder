@@ -17,7 +17,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="${ROOT_DIR}/docker-compose.observability.yml"
+COMPOSE_FILE="${ROOT_DIR}/deploy/bench/docker-compose.observability.yml"
 PROJECT_NAME="${ZINDER_OBSERVABILITY_PROJECT:-zinder-observability}"
 WORK_DIR="${ZINDER_OBSERVABILITY_WORK_DIR:-${ROOT_DIR}/.tmp/observability}"
 CONFIG_DIR="${WORK_DIR}/config"
@@ -65,8 +65,8 @@ COMPAT_CONFIG="${CONFIG_DIR}/zinder-compat-lightwalletd.toml"
 QUERY_CONFIG="${CONFIG_DIR}/zinder-query.toml"
 
 BULK_CATCHUP_SECONDS="null"
-RESTORE_STATUS="blocked"
-RESTORE_ERROR_CLASS="coherent_canonical_wallet_bundle_unimplemented"
+RESTORE_STATUS="not_exercised"
+RESTORE_ERROR_CLASS=""
 REPORT_JSON_PATH=""
 REPORT_MARKDOWN_PATH=""
 RUN_ID=""
@@ -93,11 +93,11 @@ usage() {
 Usage: scripts/observability-smoke.sh [run|calibrate|snapshot|stop]
 
 Commands:
-  run        Start Prometheus/Grafana, bulk catch up from a checkpoint, record
-             that restore is blocked until coherent canonical-plus-wallet
-             bundles exist, start ingest/projector/compat
-             services, generate traffic, print Prometheus evidence, and write
-             a readiness report.
+  run        Start Prometheus/Grafana, bulk catch up from a checkpoint, start
+             ingest/projector/query/compat services, generate traffic, print
+             Prometheus evidence, and write a readiness report. Backup/restore
+             is reported as not_exercised unless exercised separately with
+             zinder-projector backup/verify/restore.
              This is the default command.
   calibrate  Run the same smoke multiple times and write an aggregate baseline
              report. Set ZINDER_OBSERVABILITY_RUNS to control the run count.
@@ -538,7 +538,7 @@ checkpoint_height = ${CHECKPOINT_HEIGHT}
 listen_addr = "${INGEST_CONTROL_ADDR}"
 
 [ops]
-listen_addr = ""
+listen_addr = "none"
 
 [security]
 allow_public_bind = true
@@ -549,8 +549,8 @@ EOF
 name = "${network}"
 
 [storage]
-canonical_path = "${storage_path}"
-canonical_secondary_path = "${projector_canonical_secondary_path}"
+path = "${storage_path}"
+secondary_path = "${projector_canonical_secondary_path}"
 
 [wallet]
 path = "${wallet_path}"
@@ -590,7 +590,7 @@ listen_addr = "${QUERY_GRPC_ADDR}"
 reorg_window_blocks = 100
 
 [ops]
-listen_addr = ""
+listen_addr = "none"
 
 [node]
 json_rpc_addr = "${node_addr}"
@@ -627,7 +627,7 @@ addr = "http://${INGEST_CONTROL_ADDR}"
 listen_addr = "${COMPAT_GRPC_ADDR}"
 
 [ops]
-listen_addr = ""
+listen_addr = "none"
 
 [node]
 json_rpc_addr = "${node_addr}"
@@ -929,8 +929,8 @@ PY
   log "checkpoint bulk catchup completed in ${BULK_CATCHUP_SECONDS}s"
 }
 
-record_restore_unavailability() {
-  log "restore remains blocked: a coherent canonical-plus-wallet bundle restore is not implemented"
+record_restore_smoke_status() {
+  log "backup/restore is not exercised by this smoke run (use zinder-projector backup/verify/restore to exercise coherent bundles)"
 }
 
 lightwalletd_grpc() {
@@ -1368,7 +1368,7 @@ snapshot() {
   printf '  Logs:       %s\n' "$LOG_DIR"
 
   log "Prometheus evidence"
-  print_query_summary "targets up" "up{stack=\"${PROMETHEUS_STACK_LABEL}\"}"
+  print_query_summary "target scrape status" "zinder:target_scrape_status{stack=\"${PROMETHEUS_STACK_LABEL}\"}"
   print_query_summary "build info" 'zinder_build_info'
   print_query_summary "readiness states" 'zinder_readiness_state'
   print_query_summary "readiness sync lag" 'zinder_readiness_sync_lag_blocks'
@@ -1390,13 +1390,11 @@ snapshot() {
   print_query_summary "materialized-view replay effective batch" 'zinder_materialized_view_replay_effective_batch_blocks'
   print_query_summary "ingest live appends" 'sum by (service) (zinder_ingest_canonical_live_appends_total)'
   print_query_summary "ingest writer progress" 'zinder_ingest_canonical_chain_epoch'
-  print_query_summary "ingest writer status requests" 'sum by (service, status, error_class) (zinder_ingest_writer_status_request_total)'
-  print_query_summary "ingest writer status available" 'zinder_ingest_writer_status_available'
-  print_query_summary "compat wallet-serving pair publications" 'zinder_compat_lightwalletd_wallet_serving_pair_publisher_publications_total'
-  print_query_summary "compat wallet-serving pair convergence" 'sum by (outcome) (zinder_compat_lightwalletd_wallet_serving_pair_publisher_convergence_total)'
-  print_query_summary "compat wallet-serving pair replica lag" 'zinder_compat_lightwalletd_wallet_serving_pair_publisher_replica_lag_chain_epochs'
-  print_query_summary "compat writer-status requests" 'sum by (status, error_class) (zinder_compat_lightwalletd_writer_status_total)'
-  print_query_summary "compat writer-status available" 'zinder_compat_lightwalletd_writer_status_available'
+  print_query_summary "compat wallet-serving pair publications" 'zinder_wallet_serving_pair_publisher_publications_total{service="zinder-compat-lightwalletd"}'
+  print_query_summary "compat wallet-serving pair convergence" 'sum by (outcome) (zinder_wallet_serving_pair_publisher_convergence_total{service="zinder-compat-lightwalletd"})'
+  print_query_summary "compat wallet-serving pair replica lag" 'zinder_wallet_serving_pair_publisher_replica_lag_chain_epochs{service="zinder-compat-lightwalletd"}'
+  print_query_summary "compat writer-status requests" 'sum by (status) (zinder_wallet_serving_writer_status_total{service="zinder-compat-lightwalletd"})'
+  print_query_summary "compat writer-status available" 'zinder_wallet_serving_writer_status_available{service="zinder-compat-lightwalletd"}'
   print_query_summary "node rpc p95" 'histogram_quantile(0.95, sum by (le, method) (rate(zinder_node_request_duration_seconds_bucket[15m])))'
   print_query_summary "rocksdb properties" 'zinder_store_rocksdb_property'
 }
@@ -1407,7 +1405,7 @@ wait_no_traffic_blocking_readiness() {
   local blocking_services targets_up
   while true; do
     blocking_services="$(prometheus_max_value "sum(zinder_readiness_state{cause!~\"${TRAFFIC_READY_READINESS_CAUSES}\"} == 1) or vector(0)")"
-    targets_up="$(prometheus_max_value "sum(up{stack=\"${PROMETHEUS_STACK_LABEL}\"})")"
+    targets_up="$(prometheus_max_value "sum(zinder:target_scrape_status{stack=\"${PROMETHEUS_STACK_LABEL}\"} == bool 1)")"
     if jq -en \
       --arg blocking "$blocking_services" \
       --arg targets "$targets_up" \
@@ -1530,7 +1528,7 @@ write_readiness_report() {
   report_projector_metrics_url="http://$(local_url_addr "$PROJECTOR_OPS_ADDR")/metrics"
   report_query_metrics_url="http://$(local_url_addr "$QUERY_OPS_ADDR")/metrics"
   report_compat_metrics_url="http://$(local_url_addr "$COMPAT_OPS_ADDR")/metrics"
-  report_targets_up="$(prometheus_max_value "sum(up{stack=\"${PROMETHEUS_STACK_LABEL}\"})")"
+  report_targets_up="$(prometheus_max_value "sum(zinder:target_scrape_status{stack=\"${PROMETHEUS_STACK_LABEL}\"} == bool 1)")"
   report_traffic_blocking_services="$(prometheus_max_value "sum(zinder_readiness_state{cause!~\"${TRAFFIC_READY_READINESS_CAUSES}\"} == 1) or vector(0)")"
   report_readiness_warning_services="$(prometheus_max_value "sum(zinder_readiness_state{cause=~\"${READINESS_WARNING_CAUSES}\"} == 1) or vector(0)")"
   report_readiness_sync_lag_blocks="$(prometheus_max_value 'max(zinder_readiness_sync_lag_blocks)')"
@@ -1546,8 +1544,8 @@ write_readiness_report() {
   report_materialized_view_replay_caught_up="$(prometheus_max_value 'max(zinder_materialized_view_replay_caught_up)')"
   report_memory_pressure_ratio="$(prometheus_max_value 'max(zinder_ingest_memory_pressure_ratio)')"
   report_node_rpc_p95_seconds="$(prometheus_max_value 'max(histogram_quantile(0.95, sum by (le, method) (rate(zinder_node_request_duration_seconds_bucket[15m]))))')"
-  report_compat_wallet_serving_pair_publisher_publication_count="$(prometheus_max_value 'sum(zinder_compat_lightwalletd_wallet_serving_pair_publisher_publications_total)')"
-  report_compat_wallet_serving_pair_publisher_replica_lag_chain_epochs="$(prometheus_max_value 'max(zinder_compat_lightwalletd_wallet_serving_pair_publisher_replica_lag_chain_epochs)')"
+  report_compat_wallet_serving_pair_publisher_publication_count="$(prometheus_max_value 'sum(zinder_wallet_serving_pair_publisher_publications_total{service="zinder-compat-lightwalletd"})')"
+  report_compat_wallet_serving_pair_publisher_replica_lag_chain_epochs="$(prometheus_max_value 'max(zinder_wallet_serving_pair_publisher_replica_lag_chain_epochs{service="zinder-compat-lightwalletd"})')"
   report_rocksdb_pending_compaction_bytes="$(prometheus_max_value 'max(zinder_store_rocksdb_property{property="rocksdb.estimate-pending-compaction-bytes"})')"
   report_rocksdb_running_compactions="$(prometheus_max_value 'max(zinder_store_rocksdb_property{property="rocksdb.num-running-compactions"})')"
   report_rocksdb_property_samples="$(prometheus_sample_count 'zinder_store_rocksdb_property')"
@@ -1658,7 +1656,7 @@ report = {
     },
     "restore": {
         "status": os.environ["REPORT_RESTORE_STATUS"],
-        "error_class": os.environ["REPORT_RESTORE_ERROR_CLASS"],
+        "error_class": os.environ["REPORT_RESTORE_ERROR_CLASS"] or None,
     },
     "endpoints": {
         "prometheus": os.environ["REPORT_PROMETHEUS_URL"],
@@ -1868,7 +1866,7 @@ run_stack() {
   wait_http grafana "http://127.0.0.1:${GRAFANA_PORT}/api/health" 120
 
   run_bulk_catchup_seed
-  record_restore_unavailability
+  record_restore_smoke_status
 
   # Long-running ingest. No --target-height here, so the loop
   # runs indefinitely (transitioning to FollowingTip once the store
@@ -1890,14 +1888,13 @@ run_stack() {
   run_lightwalletd_testclient
   run_complete_topology_certification
 
-  wait_prometheus_samples "target scrape" "up{stack=\"${PROMETHEUS_STACK_LABEL}\"}" 45 || true
+  wait_prometheus_samples "target scrape status" "zinder:target_scrape_status{stack=\"${PROMETHEUS_STACK_LABEL}\"}" 45 || true
   wait_prometheus_samples "readiness metric" 'zinder_readiness_state' 45 || true
-  wait_prometheus_samples "compat wallet-serving-pair publication metric" 'zinder_compat_lightwalletd_wallet_serving_pair_publisher_publications_total' 45 || true
-  wait_prometheus_samples "compat wallet-serving-pair convergence metric" 'zinder_compat_lightwalletd_wallet_serving_pair_publisher_convergence_total' 45 || true
+  wait_prometheus_samples "compat wallet-serving-pair publication metric" 'zinder_wallet_serving_pair_publisher_publications_total{service="zinder-compat-lightwalletd"}' 45 || true
+  wait_prometheus_samples "compat wallet-serving-pair convergence metric" 'zinder_wallet_serving_pair_publisher_convergence_total{service="zinder-compat-lightwalletd"}' 45 || true
   wait_prometheus_samples "rocksdb property metric" 'zinder_store_rocksdb_property' 45 || true
   wait_prometheus_samples "ingest commit metric" 'zinder_ingest_canonical_live_appends_total' 45 || true
   wait_prometheus_samples "ingest writer progress metric" 'zinder_ingest_canonical_chain_epoch' 45 || true
-  wait_prometheus_samples "ingest writer status metric" 'zinder_ingest_writer_status_request_total' 45 || true
 
   wait_complete_readiness final-traffic-ready 300
   wait_no_traffic_blocking_readiness 60

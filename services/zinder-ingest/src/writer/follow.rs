@@ -18,22 +18,25 @@ use zinder_core::{
     ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, UnixTimestampMillis,
 };
 use zinder_proto::v1::ops::ReorgWindowExceededDetail;
-use zinder_runtime::{ComposedReadiness, IngestPhase, ReadinessCause, ReadinessState};
-use zinder_source::{NodeSource, SourceBlock, SourceError, SourceFailureClass};
+use zinder_runtime::{
+    ComposedReadiness, FollowWaitReason, IngestPhase, ReadinessCause, ReadinessState,
+};
+use zinder_source::{NodeSource, SourceBlock, SourceError};
 use zinder_store::{
-    CanonicalAppendAnchor, CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalLiveAppend,
-    CanonicalLiveReplacement, CanonicalReplacementBlock, CanonicalStoreError,
-    RocksDbCanonicalStore,
+    CanonicalAppendAnchor, CanonicalBuildBlock, CanonicalBuildSubtreeRoot,
+    CanonicalEventRetentionStepBudget, CanonicalLiveAppend, CanonicalLiveReplacement,
+    CanonicalReplacementBlock, CanonicalStoreError, RocksDbCanonicalStore,
 };
 
 use crate::{
     CanonicalBlockConstructionError, CanonicalConstructionError, CommitmentTreeSizes, IngestError,
-    MempoolReadyGate, NodeEndpointSwitch, NodeFailover, position_canonical_block,
-    prepare_canonical_block,
+    MempoolReadyGate, NodeEndpointSwitch, NodeFailover,
+    artifact_builder::prepare_canonical_block_for_retention,
+    position_canonical_block,
     source_recovery::{
-        SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
-        detail_for_ongoing_outage,
+        SourceOutage, SourceRecoveryDecision, decide_recovery, default_recovery_backoff,
     },
+    subtree_verification::SubtreeVerificationObservation,
     writer::construction::{
         canonical_build_block, compact_block_commitments, first_differing_subtree_root,
         register_prohibited_read_metrics,
@@ -44,7 +47,6 @@ use crate::{
         answer_canonical_control_read, apply_following_canonical_control_command,
         apply_parked_canonical_control_command,
     },
-    writer::raw_blob_policy_for_retention,
 };
 
 /// Polling and bounded-source settings for canonical following.
@@ -89,6 +91,7 @@ pub struct CanonicalFollower<'a, Source> {
     source: &'a Source,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     config: CanonicalFollowConfig,
+    event_retention_step_budget: CanonicalEventRetentionStepBudget,
     readiness: &'a ComposedReadiness,
     cancel: &'a CancellationToken,
 }
@@ -110,9 +113,20 @@ where
             source,
             network_upgrade_activations,
             config,
+            event_retention_step_budget: CanonicalEventRetentionStepBudget::default(),
             readiness,
             cancel,
         }
+    }
+
+    /// Overrides the per-step canonical event retention work budget.
+    #[must_use]
+    pub const fn with_event_retention_step_budget(
+        mut self,
+        budget: CanonicalEventRetentionStepBudget,
+    ) -> Self {
+        self.event_retention_step_budget = budget;
+        self
     }
 
     async fn recover_source_failure(
@@ -185,13 +199,61 @@ where
         canonical_tip: BlockId,
     ) -> TipConfirmation {
         if let Some(mempool_ready_gate) = self.config.mempool_ready_gate.as_ref() {
-            withdraw_follow_readiness_for_mempool_hydration(
+            update_follow_wait(
                 self.readiness,
                 canonical_tip,
+                None,
                 Some(mempool_ready_gate),
             );
         }
         tip_confirmation_after_switch(switch)
+    }
+
+    async fn wait_at_tip(
+        &self,
+        store: &mut RocksDbCanonicalStore,
+        control: &mut ControlInbox,
+        mempool_hydration_changes: &mut Option<MempoolReadyGate>,
+        state: AtTipState,
+    ) -> AtTipWaitOutcome {
+        let poll_sleep = tokio::time::sleep(self.config.poll_interval);
+        tokio::pin!(poll_sleep);
+        loop {
+            tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => return AtTipWaitOutcome::Cancelled,
+                () = &mut poll_sleep => return AtTipWaitOutcome::PollDue,
+                hydration_changed = wait_for_mempool_hydration_change(mempool_hydration_changes) => {
+                    apply_mempool_hydration_change(
+                        hydration_changed,
+                        mempool_hydration_changes,
+                        self.readiness,
+                        store.event_fence().visible_tip(),
+                        Some(state.observed_tip),
+                    );
+                }
+                command = control.next_command() => {
+                    if apply_following_canonical_control_command(
+                        store,
+                        command,
+                        state.tip_confirmation,
+                    ) == CanonicalControlScheduling::YieldToCanonical
+                    {
+                        return AtTipWaitOutcome::YieldedToCanonical;
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_follow_readiness(&self, canonical_tip: BlockId, observed_tip: Option<BlockId>) {
+        let state = follow_readiness(
+            canonical_tip,
+            observed_tip,
+            self.config.lag_threshold_blocks,
+            self.config.mempool_ready_gate.as_ref(),
+        );
+        publish_follow_readiness(self.readiness, state);
     }
 
     fn commit_append(
@@ -207,13 +269,7 @@ where
         metrics::histogram!("zinder_ingest_canonical_live_commit_seconds")
             .record(commit_started.elapsed().as_secs_f64());
         record_fence_metrics(&store, observed_tip);
-        set_follow_readiness(
-            self.readiness,
-            &store,
-            observed_tip,
-            self.config.lag_threshold_blocks,
-            self.config.mempool_ready_gate.as_ref(),
-        );
+        self.set_follow_readiness(fence.visible_tip(), Some(observed_tip));
         tracing::info!(
             target: "zinder::ingest",
             event = "canonical_live_append_committed",
@@ -234,6 +290,7 @@ where
         &self,
         store: RocksDbCanonicalStore,
         replacement: CanonicalLiveReplacement,
+        common_parent: BlockId,
         observed_tip: BlockId,
     ) -> Result<RocksDbCanonicalStore, CanonicalFollowError> {
         let commit_started = std::time::Instant::now();
@@ -244,16 +301,12 @@ where
         metrics::histogram!("zinder_ingest_canonical_live_replacement_commit_seconds")
             .record(commit_started.elapsed().as_secs_f64());
         record_fence_metrics(&store, observed_tip);
-        set_follow_readiness(
-            self.readiness,
-            &store,
-            observed_tip,
-            self.config.lag_threshold_blocks,
-            self.config.mempool_ready_gate.as_ref(),
-        );
+        self.set_follow_readiness(fence.visible_tip(), Some(observed_tip));
         tracing::info!(
             target: "zinder::ingest",
             event = "canonical_live_replacement_committed",
+            common_parent_height = common_parent.height.value(),
+            common_parent_hash = ?common_parent.hash,
             chain_epoch = fence.chain_epoch_id().value(),
             chain_event_sequence = fence.chain_event_sequence(),
             previous_tip_height = previous_tip.height.value(),
@@ -280,6 +333,18 @@ enum SourceRecovery {
     Switched(NodeEndpointSwitch),
 }
 
+#[derive(Clone, Copy)]
+struct AtTipState {
+    observed_tip: BlockId,
+    tip_confirmation: TipConfirmation,
+}
+
+enum AtTipWaitOutcome {
+    PollDue,
+    YieldedToCanonical,
+    Cancelled,
+}
+
 /// Tip confirmation after a switch to `switch`'s target.
 ///
 /// The final switch check found the visible tip block on a non-diverged
@@ -291,47 +356,6 @@ fn tip_confirmation_after_switch(switch: &NodeEndpointSwitch) -> TipConfirmation
         TipConfirmation::Unconfirmed
     } else {
         TipConfirmation::Confirmed
-    }
-}
-
-/// The source outage in progress, counted per failure class so a switch
-/// threshold for one class never counts another.
-struct SourceOutage {
-    started_at: std::time::Instant,
-    detail: zinder_runtime::NodeUnavailableDetail,
-    failure_class: SourceFailureClass,
-    consecutive_same_class: u32,
-}
-
-impl SourceOutage {
-    fn record(
-        previous: Option<Self>,
-        failure_class: SourceFailureClass,
-        last_reason: std::borrow::Cow<'static, str>,
-    ) -> Self {
-        match previous {
-            None => Self {
-                started_at: std::time::Instant::now(),
-                detail: detail_for_new_outage(failure_class, last_reason),
-                failure_class,
-                consecutive_same_class: 1,
-            },
-            Some(previous) => Self {
-                detail: detail_for_ongoing_outage(
-                    &previous.detail,
-                    failure_class,
-                    last_reason,
-                    u32::try_from(previous.started_at.elapsed().as_secs()).unwrap_or(u32::MAX),
-                ),
-                consecutive_same_class: if previous.failure_class == failure_class {
-                    previous.consecutive_same_class.saturating_add(1)
-                } else {
-                    1
-                },
-                started_at: previous.started_at,
-                failure_class,
-            },
-        }
     }
 }
 
@@ -549,8 +573,10 @@ where
 ///
 /// The receiver is owned by this loop, not by a storage adapter. While the
 /// follower waits on the node, it answers read-only commands at once and
-/// applies writes in arrival order when the wait ends. `AtTip` waits select
-/// between a command, cancellation, and the configured poll delay.
+/// applies writes in arrival order when the wait ends. `AtTip` waits yield
+/// immediately to canonical work on `YieldToCanonical`
+/// maintenance commands while preserving the poll delay across reads,
+/// non-yielding commands, and mempool hydration changes.
 pub async fn follow_canonical_tip_with_control<Source>(
     store: RocksDbCanonicalStore,
     follower: CanonicalFollower<'_, Source>,
@@ -580,18 +606,24 @@ where
         .update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
     let mut source_outage: Option<SourceOutage> = None;
     let mut observed_fence_tip = None;
-    let mut next_event_retention_check = std::time::Instant::now();
+    let mut next_event_retention_check = tokio::time::Instant::now();
     let mut mempool_hydration_changes = follower.config.mempool_ready_gate.clone();
     let mut control = ControlInbox::new(control_commands);
     // The opened store's visible tip may sit on a branch the node abandoned
     // while this writer was down. Readers learn that it is confirmed only
     // from a source observation, never from the persisted fence itself.
     let mut tip_confirmation = TipConfirmation::Unconfirmed;
+    let mut skip_top_control_drain = false;
 
     loop {
-        control.drain(&mut store, tip_confirmation);
         if follower.cancel.is_cancelled() {
             return Ok(store);
+        }
+        if !std::mem::take(&mut skip_top_control_drain) {
+            control.drain(&mut store, tip_confirmation, follower.cancel);
+            if follower.cancel.is_cancelled() {
+                return Ok(store);
+            }
         }
         if let Some(node_failover) = follower.config.node_failover.as_ref() {
             observe_fence_for_failover(node_failover, &store, &mut observed_fence_tip)?;
@@ -613,30 +645,19 @@ where
                 continue;
             }
         }
-        if std::time::Instant::now() >= next_event_retention_check {
-            if let Some(window) = follower.config.event_retention_window {
-                let now = UnixTimestampMillis::now();
-                let window_millis = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
-                let cutoff = UnixTimestampMillis::new(now.value().saturating_sub(window_millis));
-                store.prune_canonical_events_before_created_at(cutoff, now)?;
-            }
-            next_event_retention_check = std::time::Instant::now()
-                .checked_add(follower.config.event_retention_check_interval)
-                .unwrap_or_else(std::time::Instant::now);
-        }
+        maybe_advance_canonical_event_retention(
+            &store,
+            &follower.config,
+            follower.event_retention_step_budget,
+            &mut next_event_retention_check,
+        )?;
         if follower
             .config
             .target_height
             .is_some_and(|target| store.event_fence().visible_tip().height >= target)
         {
             let visible_tip = store.event_fence().visible_tip();
-            set_follow_readiness(
-                follower.readiness,
-                &store,
-                visible_tip,
-                follower.config.lag_threshold_blocks,
-                follower.config.mempool_ready_gate.as_ref(),
-            );
+            follower.set_follow_readiness(visible_tip, None);
             record_fence_metrics(&store, visible_tip);
             return Ok(store);
         }
@@ -646,15 +667,8 @@ where
                 &store,
                 tip_confirmation,
                 Box::pin(await_follow_preparation_or_mempool_change(
-                    prepare_follow_iteration(
-                        &store,
-                        follower.source,
-                        Arc::clone(&follower.network_upgrade_activations),
-                        follower.config.clone(),
-                        follower.cancel,
-                    ),
+                    prepare_follow_iteration(&store, &follower),
                     &mut mempool_hydration_changes,
-                    follower.config.mempool_ready_gate.as_ref(),
                     follower.readiness,
                     store.event_fence().visible_tip(),
                 )),
@@ -670,7 +684,10 @@ where
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(CanonicalFollowError::Source(source_error)) => {
-                control.drain(&mut store, tip_confirmation);
+                control.drain(&mut store, tip_confirmation, follower.cancel);
+                if follower.cancel.is_cancelled() {
+                    return Ok(store);
+                }
                 let recovery = follower.recover_source_failure(
                     source_error,
                     &mut source_outage,
@@ -714,7 +731,10 @@ where
         if follower.cancel.is_cancelled() {
             return Ok(store);
         }
-        control.drain(&mut store, tip_confirmation);
+        control.drain(&mut store, tip_confirmation, follower.cancel);
+        if follower.cancel.is_cancelled() {
+            return Ok(store);
+        }
 
         match prepared {
             FollowIteration::AtTip { observed_tip } => {
@@ -722,32 +742,24 @@ where
                     tip_confirmation = TipConfirmation::Confirmed;
                 }
                 record_fence_metrics(&store, observed_tip);
-                set_follow_readiness(
-                    follower.readiness,
-                    &store,
-                    observed_tip,
-                    follower.config.lag_threshold_blocks,
-                    follower.config.mempool_ready_gate.as_ref(),
-                );
-                tokio::select! {
-                    () = follower.cancel.cancelled() => return Ok(store),
-                    hydration_changed = wait_for_mempool_hydration_change(&mut mempool_hydration_changes) => {
-                        apply_mempool_hydration_change(
-                            hydration_changed,
-                            &mut mempool_hydration_changes,
-                            follower.readiness,
-                            follower.config.mempool_ready_gate.as_ref(),
-                            store.event_fence().visible_tip(),
-                        );
-                    }
-                    command = control.next_command() => {
-                        apply_following_canonical_control_command(
-                            &mut store,
-                            command,
+                follower
+                    .set_follow_readiness(store.event_fence().visible_tip(), Some(observed_tip));
+                match follower
+                    .wait_at_tip(
+                        &mut store,
+                        &mut control,
+                        &mut mempool_hydration_changes,
+                        AtTipState {
+                            observed_tip,
                             tip_confirmation,
-                        );
+                        },
+                    )
+                    .await
+                {
+                    AtTipWaitOutcome::PollDue | AtTipWaitOutcome::YieldedToCanonical => {
+                        skip_top_control_drain = true;
                     }
-                    () = tokio::time::sleep(follower.config.poll_interval) => {}
+                    AtTipWaitOutcome::Cancelled => return Ok(store),
                 }
             }
             FollowIteration::Append {
@@ -761,13 +773,60 @@ where
             }
             FollowIteration::Replacement {
                 replacement,
+                common_parent,
                 observed_tip,
             } => {
-                store = follower.commit_replacement(store, *replacement, observed_tip)?;
+                store = follower.commit_replacement(
+                    store,
+                    *replacement,
+                    common_parent,
+                    observed_tip,
+                )?;
                 tip_confirmation = TipConfirmation::Confirmed;
             }
         }
     }
+}
+
+fn maybe_advance_canonical_event_retention(
+    store: &RocksDbCanonicalStore,
+    config: &CanonicalFollowConfig,
+    step_budget: CanonicalEventRetentionStepBudget,
+    next_event_retention_check: &mut tokio::time::Instant,
+) -> Result<(), CanonicalFollowError> {
+    let Some(window) = config.event_retention_window else {
+        return Ok(());
+    };
+    let now_instant = tokio::time::Instant::now();
+    if now_instant < *next_event_retention_check {
+        return Ok(());
+    }
+    let now = UnixTimestampMillis::now();
+    let window_millis = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+    let cutoff = UnixTimestampMillis::new(now.value().saturating_sub(window_millis));
+    let outcome = store.advance_canonical_event_retention(cutoff, now, step_budget)?;
+    tracing::debug!(
+        target: "zinder::ingest",
+        event = "canonical_event_retention_step",
+        inspected_event_count = outcome.inspected_event_count,
+        pruned_event_count = outcome.report.pruned_event_count,
+        oldest_retained_sequence = outcome.report.oldest_retained_sequence,
+        current_event_sequence = outcome.report.current_event_sequence,
+        lease_protected_sequence = outcome
+            .report
+            .lease_protected_anchor
+            .map(|anchor| anchor.event_cursor().event_sequence()),
+        stop = outcome.stop.label(),
+        "completed bounded canonical event retention pass"
+    );
+    *next_event_retention_check = if outcome.has_immediate_work() {
+        now_instant
+    } else {
+        tokio::time::Instant::now()
+            .checked_add(config.event_retention_check_interval)
+            .unwrap_or_else(tokio::time::Instant::now)
+    };
+    Ok(())
 }
 
 /// The follower's end of the control channel.
@@ -792,14 +851,30 @@ impl ControlInbox {
         self.receiver.is_some()
     }
 
-    /// Applies held writes, then the commands already in the channel, until a
-    /// mempool retention step yields to canonical work or none is left.
-    fn drain(&mut self, store: &mut RocksDbCanonicalStore, tip_confirmation: TipConfirmation) {
-        while let Some(command) = self.held_writes.pop_front().or_else(|| {
-            self.receiver
-                .as_mut()
-                .and_then(|receiver| receiver.try_recv().ok())
-        }) {
+    /// Applies up to one bounded batch of held writes and queued channel
+    /// commands, returning early on cancellation or when a mempool retention
+    /// step yields to canonical work.
+    fn drain(
+        &mut self,
+        store: &mut RocksDbCanonicalStore,
+        tip_confirmation: TipConfirmation,
+        cancel: &CancellationToken,
+    ) {
+        let max_commands = self
+            .held_writes
+            .len()
+            .saturating_add(CANONICAL_CONTROL_COMMAND_CAPACITY);
+        for _ in 0..max_commands {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let Some(command) = self.held_writes.pop_front().or_else(|| {
+                self.receiver
+                    .as_mut()
+                    .and_then(|receiver| receiver.try_recv().ok())
+            }) else {
+                return;
+            };
             if apply_following_canonical_control_command(store, command, tip_confirmation)
                 == CanonicalControlScheduling::YieldToCanonical
             {
@@ -888,6 +963,7 @@ enum FollowIteration {
     },
     Replacement {
         replacement: Box<CanonicalLiveReplacement>,
+        common_parent: BlockId,
         observed_tip: BlockId,
     },
 }
@@ -898,25 +974,34 @@ enum FollowIteration {
 )]
 async fn prepare_follow_iteration<Source>(
     store: &RocksDbCanonicalStore,
-    source: &Source,
-    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    config: CanonicalFollowConfig,
-    cancel: &CancellationToken,
+    follower: &CanonicalFollower<'_, Source>,
 ) -> Result<FollowIteration, CanonicalFollowError>
 where
     Source: NodeSource,
 {
+    let config = &follower.config;
+    let source = follower.source;
+    let cancel = follower.cancel;
+    let network_upgrade_activations = &follower.network_upgrade_activations;
     let anchor = store.append_anchor()?;
     let observed_tip = source_request(config.request_timeout, cancel, source.tip_id()).await?;
     let local_tip = anchor.event_fence().visible_tip();
+    if local_tip != observed_tip {
+        update_follow_wait(
+            follower.readiness,
+            local_tip,
+            Some(observed_tip),
+            config.mempool_ready_gate.as_ref(),
+        );
+    }
     if observed_tip.height < local_tip.height
         || (observed_tip.height == local_tip.height && observed_tip.hash != local_tip.hash)
     {
         return prepare_replacement_iteration(
             store,
             source,
-            network_upgrade_activations,
-            config,
+            Arc::clone(network_upgrade_activations),
+            config.clone(),
             cancel,
             anchor,
             observed_tip,
@@ -949,8 +1034,8 @@ where
         return prepare_replacement_iteration(
             store,
             source,
-            network_upgrade_activations,
-            config,
+            Arc::clone(network_upgrade_activations),
+            config.clone(),
             cancel,
             anchor,
             observed_tip,
@@ -970,7 +1055,7 @@ where
     let predecessor_checkpoint = anchor.tip_checkpoint().clone();
     let raw_blob_retention = store.raw_blob_retention();
     let preparation_started = std::time::Instant::now();
-    let activations_for_prepare = Arc::clone(&network_upgrade_activations);
+    let activations_for_prepare = Arc::clone(network_upgrade_activations);
     let prepared = tokio::task::spawn_blocking(move || {
         prepare_live_block(
             &source_block,
@@ -1252,6 +1337,7 @@ where
             replacement_blocks,
             UnixTimestampMillis::now(),
         )),
+        common_parent,
         observed_tip,
     })
 }
@@ -1494,10 +1580,10 @@ fn prepare_live_block(
     raw_blob_retention: zinder_store::RawBlobRetention,
 ) -> Result<PreparedLiveBlock, CanonicalFollowError> {
     let height = source_block.height;
-    let prepared = prepare_canonical_block(
+    let prepared = prepare_canonical_block_for_retention(
         source_block,
         network_upgrade_activations,
-        raw_blob_policy_for_retention(raw_blob_retention),
+        raw_blob_retention,
     )?;
     let commitments = compact_block_commitments(&prepared)?;
     let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
@@ -1542,7 +1628,7 @@ fn prepare_live_block(
         positioned.tip_metadata,
     )?;
     Ok(PreparedLiveBlock {
-        block: canonical_build_block(positioned, Some(derived_checkpoint), None),
+        block: canonical_build_block(positioned, Some(derived_checkpoint)),
         block_id,
         subtree_root_ranges,
         derived_subtree_roots: accumulator
@@ -1598,10 +1684,18 @@ async fn confirm_live_subtree_roots<Source>(
 where
     Source: NodeSource,
 {
+    let mut observation = SubtreeVerificationObservation::new(
+        prepared
+            .subtree_root_ranges
+            .iter()
+            .map(|range| range.protocol),
+    );
     let source_roots = fetch_live_subtree_roots(source, request_timeout, cancel, prepared).await?;
     if first_differing_subtree_root(&prepared.derived_subtree_roots, &source_roots).is_none() {
+        observation.first_match();
         return Ok(prepared.derived_subtree_roots.clone());
     }
+    observation.begin_recheck();
     source_request(
         request_timeout,
         cancel,
@@ -1612,12 +1706,14 @@ where
     if let Some(differing_root) =
         first_differing_subtree_root(&prepared.derived_subtree_roots, &source_roots)
     {
+        observation.mismatch();
         return Err(CanonicalFollowError::SourceSubtreeRootMismatch {
             height: prepared.block_id.height,
             protocol: differing_root.protocol,
             subtree_index: differing_root.subtree_index,
         });
     }
+    observation.recheck_match();
     Ok(prepared.derived_subtree_roots.clone())
 }
 
@@ -1639,7 +1735,8 @@ where
             cancel,
             source.fetch_subtree_root_range(*range),
         )
-        .await?;
+        .await;
+        let response = response?;
         source_roots.extend(response.subtree_roots.into_iter().map(|root| {
             CanonicalBuildSubtreeRoot {
                 protocol: response.protocol,
@@ -1701,7 +1798,6 @@ async fn source_request<T>(
 async fn await_follow_preparation_or_mempool_change<T>(
     preparation: impl Future<Output = T>,
     mempool_hydration_changes: &mut Option<MempoolReadyGate>,
-    mempool_ready_gate: Option<&MempoolReadyGate>,
     readiness: &ComposedReadiness,
     canonical_tip: BlockId,
 ) -> Option<T> {
@@ -1712,8 +1808,8 @@ async fn await_follow_preparation_or_mempool_change<T>(
                 hydration_changed,
                 mempool_hydration_changes,
                 readiness,
-                mempool_ready_gate,
                 canonical_tip,
+                None,
             );
             None
         }
@@ -1725,53 +1821,47 @@ fn apply_mempool_hydration_change(
     hydration_changed: bool,
     mempool_hydration_changes: &mut Option<MempoolReadyGate>,
     readiness: &ComposedReadiness,
-    mempool_ready_gate: Option<&MempoolReadyGate>,
     canonical_tip: BlockId,
+    observed_tip: Option<BlockId>,
 ) {
+    update_follow_wait(
+        readiness,
+        canonical_tip,
+        observed_tip,
+        mempool_hydration_changes.as_ref(),
+    );
     if !hydration_changed {
         *mempool_hydration_changes = None;
     }
-    withdraw_follow_readiness_for_mempool_hydration(readiness, canonical_tip, mempool_ready_gate);
 }
 
-fn set_follow_readiness(
-    readiness: &ComposedReadiness,
-    store: &RocksDbCanonicalStore,
-    observed_tip: BlockId,
+fn follow_readiness(
+    canonical_tip: BlockId,
+    observed_tip: Option<BlockId>,
     lag_threshold_blocks: u64,
     mempool_ready_gate: Option<&MempoolReadyGate>,
-) {
-    let current_height = store.event_fence().visible_tip().height;
-    let lag = u64::from(
-        observed_tip
-            .height
-            .value()
-            .saturating_sub(current_height.value()),
-    );
-    let state = if lag <= lag_threshold_blocks {
-        ReadinessState::ready_with_target(
-            Some(current_height.value()),
-            Some(observed_tip.height.value()),
-        )
-    } else {
-        ReadinessState::syncing(
+) -> ReadinessState {
+    let current = canonical_tip.height.value();
+    let target = observed_tip.map_or(current, |tip| tip.height.value());
+    let lag = u64::from(target.saturating_sub(current));
+    if lag > lag_threshold_blocks {
+        return ReadinessState::follow_syncing(
+            FollowWaitReason::CanonicalProgress,
             Some(lag),
-            Some(current_height.value()),
-            Some(observed_tip.height.value()),
-        )
-    };
-    metrics::gauge!("zinder_ingest_canonical_lag_blocks").set(f64::from(
-        observed_tip
-            .height
-            .value()
-            .saturating_sub(store.event_fence().visible_tip().height.value()),
-    ));
-    let state = gate_canonical_readiness_on_mempool_hydration(
-        state,
-        store.event_fence().visible_tip(),
-        mempool_ready_gate,
-    );
-    publish_follow_readiness(readiness, state.with_phase(IngestPhase::FollowingTip));
+            Some(current),
+            Some(target),
+        );
+    }
+    if mempool_ready_gate.is_some_and(|gate| !gate.admits_canonical_tip(canonical_tip)) {
+        let wait_reason = if Some(canonical_tip) == observed_tip {
+            FollowWaitReason::MempoolHydrationAtTip
+        } else {
+            FollowWaitReason::CanonicalProgress
+        };
+        return ReadinessState::follow_syncing(wait_reason, None, Some(current), Some(target));
+    }
+    ReadinessState::ready_with_target(Some(current), Some(target))
+        .with_phase(IngestPhase::FollowingTip)
 }
 
 /// Publishes one follow observation as the writer's admission state without
@@ -1796,32 +1886,38 @@ fn publish_follow_readiness(readiness: &ComposedReadiness, state: ReadinessState
     });
 }
 
-fn gate_canonical_readiness_on_mempool_hydration(
-    state: ReadinessState,
-    canonical_tip: BlockId,
-    mempool_ready_gate: Option<&MempoolReadyGate>,
-) -> ReadinessState {
-    if matches!(&state.cause, zinder_runtime::ReadinessCause::Ready)
-        && mempool_ready_gate.is_some_and(|gate| !gate.admits_canonical_tip(canonical_tip))
-    {
-        ReadinessState::syncing(None, state.current_height, state.target_height)
-    } else {
-        state
-    }
-}
-
-fn withdraw_follow_readiness_for_mempool_hydration(
+fn update_follow_wait(
     readiness: &ComposedReadiness,
     canonical_tip: BlockId,
+    observed_tip: Option<BlockId>,
     mempool_ready_gate: Option<&MempoolReadyGate>,
 ) {
-    if mempool_ready_gate.is_none_or(|gate| gate.admits_canonical_tip(canonical_tip)) {
-        return;
-    }
-
+    let waiting_for_mempool =
+        mempool_ready_gate.is_some_and(|gate| !gate.admits_canonical_tip(canonical_tip));
+    let reason = if waiting_for_mempool && observed_tip == Some(canonical_tip) {
+        FollowWaitReason::MempoolHydrationAtTip
+    } else {
+        FollowWaitReason::CanonicalProgress
+    };
     readiness.update_admission(|state| {
-        if state.cause.permits_traffic() {
-            state.cause = ReadinessCause::Syncing { lag_blocks: None };
+        if let ReadinessCause::Syncing { wait_reason, .. } = &mut state.cause {
+            *wait_reason = Some(reason);
+        } else if let Some(target) = observed_tip
+            && matches!(state.cause, ReadinessCause::NodeUnavailable(_))
+        {
+            let current = canonical_tip.height.value();
+            let target = target.height.value();
+            *state = ReadinessState::follow_syncing(
+                reason,
+                Some(u64::from(target.saturating_sub(current))),
+                Some(current),
+                Some(target),
+            );
+        } else if state.cause.permits_traffic() && waiting_for_mempool {
+            state.cause = ReadinessCause::Syncing {
+                lag_blocks: None,
+                wait_reason: Some(reason),
+            };
         }
     });
 }
@@ -1836,6 +1932,7 @@ async fn wait_for_mempool_hydration_change(
 }
 
 fn record_fence_metrics(store: &RocksDbCanonicalStore, observed_tip: BlockId) {
+    store.record_resource_gauges();
     let fence = store.event_fence();
     metrics::gauge!("zinder_ingest_canonical_chain_epoch").set(f64::from(
         u32::try_from(fence.chain_epoch_id().value()).unwrap_or(u32::MAX),
@@ -1857,6 +1954,8 @@ fn record_fence_metrics(store: &RocksDbCanonicalStore, observed_tip: BlockId) {
 mod tests {
     use std::{num::NonZeroU32, time::Duration};
 
+    use tokio_util::sync::CancellationToken;
+
     use zinder_core::{
         BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint,
         CommitmentTreeFrontiers, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootIndex,
@@ -1873,9 +1972,8 @@ mod tests {
     use super::{
         CheckpointComponent, ControlInbox, ReplacementMemory,
         await_follow_preparation_or_mempool_change, differing_checkpoint_component,
-        gate_canonical_readiness_on_mempool_hydration, live_subtree_root_ranges,
-        next_settled_height, publish_follow_readiness, wait_for_mempool_hydration_change,
-        withdraw_follow_readiness_for_mempool_hydration,
+        follow_readiness, live_subtree_root_ranges, next_settled_height, publish_follow_readiness,
+        update_follow_wait, wait_for_mempool_hydration_change,
     };
     use crate::{
         mempool_ready_channel,
@@ -1884,8 +1982,8 @@ mod tests {
         },
     };
     use zinder_runtime::{
-        ComposedReadiness, IngestPhase, Readiness, ReadinessCause, ReadinessInput, ReadinessState,
-        UpstreamHealth, UpstreamNotReadyDetail,
+        ComposedReadiness, FollowWaitReason, IngestPhase, Readiness, ReadinessCause,
+        ReadinessInput, ReadinessState, UpstreamHealth, UpstreamNotReadyDetail,
     };
 
     /// Returns the runtime handle and the writer composition seeded with `admission`.
@@ -1956,7 +2054,8 @@ mod tests {
         assert!(prune_outcome.try_recv().is_err());
         assert!(second_append.try_recv().is_err());
 
-        control.drain(&mut store, TipConfirmation::Confirmed);
+        let cancel = CancellationToken::new();
+        control.drain(&mut store, TipConfirmation::Confirmed, &cancel);
         assert_eq!(first_append.try_recv()??.event_sequence, 1);
         prune_outcome.try_recv()??;
         assert!(
@@ -1964,8 +2063,67 @@ mod tests {
             "a held retention step yields before the next held write"
         );
 
-        control.drain(&mut store, TipConfirmation::Confirmed);
+        control.drain(&mut store, TipConfirmation::Confirmed, &cancel);
         assert_eq!(second_append.try_recv()??.event_sequence, 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn timed_out_mempool_append_does_not_commit_after_replay_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::writer::control::canonical_control_channel;
+
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, commands) = canonical_control_channel();
+        let mut control = ControlInbox::new(Some(commands));
+        let single_event = MempoolEvent::Invalidated {
+            transaction_id: TransactionId::from_bytes([1; 32]),
+            reason: MempoolEvictionReason::Unknown,
+        };
+        let batch_event = MempoolEvent::Invalidated {
+            transaction_id: TransactionId::from_bytes([2; 32]),
+            reason: MempoolEvictionReason::Unknown,
+        };
+
+        let (single_outcome, batch_outcome, ()) = tokio::join!(
+            canonical.append_mempool_event(single_event, UnixTimestampMillis::new(1_000)),
+            canonical.append_mempool_events(vec![(batch_event, UnixTimestampMillis::new(1_001))]),
+            control.serve_reads_until(
+                &store,
+                TipConfirmation::Confirmed,
+                tokio::time::sleep(Duration::from_secs(61)),
+            ),
+        );
+        assert!(single_outcome.is_err());
+        assert!(batch_outcome.is_err());
+
+        let page_size = NonZeroU32::new(4).ok_or("page size must be nonzero")?;
+        let (replay_page, ()) = tokio::join!(
+            canonical.mempool_event_page(None, page_size),
+            control.serve_reads_until(
+                &store,
+                TipConfirmation::Confirmed,
+                tokio::time::sleep(Duration::from_secs(1)),
+            ),
+        );
+        assert_eq!(replay_page?, [] as [zinder_store::MempoolEventEnvelope; 0]);
+
+        let cancel = CancellationToken::new();
+        control.drain(&mut store, TipConfirmation::Confirmed, &cancel);
+        let (durable_page, ()) = tokio::join!(
+            canonical.mempool_event_page(None, page_size),
+            control.serve_reads_until(
+                &store,
+                TipConfirmation::Confirmed,
+                tokio::time::sleep(Duration::from_secs(1)),
+            ),
+        );
+        assert_eq!(
+            durable_page?,
+            [] as [zinder_store::MempoolEventEnvelope; 0],
+            "abandoned mempool appends held during node waits must not commit after replay"
+        );
         Ok(())
     }
 
@@ -2088,7 +2246,8 @@ mod tests {
         assert!(matches!(
             readiness.report().cause,
             ReadinessCause::Syncing {
-                lag_blocks: Some(10)
+                lag_blocks: Some(10),
+                ..
             }
         ));
     }
@@ -2104,73 +2263,75 @@ mod tests {
     fn hydration_marker_does_not_make_a_syncing_canonical_writer_ready() {
         let (signal, gate) = mempool_ready_channel();
         signal.withdraw_certification();
-        let canonical_syncing = ReadinessState::syncing(Some(3), Some(100), Some(103));
         let canonical_tip = block_id(100, 1);
 
-        let while_hydrating = gate_canonical_readiness_on_mempool_hydration(
-            canonical_syncing.clone(),
-            canonical_tip,
-            Some(&gate),
-        );
+        let while_hydrating =
+            follow_readiness(canonical_tip, Some(block_id(103, 2)), 0, Some(&gate));
         assert!(matches!(
             &while_hydrating.cause,
             ReadinessCause::Syncing {
-                lag_blocks: Some(3)
+                lag_blocks: Some(3),
+                wait_reason: Some(FollowWaitReason::CanonicalProgress)
             }
         ));
         assert!(!while_hydrating.cause.permits_traffic());
 
         signal.certify_source_tip(canonical_tip, signal.observe_node_endpoint());
-        let after_marker = gate_canonical_readiness_on_mempool_hydration(
-            canonical_syncing,
-            canonical_tip,
-            Some(&gate),
-        );
+        let after_marker = follow_readiness(canonical_tip, Some(block_id(103, 2)), 0, Some(&gate));
         assert!(matches!(
             &after_marker.cause,
             ReadinessCause::Syncing {
-                lag_blocks: Some(3)
+                lag_blocks: Some(3),
+                wait_reason: Some(FollowWaitReason::CanonicalProgress)
             }
         ));
         assert!(!after_marker.cause.permits_traffic());
     }
 
     #[test]
+    fn a_gated_writer_requires_a_matching_node_tip_for_a_mempool_wait() {
+        let (_signal, gate) = mempool_ready_channel();
+        let canonical_tip = block_id(100, 1);
+        for observed_tip in [Some(block_id(101, 2)), Some(block_id(100, 2)), None] {
+            let state = follow_readiness(canonical_tip, observed_tip, 1, Some(&gate));
+            assert_eq!(
+                state.cause,
+                ReadinessCause::Syncing {
+                    lag_blocks: None,
+                    wait_reason: Some(FollowWaitReason::CanonicalProgress),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn canonical_ready_requires_a_certified_mempool_generation() {
         let (signal, gate) = mempool_ready_channel();
-        let canonical_ready = ReadinessState::ready_with_target(Some(100), Some(100));
         let canonical_tip = block_id(100, 2);
 
-        let while_hydrating = gate_canonical_readiness_on_mempool_hydration(
-            canonical_ready.clone(),
-            canonical_tip,
-            Some(&gate),
-        );
+        let while_hydrating = follow_readiness(canonical_tip, Some(canonical_tip), 0, Some(&gate));
         assert!(matches!(
             &while_hydrating.cause,
-            ReadinessCause::Syncing { .. }
+            ReadinessCause::Syncing {
+                lag_blocks: None,
+                wait_reason: Some(FollowWaitReason::MempoolHydrationAtTip)
+            }
         ));
         assert!(!while_hydrating.cause.permits_traffic());
 
         // A block arrives: canonical ingest commits it before the owner
         // certifies the replacement generation at the same tip.
         signal.certify_source_tip(block_id(99, 1), signal.observe_node_endpoint());
-        let during_tip_transition = gate_canonical_readiness_on_mempool_hydration(
-            canonical_ready.clone(),
-            canonical_tip,
-            Some(&gate),
-        );
+        let during_tip_transition =
+            follow_readiness(canonical_tip, Some(canonical_tip), 0, Some(&gate));
         assert!(
             matches!(&during_tip_transition.cause, ReadinessCause::Ready),
             "block arrival must not withdraw ingest readiness"
         );
 
         signal.certify_source_tip(canonical_tip, signal.observe_node_endpoint());
-        let after_current_marker = gate_canonical_readiness_on_mempool_hydration(
-            canonical_ready,
-            canonical_tip,
-            Some(&gate),
-        );
+        let after_current_marker =
+            follow_readiness(canonical_tip, Some(canonical_tip), 0, Some(&gate));
         assert!(matches!(&after_current_marker.cause, ReadinessCause::Ready));
         assert!(after_current_marker.cause.permits_traffic());
     }
@@ -2192,7 +2353,6 @@ mod tests {
             await_follow_preparation_or_mempool_change(
                 preparation_receiver,
                 &mut hydration_changes,
-                Some(&gate),
                 &composed,
                 canonical_tip,
             ),
@@ -2210,7 +2370,10 @@ mod tests {
         let withdrawn = readiness.report();
         assert!(matches!(
             withdrawn.cause,
-            ReadinessCause::Syncing { lag_blocks: None }
+            ReadinessCause::Syncing {
+                lag_blocks: None,
+                wait_reason: Some(FollowWaitReason::CanonicalProgress)
+            }
         ));
         assert_eq!(withdrawn.current_height, Some(100));
         assert_eq!(withdrawn.target_height, Some(100));
@@ -2220,7 +2383,6 @@ mod tests {
         let interrupted_by_rehydration = await_follow_preparation_or_mempool_change(
             std::future::ready(()),
             &mut hydration_changes,
-            Some(&gate),
             &composed,
             canonical_tip,
         )
@@ -2238,7 +2400,6 @@ mod tests {
         let fresh_observation = await_follow_preparation_or_mempool_change(
             std::future::ready(()),
             &mut hydration_changes,
-            Some(&gate),
             &composed,
             canonical_tip,
         )
@@ -2265,7 +2426,6 @@ mod tests {
             await_follow_preparation_or_mempool_change(
                 preparation_receiver,
                 &mut hydration_changes,
-                Some(&gate),
                 &composed,
                 block_id(100, 1),
             ),
@@ -2284,12 +2444,16 @@ mod tests {
     #[test]
     fn hydration_withdrawal_preserves_canonical_non_ready_authority() {
         let (_signal, gate) = mempool_ready_channel();
-        let canonical_syncing = ReadinessState::syncing(Some(3), Some(100), Some(103))
-            .with_phase(IngestPhase::FollowingTip);
+        let canonical_syncing = ReadinessState::follow_syncing(
+            FollowWaitReason::CanonicalProgress,
+            Some(3),
+            Some(100),
+            Some(103),
+        );
         let (readiness, composed) = writer_readiness(canonical_syncing.clone());
         let canonical_tip = block_id(100, 1);
 
-        withdraw_follow_readiness_for_mempool_hydration(&composed, canonical_tip, Some(&gate));
+        update_follow_wait(&composed, canonical_tip, None, Some(&gate));
 
         let report = readiness.report();
         assert_eq!(report.cause, canonical_syncing.cause);
@@ -2301,7 +2465,6 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn hydration_watch_interrupts_at_tip_wait_on_each_transition() {
         let (signal, gate) = mempool_ready_channel();
-        let canonical_ready = ReadinessState::ready_with_target(Some(100), Some(100));
         let canonical_tip = block_id(100, 1);
         signal.certify_source_tip(canonical_tip, signal.observe_node_endpoint());
 
@@ -2324,11 +2487,7 @@ mod tests {
             Some(true),
             "a reconnect must interrupt the at-tip wait instead of waiting for the poll delay"
         );
-        let withdrawn = gate_canonical_readiness_on_mempool_hydration(
-            canonical_ready.clone(),
-            canonical_tip,
-            Some(&gate),
-        );
+        let withdrawn = follow_readiness(canonical_tip, Some(canonical_tip), 0, Some(&gate));
         assert!(matches!(&withdrawn.cause, ReadinessCause::Syncing { .. }));
 
         let (rehydration_sender, rehydration_receiver) = tokio::sync::oneshot::channel();
@@ -2350,11 +2509,8 @@ mod tests {
             Some(true),
             "snapshot completion must interrupt the wait so canonical state is observed again"
         );
-        let after_fresh_observation = gate_canonical_readiness_on_mempool_hydration(
-            canonical_ready,
-            canonical_tip,
-            Some(&gate),
-        );
+        let after_fresh_observation =
+            follow_readiness(canonical_tip, Some(canonical_tip), 0, Some(&gate));
         assert!(matches!(
             &after_fresh_observation.cause,
             ReadinessCause::Ready

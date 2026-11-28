@@ -418,9 +418,9 @@ pub struct CompactTransparentOutput {
     #[prost(bytes = "vec", tag = "2")]
     pub script_pub_key: ::prost::alloc::vec::Vec<u8>,
 }
-/// Inclusive compact block range request.
+/// Inclusive compact block range in the direction of the requested endpoints.
 #[allow(clippy::all)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CompactBlocksInRangeRequest {
     /// First requested block height.
     #[prost(uint32, tag = "1")]
@@ -432,6 +432,10 @@ pub struct CompactBlocksInRangeRequest {
     /// absent, the server uses the visible epoch at request time.
     #[prost(uint64, optional, tag = "3")]
     pub at_epoch_id: ::core::option::Option<u64>,
+    /// Pools to include. Empty includes every pool. Ascending requests without
+    /// this field work on endpoints that advertise only the v2 capability.
+    #[prost(enumeration = "CompactPool", repeated, tag = "4")]
+    pub pool_types: ::prost::alloc::vec::Vec<i32>,
 }
 /// Single compact block request.
 #[allow(clippy::all)]
@@ -651,7 +655,7 @@ pub struct TransactionStatusResponse {
 /// One message in the \[`CompactBlocksInRange`\] server stream.
 ///
 /// The server sends exactly one `header` message first, then one `item`
-/// message per block in ascending height order, from `start_height` through
+/// message per block in requested height order, from `start_height` through
 /// `end_height`. The header carries the single chain epoch that answers the
 /// whole range; items carry no per-block epoch. A consumer reads the epoch once
 /// and binds every later block to it.
@@ -667,13 +671,105 @@ pub mod compact_blocks_in_range_chunk {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Body {
         /// Leading header carrying the chain epoch that answers the entire range
-        /// (ADR-0019). Sent once, before any item.
+        /// (ADR-0003, ADR-0014). Sent once, before any item.
         #[prost(message, tag = "1")]
         Header(super::ChainView),
         /// Compact block at the next requested height. Sent after the header.
         #[prost(message, tag = "2")]
         Item(super::CompactBlock),
     }
+}
+/// Inclusive range of shielded nullifier blocks in endpoint order.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CompactNullifiersInRangeRequest {
+    /// First requested block height.
+    #[prost(uint32, tag = "1")]
+    pub start_height: u32,
+    /// Last requested block height.
+    #[prost(uint32, tag = "2")]
+    pub end_height: u32,
+    /// Optional chain epoch pin.
+    #[prost(uint64, optional, tag = "3")]
+    pub at_epoch_id: ::core::option::Option<u64>,
+    /// Shielded pools to include. Empty includes every shielded pool.
+    #[prost(enumeration = "CompactPool", repeated, tag = "4")]
+    pub pool_types: ::prost::alloc::vec::Vec<i32>,
+}
+/// Shielded nullifiers from one transaction in consensus order.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CompactTransactionNullifiers {
+    /// Zero-based transaction position in consensus block order.
+    #[prost(uint64, tag = "1")]
+    pub index: u64,
+    /// Transaction identifier in Zcash protocol byte order.
+    #[prost(bytes = "vec", tag = "2")]
+    pub transaction_id: ::prost::alloc::vec::Vec<u8>,
+    /// Sapling spend nullifiers, each exactly 32 consensus bytes.
+    #[prost(bytes = "vec", repeated, tag = "3")]
+    pub sapling_nullifiers: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Orchard action nullifiers, each exactly 32 consensus bytes.
+    #[prost(bytes = "vec", repeated, tag = "4")]
+    pub orchard_nullifiers: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Ironwood action nullifiers, each exactly 32 consensus bytes.
+    #[prost(bytes = "vec", repeated, tag = "5")]
+    pub ironwood_nullifiers: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+}
+/// Block identity and shielded nullifiers without note payloads.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CompactBlockNullifiers {
+    /// Height of the source block.
+    #[prost(uint32, tag = "1")]
+    pub height: u32,
+    /// Canonical block hash in RPC byte order.
+    #[prost(string, tag = "2")]
+    pub block_hash: ::prost::alloc::string::String,
+    /// Canonical parent block hash in RPC byte order.
+    #[prost(string, tag = "3")]
+    pub previous_block_hash: ::prost::alloc::string::String,
+    /// Block time as Unix seconds.
+    #[prost(uint32, tag = "4")]
+    pub time: u32,
+    /// Transactions with nullifiers in the selected pools, in block order.
+    #[prost(message, repeated, tag = "5")]
+    pub transactions: ::prost::alloc::vec::Vec<CompactTransactionNullifiers>,
+}
+/// One leading chain view followed by one nullifier block per height.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CompactNullifiersInRangeChunk {
+    #[prost(oneof = "compact_nullifiers_in_range_chunk::Body", tags = "1, 2")]
+    pub body: ::core::option::Option<compact_nullifiers_in_range_chunk::Body>,
+}
+/// Nested message and enum types in `CompactNullifiersInRangeChunk`.
+pub mod compact_nullifiers_in_range_chunk {
+    #[allow(clippy::all)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Body {
+        /// Chain view pinned for the entire stream.
+        #[prost(message, tag = "1")]
+        Header(super::ChainView),
+        /// Nullifiers for the next block in requested height order.
+        #[prost(message, tag = "2")]
+        Block(super::CompactBlockNullifiers),
+    }
+}
+/// Request the upstream node's recommended marginal fee.
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StandardFeeRequest {}
+/// The upstream node's recommended fee per logical action.
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StandardFeeResponse {
+    /// Recommended fee per logical action, in zatoshis.
+    #[prost(uint64, tag = "1")]
+    pub fee_zat: u64,
+    /// Node fee estimator version. Zero identifies the static estimate.
+    #[prost(uint32, tag = "2")]
+    pub estimator_version: u32,
 }
 /// Tree-state request for one exact block height.
 #[allow(clippy::all)]
@@ -1396,6 +1492,45 @@ pub struct TransparentAddressUnspentOutputsRequest {
     #[prost(uint64, optional, tag = "3")]
     pub at_epoch_id: ::core::option::Option<u64>,
 }
+/// Request the confirmed total balance across a set of transparent addresses.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TransparentAddressBalancesRequest {
+    /// Between 1 and 256 selectors. Duplicate addresses count once.
+    #[prost(message, repeated, tag = "1")]
+    pub addresses: ::prost::alloc::vec::Vec<AddressLookup>,
+    /// Optional chain epoch pin.
+    #[prost(uint64, optional, tag = "2")]
+    pub at_epoch_id: ::core::option::Option<u64>,
+}
+/// Confirmed balance across the requested addresses at one chain epoch.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TransparentAddressBalancesResponse {
+    /// Chain view used for every address.
+    #[prost(message, optional, tag = "1")]
+    pub chain_view: ::core::option::Option<ChainView>,
+    /// Confirmed unspent balance in zatoshis.
+    #[prost(uint64, tag = "2")]
+    pub confirmed_zat: u64,
+    /// Number of distinct addresses included in the total.
+    #[prost(uint32, tag = "3")]
+    pub address_count: u32,
+}
+/// Request the complete unspent output set across transparent addresses.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TransparentAddressesUnspentOutputsRequest {
+    /// Between 1 and 256 selectors. Duplicate addresses count once.
+    #[prost(message, repeated, tag = "1")]
+    pub addresses: ::prost::alloc::vec::Vec<AddressLookup>,
+    /// Minimum mined height to include. Zero includes all retained heights.
+    #[prost(uint32, tag = "2")]
+    pub start_height: u32,
+    /// Optional chain epoch pin.
+    #[prost(uint64, optional, tag = "3")]
+    pub at_epoch_id: ::core::option::Option<u64>,
+}
 /// One unspent transparent output streamed by
 /// \[`TransparentAddressUnspentOutputs`\].
 #[allow(clippy::all)]
@@ -1441,7 +1576,7 @@ pub mod transparent_unspent_outputs_chunk {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Body {
         /// Leading header carrying the chain epoch pinned for the entire stream
-        /// (ADR-0019). Sent once, before any item.
+        /// (ADR-0003, ADR-0014). Sent once, before any item.
         #[prost(message, tag = "1")]
         Header(super::ChainView),
         /// One unspent transparent output. Sent after the header.
@@ -1643,7 +1778,7 @@ pub mod transparent_address_tx_ids_chunk {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Body {
         /// Leading header carrying the chain epoch pinned for the entire stream
-        /// (ADR-0019). Sent once, before any item.
+        /// (ADR-0003, ADR-0014). Sent once, before any item.
         #[prost(message, tag = "1")]
         Header(super::ChainView),
         /// One indexed transparent-address tx-history entry. Sent after the header.
@@ -1686,6 +1821,43 @@ impl MaterializedViewHealth {
             "MATERIALIZED_VIEW_HEALTH_LIVE" => Some(Self::Live),
             "MATERIALIZED_VIEW_HEALTH_CATCHING_UP" => Some(Self::CatchingUp),
             "MATERIALIZED_VIEW_HEALTH_PAUSED" => Some(Self::Paused),
+            _ => None,
+        }
+    }
+}
+/// Pool whose scan fields a compact block stream includes.
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CompactPool {
+    Unspecified = 0,
+    Sapling = 1,
+    Orchard = 2,
+    Ironwood = 3,
+    Transparent = 4,
+}
+impl CompactPool {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "COMPACT_POOL_UNSPECIFIED",
+            Self::Sapling => "COMPACT_POOL_SAPLING",
+            Self::Orchard => "COMPACT_POOL_ORCHARD",
+            Self::Ironwood => "COMPACT_POOL_IRONWOOD",
+            Self::Transparent => "COMPACT_POOL_TRANSPARENT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "COMPACT_POOL_UNSPECIFIED" => Some(Self::Unspecified),
+            "COMPACT_POOL_SAPLING" => Some(Self::Sapling),
+            "COMPACT_POOL_ORCHARD" => Some(Self::Orchard),
+            "COMPACT_POOL_IRONWOOD" => Some(Self::Ironwood),
+            "COMPACT_POOL_TRANSPARENT" => Some(Self::Transparent),
             _ => None,
         }
     }
@@ -1800,13 +1972,19 @@ impl BroadcastRejectionReason {
         }
     }
 }
-/// Chain-event stream family. Visible receives every chain event. Settled
-/// receives only non-reorg commits entirely at or below the settled tip.
+/// Selects which block ranges a ChainEvents subscription delivers.
 #[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ChainEventStreamFamily {
+    /// Every visible canonical transition, including reorgs.
     Visible = 0,
+    /// One ChainCommitted event for each advance of the settled tip.
+    ///
+    /// The inclusive range starts just above the previous settled tip (at the
+    /// first stored height for the baseline) and ends at the new settled tip.
+    /// The cursor is anchored at that settled block. Settled never receives
+    /// ChainReorged.
     Settled = 1,
 }
 impl ChainEventStreamFamily {
@@ -2128,6 +2306,63 @@ pub mod wallet_query_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Stream shielded nullifiers for an inclusive height range.
+        pub async fn compact_nullifiers_in_range(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CompactNullifiersInRangeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<
+                tonic::codec::Streaming<super::CompactNullifiersInRangeChunk>,
+            >,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/zinder.v1.wallet.WalletQuery/CompactNullifiersInRange",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "zinder.v1.wallet.WalletQuery",
+                        "CompactNullifiersInRange",
+                    ),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        /// Return the verified upstream node's recommended marginal fee.
+        pub async fn standard_fee(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StandardFeeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::StandardFeeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/zinder.v1.wallet.WalletQuery/StandardFee",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("zinder.v1.wallet.WalletQuery", "StandardFee"));
+            self.inner.unary(req, path, codec).await
+        }
         /// Return one full serialized block at a given height. Served from the
         /// stored block blob, present only when the writer deployment retains
         /// block blobs (`storage.raw_blob_policy = "all"`); otherwise NOT_FOUND.
@@ -2337,7 +2572,9 @@ pub mod wallet_query_client {
                 );
             self.inner.unary(req, path, codec).await
         }
-        /// Stream replayable chain events.
+        /// Stream replayable chain events. From contract revision 12, a subscription
+        /// whose resolved family is Settled carries initial gRPC metadata
+        /// `zinder-chain-event-family: settled`, including when resuming from a cursor.
         pub async fn chain_events(
             &mut self,
             request: impl tonic::IntoRequest<super::ChainEventsRequest>,
@@ -2448,6 +2685,70 @@ pub mod wallet_query_client {
                     GrpcMethod::new(
                         "zinder.v1.wallet.WalletQuery",
                         "TransparentAddressUnspentOutputs",
+                    ),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        /// Return the confirmed unspent balance across the requested addresses.
+        pub async fn transparent_address_balances(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TransparentAddressBalancesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TransparentAddressBalancesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/zinder.v1.wallet.WalletQuery/TransparentAddressBalances",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "zinder.v1.wallet.WalletQuery",
+                        "TransparentAddressBalances",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Stream complete unspent output sets across the requested addresses.
+        pub async fn transparent_addresses_unspent_outputs(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::TransparentAddressesUnspentOutputsRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<
+                tonic::codec::Streaming<super::TransparentUnspentOutputsChunk>,
+            >,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/zinder.v1.wallet.WalletQuery/TransparentAddressesUnspentOutputs",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "zinder.v1.wallet.WalletQuery",
+                        "TransparentAddressesUnspentOutputs",
                     ),
                 );
             self.inner.server_streaming(req, path, codec).await
@@ -2686,6 +2987,31 @@ pub mod wallet_query_server {
             tonic::Response<Self::CompactBlocksInRangeStream>,
             tonic::Status,
         >;
+        /// Server streaming response type for the CompactNullifiersInRange method.
+        type CompactNullifiersInRangeStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<
+                    super::CompactNullifiersInRangeChunk,
+                    tonic::Status,
+                >,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Stream shielded nullifiers for an inclusive height range.
+        async fn compact_nullifiers_in_range(
+            &self,
+            request: tonic::Request<super::CompactNullifiersInRangeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::CompactNullifiersInRangeStream>,
+            tonic::Status,
+        >;
+        /// Return the verified upstream node's recommended marginal fee.
+        async fn standard_fee(
+            &self,
+            request: tonic::Request<super::StandardFeeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::StandardFeeResponse>,
+            tonic::Status,
+        >;
         /// Return one full serialized block at a given height. Served from the
         /// stored block blob, present only when the writer deployment retains
         /// block blobs (`storage.raw_blob_policy = "all"`); otherwise NOT_FOUND.
@@ -2774,7 +3100,9 @@ pub mod wallet_query_server {
             >
             + std::marker::Send
             + 'static;
-        /// Stream replayable chain events.
+        /// Stream replayable chain events. From contract revision 12, a subscription
+        /// whose resolved family is Settled carries initial gRPC metadata
+        /// `zinder-chain-event-family: settled`, including when resuming from a cursor.
         async fn chain_events(
             &self,
             request: tonic::Request<super::ChainEventsRequest>,
@@ -2821,6 +3149,31 @@ pub mod wallet_query_server {
             request: tonic::Request<super::TransparentAddressUnspentOutputsRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::TransparentAddressUnspentOutputsStream>,
+            tonic::Status,
+        >;
+        /// Return the confirmed unspent balance across the requested addresses.
+        async fn transparent_address_balances(
+            &self,
+            request: tonic::Request<super::TransparentAddressBalancesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TransparentAddressBalancesResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the TransparentAddressesUnspentOutputs method.
+        type TransparentAddressesUnspentOutputsStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<
+                    super::TransparentUnspentOutputsChunk,
+                    tonic::Status,
+                >,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Stream complete unspent output sets across the requested addresses.
+        async fn transparent_addresses_unspent_outputs(
+            &self,
+            request: tonic::Request<super::TransparentAddressesUnspentOutputsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::TransparentAddressesUnspentOutputsStream>,
             tonic::Status,
         >;
         /// Server streaming response type for the TransparentAddressTxIdsInRange method.
@@ -3237,6 +3590,104 @@ pub mod wallet_query_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/zinder.v1.wallet.WalletQuery/CompactNullifiersInRange" => {
+                    #[allow(non_camel_case_types)]
+                    struct CompactNullifiersInRangeSvc<T: WalletQuery>(pub Arc<T>);
+                    impl<
+                        T: WalletQuery,
+                    > tonic::server::ServerStreamingService<
+                        super::CompactNullifiersInRangeRequest,
+                    > for CompactNullifiersInRangeSvc<T> {
+                        type Response = super::CompactNullifiersInRangeChunk;
+                        type ResponseStream = T::CompactNullifiersInRangeStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::CompactNullifiersInRangeRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as WalletQuery>::compact_nullifiers_in_range(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CompactNullifiersInRangeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/zinder.v1.wallet.WalletQuery/StandardFee" => {
+                    #[allow(non_camel_case_types)]
+                    struct StandardFeeSvc<T: WalletQuery>(pub Arc<T>);
+                    impl<
+                        T: WalletQuery,
+                    > tonic::server::UnaryService<super::StandardFeeRequest>
+                    for StandardFeeSvc<T> {
+                        type Response = super::StandardFeeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::StandardFeeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as WalletQuery>::standard_fee(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StandardFeeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
@@ -3745,6 +4196,113 @@ pub mod wallet_query_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = TransparentAddressUnspentOutputsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/zinder.v1.wallet.WalletQuery/TransparentAddressBalances" => {
+                    #[allow(non_camel_case_types)]
+                    struct TransparentAddressBalancesSvc<T: WalletQuery>(pub Arc<T>);
+                    impl<
+                        T: WalletQuery,
+                    > tonic::server::UnaryService<
+                        super::TransparentAddressBalancesRequest,
+                    > for TransparentAddressBalancesSvc<T> {
+                        type Response = super::TransparentAddressBalancesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::TransparentAddressBalancesRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as WalletQuery>::transparent_address_balances(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = TransparentAddressBalancesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/zinder.v1.wallet.WalletQuery/TransparentAddressesUnspentOutputs" => {
+                    #[allow(non_camel_case_types)]
+                    struct TransparentAddressesUnspentOutputsSvc<T: WalletQuery>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: WalletQuery,
+                    > tonic::server::ServerStreamingService<
+                        super::TransparentAddressesUnspentOutputsRequest,
+                    > for TransparentAddressesUnspentOutputsSvc<T> {
+                        type Response = super::TransparentUnspentOutputsChunk;
+                        type ResponseStream = T::TransparentAddressesUnspentOutputsStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::TransparentAddressesUnspentOutputsRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as WalletQuery>::transparent_addresses_unspent_outputs(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = TransparentAddressesUnspentOutputsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

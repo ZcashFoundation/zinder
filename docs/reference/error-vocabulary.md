@@ -25,9 +25,22 @@ Transport refusals, which happen before any handler runs, carry no
 `ErrorInfo`. [Configuration](configuration.md#public-grpc-listeners) lists
 them with their status codes.
 
+A response whose client stops reading it ends at the send-stall deadline with
+an HTTP/2 stream reset (`RST_STREAM` with `CANCEL`) instead of a status.
+Clients built on grpc-go, grpc-java, and tonic with its `server` feature
+report it as `CANCELLED` with no `ErrorInfo`. gRPC Swift on SwiftNIO reports `UNAVAILABLE`, and other
+clients, or a proxy in front of Zinder, may report it differently.
+`zinder-client` classifies it as `RetryPolicy::RetryWithBackoff`.
+
 A node that rejects a broadcast transaction is not an error. The response
 carries a `BroadcastRejectionReason` verdict instead, as
 [ADR-0018](../adrs/0018-transaction-facts-status-and-broadcast.md) describes.
+
+## Retry pushback
+
+Zinder sends `grpc-retry-pushback-ms` as trailing metadata, including on trailers-only responses, when it refuses a call for admission, overload, or readiness. Wallet listener range admission uses a fixed delay of 250 milliseconds, and `SERVED_TIP_MISMATCH` uses 1,000 milliseconds. Other retryable refusals with pushback use a delay selected from 500 to 1,500 milliseconds. A value of `-1` stops automatic retries on the current call. Examples include a schema mismatch and a [projector parked at its wallet transition limit](readiness.md#projector).
+
+Apply the delay to calls that your retry policy permits you to retry. A pushback delay alone does not make transaction submission safe to retry. See the [gRPC retry specification](https://github.com/grpc/proposal/blob/master/A6-client-retries.md).
 
 ## Retry dispositions
 
@@ -47,6 +60,7 @@ than the wire disposition:
 | `RetryWithBackoff` | Retry with exponential backoff. |
 | `RefreshChainEpoch` | Read the current epoch again and restart the whole epoch-bound operation. Retrying the same pinned request cannot succeed. |
 | `RestartFromEarliestRetained` | Resubscribe to chain events from the earliest retained event and rebuild derived state from there. |
+| `RefreshMempoolSnapshot` | Discard the expired cursor and any partial snapshot. Start a new mempool snapshot and subscribe from its events resume cursor. |
 | `OperatorActionRequired` | Alert an operator. Do not retry until the deployment changes. |
 | `ClientError` | Fix the request. |
 
@@ -57,6 +71,7 @@ match error.retry_policy() {
     RetryPolicy::RetryWithBackoff => retry_with_backoff(),
     RetryPolicy::RefreshChainEpoch => restart_at_current_epoch(),
     RetryPolicy::RestartFromEarliestRetained => resubscribe_from_earliest(),
+    RetryPolicy::RefreshMempoolSnapshot => restart_mempool_snapshot(),
     RetryPolicy::ClientError => fix_request(),
     _ => alert_operator(),
 }
@@ -102,10 +117,9 @@ with a `type` and `subject`.
 
 | Reason | Meaning |
 | --- | --- |
-| `BROADCAST_DISABLED` | Defined for a server that cannot broadcast, but current servers do not return it. Without `[node]`, broadcast is not advertised and fails with `ENDPOINT_CAPABILITY_UNAVAILABLE` instead. |
 | `CHAIN_EVENT_CURSOR_EXPIRED` | The cursor is older than retained chain events. Client policy: `RestartFromEarliestRetained`. |
-| `MEMPOOL_EVENT_CURSOR_EXPIRED` | The cursor is older than retained mempool events. Client policy: `OperatorActionRequired`, so the Rust client does not recover on its own. To continue, read a new `MempoolSnapshot` and follow `MempoolEvents` from its `events_resume_cursor`. |
-| `SNAPSHOT_PAGE_CURSOR_EXPIRED` | A `MempoolSnapshot` page cursor is anchored ahead of the mempool events the writer has applied. Client policy: `OperatorActionRequired`, so the Rust client does not recover on its own. To continue, start the snapshot walk again from the first page. |
+| `MEMPOOL_EVENT_CURSOR_EXPIRED` | The event cursor is older than retained mempool events. The client reports `RefreshMempoolSnapshot`. |
+| `SNAPSHOT_PAGE_CURSOR_EXPIRED` | The snapshot page cursor is ahead of the writer’s applied events, or its pinned multi-page snapshot is no longer retained after the writer’s applied events moved on. The client reports `RefreshMempoolSnapshot`. |
 | `CHAIN_EPOCH_PIN_UNAVAILABLE` | The pinned epoch is no longer retained. A `TransparentAddressUnspentOutputs` or `FullBlocksInRange` stream can also end with it after sending items, when its serving pair is released or replaced. Discard the partial result and read again at a newer epoch. Client policy: `RefreshChainEpoch`. |
 | `SCHEMA_MISMATCH` | The store's schema does not match the running binary. |
 | `SCHEMA_TOO_NEW` | A newer Zinder wrote the store. Rolling back is unsafe. |
@@ -155,6 +169,7 @@ data may be corrupt.
 | --- | --- |
 | `TREE_STATE_REPLAY_LIMIT_REACHED` | `TreeStateAtHeight` named a height without a stored checkpoint while the server was already rebuilding one tree state per CPU, and either no rebuild slot freed within the wait (2 seconds by default) or every waiting place was already taken (64 per slot by default), in which case the request is refused at once. A height with a stored checkpoint is never refused this way. |
 | `COMPACT_BLOCK_STREAM_LIMIT_REACHED` | Native `CompactBlocksInRange` was refused because the server already serves its limit of open streams (100 by default). A slot frees when an open stream ends or the client drops it and its outstanding read finishes. The lightwalletd `GetBlockRange` has its own limit and does not carry this reason. |
+| `FORWARDED_READ_LIMIT_REACHED` | A wallet read the server forwards to its node, such as a mined transaction body the store omits, found every slot of its kind taken, and either no slot freed within `query.forwarded_read_wait_ms` (10 seconds by default) or every waiting place was already taken (64 per slot by default), in which case the request is refused at once. The lightwalletd surface refuses the same reads with `UNAVAILABLE` and no reason. |
 
 ### `UNAVAILABLE`
 
@@ -162,8 +177,11 @@ data may be corrupt.
 
 | Reason | Meaning |
 | --- | --- |
+| `BLOCK_RANGE_ADMISSION_REFUSED` | The public wallet listener refused a native `CompactBlocksInRange`, `CompactNullifiersInRange`, or `FullBlocksInRange` call because its client quota or tracking table was full, or the listener was shedding new ranges. The response attaches `grpc-retry-pushback-ms: 250`. Back off and retry on the existing connection. Lightwalletd range refusals carry the same code and pushback without `zinder.dev` ErrorInfo. |
 | `NODE_UNAVAILABLE` | The node is unreachable or failing. A broadcast also returns it, without sending, until one configured endpoint passes first-contact verification and whenever every verified endpoint is unreachable. The writer's mempool returns it while it hydrates from the node, and query forwards that for mempool calls. |
-| `STORAGE_UNAVAILABLE` | Local storage cannot serve the request. The writer also returns it for a control request that its store owner did not answer within 60 seconds or stopped before answering. Native query forwards it for mempool calls when the owner has stopped. Native query gives up on ingest control after 15 seconds, so a stalled owner reaches its callers as `UPSTREAM_UNREACHABLE`. |
+| `NODE_RATE_LIMITED` | The node refused a forwarded call with HTTP 429 because it already holds its JSON-RPC connection limit, 100 by default on Zebra. The node is up. The response carries [retry pushback](#retry-pushback). A broadcast tries the next verified endpoint first and returns this reason only when no endpoint accepted the transaction. |
+| `SERVED_TIP_MISMATCH` | A forwarded transparent UTXO or balance lookup in light-wallet serving answered at a different tip than the reader's served tip, or consecutive UTXO pages disagreed at that tip. The node is up. Retry after the delay in [retry pushback](#retry-pushback). |
+| `STORAGE_UNAVAILABLE` | Local storage cannot serve the request. Native query forwards this reason for mempool reads and stream establishment when the writer’s store owner stalls or stops. The writer reserves up to one second of the caller’s deadline to return the refusal. Reads without a deadline and owner writes retain the 60-second bound. |
 | `UPSTREAM_UNREACHABLE` | A configured federated endpoint, such as the explorer's wallet query endpoint or native query's ingest control, is temporarily unreachable. |
 | `SERVICE_NOT_READY` | The process is alive but not ready. Metadata: `readiness_cause`, a label from [Readiness](readiness.md#readiness-causes). With `canonical_store_damaged`, retrying does not succeed until an operator rebuilds the canonical store. |
 | `NO_VISIBLE_CHAIN_EPOCH` | No chain epoch has been committed yet. |
@@ -172,7 +190,7 @@ data may be corrupt.
 | `UNSUPPORTED_CHAIN_EVENT` | This binary cannot represent the requested event variant. |
 | `UNSUPPORTED_BLOCK_SELECTOR` | This binary cannot represent the requested selector. |
 | `UNSUPPORTED_TRANSACTION_STATUS` | A transaction status cannot be encoded on the wire. |
-| `UNSUPPORTED_WALLET_ENCODING` | A value has no representation in the wallet protocol. |
+| `UNSUPPORTED_WALLET_ENCODING` | A value has no representation in the wallet protocol, or a single mempool entry exceeds the `MempoolSnapshot` response budget. |
 
 ### `UNIMPLEMENTED`
 

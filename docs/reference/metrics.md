@@ -17,11 +17,12 @@ Conventions:
   `zinder_readiness_*` and `zinder_materialized_view_identity_info` series.
   Your scrape configuration supplies the target identity for the rest.
 - A histogram whose name ends in `_duration_seconds` exports Prometheus
-  buckets, and so does
-  `zinder_grpc_request_receive_slots_held_at_admission`. Other histograms
+  buckets, as do
+  `zinder_grpc_request_receive_slots_held_at_admission` and the wallet RPC
+  block-count histogram `zinder_wallet_rpc_block_range_blocks`. Other histograms
   export as summaries with quantiles.
-- A series appears only after its first sample. For example, a runtime that
-  has not broadcast yet exports no broadcast series.
+- Unless noted below, a series appears only after its first sample. For
+  example, a runtime that has not broadcast yet exports no broadcast series.
 - Each runtime folds new histogram samples into their buckets or summaries
   every five seconds, so its metrics memory stays bounded when nothing
   scrapes `/metrics`.
@@ -34,7 +35,8 @@ both the reference Compose Prometheus and the local
 
 | Alert | Fires when | What it means |
 | --- | --- | --- |
-| `ZinderTargetDown` | A scrape target is down for 30 seconds. | The process or its operational endpoint is gone. |
+| `ZinderTargetDown` | A configured target fails scrapes for 30 seconds. | Check the process, listener, and scrape path. |
+| `ZinderTargetMissing` | An expected target has no current scrape series for 30 seconds. | Check discovery, role, and instance against the topology's inventory. |
 | `ZinderServiceNotReady` | `zinder_readiness_state` reports a refusing cause for 1 minute. | The runtime refuses traffic. Read its `/readyz`. |
 | `ZinderReadinessWarning` | `cursor_at_risk` for 5 minutes. | A chain-event consumer is close to losing its cursor. |
 | `ZinderServingPairStale` | `serving_pair_stale` for 1 minute. | A reader serves an older attested chain view and stops when the staleness ceiling passes. |
@@ -48,8 +50,21 @@ both the reference Compose Prometheus and the local
 | `ZinderStoreWalGrowth` | A store's WAL is above 75% of its limit for 5 minutes. | Flushes stall. See [Bulk catch-up resource tuning](../runbooks/bulk-catchup-resource-tuning.md). |
 | `ZinderStartupOpenStorageSlow` | p95 of the `open_storage` startup phase is above 60 seconds. | Opening storage is slow, usually from WAL replay or disk contention. |
 
-A wallet-serving reader answers 200 on `/readyz` during a node outage, so watch
-the dependency gauge and the served-chain age, not only HTTP status.
+The **Scrape Targets** panel reads `zinder:target_scrape_status`. Each
+expected target has a value of 1 (up), 0 (down), or −1 (missing). A stale series or a last
+scrape older than 45 seconds counts as missing, including a job removed on
+reload. With evaluations on schedule, the 30-second alert hold expires within
+90 seconds of the final sample in Compose or 80 seconds in the local smoke.
+An explicit stale marker can shorten that interval. Compose expects
+`zinder-index` and `zinder-serve` (aggregating supervised reader metrics under
+`zinder_supervisor_ready` and `zinder_supervisor_role_ready` on `:9108`), while
+individual `zinder run <role>` processes expose per-role targets. Keep the
+independent expected-target rules in step with intentional topology or
+scrape-address changes. Monitor the collector from outside it.
+
+Wallet and light-wallet readers can answer 200 on `/readyz` during a node
+outage. Watch the dependency gauge and the served-chain age. See
+[During a node outage](readiness.md#during-a-node-outage).
 
 Other signals that need attention when they keep rising:
 
@@ -79,15 +94,25 @@ Other signals that need attention when they keep rising:
   listener with `trust_proxy_client_address` set without one valid client
   address header, so they count against the proxy's own connection. Check
   that the proxy replaces the header on every request, and that nothing else
-  reaches the listener.
+  reaches the listener. The supervisor's headerless loopback health checks
+  use their own connection and leave this counter unchanged.
 - `zinder_wallet_serving_missing_table_file_pairs_total` rising with most
   publications: store files are replaced faster than serving pairs, as during
   a manual compaction.
+- `zinder_store_rocksdb_ticker{store_role="canonical_secondary",ticker="rocksdb.no.file.opens"}`
+  (or `store_role="wallet_secondary"`) rising while the served fence is
+  unchanged: SST table readers are being evicted and reopened. Under direct
+  reads, each reopen prefetches the SST tail (~0.4 MB) outside the block cache
+  and its miss counters. Zero steady-state growth after warm-up is the healthy
+  baseline.
 
 ## Every runtime
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
+| `zinder_process_start_time_seconds` | gauge | | Linux process start in Unix seconds from kernel boot time and start ticks. Compare within one target to detect observed restarts. |
+| `zinder_process_rss_bytes` | gauge | | Resident bytes at scrape time from Linux `VmRSS`. |
+| `zinder_process_rss_anon_bytes` | gauge | | Anonymous resident bytes at scrape time from Linux `RssAnon`. |
 | `zinder_build_info` | gauge | `service`, `version`, `git_commit`, `network` | Always 1. Identifies the build. |
 | `zinder_readiness_state` | gauge | `service`, `network`, `cause` | 1 for the current [readiness cause](readiness.md#readiness-causes), 0 for the others. |
 | `zinder_readiness_dependency_state` | gauge | `service`, `network`, `input`, `cause` | 1 for each dependency's current cause. Includes a writer halt read through a dependency. |
@@ -96,9 +121,17 @@ Other signals that need attention when they keep rising:
 | `zinder_readiness_replica_lag_chain_epochs` | gauge | `service`, `network` | Lag of a current `replica_lagging` or `serving_pair_stale` cause, otherwise 0. |
 | `zinder_readiness_served_epoch_age_seconds` | gauge | `service`, `network` | Wallet-serving readers: seconds since the writer committed the served chain state. |
 | `zinder_materialized_view_identity_info` | gauge | `service`, `network`, `identity` | 1 for each Explorer view store identity the runtime admitted. |
+| `zinder_supervisor_ready` | gauge | `mode`, `preset`, `network` | 1 when the `zinder serve` or `zinder index` supervisor's required roles are all ready. |
+| `zinder_supervisor_role_ready` | gauge | `role`, `network` | 1 when the supervised role reports ready on its loopback `/readyz`, 0 otherwise. |
 | `zinder_startup_phase_duration_seconds` | histogram | `phase`, `outcome` | Duration of each [startup phase](../architecture/service-operations.md). |
 
-The projector exports only these series. Its wallet store exports no
+Process gauges use scrape target labels. An unavailable kernel field is absent.
+A process that starts and exits between scrapes needs lifecycle event evidence.
+For the single-volume image use the ingest cgroup series once per container.
+Ingest's existing `zinder_ingest_process_rss_*` series also sample its own process.
+
+Besides these series, the projector exports only its
+[wallet build stages](#zinder-projector). Its wallet store exports no
 `zinder_store_*` metrics.
 
 ## zinder-ingest
@@ -117,6 +150,9 @@ The projector exports only these series. Its wallet store exports no
 | `zinder_ingest_canonical_live_commit_seconds` | histogram | | Time to commit one appended block. |
 | `zinder_ingest_canonical_live_replacement_prepare_seconds` | histogram | | Time to prepare one replacement block. |
 | `zinder_ingest_canonical_live_replacement_commit_seconds` | histogram | | Time to commit one replacement. |
+| `zinder_ingest_subtree_root_verifications_total` | counter | `pool`, `outcome` | Source comparisons of nonempty subtree-root batches during construction and following. Each batch records one terminal outcome. |
+| `zinder_ingest_subtree_root_verification_duration_seconds` | histogram | `pool`, `outcome` | Elapsed time for the batch, including source reads, checkpoint confirmation when required, and any recheck. |
+| `zinder_ingest_subtree_root_recheck_duration_seconds` | histogram | `pool`, `outcome` | Portion of the batch duration spent after the first disagreement, including any interrupted recheck. |
 | `zinder_ingest_canonical_fork_discoveries_total` | counter | | Forks found and prepared for replacement. |
 | `zinder_ingest_canonical_fork_discovery_seconds` | histogram | | Time to find where a fork starts. |
 | `zinder_ingest_canonical_fork_trigger_block_reads_total` | counter | | Node block reads whose parent did not match the store's tip. |
@@ -144,15 +180,24 @@ The projector exports only these series. Its wallet store exports no
 | `zinder_explorer_views_admitted` | gauge | | 1 when ingest admitted its Explorer view store. |
 | `zinder_ingest_raw_blob_disabled_total` | counter | `table` | Rows stored without raw bytes under the raw-blob policy. |
 
+A single-pool batch names its shielded protocol. Batches covering multiple pools use `multiple`.
+A subtree batch records `first_match`, `recheck_match`, `mismatch` after a
+second disagreement, or `interrupted` when verification ends before a
+decision. Compare these observations with node
+request counts and durations by RPC method to measure transport work.
+
 ### Fresh construction
 
 These series describe the first sync. They stay flat while ingest follows.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
+| `zinder_ingest_construction_loaded_height` | gauge | | Highest block height staged into the canonical store builder during fresh construction. Starts at the build plan's predecessor height (`0` for a genesis build, or the configured checkpoint height), updates at a bounded cadence as blocks load, and stops at `zinder_ingest_construction_target_height` when block loading finishes. |
+| `zinder_ingest_construction_target_height` | gauge | | Fixed target tip height of the fresh canonical store construction. |
 | `zinder_ingest_canonical_construction_phase_duration_seconds` | histogram | `phase` | Duration of each completed construction phase: `construction_range` (pick the build tip), `block_load` (fetch, prepare, and load every block), `source_families` (check subtree roots and the tip against the node), and `publication`. One sample per phase per run; read `_sum`, because a long run exceeds the largest bucket. |
 | `zinder_ingest_canonical_block_construction_stage_duration_seconds` | histogram | `stage`, `status` | Duration of each block-preparation stage. |
-| `zinder_ingest_canonical_block_load_stage_duration_seconds` | histogram | `stage` | Per-block time in the single-threaded loader that follows preparation. `receive_wait` is time spent idle waiting for the next prepared block; when it dominates, the node or preparation is the bottleneck, not the loader. The other stages are `commitment_extract`, `tree_hashing_append`, `position`, `tree_hashing_checkpoint` (checkpoint heights only), and `tree_hashing_final_roots` (explorer builds only). The stages do not overlap, and the `tree_hashing_*` stages are all of the loader's commitment-tree hashing: sum them for its serial hashing cost. |
+| `zinder_ingest_canonical_block_load_stage_duration_seconds` | histogram | `stage` | Stage time on the ordered tree-staging path that follows block preparation. `receive_wait` is time spent idle waiting for the next prepared block; when it dominates, the node or preparation is the bottleneck, not tree hashing or SST staging. The other stages are `commitment_extract`, `tree_hashing_append`, `position`, `tree_hashing_checkpoint` (batches or blocks with checkpoints), and `tree_hashing_final_roots` (explorer builds only). With `ingest.construction.tree_hashing_workers` at 1, all stages run serially on the loader thread and the `tree_hashing_*` stages sum to serial commitment-tree hashing cost. With more workers, `tree_hashing_append`, `tree_hashing_checkpoint`, and `tree_hashing_final_roots` measure batch wall time on the tree-staging thread while `RocksDB` SST staging runs concurrently on the store loader thread. |
+| `zinder_ingest_canonical_tree_append_duration_seconds` | histogram | `pool` | Parallel decode and commitment-tree append duration per shielded pool (`sapling`, `orchard`, `ironwood`) across batched canonical block appends. |
 | `zinder_store_canonical_block_load_stage_duration_seconds` | histogram | `stage` | Per-block time the store spends on a loaded block: `validate`, `encode` (the compact block, tree-state checkpoint, and final-root values, once each), `sequence` (counts and the ordered fact digest), and `write` (hand the rows to the staged files and sort runs). |
 | `zinder_store_canonical_block_load_finish_duration_seconds` | histogram | `step`, `family` | Time per column family to finish the load after the last block: `sst_finish` closes a height-ordered family's last file, `sort_merge` merges a hash-keyed family's sorted runs and writes its files, and `ingest` hands the family's files to RocksDB. One sample per step per run; read `_sum`. |
 | `zinder_ingest_canonical_historical_prevout_reads_total` | counter | | Always 0. Marks a read construction never makes: spent outputs from earlier blocks. |
@@ -175,6 +220,7 @@ These series describe the first sync. They stay flat while ingest follows.
 | `zinder_ingest_source_segment_reassembly_segments` | gauge | | Fetched segments waiting to be emitted in order. |
 | `zinder_ingest_source_segment_reassembly_bytes` | gauge | | Bytes of those segments. |
 | `zinder_ingest_source_segment_connected_blocks_total` | counter | | Blocks received in segments. |
+| `zinder_ingest_source_segment_updates` | histogram | | Chain updates returned by each successful segment request. |
 | `zinder_ingest_source_segment_response_payload_bytes` | histogram | | Response size of each segment. |
 | `zinder_ingest_source_segment_reserved_response_bytes` | histogram | | Bytes reserved for each segment request. |
 | `zinder_ingest_source_segment_reservation_undersized_total` | counter | | Segments larger than their reservation. |
@@ -285,11 +331,46 @@ missing when the host does not expose its source.
 | `zinder_ingest_memory_pressure_ratio` | gauge | | Anonymous memory divided by `memory.high`, or `memory.max` when unset. |
 | `zinder_ingest_memory_current_pressure_ratio` | gauge | | `memory.current` divided by the same limit. |
 
+## zinder-projector
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `zinder_store_canonical_secondary_live_tail_reopens_total` | counter | | Fresh canonical-secondary opens attempted after a live-tail replay row was missing during catch-up or wallet replay. Counts failed opens as well as successful recovery. |
+| `zinder_wallet_projection_build_stage_duration_seconds` | histogram | `stage` | Wall time of each stage of a fresh wallet build, recorded once when the build publishes READY. The stages run in this order and do not overlap: `store_initialization`, `canonical_scan`, `outpoint_run_spill`, `outpoint_sort`, `outpoint_drain`, `primary_sst_write`, `address_index_run_spill`, `address_transaction_run_spill`, `secondary_address_derivation`, `reorg_undo_write`, `logical_evidence`, `row_load`, `flush_and_close`, `cold_reopen`, `cold_validation_family_readback`, `cold_validation_reorg_undo_readback`, and `ready_publication`. A `*_run_spill` stage is the time a sorter spent writing runs while records were still arriving, and `primary_sst_write` is the SST writer time inside `outpoint_drain`; each is taken out of the stage it ran inside. `outpoint_sort` is the outpoint sorter's final run flush and any merge passes that write runs. `secondary_address_derivation` is the wall time of deriving the address-unspent index, address balances, and address transaction history (sorting and draining their sorters). With `projector.build.accumulator_hashing_workers` above 1, `canonical_scan` scans settled canonical replay chunks across that many workers, `outpoint_sort` flushes their sharded runs in parallel, `secondary_address_derivation` runs the address-index and address-transaction branches concurrently while splitting hashing threads between them, bulk `OrderedSstWriter` instances offload `SstFileWriter` writes and dual SHA-256 hashing behind bounded queued batches, and a drain waits at the end for the rows it handed to the hashing threads. `cold_validation_family_readback` is the wall time of the concurrent family scans: the address-index scan, and the primary output and address-transaction scans each split into up to `projector.build.accumulator_hashing_workers` hash-prefix key ranges. The sum is at most the build's total, and the rest is bookkeeping between stages. |
+
 ## zinder-query and zinder-compat-lightwalletd
 
-Both runtimes serve wallet reads through the same code and export the same
-series. Compatibility in compact-blocks mode has no serving pair and no
-broadcast, so it exports none of those series.
+Native query and wallet-mode compatibility share the wallet query engine
+and its serving-pair metrics. Canonical-only compatibility modes serve from
+one canonical generation. Light-wallet also records broadcast attempts
+for its single endpoint at `position="0"`.
+
+### Wallet RPCs at the listener
+
+Native WalletQuery and all three lightwalletd serving modes count each recognized
+wallet method once. Use `surface` (`wallet_query` or `lightwalletd`) and the
+protobuf `method` for caller traffic. A terminal `grpc_code` is the gRPC code
+in snake case. `error_class` is the typed Zinder wire reason when present and
+`none` otherwise. A dropped unfinished call counts as cancelled. Health,
+reflection, and unknown method paths are outside this denominator.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `zinder_wallet_rpc_requests_total` | counter | `surface`, `method`, `grpc_code`, `error_class` | Completed RPCs, including refusals and terminal stream errors. |
+| `zinder_grpc_block_range_admission_refusals_total` | counter | `surface`, `reason` | New block-range calls refused on `lightwalletd` or `wallet_query`. Reasons are `client_quota`, `client_capacity` when the client table is full, and `scheduling_delay` when adaptive shedding is active. |
+| `zinder_wallet_rpc_readiness_refusals_total` | counter | `surface`, `method` | Requests refused by the readiness interceptor. Each recognized method starts at zero. A refusal also contributes one terminal RPC outcome. |
+| `zinder_wallet_rpc_duration_seconds` | histogram | same as completed RPCs | Seconds from listener arrival through completion or cancellation. |
+| `zinder_wallet_rpc_in_flight` | gauge | `surface`, `method` | Calls from arrival until their final outcome. |
+| `zinder_wallet_rpc_open_streams` | gauge | `surface`, `method` | Open streaming response bodies or an admitted native balance upload from its first body poll through half-close, error, or drop. Included in in-flight calls. |
+| `zinder_wallet_rpc_block_range_blocks` | histogram | same as completed RPCs | Complete block messages handed to the transport per opened range stream, including partial results before errors or cancellation. |
+| `zinder_wallet_rpc_block_range_duration_seconds` | histogram | same as completed RPCs | Seconds from opening a range response body until its final outcome. |
+
+Readiness refusals contribute to completed RPCs. A range refused before it
+opens contributes no stream-length or open-duration observation. Native range
+headers are excluded from the block count. On HTTP/2, a response stays in
+flight until the listener releases its final status or the stream ends. A
+stream reset before that release records cancellation. To measure what arrived
+at a wallet, collect the client's outcome as well.
 
 ### Wallet requests
 
@@ -297,15 +378,15 @@ broadcast, so it exports none of those series.
 | --- | --- | --- | --- |
 | `zinder_query_request_total` | counter | `operation`, `status`, `error_class` | Wallet reads. One protocol request can record several reads. |
 | `zinder_query_request_duration_seconds` | histogram | `operation`, `status`, `error_class` | Duration of each read, including any tree-state rebuild and the node call of a broadcast. |
-| `zinder_query_compact_block_range_block_count` | histogram | `status` | Blocks each compact-block range read asked for. |
-| `zinder_query_tree_state_reads_total` | counter | `source`, `height_band` | Served tree-state reads. `source` is `stored` for a height with a stored checkpoint and `replayed` for a rebuilt one. |
-| `zinder_query_tree_state_replayed_blocks` | histogram | `height_band` | Blocks replayed to answer each served tree-state read, from 0 to 99. A stored checkpoint records 0. |
-| `zinder_query_tree_state_replayed_commitments` | histogram | `pool`, `height_band` | Note commitments appended to each pool (`sapling`, `orchard`, `ironwood`) to answer each served tree-state read. A stored checkpoint records 0. |
+| `zinder_query_compact_block_range_block_count` | histogram | `status` | Requested block count for compact-block and nullifier range reads. |
+| `zinder_query_tree_state_reads_total` | counter | `source`, `height_band` | Counts each request when the query returns its tree state. `source` is `stored` for an exact checkpoint, `replayed` for the caller that started the rebuild, `coalesced` for a caller sharing that rebuild, and `cached` for an in-memory cache hit. A caller that disconnects while awaiting the result adds no served read. |
+| `zinder_query_tree_state_replayed_blocks` | histogram | `height_band` | Blocks processed by each completed reconstruction, from 1 to 99. The worker records its work once even if its first caller disconnects. |
+| `zinder_query_tree_state_replayed_commitments` | histogram | `pool`, `height_band` | Note commitments appended to each pool (`sapling`, `orchard`, `ironwood`) by each completed reconstruction. A pool with no new commitments in that reconstruction records 0. |
 | `zinder_query_tree_state_replay_admissions_total` | counter | | Tree-state rebuilds that took a rebuild slot. |
 | `zinder_query_tree_state_replay_refusals_total` | counter | `reason` | Tree-state reads refused a rebuild slot: `wait_expired` when no slot freed within the wait, `waiters_full` when every waiting place was taken. |
 | `zinder_query_tree_state_replay_wait_duration_seconds` | histogram | | Time each admitted or refused rebuild waited for a rebuild slot. |
 | `zinder_query_tree_state_replay_duration_seconds` | histogram | `height_band` | Time each completed rebuild took, from the start of its storage read until it answered: reading and replaying compact blocks, and any wait for a blocking thread. |
-| `zinder_query_compact_block_range_stream_refusals_total` | counter | | Native `CompactBlocksInRange` streams refused because 100 were already open. |
+| `zinder_query_compact_block_range_stream_refusals_total` | counter | | Native compact-block and nullifier range streams refused because 100 were already open. |
 | `zinder_query_broadcast_budget_refusals_total` | counter | | Broadcasts refused because 16 MiB of transactions were already in flight. |
 
 `height_band` is the first height of the read's 250,000-block band, such as
@@ -323,6 +404,30 @@ success and otherwise the error's snake-case name, such as
 is established. The native gRPC adapter also records `chain_events` and the
 mempool proxies, with the gRPC code name as `error_class`.
 
+### Forwarded reads
+
+These series cover reads a process forwards to its node, as
+[Node-forwarded reads](lightwalletd-compatibility.md#node-forwarded-reads)
+describes: lean wallet serving in `zinder-query` and `zinder-compat-lightwalletd`,
+and light-wallet serving. `kind` is `transaction`, `utxo`, or `history` for a
+node-call slot, and `utxo_response` or `history_stream` for a response slot.
+Every gauge and refusal series starts at zero when the process starts.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `zinder_forwarded_read_active` | gauge | `kind` | Reads holding a slot of the kind now. |
+| `zinder_forwarded_read_queued` | gauge | `kind` | Reads waiting for a slot of the kind now. |
+| `zinder_forwarded_read_wait_duration_seconds` | histogram | `kind`, `outcome` | Time a read waited before it took a slot (`admitted`), was refused (`refused`), or its client went away (`cancelled`). |
+| `zinder_forwarded_read_refusals_total` | counter | `kind`, `reason` | Reads refused: `waiters_full` when every waiting place was taken, `wait_timeout` when no slot freed within `forwarded_read_wait_ms`, and `node_rate_limited` when the node refused the call with HTTP 429. |
+| `zinder_forwarded_transaction_cache_lookups_total` | counter | `outcome` | Mined transaction body lookups: `hit` from the verified cache, `coalesced` onto a node call already running for the same transaction, or `miss` starting a node call. |
+
+A sustained `zinder_forwarded_read_queued` near the kind's waiting places, or
+growth in `waiters_full` or `wait_timeout` refusals, means wallets need more
+node calls than the budget allows. Raise `forwarded_read_max_concurrent` only
+while the node has spare JSON-RPC connections. `node_rate_limited` refusals
+mean the node itself is at its connection limit. A high `miss` share on a busy
+public deployment is the case for retaining transaction bodies locally.
+
 ### Serving pair
 
 A reader serves from a published pair of read-only store copies and refreshes
@@ -333,7 +438,7 @@ it as the writer commits.
 | `zinder_wallet_serving_writer_status_total` | counter | `status` | Reads of the writer's status RPC. |
 | `zinder_wallet_serving_writer_status_duration_seconds` | histogram | `status` | Duration of those reads. |
 | `zinder_wallet_serving_writer_status_available` | gauge | | 1 when the latest status read succeeded. |
-| `zinder_wallet_serving_pair_publisher_refresh_total` | counter | `status`, `error_class` | Refresh attempts. |
+| `zinder_wallet_serving_pair_publisher_refresh_total` | counter | `status`, `error_class` | Completed background refresh attempts, including successful polls of an unchanged fence (`ok`, `none`) and failures. A poll that cannot reserve a slot can succeed without publishing. |
 | `zinder_wallet_serving_pair_publisher_convergence_total` | counter | `outcome` | Rounds spent bringing a candidate pair to the writer's state. |
 | `zinder_wallet_serving_pair_publisher_publications_total` | counter | | Pairs published. |
 | `zinder_wallet_serving_pair_publisher_replica_lag_chain_epochs` | gauge | | Chain epochs between the writer and the published pair. |
@@ -342,9 +447,10 @@ it as the writer commits.
 | `zinder_wallet_serving_pair_publisher_teardown_duration_seconds` | histogram | `status` | Time to close a retired pair. |
 | `zinder_wallet_serving_pair_publisher_candidate_prepared_total` | counter | `kind` | Candidates prepared: `cold` for a new slot, `recycled` for a reused one. More than four `cold` means refreshes keep failing. |
 | `zinder_wallet_serving_pair_publisher_open_generations` | gauge | | Pair slots holding open stores, at most four. |
-| `zinder_wallet_serving_pair_publisher_retained_pairs` | gauge | | Replaced pairs kept for one minute for pinned reads. |
+| `zinder_wallet_serving_pair_publisher_retained_pairs` | gauge | | Replaced pairs retained for epoch pins. Native query defaults to 60 seconds and accepts 60 to 300 seconds within the four-generation limit. |
 | `zinder_wallet_serving_pair_publisher_pinned_retired_pairs` | gauge | | Retired pairs that requests still hold. |
 | `zinder_wallet_serving_pair_publisher_generation_wait_total` | counter | `reason` | Refreshes that published nothing because every slot was taken: `retention_window` or `in_flight_requests`. |
+| `zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds` | histogram | `reason`, `outcome` | Elapsed time from the first blocked slot check to the first observation of a free slot (`available`), a different reason (`reason_changed`), or a failed or unnecessary refresh or shutdown (`interrupted`). Repeated checks with the same reason share one observation. |
 | `zinder_wallet_serving_pair_publisher_revoked_pairs_total` | counter | | Retired pairs whose reads were revoked after 30 seconds. |
 | `zinder_wallet_serving_missing_table_file_pairs_total` | counter | | Pairs replaced because compaction deleted a file they needed. |
 
@@ -356,7 +462,7 @@ it as the writer commits.
 | --- | --- | --- | --- |
 | `zinder_wallet_broadcast_endpoint_attempts_total` | counter | `position`, `outcome` | Broadcasts sent to an endpoint, by result, such as `accepted`, `rejected`, or `node_unreachable`. |
 | `zinder_wallet_broadcast_endpoint_state` | gauge | `position`, `state` | 1 for the endpoint's state: `verified`, `unverified`, or `excluded`. |
-| `zinder_wallet_broadcast_endpoint_switches_total` | counter | `from_position`, `to_position`, `cause` | Changes of the preferred endpoint: `node_unreachable` or `bad_consensus_branch`. |
+| `zinder_wallet_broadcast_endpoint_switches_total` | counter | `from_position`, `to_position`, `cause` | Changes of the preferred endpoint: `node_unreachable`, `node_rate_limited`, or `bad_consensus_branch`. |
 
 ### Public gRPC listeners
 
@@ -372,19 +478,23 @@ bidirectional calls.
 | `zinder_grpc_request_receive_slots_held` | gauge | `pool` | Slots the pool holds now. `avg_over_time` over a range gives the mean number of slots held during it. |
 | `zinder_grpc_request_receive_slots_held_at_admission` | histogram | `pool` | Slots the pool held once it admitted a request, the request's own included. Its buckets are 1, 2, 4, 8, 16, 24, 31, and 32, so with the default 32 slots a sample above `le="31"` is a request that left the pool full, by taking its last free slot or another client's slot. |
 | `zinder_grpc_request_receive_slot_hold_duration_seconds` | histogram | `pool` | Time an admitted request held its slot, until its request arrived, its client stream ended, or another client's request took the slot. Each hold is recorded whole when it ends, so `_sum` does not show how many slots were held during a range; `zinder_grpc_request_receive_slots_held` does. |
-| `zinder_grpc_proxy_client_address_fallbacks_total` | counter | `reason` | Requests on a listener with `trust_proxy_client_address` set that counted against the proxy's own connection, because the `x-zinder-client-address` header was `missing`, `repeated` (sent more than once or as a list), or `invalid` (not one IP address and port). |
-| `zinder_grpc_response_send_stalls_total` | counter | | Responses ended because the client stopped reading for 60 seconds. |
+| `zinder_grpc_proxy_client_address_fallbacks_total` | counter | `reason` | Requests on a listener with `trust_proxy_client_address` set that used the transport peer because the `x-zinder-client-address` header was `missing`, `repeated` (sent more than once or as a list), or `invalid` (neither one `ip:port` address nor one bare IP address). Excludes headerless loopback `grpc.health.v1.Health/Check` calls. |
+| `zinder_grpc_response_send_stalls_total` | counter | | Responses the listener abandoned because the transport held a piece of their data for 60 seconds, waiting for the client's window or for the connection to write the data ahead of it. The listener resets the response's HTTP/2 stream, or closes its HTTP/1.1 connection. |
+| `zinder_grpc_response_release_probes_total` | counter | | Times the listener probed an HTTP/2 stream's flow-control window before ending a response or waiting for its producer, either by wrapping a chunk of at most 4 KiB whole or by holding back the last byte of a larger chunk to send on its own. Counted when the listener prepares the probe; a stream reset first never finishes sending it. About one per response that ends after data, plus one per pause in a stream. |
 
 ## zinder-compat-lightwalletd
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `zinder_compat_serving_info` | gauge | `serving` | 1 for the serving mode: `wallet` or `compact-blocks`. |
+| `zinder_compat_serving_info` | gauge | `serving` | 1 for the selected serving mode (`wallet`, `compact-blocks`, or `light-wallet`). |
 | `zinder_compat_block_range_streams_open` | gauge | | Block-range streams holding a slot of `compat.max_concurrent_block_range_streams`. |
 | `zinder_compat_block_range_streams_admitted_total` | counter | | Block-range requests that took a slot. |
-| `zinder_compat_block_range_stream_refusals_total` | counter | `reason` | Block-range requests refused with `UNAVAILABLE`: `wait_timeout` when no slot returned within 10 seconds, `waiters_full` when as many requests already waited as the limit has slots. |
+| `zinder_compat_block_range_stream_refusals_total` | counter | `reason` | Block-range requests refused with `UNAVAILABLE`: `wait_timeout` when no slot returned within 10 seconds, `waiters_full` when three times as many requests already waited as the limit has slots. Both `reason` series are registered and start at zero when the process starts. |
 | `zinder_compat_block_range_slot_wait_duration_seconds` | histogram | `outcome` | Time a block-range request waited before it took a slot (`admitted`), was refused (`refused`), or its client went away (`cancelled`). |
 | `zinder_compat_block_range_stage_duration_seconds` | histogram | `stage` | Time one chunk of a block-range stream spent reading from storage (`read`), converting to lightwalletd messages (`convert`), or, for each chunk after the first, waiting for room for it before its read (`send`). The adapter holds two chunks of a stream, so a chunk waits until the gRPC server has taken every block of the chunk two before it to send. A later read that finds a height outside retained history and gives way to a read of heights an earlier read checked records a `read` sample for each. In compact-blocks mode `read` is the storage read alone; in wallet mode it is the wallet query, including its wait for a blocking thread, and ends when the query returns, so it leaves out the conversion's wait for one. |
+| `zinder_compat_tip_wait_total` | counter | `method`, `outcome`, `blocks_ahead` | Height-selected block reads and light-wallet forwarded UTXO and balance reads that observed a tip just past the visible tip, by how the [tip wait](lightwalletd-compatibility.md#waiting-for-a-height-just-past-the-tip) ended. `method` is snake_case, such as `get_block`, `get_block_range`, `get_tree_state`, `get_address_utxos`, `get_address_utxos_stream`, `get_taddress_balance`, or `get_taddress_balance_stream`. `outcome` is `served` (the height arrived), `expired` (the wait ran out), `cancelled` (the client left, shutdown began, or the publisher stopped), `waiters_full` (every waiting place was taken), `left_window` (the tip moved down out of the window), or `refused` (reading the tip failed, and the request failed with that status). `blocks_ahead` is `1` to `4`, or `over_4`. |
+| `zinder_compat_tip_wait_duration_seconds` | histogram | `outcome` | Time a read waited for the tip, by the same outcomes. |
+| `zinder_compat_tip_waiters` | gauge | | Reads waiting for the tip now, against `compat.tip_wait_max_waiters`. |
 | `zinder_compat_stale_tip_refusals_total` | counter | `method` | `GetLatestBlock` (`get_latest_block`) and `GetLightdInfo` (`get_lightd_info`) calls refused with `UNAVAILABLE` because the served tip was older than `compat.stale_tip_limit_ms` and the writer's node did not vouch for it. |
 | `zinder_compat_block_range_reorg_endings_total` | counter | `cause` | Streams ended early by a reorg: `chain_replaced` or `tip_lowered`. Clients retry. |
 | `zinder_compat_compact_refresh_failures_total` | counter | `cause` | Compact-blocks mode: failed refreshes, by readiness cause. |
@@ -406,7 +516,9 @@ Any runtime that calls a node exports these series. `source` is
 | --- | --- | --- | --- |
 | `zinder_node_request_total` | counter | `source`, `method`, `status`, `error_class` | Node requests. |
 | `zinder_node_request_duration_seconds` | histogram | `source`, `method`, `status`, `error_class` | Duration of node requests. |
-| `zinder_node_request_admission_wait_seconds` | histogram | `source`, `method` | Time an indexer block request waited for a request slot. |
+| `zinder_node_request_admission_wait_seconds` | histogram | `source`, `method` | Time a request waited for a request slot: an indexer block request, or a JSON-RPC call under `node.max_concurrent_requests`. |
+| `zinder_node_request_admission_timeouts_total` | counter | `source`, `method` | JSON-RPC calls that found no free slot under `node.max_concurrent_requests` within their timeout. They fail with `NodeUnavailable` without reaching the node. |
+| `zinder_node_rate_limited_total` | counter | `source`, `method` | JSON-RPC calls the node refused with HTTP 429. Each refusal also counts in `zinder_node_request_total` with `error_class="node_rate_limited"`. Registered and starts at zero for `source="zebra_json_rpc"` and each known JSON-RPC `method` when the process starts its JSON-RPC node client. |
 | `zinder_node_active_requests` | gauge | `source`, `method` | Indexer requests in flight. |
 | `zinder_node_queued_requests` | gauge | `source`, `method` | Indexer requests waiting for a slot. |
 | `zinder_node_response_bytes_total` | counter | `source`, `method`, `encoding` | Bytes received from the indexer stream. |
@@ -418,36 +530,149 @@ Any runtime that calls a node exports these series. `source` is
 
 ## Storage
 
-`store_role` is `canonical_secondary`, `wallet_secondary`,
-`materialized_view_primary`, or `materialized_view_secondary`. The canonical
-primary that ingest writes, and the wallet primary that the projector writes,
-export no storage series.
+The `store_role` label identifies the RocksDB handle or shared serving cache
+within each process.
 
 | Runtime | Roles |
 | --- | --- |
-| `zinder-ingest` | `canonical_secondary` (the copy view replay reads), `materialized_view_primary` |
+| `zinder-ingest` | `canonical_primary` (including wallet-only ingest), `canonical_secondary` (materialized-view replay), `tree_state_verification_secondary`, and `materialized_view_primary` |
+| `zinder-projector` | `wallet_primary` |
 | `zinder-explorer` | `materialized_view_secondary` |
-| `zinder-query`, `zinder-compat-lightwalletd` | `canonical_secondary`, `wallet_secondary`, with the smaller set below |
+| `zinder-query`, wallet-mode `zinder-compat-lightwalletd` | `canonical_secondary` and `wallet_secondary` |
+| Compact-blocks-mode `zinder-compat-lightwalletd` | `canonical_secondary` |
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `zinder_store_block_cache_capacity_bytes` | gauge | `store_role` | Block cache capacity. |
-| `zinder_store_block_cache_usage_bytes` | gauge | `store_role` | Block cache use. It can exceed capacity by pinned index and filter blocks. |
+| `zinder_store_block_cache_capacity_bytes` | gauge | `store_role` | Block cache capacity. Excludes canonical settled-segment (`ZSHRNG02` / `ZSTSUP01` / `ZSBLKB01`) file reads, which use OS buffered I/O and rely on the Linux OS page cache. |
+| `zinder_store_block_cache_usage_bytes` | gauge | `store_role` | Block cache use. It can exceed capacity by pinned index and filter blocks. Settled-segment file pages are accounted for by the OS. |
+| `zinder_store_settled_segment_corpus_bytes` | gauge | `store_role` | Sum of the logical file lengths of admitted shielded, supplement, and raw-block segments. |
+| `zinder_store_settled_segment_memory_budget_bytes` | gauge | `store_role` | Tightest finite cgroup v2 memory budget detected at canonical open. `+Inf` means no finite limit was detected. |
+| `zinder_store_settled_segment_corpus_to_budget_ratio` | gauge | `store_role` | Corpus bytes divided by the budget, or zero when no finite limit was detected. |
 | `zinder_store_block_cache_pinned_usage_bytes` | gauge | `store_role` | Pinned block cache use. |
+| `zinder_store_block_cache_entries` | gauge | `store_role`, `entry_role` | Serving readers only. Number of cached entries by RocksDB role, such as `DataBlock`, `IndexBlock`, or `FilterBlock`. |
+| `zinder_store_block_cache_entry_bytes` | gauge | `store_role`, `entry_role` | Serving readers only. Approximate cache charge by entry role. RocksDB rounds each role's charge before export. |
 | `zinder_store_memtable_budget_bytes` | gauge | `store_role` | Memtable budget. Readers sum it over open pair slots. |
 | `zinder_store_memtable_budget_usage_bytes` | gauge | `store_role` | Memtable use. Readers sum it over open pair slots. |
 | `zinder_store_table_reader_memory_bytes` | gauge | `store_role` | Readers only: table-reader memory outside the block cache, sampled at most every 15 seconds. |
 | `zinder_store_wal_bytes` | gauge | `store_role` | Live WAL size. |
-| `zinder_store_wal_bytes_limit` | gauge | `store_role` | Configured WAL limit. |
-| `zinder_store_max_background_jobs` | gauge | `store_role` | Effective RocksDB background jobs. |
+| `zinder_store_wal_bytes_limit` | gauge | `store_role` | Configured WAL limit. Only primary opens apply it. |
+| `zinder_store_max_background_jobs` | gauge | `store_role` | Configured background job limit on a primary. |
 | `zinder_store_rocksdb_io_mode` | gauge | `store_role`, `mode` | 1 for the I/O mode: `direct` or `buffered`. |
-| `zinder_store_rocksdb_property` | gauge | `store_role`, `cf`, `property` | RocksDB properties, such as pending compaction bytes. |
+| `zinder_store_rocksdb_property` | gauge | `store_role`, `cf`, `property` | RocksDB properties, such as pending compaction bytes and per-family live SST size (`rocksdb.live-sst-files-size`). |
 | `zinder_store_rocksdb_ticker` | gauge | `store_role`, `ticker` | RocksDB statistics tickers, when statistics are on. |
 
-Query and compatibility export only the block cache, memtable, and
-table-reader series. One block cache serves every open pair slot of a store.
-In a serving process, resident memory minus those three is memory that is not
-cache.
+Each successful canonical open, including a cold replacement generation, sets
+the gauges for its `store_role`. An open above a ratio of 1 emits
+`settled_segment_corpus_exceeds_memory_budget` at WARN with `store_role`,
+`corpus_bytes`, and `memory_budget_bytes`. In-place catch-up adds the lengths
+of newly admitted files and refreshes the gauges when the corpus grows. It
+warns when growth first pushes the corpus above the budget sampled at open.
+Live-tail recovery reopens refresh the gauges after validating the new handle's
+fence and warn only when recovery switches to a constrained reader.
+
+On Linux, constrained handles disable speculative readahead and request
+release of consumed pages during sequential range reads and cold verification.
+The ratio compares file lengths with the full budget. Use cgroup memory and
+disk I/O metrics to observe actual residency and reclaim. See
+[ADR-0005](../adrs/0005-bounded-process-memory.md) for the policy and
+[Size your host](../runbooks/deploying.md#step-3-size-your-host) for serving limits.
+
+Ingest samples the canonical primary after bulk loads, while following the
+tip, and after checkpoint densification commits. The projector samples the
+wallet primary during following. Commit bursts refresh the writer gauges at
+most once per second. Writers sample WAL size at most once every 15 seconds.
+
+For each data column family, `rocksdb.num-files-at-level0` includes zero.
+Levels 1 through 6 acquire a file-count series when they hold SSTs.
+When a level empties, its previous count clears to zero. Each data column
+family also exports `rocksdb.live-sst-files-size` (live on-disk SST bytes)
+alongside its memtable and compaction integer properties. The `cf` label is
+`__db__` for database-wide write pressure.
+
+In `zinder-ingest`, `rocksdb.live-sst-files-size` is exported under both
+`store_role="canonical_primary"` and `store_role="tree_state_verification_secondary"`
+(as well as `store_role="canonical_secondary"` when Explorer views are enabled),
+and those roles report properties from the same canonical SST files on disk.
+Filter canonical disk-size queries and alerts by `store_role="canonical_primary"`
+rather than summing ungrouped across all `store_role` values.
+
+Inspect `rocksdb.aggregated-table-properties` offline for index and filter
+sizes. RocksDB can open every uncached SST to collect them. Per-level
+compression ratios also belong in offline inspection because RocksDB visits
+every file's in-memory metadata. Replay and materialized-view stores retain
+their existing estimates of live data size, total SST size, and table-reader
+memory.
+
+Serving publishers report the cache footprint, cache entries, tickers,
+per-column-family `zinder_store_rocksdb_property` gauges (including
+`rocksdb.live-sst-files-size` and level file counts), and summed instance
+memory. Compact-block mode serves only the canonical store. Cache usage
+includes pinned bytes. Each store shares one cache and one set of tickers
+across generations. Recycling a generation preserves its reads in the
+cumulative totals. Serving publishers sample cache composition and
+per-column-family properties on the blocking pool, using the single newest
+active generation per store (`canonical_secondary`, `wallet_secondary`) at
+the 15-second instance-memory cadence.
+
+`zinder_store_rocksdb_ticker` uses upstream names for its `ticker` label.
+The store's `statistics_level` must be `tickers` or `full`.
+
+| To measure | Tickers |
+| --- | --- |
+| File opens and errors | `rocksdb.no.file.opens`, `rocksdb.no.file.errors` (on `canonical_secondary` and `wallet_secondary`, `rocksdb.no.file.opens` climbs during cold warm-up and catch-up of newly published SSTs; zero steady-state growth at an unchanged fence is the healthy baseline showing no table-reader churn) |
+| Bytes served from cache | `rocksdb.block.cache.bytes.read` |
+| Where point reads hit | `rocksdb.memtable.hit`, `rocksdb.l0.hit`, `rocksdb.l1.hit`, `rocksdb.l2andup.hit` |
+| Iterator work | `rocksdb.number.db.seek`, `rocksdb.number.db.next`, `rocksdb.db.iter.bytes.read` |
+| Readahead | `rocksdb.prefetch.bytes`, `rocksdb.prefetch.bytes.useful`, `rocksdb.readahead.trimmed` |
+
+### Settled-segment readers
+
+The `kind` label is `shielded` for `ZSHRNG02`, `supplement` for `ZSTSUP01`,
+and `block_blob` for `ZSBLKB01`. Cache metrics sum across the process's
+canonical settled-segment reader caches.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `zinder_store_settled_segment_cache_open_readers` | gauge | `kind` | Resident reader entries. Each holds one open segment file descriptor. |
+| `zinder_store_settled_segment_cache_index_heap_bytes` | gauge | `kind` | Estimated heap bytes of decoded index arrays and page digests in resident readers. |
+| `zinder_store_settled_segment_cache_hits_total` | counter | `kind` | Lookups that found a resident reader. |
+| `zinder_store_settled_segment_cache_misses_total` | counter | `kind` | Lookups that needed a file open or joined an open already in flight. |
+| `zinder_store_settled_segment_cache_evictions_total` | counter | `kind` | Reader entries removed by LRU capacity eviction. Each removed segment can contribute one entry per kind. |
+| `zinder_store_settled_segment_pread_bytes_total` | counter | `kind` | Bytes returned by successful positional file reads, including headers and indexes read during admission. |
+| `zinder_store_settled_segment_pread_duration_seconds` | histogram | `kind` | Wall time per non-empty positional file read, including failed reads and retries within the operation. |
+
+The cache gauges count only resident entries. Requests can hold a reader after
+eviction, in which case its file and index stay live until the last reference
+drops. The heap estimate excludes reader objects, cache bookkeeping, and
+allocator overhead. Positional read metrics include OS page-cache hits and
+measure file I/O as seen by the process. The latency histogram has finite
+buckets from 1 microsecond to 1 second. Use host disk metrics for physical I/O.
+
+For a serving target, use the Linux `zinder_process_rss_anon_bytes` gauge
+alongside RocksDB block-cache use, memtable use, table-reader memory, and
+settled-segment index heap. The PromQL expression below estimates residual
+anonymous RSS after subtracting those reported components.
+
+```promql
+zinder_process_rss_anon_bytes
+  - sum without (store_role) (zinder_store_block_cache_usage_bytes)
+  - sum without (store_role) (zinder_store_memtable_budget_usage_bytes)
+  - sum without (store_role) (zinder_store_table_reader_memory_bytes)
+  - sum without (kind) (zinder_store_settled_segment_cache_index_heap_bytes)
+```
+
+The residual includes other process memory such as allocator overhead, request
+buffers, and in-flight readers outside the cache. The component gauges estimate
+allocations or cache charge. They can include nonresident memory and can be
+sampled at different times. The expression requires all component series and
+can return negative estimates.
+
+Canonical segment files use OS buffered I/O. Under Linux cgroup v2, file pages
+count toward the reader's cgroup memory limit. To diagnose page-cache churn,
+compare per-kind positional-read latency and volume with disk read saturation
+and `zinder_compat_block_range_stream_refusals_total{reason="wait_timeout"}`.
+The cgroup memory limit needs to accommodate the segment working set as well
+as anonymous memory.
 
 ## Structured logs
 
@@ -466,10 +691,12 @@ information and query.
 
 | Event | Runtime | Meaning |
 | --- | --- | --- |
+| `rocksdb_direct_io_open_failed` | All store runtimes | The direct I/O open failed. The `error` field holds the RocksDB error, and the process retries with buffered I/O. |
+| `rocksdb_io_mode` | All store runtimes | A successful open resolved to `mode=direct` or `mode=buffered`. |
 | `canonical_writer_started` | ingest | The writer started. |
 | `canonical_ready_store_reopened` | ingest | An existing store was reopened. |
 | `canonical_empty_construction_staging_removed`, `canonical_unpublished_construction_restarted` | ingest | A first sync restarted from scratch. |
-| `canonical_live_append_committed`, `canonical_live_replacement_committed` | ingest | A block or a reorg replacement was committed. |
+| `canonical_live_append_committed`, `canonical_live_replacement_committed` | ingest | A block or a reorg replacement was committed. A replacement includes the previous tip and the common parent. |
 | `canonical_source_recovery` | ingest | A node outage started or changed class. |
 | `upstream_health_probe_started`, `upstream_health_endpoint_unreachable` | ingest | The node health probe started, or cannot reach its endpoint. |
 | `node_endpoint_admitted`, `node_endpoint_excluded`, `node_endpoint_unreachable`, `node_endpoint_skipped`, `node_endpoint_deferred` | ingest | Startup checks of fallback nodes. |
@@ -480,8 +707,12 @@ information and query.
 | `tree_state_verification_cycle_completed`, `tree_state_verification_mismatch` | ingest | The verification pass checked every settled tree-state row, or found a damaged one, with its `height`, `pool`, and `reason`. |
 | `tree_state_verification_recorded_damage_reported`, `tree_state_verification_recorded_damage_cleared`, `tree_state_verification_recorded_damage_discarded` | ingest | A start reported damage the pass recorded before, a recheck found that row intact, or the record named another store. |
 | `canonical_secondary_behind_writer` | projector | A convergence attempt timed out. |
-| `wallet_serving_pair_publisher_published` | query, compatibility | A pair was published. Match it with `canonical_live_append_committed` to measure block-to-wallet delay. |
+| `canonical_secondary_live_tail_reopen` | projector, active-writer benchmark | A missing live-tail replay row triggered a reopen attempt. The fields identify the missing height, the admitted tip and event sequence, and the tip of the READY fence being replayed. |
+| `wallet_serving_pair_publisher_published` | query, compatibility | A reader published a fence. The process ID, epoch, sequence, visible tip, and sequence digest identify the observation for the [census](../runbooks/serving-census.md#measure-publication-delay). |
 | `wallet_serving_pair_publisher_refresh_failed` | query, compatibility | A refresh failed. Routine lag logs at debug level. |
+| `wallet_projection_following_applied` | projector | The wallet primary applied and verified a retained-event transition at the logged fence. |
+| `wallet_serving_pair_publisher_generation_selected` | query, compatibility | A refresh selected an inactive generation after observing this writer fence. Preparation and convergence follow. |
+| `wallet_serving_pair_publisher_generation_wait_started`, `wallet_serving_pair_publisher_generation_wait_ended` | query, compatibility | The reader first observed occupied slots or ended the observation. A process exit can leave an open interval. |
 | `wallet_serving_pair_publisher_generation_opened` | query, compatibility | A pair slot was opened cold. |
 | `wallet_serving_pair_table_file_missing`, `wallet_serving_pair_reads_revoked` | query, compatibility | A pair lost a file to compaction, or its reads were revoked. |
 | `wallet_node_verified`, `wallet_node_verification_failed`, `wallet_node_excluded`, `wallet_node_reverification_inconclusive` | query, compatibility | Broadcast endpoint verification. |
@@ -494,3 +725,13 @@ information and query.
 
 Startup phases log under the `zinder::startup` target, as
 [Service operations](../architecture/service-operations.md) describes.
+
+
+## Distributed traces
+
+To export spans, configure [trace export](configuration.md#trace-export).
+Wallet RPC spans identify the protocol surface and method. Ingest control
+spans share the trace ID when the caller forwards W3C Trace Context. Wallet
+transaction broadcasts also include a span for the upstream node call. Use
+that ID in your collector to relate control and node work to the wallet request.
+Collector export uses a bounded queue that can drop spans during overload.

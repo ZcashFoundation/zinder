@@ -1,6 +1,7 @@
 //! Remote gRPC implementation of the chain-index contract.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,29 +23,35 @@ use zinder_core::wire::{
 use zinder_core::{
     ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeader, BlockHeight,
     BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId, ChainValuePool,
-    ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId,
-    MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MempoolEntry, MempoolEvictionReason, MinedTransaction,
-    MinedTransactionChainContext, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
-    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
+    ChainValuePoolsAtTip, CompactBlockArtifact, CompactBlockNullifiers, CompactPool,
+    ConsensusBranchId, MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MAX_TRANSPARENT_ADDRESSES_PER_BATCH,
+    MempoolEntry, MempoolEvictionReason, MinedTransaction, MinedTransactionChainContext, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    StandardFee, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressBalance,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
     TransparentOutpointSpendStatus, TransparentUnspentOutput, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::{
-    TransactionAbsence, WalletWireDecodeError, chain_epoch_from_message,
-    compact_block_from_message as compact_block_from_wire_message, mempool_entry_from_message,
-    outpoint_message, transparent_outpoint_spend_status_entry_from_message,
+    CHAIN_EVENT_FAMILY_HEADER, TransactionAbsence, WalletWireDecodeError, chain_epoch_from_message,
+    compact_block_from_message as compact_block_from_wire_message,
+    compact_block_nullifiers_from_message, compact_pool_message, mempool_entry_from_message,
+    outpoint_message, standard_fee_from_message,
+    transparent_outpoint_spend_status_entry_from_message,
 };
 
 use crate::error::ZINDER_ERROR_DOMAIN;
+use crate::proxy::Socks5Proxy;
+use crate::retry::{MAX_READ_ATTEMPTS, ReadBackoff};
+use crate::tls::{self, TlsRoots};
 use crate::{
     BlockId, Capability, CapabilityDescriptor, ChainEpochCommitted, ChainEvent, ChainEventCursor,
     ChainEventEnvelope, ChainEventStream, ChainEventStreamFamily, ChainIndex, ChainRangeReverted,
-    EndpointBackedIndex, EventStreamStart, IndexStream, IndexerError, MempoolEvent,
-    MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor,
-    MempoolSnapshotRequest, MempoolSnapshotView, NodeServerInfo, ServerInfo,
-    TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
+    CompactRangeQuery, EndpointBackedIndex, EventStreamStart, IndexStream, IndexerError,
+    MempoolEvent, MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream,
+    MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView, NodeServerInfo,
+    RetryPolicy, ServerInfo, TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
     TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
     TransparentOutpointSpendStatuses, TransparentUnspentOutputChunk,
@@ -57,6 +64,65 @@ pub struct RemoteOpenOptions {
     pub endpoint: String,
     /// Expected network served by the endpoint.
     pub network: Network,
+}
+
+/// Optional transport and read retry settings for [`RemoteChainIndex`].
+///
+/// The default uses system TLS roots, a direct connection, and one attempt
+/// per RPC.
+#[derive(Clone, Default)]
+#[must_use]
+pub struct RemoteClientOptions {
+    tls_roots: Option<TlsRoots>,
+    tls_domain_name: Option<String>,
+    tls_spki_pin: Option<[u8; 32]>,
+    socks5_proxy: Option<String>,
+    retry_reads: bool,
+}
+
+impl RemoteClientOptions {
+    /// Trust the certificates in a PEM bundle in place of system roots.
+    pub fn with_tls_ca_pem(mut self, bundle: impl Into<Vec<u8>>) -> Self {
+        self.tls_roots = Some(TlsRoots::Pem(bundle.into()));
+        self
+    }
+
+    /// Trust a collection of DER-encoded CA certificates in place of system roots.
+    pub fn with_tls_ca_der(mut self, certificates: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        self.tls_roots = Some(TlsRoots::Der(certificates.into_iter().collect()));
+        self
+    }
+
+    /// Override the TLS certificate name and HTTP/2 authority host.
+    pub fn with_tls_domain_name(mut self, domain_name: impl Into<String>) -> Self {
+        self.tls_domain_name = Some(domain_name.into());
+        self
+    }
+
+    /// Require the SHA-256 digest of the leaf certificate's DER-encoded
+    /// `SubjectPublicKeyInfo` in addition to standard TLS certificate verification.
+    pub const fn with_tls_spki_pin(mut self, sha256: [u8; 32]) -> Self {
+        self.tls_spki_pin = Some(sha256);
+        self
+    }
+
+    /// Route every connection through an unauthenticated SOCKS5 proxy.
+    ///
+    /// Both `socks5://host:port` and `socks5h://host:port` send destination
+    /// hostnames to the proxy for resolution.
+    pub fn with_socks5_proxy(mut self, uri: impl Into<String>) -> Self {
+        self.socks5_proxy = Some(uri.into());
+        self
+    }
+
+    /// Allow up to four attempts per read RPC with bounded backoff.
+    ///
+    /// Range and history reads may retry before a stream opens. Broadcasts
+    /// and event subscriptions always use a single attempt.
+    pub const fn with_read_retries(mut self) -> Self {
+        self.retry_reads = true;
+        self
+    }
 }
 
 /// Remote chain index backed by the native wallet gRPC API.
@@ -88,7 +154,9 @@ pub struct RemoteOpenOptions {
 pub struct RemoteChainIndex {
     client: Arc<ArcSwap<WalletQueryClient<Channel>>>,
     endpoint: Endpoint,
+    proxy: Option<Socks5Proxy>,
     network: Network,
+    retry_reads: bool,
 }
 
 /// Cadence at which HTTP/2 PING frames are sent over the channel; with
@@ -100,8 +168,7 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// connection is dead and tearing it down so the next call re-dials.
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Upper bound on the initial TCP+HTTP/2 handshake when the channel
-/// establishes (or re-establishes) the connection lazily.
+/// Timeout for the TCP connection, TLS handshake, and internal metadata probe.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// OS-level TCP keepalive idle interval. Belt-and-braces alongside the
@@ -109,43 +176,136 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// intermediaries that don't surface the failure to userspace.
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
-/// Oldest native wallet contract revision this client can safely consume.
+/// HTTP/2 stream-level receive window the client advertises to the server.
 ///
-/// Revision 8 adds `TransparentOutpointSpendStatus` and removes the transparent
-/// reads that no packaged consumer calls. It keeps the revision 7
-/// `CompactBlocksInRange` stream, which sends the chain view once as a leading
-/// header instead of on every block.
+/// Raised above hyper's unconfigured 2 MiB client stream window so a single
+/// `CompactBlocksInRange` stream can fill a WAN bandwidth-delay product.
+/// Hyper's client, not the HTTP/2 spec, chooses that 2 MiB default; other
+/// stacks start from the 65,535-byte spec window.
+const HTTP2_INITIAL_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
+
+/// HTTP/2 connection-level receive window the client advertises to the server.
+///
+/// Raised above hyper's unconfigured 5 MiB client connection window so every
+/// concurrent stream shares the connection window without one stream's window
+/// bounding aggregate WAN throughput.
+const HTTP2_INITIAL_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// Maximum DATA frame size the client advertises in `SETTINGS_MAX_FRAME_SIZE`.
+///
+/// A server caps the frames it sends at the value its peer advertises, so
+/// raising this from hyper's 16 KiB default lets the server send 64 KiB frames
+/// and reduces per-frame overhead over a WAN round trip.
+const HTTP2_MAX_FRAME_SIZE: u32 = 64 * 1024;
+
+/// Oldest native wallet contract revision this client can safely consume.
 pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 8;
+
+/// Builds the tonic [`Endpoint`] for a native `WalletQuery` endpoint, with the
+/// WAN HTTP/2 flow-control and framing settings the remote index relies on.
+///
+/// The endpoint advertises fixed initial windows and frame size. It does not
+/// enable hyper's adaptive window, because in tonic 0.14.9 and hyper 1.12.0
+/// `adaptive_window(true)` resets both initial windows back to the 65,535-byte
+/// spec value, discarding these larger sizes.
+fn build_endpoint(uri: String) -> Result<Endpoint, IndexerError> {
+    let endpoint = Channel::from_shared(uri)
+        .map_err(|_| IndexerError::invalid_request("invalid wallet endpoint URI"))?;
+    Ok(endpoint
+        .keep_alive_while_idle(true)
+        .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .tcp_keepalive(Some(TCP_KEEPALIVE))
+        .initial_stream_window_size(HTTP2_INITIAL_STREAM_WINDOW)
+        .initial_connection_window_size(HTTP2_INITIAL_CONNECTION_WINDOW)
+        .max_frame_size(HTTP2_MAX_FRAME_SIZE))
+}
 
 impl RemoteChainIndex {
     /// Builds a remote-chain-index handle pointed at a `WalletQuery` endpoint.
     ///
-    /// The channel is constructed lazily: the TCP+HTTP/2 connection is
-    /// established on the first gRPC call, not here. Only URI parsing can
-    /// fail at this stage; transport errors surface at first use.
+    /// The first RPC establishes the connection.
     pub fn connect(options: RemoteOpenOptions) -> Result<Self, IndexerError> {
-        // URI scheme is the TLS signal: `https://` negotiates rustls with system roots.
-        let use_tls = options.endpoint.starts_with("https://");
-        let mut endpoint = Channel::from_shared(options.endpoint)
-            .map_err(|error| IndexerError::invalid_request(error.to_string()))?;
-        if use_tls {
-            endpoint = endpoint
-                .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())
-                .map_err(|error| IndexerError::invalid_request(error.to_string()))?;
-        }
-        let endpoint = endpoint
-            .keep_alive_while_idle(true)
-            .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
-            .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .tcp_keepalive(Some(TCP_KEEPALIVE));
-        let channel = endpoint.connect_lazy();
+        Self::connect_with_options(options, RemoteClientOptions::default())
+    }
+
+    /// Builds a lazy connection with explicit TLS, proxy, or read retry settings.
+    ///
+    /// Invalid settings fail here. Handshake and certificate verification
+    /// failures surface when an RPC first uses the connection.
+    pub fn connect_with_options(
+        options: RemoteOpenOptions,
+        client_options: RemoteClientOptions,
+    ) -> Result<Self, IndexerError> {
+        let endpoint = tls::configure(
+            build_endpoint(options.endpoint)?,
+            client_options.tls_roots.as_ref(),
+            client_options.tls_domain_name,
+            client_options.tls_spki_pin,
+            CONNECT_TIMEOUT,
+        )?;
+        let proxy = client_options
+            .socks5_proxy
+            .as_deref()
+            .map(|uri| Socks5Proxy::new(uri, &endpoint))
+            .transpose()?;
+        let channel = connect_channel(&endpoint, proxy.as_ref());
 
         Ok(Self {
             client: Arc::new(ArcSwap::new(Arc::new(WalletQueryClient::new(channel)))),
             endpoint,
+            proxy,
             network: options.network,
+            retry_reads: client_options.retry_reads,
         })
+    }
+
+    async fn read_rpc<Req, Resp, Fut>(
+        &self,
+        request: Req,
+        invoke: impl Fn(WalletQueryClient<Channel>, Req) -> Fut,
+    ) -> Result<tonic::Response<Resp>, tonic::Status>
+    where
+        Req: Clone,
+        Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+    {
+        self.read_rpc_with_retry_policy(request, invoke, |status| {
+            Some(IndexerError::from_status(status.clone()).retry_policy())
+        })
+        .await
+    }
+
+    async fn read_rpc_with_retry_policy<Req, Resp, Fut>(
+        &self,
+        request: Req,
+        invoke: impl Fn(WalletQueryClient<Channel>, Req) -> Fut,
+        retry_policy: impl Fn(&tonic::Status) -> Option<RetryPolicy>,
+    ) -> Result<tonic::Response<Resp>, tonic::Status>
+    where
+        Req: Clone,
+        Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+    {
+        if self.retry_reads {
+            let mut backoff = ReadBackoff::new();
+            for _ in 1..MAX_READ_ATTEMPTS {
+                match invoke(self.client(), request.clone()).await {
+                    Ok(response) => return Ok(response),
+                    Err(status) => {
+                        if retry_policy(&status) != Some(RetryPolicy::RetryWithBackoff) {
+                            return Err(status);
+                        }
+                        let Some(delay) = backoff.delay(&status, has_zinder_error_info(&status))
+                        else {
+                            return Err(status);
+                        };
+                        self.recover_channel(&status);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+        invoke(self.client(), request).await
     }
 
     /// Returns a per-call `WalletQueryClient` clone backed by the current
@@ -154,6 +314,69 @@ impl RemoteChainIndex {
     /// HTTP/2 multiplexer until [`Self::rebuild_channel`] swaps it out.
     fn client(&self) -> WalletQueryClient<Channel> {
         (**self.client.load()).clone()
+    }
+
+    async fn require_capability(&self, capability: Capability) -> Result<(), IndexerError> {
+        let descriptor = tokio::time::timeout(CONNECT_TIMEOUT, self.server_info())
+            .await
+            .map_err(|_| IndexerError::ServiceUnavailable {
+                reason: "wallet capability lookup timed out".to_owned(),
+            })??;
+        ensure_advertised_capability(&descriptor, capability)
+    }
+
+    fn unspent_outputs_stream(
+        &self,
+        response: tonic::Streaming<wallet::TransparentUnspentOutputsChunk>,
+        addresses: HashSet<TransparentAddressScriptHash>,
+        start_height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> TransparentAddressUnspentOutputsStream {
+        let recovery = self.clone();
+        let addresses = Arc::new(addresses);
+        let decoded = futures_util::stream::unfold(Some((response, None)), move |state| {
+            let recovery = recovery.clone();
+            let addresses = Arc::clone(&addresses);
+            async move {
+                let (mut response, mut chain_epoch) = state?;
+                loop {
+                    let message = match response.message().await {
+                        Ok(Some(message)) => message,
+                        Ok(None) => {
+                            return missing_transparent_unspent_header_error(chain_epoch.is_some())
+                                .map(|error| (Err(error), None));
+                        }
+                        Err(status) => return Some((Err(recovery.map_status(status)), None)),
+                    };
+                    match transparent_unspent_output_stream_item(
+                        recovery.network,
+                        at_epoch_id,
+                        &mut chain_epoch,
+                        message,
+                    ) {
+                        Ok(None) => {}
+                        Ok(Some(output)) => {
+                            if !addresses.contains(&output.output.address_script_hash)
+                                || output.output.block_height < start_height
+                                || output.output.block_height
+                                    > output.chain_epoch.visible_tip_height
+                            {
+                                return Some((
+                                    Err(IndexerError::malformed(
+                                        "transparent_unspent_output",
+                                        "output does not match the requested addresses and height bounds",
+                                    )),
+                                    None,
+                                ));
+                            }
+                            return Some((Ok(output), Some((response, chain_epoch))));
+                        }
+                        Err(error) => return Some((Err(error), None)),
+                    }
+                }
+            }
+        });
+        Box::pin(futures_util::StreamExt::fuse(decoded))
     }
 
     /// Maps a tonic [`Status`](tonic::Status) into the typed [`IndexerError`]
@@ -165,25 +388,24 @@ impl RemoteChainIndex {
     /// the upstream omitted the trailer, since those are caller bugs that
     /// reconnecting would not fix.
     fn map_status(&self, status: tonic::Status) -> IndexerError {
-        let poisoned_transport = matches!(
+        self.recover_channel(&status);
+        IndexerError::from_status(status)
+    }
+
+    fn recover_channel(&self, status: &tonic::Status) {
+        if matches!(
             status.code(),
             tonic::Code::Unavailable | tonic::Code::Unknown
-        ) && status
-            .get_error_details()
-            .error_info()
-            .is_none_or(|error_info| error_info.domain != ZINDER_ERROR_DOMAIN);
-        let err = IndexerError::from_status(status);
-        if poisoned_transport {
+        ) && !has_zinder_error_info(status)
+        {
             self.rebuild_channel();
         }
-        err
     }
 
     /// Maps a failed transaction lookup to [`TxStatus::NotFound`] only for the
     /// typed `TRANSACTION_NOT_FOUND` absence signal.
     fn tx_status_from_lookup_failure(
-        &self,
-        status: tonic::Status,
+        status: &tonic::Status,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TxStatus, IndexerError> {
         let details = status.get_error_details();
@@ -196,12 +418,59 @@ impl RemoteChainIndex {
                     message: status.message().to_owned(),
                 })
             }
-            Ok(None) => Err(self.map_status(status)),
+            Ok(None) => Err(IndexerError::from_status(status.clone())),
             Err(metadata_error) => Err(IndexerError::malformed(
                 "error_info.metadata",
                 metadata_error.to_string(),
             )),
         }
+    }
+
+    async fn wallet_server_info(
+        &self,
+        client: &mut WalletQueryClient<Channel>,
+    ) -> Result<ServerInfo, IndexerError> {
+        let response = client
+            .server_info(Request::new(wallet::ServerInfoRequest {}))
+            .await
+            .map_err(|status| self.map_status(status))?
+            .into_inner();
+        self.decode_server_info(response)
+    }
+
+    fn decode_server_info(
+        &self,
+        response: wallet::ServerInfoResponse,
+    ) -> Result<ServerInfo, IndexerError> {
+        let wallet_info = response
+            .info
+            .ok_or_else(|| IndexerError::malformed("info", "field is missing"))?;
+        server_info_from_message(self.network, wallet_info)
+    }
+
+    async fn validate_reorg_cursor(
+        &self,
+        client: &mut WalletQueryClient<Channel>,
+        envelope: &ChainEventEnvelope,
+    ) -> Result<(), IndexerError> {
+        let ChainEvent::ChainReorged { reverted, .. } = &envelope.event else {
+            return Ok(());
+        };
+        // Revisions 8 and 9 number retained transitions with their resulting epoch.
+        // Only a synthesized reorg reports the current epoch at the pre-retention sequence.
+        if envelope.event_sequence < envelope.chain_epoch.id.value() {
+            let descriptor = tokio::time::timeout(CONNECT_TIMEOUT, self.wallet_server_info(client))
+                .await
+                .map_err(|_| IndexerError::ServiceUnavailable {
+                    reason: "wallet contract revision lookup timed out".to_owned(),
+                })??;
+            if descriptor.contract_revision < 10 {
+                return Err(IndexerError::ChainEventCursorExpired {
+                    recovery: crate::ChainEventCursorRecovery::EarliestRetained,
+                });
+            }
+        }
+        validate_reverted_range_start(reverted)
     }
 
     /// Reads one request-sized batch of outpoint spend statuses.
@@ -211,13 +480,13 @@ impl RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<(ChainEpoch, Vec<TransparentOutpointSpendStatus>), IndexerError> {
         let response = self
-            .client()
-            .transparent_outpoint_spend_status(Request::new(
+            .read_rpc(
                 wallet::TransparentOutpointSpendStatusRequest {
                     outpoints: outpoints.iter().map(outpoint_message).collect(),
                     at_epoch_id: at_epoch_id.map(ChainEpochId::value),
                 },
-            ))
+                async |mut client, request| client.transparent_outpoint_spend_status(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -254,7 +523,7 @@ impl RemoteChainIndex {
     }
 
     fn rebuild_channel(&self) {
-        let fresh = self.endpoint.connect_lazy();
+        let fresh = connect_channel(&self.endpoint, self.proxy.as_ref());
         self.client.store(Arc::new(WalletQueryClient::new(fresh)));
         warn!(
             target: "zinder_client",
@@ -272,10 +541,10 @@ impl RemoteChainIndex {
 impl ChainIndex for RemoteChainIndex {
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError> {
         let response = self
-            .client()
-            .visible_tip_block(Request::new(wallet::VisibleTipBlockRequest {
-                at_epoch_id: None,
-            }))
+            .read_rpc(
+                wallet::VisibleTipBlockRequest { at_epoch_id: None },
+                async |mut client, request| client.visible_tip_block(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -288,8 +557,10 @@ impl ChainIndex for RemoteChainIndex {
         ensure_advertised_capability(&server_info, Capability::NetworkUpgradeActivations)?;
 
         let response = self
-            .client()
-            .network_upgrade_activations(Request::new(wallet::NetworkUpgradeActivationsRequest {}))
+            .read_rpc(
+                wallet::NetworkUpgradeActivationsRequest {},
+                async |mut client, request| client.network_upgrade_activations(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -302,10 +573,12 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
         let response = self
-            .client()
-            .visible_tip_block(Request::new(wallet::VisibleTipBlockRequest {
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::VisibleTipBlockRequest {
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.visible_tip_block(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -337,10 +610,12 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
         let response = self
-            .client()
-            .settled_tip_block(Request::new(wallet::SettledTipBlockRequest {
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::SettledTipBlockRequest {
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.settled_tip_block(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -374,11 +649,13 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
         let response = self
-            .client()
-            .block_id_by_selector(Request::new(wallet::BlockSelectorRequest {
-                selector: Some(block_selector_to_message(selector)?),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::BlockSelectorRequest {
+                    selector: Some(block_selector_to_message(selector)?),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.block_id_by_selector(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -391,11 +668,13 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeader, IndexerError> {
         let response = self
-            .client()
-            .block_header_by_selector(Request::new(wallet::BlockSelectorRequest {
-                selector: Some(block_selector_to_message(selector)?),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::BlockSelectorRequest {
+                    selector: Some(block_selector_to_message(selector)?),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.block_header_by_selector(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -408,11 +687,13 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockArtifact, IndexerError> {
         let response = self
-            .client()
-            .compact_block(Request::new(wallet::CompactBlockRequest {
-                height: height.value(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::CompactBlockRequest {
+                    height: height.value(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.compact_block(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -437,13 +718,36 @@ impl ChainIndex for RemoteChainIndex {
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
+        if block_range.start > block_range.end {
+            return Err(IndexerError::invalid_request(
+                "compact block range start exceeds end",
+            ));
+        }
+        self.scan_compact_blocks(CompactRangeQuery {
+            at_epoch_id,
+            ..CompactRangeQuery::new(block_range.start, block_range.end)
+        })
+        .await
+    }
+
+    async fn scan_compact_blocks(
+        &self,
+        query: CompactRangeQuery,
+    ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
+        if query.start_height > query.end_height || !query.pools.is_empty() {
+            self.require_capability(Capability::CompactBlockScan)
+                .await?;
+        }
         let response = self
-            .client()
-            .compact_blocks_in_range(Request::new(wallet::CompactBlocksInRangeRequest {
-                start_height: block_range.start.value(),
-                end_height: block_range.end.value(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::CompactBlocksInRangeRequest {
+                    start_height: query.start_height.value(),
+                    end_height: query.end_height.value(),
+                    at_epoch_id: query.at_epoch_id.map(ChainEpochId::value),
+                    pool_types: encode_compact_pools(&query.pools),
+                },
+                async |mut client, request| client.compact_blocks_in_range(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?;
         let recovery = self.clone();
@@ -453,7 +757,49 @@ impl ChainIndex for RemoteChainIndex {
             });
         Ok(compact_block_range_stream(
             Box::pin(wire_stream),
-            CompactBlockRangeStreamState::new(self.network, at_epoch_id, block_range),
+            CompactBlockRangeStreamState::new(
+                self.network,
+                query.at_epoch_id,
+                BlockHeightRange::inclusive(query.start_height, query.end_height),
+            ),
+        ))
+    }
+
+    async fn scan_compact_nullifiers(
+        &self,
+        query: CompactRangeQuery,
+    ) -> Result<IndexStream<CompactBlockNullifiers>, IndexerError> {
+        if query.pools.contains(&CompactPool::Transparent) {
+            return Err(IndexerError::invalid_request(
+                "compact nullifier scans accept shielded pools only",
+            ));
+        }
+        self.require_capability(Capability::CompactNullifierRange)
+            .await?;
+        let response = self
+            .read_rpc(
+                wallet::CompactNullifiersInRangeRequest {
+                    start_height: query.start_height.value(),
+                    end_height: query.end_height.value(),
+                    at_epoch_id: query.at_epoch_id.map(ChainEpochId::value),
+                    pool_types: encode_compact_pools(&query.pools),
+                },
+                async |mut client, request| client.compact_nullifiers_in_range(request).await,
+            )
+            .await
+            .map_err(|status| self.map_status(status))?;
+        let recovery = self.clone();
+        let wire_stream = tokio_stream::StreamExt::map(response.into_inner(), move |chunk| {
+            chunk.map_err(|status| recovery.map_status(status))
+        });
+        Ok(compact_range_stream(
+            Box::pin(wire_stream),
+            CompactBlockRangeStreamState::new(
+                self.network,
+                query.at_epoch_id,
+                BlockHeightRange::inclusive(query.start_height, query.end_height),
+            ),
+            CompactBlockRangeStreamState::accept_nullifiers,
         ))
     }
 
@@ -463,11 +809,13 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockBlobArtifact, IndexerError> {
         let response = self
-            .client()
-            .full_block(Request::new(wallet::FullBlockRequest {
-                height: height.value(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::FullBlockRequest {
+                    height: height.value(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.full_block(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -493,12 +841,14 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<IndexStream<BlockBlobArtifact>, IndexerError> {
         let response = self
-            .client()
-            .full_blocks_in_range(Request::new(wallet::FullBlocksInRangeRequest {
-                start_height: block_range.start.value(),
-                end_height: block_range.end.value(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::FullBlocksInRangeRequest {
+                    start_height: block_range.start.value(),
+                    end_height: block_range.end.value(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.full_blocks_in_range(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?;
         let recovery = self.clone();
@@ -575,11 +925,13 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeStateArtifact, IndexerError> {
         let response = self
-            .client()
-            .tree_state_at_height(Request::new(wallet::TreeStateAtHeightRequest {
-                height: height.value(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::TreeStateAtHeightRequest {
+                    height: height.value(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.tree_state_at_height(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -613,10 +965,12 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeStateArtifact, IndexerError> {
         let response = self
-            .client()
-            .latest_tree_state_checkpoint(Request::new(wallet::LatestTreeStateCheckpointRequest {
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::LatestTreeStateCheckpointRequest {
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.latest_tree_state_checkpoint(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -641,14 +995,16 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<Vec<SubtreeRootArtifact>, IndexerError> {
         let response = self
-            .client()
-            .subtree_roots(Request::new(wallet::SubtreeRootsRequest {
-                shielded_protocol: shielded_protocol_to_message(subtree_root_range.protocol)?
-                    as i32,
-                start_index: subtree_root_range.start_index.value(),
-                max_entries: subtree_root_range.max_entries.get(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::SubtreeRootsRequest {
+                    shielded_protocol: shielded_protocol_to_message(subtree_root_range.protocol)?
+                        as i32,
+                    start_index: subtree_root_range.start_index.value(),
+                    max_entries: subtree_root_range.max_entries.get(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.subtree_roots(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -661,15 +1017,25 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TxStatus, IndexerError> {
         let response = match self
-            .client()
-            .transaction(Request::new(wallet::TransactionRequest {
-                transaction_id: encode_rpc_transaction_id_hex(transaction_id),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc_with_retry_policy(
+                wallet::TransactionRequest {
+                    transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.transaction(request).await,
+                |status| {
+                    Self::tx_status_from_lookup_failure(status, at_epoch_id)
+                        .err()
+                        .map(|error| error.retry_policy())
+                },
+            )
             .await
         {
             Ok(response) => response.into_inner(),
-            Err(status) => return self.tx_status_from_lookup_failure(status, at_epoch_id),
+            Err(status) => {
+                self.recover_channel(&status);
+                return Self::tx_status_from_lookup_failure(&status, at_epoch_id);
+            }
         };
         tx_status_from_message(self.network, transaction_id, at_epoch_id, response)
     }
@@ -679,51 +1045,95 @@ impl ChainIndex for RemoteChainIndex {
         query: TransparentAddressUnspentOutputsQuery,
     ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
         let request = wallet::TransparentAddressUnspentOutputsRequest {
-            address: Some(wallet::AddressLookup {
-                selector: Some(wallet::address_lookup::Selector::ScriptHash(
-                    query.address_script_hash.as_bytes().to_vec(),
-                )),
-            }),
+            address: Some(address_lookup_message(query.address_script_hash)),
             start_height: query.start_height.value(),
             at_epoch_id: query.at_epoch_id.map(ChainEpochId::value),
         };
         let response = self
-            .client()
-            .transparent_address_unspent_outputs(Request::new(request))
+            .read_rpc(request, async |mut client, request| {
+                client.transparent_address_unspent_outputs(request).await
+            })
             .await
             .map_err(|status| self.map_status(status))?;
-        let expected_network = self.network;
-        let expected_epoch_id = query.at_epoch_id;
-        let recovery = self.clone();
-        // The leading header pins the chain epoch for the whole stream; the
-        // closure captures it and drops the header (yielding no item).
-        let mut pinned_chain_epoch: Option<ChainEpoch> = None;
-        let header_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let header_seen_while_decoding = std::sync::Arc::clone(&header_seen);
-        let stream = response.into_inner().filter_map(move |message_result| {
-            message_result
-                .map_err(|status| recovery.map_status(status))
-                .and_then(|message| {
-                    transparent_unspent_output_stream_item(
-                        expected_network,
-                        expected_epoch_id,
-                        &mut pinned_chain_epoch,
-                        &header_seen_while_decoding,
-                        message,
-                    )
-                })
-                .transpose()
-        });
-        let terminal = futures_util::StreamExt::filter_map(
-            futures_util::stream::once(async move {
-                missing_transparent_unspent_header_error(
-                    header_seen.load(std::sync::atomic::Ordering::Acquire),
-                )
-                .map(Err)
-            }),
-            |terminal_result| async move { terminal_result },
-        );
-        Ok(Box::pin(futures_util::StreamExt::chain(stream, terminal)))
+        Ok(self.unspent_outputs_stream(
+            response.into_inner(),
+            HashSet::from([query.address_script_hash]),
+            query.start_height,
+            query.at_epoch_id,
+        ))
+    }
+
+    async fn transparent_address_balances(
+        &self,
+        addresses: &[TransparentAddressScriptHash],
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressBalance, IndexerError> {
+        validate_address_batch(addresses)?;
+        self.require_capability(Capability::TransparentAddressBalances)
+            .await?;
+        let response = self
+            .read_rpc(
+                wallet::TransparentAddressBalancesRequest {
+                    addresses: addresses
+                        .iter()
+                        .copied()
+                        .map(address_lookup_message)
+                        .collect(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.transparent_address_balances(request).await,
+            )
+            .await
+            .map_err(|status| self.map_status(status))?
+            .into_inner();
+        let chain_epoch =
+            chain_epoch_from_chain_view_with_pin(self.network, at_epoch_id, response.chain_view)?;
+        let distinct_addresses: HashSet<_> = addresses.iter().collect();
+        if usize::try_from(response.address_count) != Ok(distinct_addresses.len()) {
+            return Err(IndexerError::malformed(
+                "transparent_address_balances.address_count",
+                "the number of distinct addresses does not match the request",
+            ));
+        }
+        Ok(TransparentAddressBalance {
+            confirmed_zat: response.confirmed_zat,
+            address_count: response.address_count,
+            chain_epoch,
+        })
+    }
+
+    async fn transparent_addresses_unspent_outputs(
+        &self,
+        addresses: &[TransparentAddressScriptHash],
+        start_height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
+        validate_address_batch(addresses)?;
+        self.require_capability(Capability::TransparentAddressesUnspentOutputs)
+            .await?;
+        let response = self
+            .read_rpc(
+                wallet::TransparentAddressesUnspentOutputsRequest {
+                    addresses: addresses
+                        .iter()
+                        .copied()
+                        .map(address_lookup_message)
+                        .collect(),
+                    start_height: start_height.value(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| {
+                    client.transparent_addresses_unspent_outputs(request).await
+                },
+            )
+            .await
+            .map_err(|status| self.map_status(status))?;
+        Ok(self.unspent_outputs_stream(
+            response.into_inner(),
+            addresses.iter().copied().collect(),
+            start_height,
+            at_epoch_id,
+        ))
     }
 
     async fn transparent_address_tx_ids_in_range(
@@ -747,8 +1157,9 @@ impl ChainIndex for RemoteChainIndex {
                 .map_or_default(|cursor| cursor.as_bytes().to_vec()),
         };
         let response = self
-            .client()
-            .transparent_address_tx_ids_in_range(Request::new(request))
+            .read_rpc(request, async |mut client, request| {
+                client.transparent_address_tx_ids_in_range(request).await
+            })
             .await
             .map_err(|status| self.map_status(status))?;
         let expected_network = self.network;
@@ -799,6 +1210,30 @@ impl ChainIndex for RemoteChainIndex {
             chain_epoch,
             statuses,
         })
+    }
+}
+
+fn encode_compact_pools(pools: &[CompactPool]) -> Vec<i32> {
+    pools
+        .iter()
+        .map(|&pool| compact_pool_message(pool) as i32)
+        .collect()
+}
+
+fn validate_address_batch(addresses: &[TransparentAddressScriptHash]) -> Result<(), IndexerError> {
+    if (1..=MAX_TRANSPARENT_ADDRESSES_PER_BATCH).contains(&addresses.len()) {
+        return Ok(());
+    }
+    Err(IndexerError::invalid_request(format!(
+        "addresses must contain between 1 and {MAX_TRANSPARENT_ADDRESSES_PER_BATCH} script hashes",
+    )))
+}
+
+fn address_lookup_message(address: TransparentAddressScriptHash) -> wallet::AddressLookup {
+    wallet::AddressLookup {
+        selector: Some(wallet::address_lookup::Selector::ScriptHash(
+            address.as_bytes().to_vec(),
+        )),
     }
 }
 
@@ -903,21 +1338,36 @@ fn subtree_roots_from_response(
 impl EndpointBackedIndex for RemoteChainIndex {
     async fn server_info(&self) -> Result<ServerInfo, IndexerError> {
         let response = self
-            .client()
-            .server_info(Request::new(wallet::ServerInfoRequest {}))
+            .read_rpc(wallet::ServerInfoRequest {}, async |mut client, request| {
+                client.server_info(request).await
+            })
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
-        let wallet_info = response
-            .info
-            .ok_or_else(|| IndexerError::malformed("info", "field is missing"))?;
-        server_info_from_message(self.network, wallet_info)
+        self.decode_server_info(response)
+    }
+
+    async fn standard_fee(&self) -> Result<StandardFee, IndexerError> {
+        self.require_capability(Capability::StandardFee).await?;
+        let response = self
+            .read_rpc(
+                wallet::StandardFeeRequest {},
+                async |mut client, request| client.standard_fee(request).await,
+            )
+            .await
+            .map_err(|status| self.map_status(status))?
+            .into_inner();
+        standard_fee_from_message(response).ok_or_else(|| {
+            IndexerError::malformed("standard_fee.fee_zat", "recommended fee is zero")
+        })
     }
 
     async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError> {
         let response = self
-            .client()
-            .chain_value_pools_at_tip(Request::new(wallet::ChainValuePoolsAtTipRequest {}))
+            .read_rpc(
+                wallet::ChainValuePoolsAtTipRequest {},
+                async |mut client, request| client.chain_value_pools_at_tip(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -954,8 +1404,9 @@ impl EndpointBackedIndex for RemoteChainIndex {
         family: ChainEventStreamFamily,
         address_filter: Vec<String>,
     ) -> Result<ChainEventStream, IndexerError> {
-        let response = self
-            .client()
+        let address_filtered = !address_filter.is_empty();
+        let mut client = self.client();
+        let response = client
             .chain_events(Request::new(wallet::ChainEventsRequest {
                 start: Some(event_stream_start_to_message(&start, |cursor| {
                     cursor.as_bytes()
@@ -965,15 +1416,30 @@ impl EndpointBackedIndex for RemoteChainIndex {
             }))
             .await
             .map_err(|status| self.map_status(status))?;
-        let expected_network = self.network;
-        let recovery = self.clone();
-        let mut progression = EventStreamProgression::new(CHAIN_EVENT_STREAM_LABELS);
-        let stream = response.into_inner().map(move |event_result| {
-            let event = event_result.map_err(|status| recovery.map_status(status))?;
-            let envelope = chain_event_envelope_from_message(expected_network, event)?;
-            progression.validate(envelope.event_sequence, envelope.cursor.as_bytes())?;
-            Ok(envelope)
-        });
+        let family = resolved_chain_event_family(response.metadata(), family, &start)?;
+        let state = (
+            response.into_inner(),
+            ChainEventStreamProgression::new(family, address_filtered),
+            client,
+            self.clone(),
+        );
+        let stream = futures_util::stream::try_unfold(
+            state,
+            |(mut wire, mut progression, mut client, index)| async move {
+                let Some(message) = wire
+                    .message()
+                    .await
+                    .map_err(|status| index.map_status(status))?
+                else {
+                    return Ok(None);
+                };
+                let envelope =
+                    chain_event_envelope_from_message(index.network, progression.family, message)?;
+                progression.validate(&envelope)?;
+                index.validate_reorg_cursor(&mut client, &envelope).await?;
+                Ok(Some((envelope, (wire, progression, client, index))))
+            },
+        );
 
         Ok(Box::pin(stream))
     }
@@ -986,11 +1452,13 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .from_cursor
             .map_or_default(|cursor| cursor.as_bytes().to_vec());
         let response = self
-            .client()
-            .mempool_snapshot(Request::new(wallet::MempoolSnapshotRequest {
-                max_entries: request.max_entries,
-                from_cursor,
-            }))
+            .read_rpc(
+                wallet::MempoolSnapshotRequest {
+                    max_entries: request.max_entries,
+                    from_cursor,
+                },
+                async |mut client, request| client.mempool_snapshot(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -1030,6 +1498,20 @@ impl EndpointBackedIndex for RemoteChainIndex {
         let outcome = self.transaction_by_id(transaction_id, None).await?;
         Ok(matches!(outcome, TxStatus::InMempool(_)))
     }
+}
+
+fn connect_channel(endpoint: &Endpoint, proxy: Option<&Socks5Proxy>) -> Channel {
+    proxy.map_or_else(
+        || endpoint.connect_lazy(),
+        |proxy| proxy.connect_lazy(endpoint),
+    )
+}
+
+fn has_zinder_error_info(status: &tonic::Status) -> bool {
+    status
+        .get_error_details()
+        .error_info()
+        .is_some_and(|error_info| error_info.domain == ZINDER_ERROR_DOMAIN)
 }
 
 fn ensure_supported_contract_revision(contract_revision: u32) -> Result<(), IndexerError> {
@@ -1284,6 +1766,126 @@ mod server_info_conversion_tests {
     }
 }
 
+#[cfg(test)]
+mod endpoint_transport_tests {
+    use std::{io, time::Duration};
+
+    use tokio::io::AsyncReadExt;
+
+    use super::*;
+
+    /// The 24-byte HTTP/2 connection preface every client sends before its
+    /// first frame.
+    const CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    /// The header and payload of one HTTP/2 frame.
+    struct Http2Frame {
+        kind: u8,
+        stream_id: u32,
+        payload: Vec<u8>,
+    }
+
+    async fn read_frame(stream: &mut (impl AsyncReadExt + Unpin)) -> io::Result<Http2Frame> {
+        let mut header = [0u8; 9];
+        stream.read_exact(&mut header).await?;
+        let length = u32::from(header[0]) << 16 | u32::from(header[1]) << 8 | u32::from(header[2]);
+        let kind = header[3];
+        let stream_id =
+            u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
+        let mut payload = vec![
+            0u8;
+            usize::try_from(length).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "frame length exceeds usize")
+            })?
+        ];
+        stream.read_exact(&mut payload).await?;
+        Ok(Http2Frame {
+            kind,
+            stream_id,
+            payload,
+        })
+    }
+
+    /// The endpoint advertises fixed WAN windows and frame size, not the
+    /// 65,535-byte windows hyper's adaptive setting would substitute.
+    #[tokio::test]
+    async fn the_endpoint_advertises_fixed_wan_http2_windows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let endpoint = build_endpoint(format!("http://{address}"))?;
+        let connect = tokio::spawn(async move { endpoint.connect().await });
+
+        let (initial_window_size, max_frame_size, connection_window_increment) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut stream, _) = listener.accept().await?;
+                let mut preface = [0u8; 24];
+                stream.read_exact(&mut preface).await?;
+                assert_eq!(&preface, CLIENT_PREFACE);
+
+                let mut initial_window_size = None;
+                let mut max_frame_size = None;
+                let mut connection_window_increment = 0u32;
+                loop {
+                    let frame = read_frame(&mut stream).await?;
+                    match frame.kind {
+                        // SETTINGS.
+                        0x4 => {
+                            for entry in frame.payload.as_chunks::<6>().0 {
+                                let id = u16::from_be_bytes([entry[0], entry[1]]);
+                                let value =
+                                    u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
+                                match id {
+                                    // SETTINGS_INITIAL_WINDOW_SIZE.
+                                    0x4 => initial_window_size = Some(value),
+                                    // SETTINGS_MAX_FRAME_SIZE.
+                                    0x5 => max_frame_size = Some(value),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        // WINDOW_UPDATE on the connection, stream 0.
+                        0x8 if frame.stream_id == 0 && frame.payload.len() == 4 => {
+                            let increment = u32::from_be_bytes([
+                                frame.payload[0],
+                                frame.payload[1],
+                                frame.payload[2],
+                                frame.payload[3],
+                            ]) & 0x7fff_ffff;
+                            connection_window_increment =
+                                connection_window_increment.wrapping_add(increment);
+                        }
+                        _ => {}
+                    }
+                    if initial_window_size.is_some()
+                        && max_frame_size.is_some()
+                        && connection_window_increment > 0
+                    {
+                        break;
+                    }
+                }
+                Ok::<_, io::Error>((
+                    initial_window_size,
+                    max_frame_size,
+                    connection_window_increment,
+                ))
+            })
+            .await??;
+
+        assert_eq!(initial_window_size, Some(HTTP2_INITIAL_STREAM_WINDOW));
+        assert_eq!(max_frame_size, Some(HTTP2_MAX_FRAME_SIZE));
+        // The connection window starts at the spec's 65,535 bytes and the
+        // client raises it to its advertised size by WINDOW_UPDATE.
+        assert_eq!(
+            65_535u32 + connection_window_increment,
+            HTTP2_INITIAL_CONNECTION_WINDOW
+        );
+
+        connect.abort();
+        Ok(())
+    }
+}
+
 fn chain_value_pools_at_tip_from_message(
     expected_network: Network,
     message: wallet::ChainValuePoolsAtTipResponse,
@@ -1400,10 +2002,7 @@ fn tree_state_from_response(
     response: wallet::TreeStateResponse,
 ) -> Result<TreeStateArtifact, IndexerError> {
     let block_time_seconds = response.block_time_seconds.ok_or_else(|| {
-        IndexerError::malformed(
-            "tree_state.block_time_seconds",
-            "field is missing from a contract revision 2 response",
-        )
+        IndexerError::malformed("tree_state.block_time_seconds", "required field is missing")
     })?;
     Ok(TreeStateArtifact::new(
         BlockHeight::new(response.height),
@@ -1542,23 +2141,23 @@ fn transparent_unspent_output_stream_item(
     expected_network: Network,
     expected_epoch_id: Option<ChainEpochId>,
     pinned_chain_epoch: &mut Option<ChainEpoch>,
-    header_seen: &std::sync::atomic::AtomicBool,
     message: wallet::TransparentUnspentOutputsChunk,
 ) -> Result<Option<TransparentUnspentOutputChunk>, IndexerError> {
     match message.body.ok_or_else(|| {
         IndexerError::malformed("transparent_unspent_outputs_chunk.body", "field is missing")
     })? {
         wallet::transparent_unspent_outputs_chunk::Body::Header(chain_view) => {
-            stream_header_chain_epoch(expected_network, pinned_chain_epoch, Some(chain_view))?;
+            let mut validated_epoch = *pinned_chain_epoch;
+            stream_header_chain_epoch(expected_network, &mut validated_epoch, Some(chain_view))?;
             if let Some(expected) = expected_epoch_id
-                && pinned_chain_epoch.as_ref().map(|epoch| epoch.id) != Some(expected)
+                && validated_epoch.as_ref().map(|epoch| epoch.id) != Some(expected)
             {
                 return Err(IndexerError::malformed(
                     "transparent_unspent_outputs.header.chain_epoch_id",
                     "response epoch does not match requested epoch pin",
                 ));
             }
-            header_seen.store(true, std::sync::atomic::Ordering::Release);
+            *pinned_chain_epoch = validated_epoch;
             Ok(None)
         }
         wallet::transparent_unspent_outputs_chunk::Body::Item(output_message) => {
@@ -1631,31 +2230,62 @@ impl CompactBlockRangeStreamState {
             IndexerError::malformed("compact_blocks_in_range_chunk.body", "field is missing")
         })? {
             wallet::compact_blocks_in_range_chunk::Body::Header(chain_view) => {
-                if self.chain_epoch.is_some() {
-                    return Err(IndexerError::malformed(
-                        "compact_blocks_in_range.header",
-                        "stream sent more than one chain-view header",
-                    ));
-                }
-                self.chain_epoch = Some(chain_epoch_from_chain_view_with_pin(
-                    self.expected_network,
-                    self.expected_epoch_id,
-                    Some(chain_view),
-                )?);
+                self.accept_header(chain_view)?;
                 Ok(None)
             }
             wallet::compact_blocks_in_range_chunk::Body::Item(compact_block) => {
-                let chain_epoch = self.chain_epoch.ok_or_else(|| {
-                    IndexerError::malformed(
-                        "compact_blocks_in_range.item",
-                        "stream sent a compact block before its chain-view header",
-                    )
-                })?;
+                let chain_epoch = self.require_header()?;
                 let artifact = compact_block_from_message(compact_block)?;
                 self.accept_block_height(chain_epoch, artifact.height())?;
                 Ok(Some(artifact))
             }
         }
+    }
+
+    fn accept_nullifiers(
+        &mut self,
+        chunk: wallet::CompactNullifiersInRangeChunk,
+    ) -> Result<Option<CompactBlockNullifiers>, IndexerError> {
+        use wallet::compact_nullifiers_in_range_chunk::Body;
+        match chunk.body.ok_or_else(|| {
+            IndexerError::malformed("compact_nullifiers_in_range_chunk.body", "field is missing")
+        })? {
+            Body::Header(chain_view) => {
+                self.accept_header(chain_view)?;
+                Ok(None)
+            }
+            Body::Block(block) => {
+                let chain_epoch = self.require_header()?;
+                let block = compact_block_nullifiers_from_message(block)
+                    .map_err(wallet_decode_error_to_indexer_error)?;
+                self.accept_block_height(chain_epoch, block.height)?;
+                Ok(Some(block))
+            }
+        }
+    }
+
+    fn accept_header(&mut self, chain_view: wallet::ChainView) -> Result<(), IndexerError> {
+        if self.chain_epoch.is_some() {
+            return Err(IndexerError::malformed(
+                "stream.header",
+                "stream sent more than one chain-view header",
+            ));
+        }
+        self.chain_epoch = Some(chain_epoch_from_chain_view_with_pin(
+            self.expected_network,
+            self.expected_epoch_id,
+            Some(chain_view),
+        )?);
+        Ok(())
+    }
+
+    fn require_header(&self) -> Result<ChainEpoch, IndexerError> {
+        self.chain_epoch.ok_or_else(|| {
+            IndexerError::malformed(
+                "compact_blocks_in_range.item",
+                "stream sent a compact block before its chain-view header",
+            )
+        })
     }
 
     fn accept_block_height(
@@ -1685,10 +2315,10 @@ impl CompactBlockRangeStreamState {
                 ),
             ));
         }
-        self.next_height = if expected < self.block_range.end {
-            expected.value().checked_add(1).map(BlockHeight::new)
-        } else {
-            None
+        self.next_height = match expected.cmp(&self.block_range.end) {
+            std::cmp::Ordering::Less => expected.next(),
+            std::cmp::Ordering::Greater => expected.value().checked_sub(1).map(BlockHeight::new),
+            std::cmp::Ordering::Equal => None,
         };
         Ok(())
     }
@@ -1722,16 +2352,28 @@ fn compact_block_range_stream(
     wire_stream: IndexStream<wallet::CompactBlocksInRangeChunk>,
     state: CompactBlockRangeStreamState,
 ) -> IndexStream<CompactBlockArtifact> {
+    compact_range_stream(wire_stream, state, CompactBlockRangeStreamState::accept)
+}
+
+fn compact_range_stream<Chunk, Block>(
+    wire_stream: IndexStream<Chunk>,
+    state: CompactBlockRangeStreamState,
+    accept: fn(&mut CompactBlockRangeStreamState, Chunk) -> Result<Option<Block>, IndexerError>,
+) -> IndexStream<Block>
+where
+    Chunk: Send + 'static,
+    Block: Send + 'static,
+{
     Box::pin(futures_util::stream::unfold(
         Some((wire_stream, state)),
-        |stream_state| async move {
+        move |stream_state| async move {
             let (mut wire_stream, mut state) = stream_state?;
             loop {
                 let Some(chunk_result) = futures_util::StreamExt::next(&mut wire_stream).await
                 else {
                     return state.end_of_stream_error().map(|error| (Err(error), None));
                 };
-                match chunk_result.and_then(|chunk| state.accept(chunk)) {
+                match chunk_result.and_then(|chunk| accept(&mut state, chunk)) {
                     Ok(None) => {}
                     Ok(Some(artifact)) => return Some((Ok(artifact), Some((wire_stream, state)))),
                     Err(error) => return Some((Err(error), None)),
@@ -1866,8 +2508,36 @@ fn broadcast_rejection_reason_from_message(code: i32) -> zinder_core::BroadcastR
     }
 }
 
+fn resolved_chain_event_family(
+    metadata: &tonic::metadata::MetadataMap,
+    requested: ChainEventStreamFamily,
+    start: &EventStreamStart<ChainEventCursor>,
+) -> Result<ChainEventStreamFamily, IndexerError> {
+    match metadata.get(CHAIN_EVENT_FAMILY_HEADER) {
+        None if requested == ChainEventStreamFamily::Settled => {
+            Err(IndexerError::FailedPrecondition {
+                reason: "settled chain events require wallet contract revision 12 or later"
+                    .to_owned(),
+            })
+        }
+        None => Ok(ChainEventStreamFamily::Visible),
+        Some(header)
+            if header == "settled"
+                && (requested == ChainEventStreamFamily::Settled
+                    || matches!(start, EventStreamStart::AfterCursor(_))) =>
+        {
+            Ok(ChainEventStreamFamily::Settled)
+        }
+        Some(_) => Err(IndexerError::malformed(
+            CHAIN_EVENT_FAMILY_HEADER,
+            "unexpected chain-event stream family",
+        )),
+    }
+}
+
 fn chain_event_envelope_from_message(
     expected_network: Network,
+    family: ChainEventStreamFamily,
     message: wallet::ChainEventEnvelope,
 ) -> Result<ChainEventEnvelope, IndexerError> {
     if message.cursor.is_empty() {
@@ -1898,10 +2568,16 @@ fn chain_event_envelope_from_message(
                     "committed event epoch does not match envelope chain view",
                 ));
             }
-            validate_committed_range(&committed)?;
+            validate_committed_range(&committed, family)?;
             ChainEvent::ChainCommitted { committed }
         }
         wallet::chain_event_envelope::Event::ChainReorged(chain_reorged) => {
+            if family == ChainEventStreamFamily::Settled {
+                return Err(IndexerError::malformed(
+                    "event",
+                    "settled streams cannot deliver a reorg",
+                ));
+            }
             let reverted = chain_range_reverted_from_message(
                 expected_network,
                 chain_reorged.reverted.ok_or_else(|| {
@@ -1937,8 +2613,20 @@ fn chain_event_envelope_from_message(
     })
 }
 
-fn validate_committed_range(committed: &ChainEpochCommitted) -> Result<(), IndexerError> {
+fn validate_committed_range(
+    committed: &ChainEpochCommitted,
+    family: ChainEventStreamFamily,
+) -> Result<(), IndexerError> {
     let range = committed.block_range;
+    if family == ChainEventStreamFamily::Settled {
+        if range.start > range.end || range.end != committed.chain_epoch.settled_tip_height {
+            return Err(IndexerError::malformed(
+                "committed.block_range",
+                "settled range must be non-empty and end at its epoch settled tip",
+            ));
+        }
+        return Ok(());
+    }
     let visible_tip = committed.chain_epoch.visible_tip_height;
     if range.start <= range.end {
         if range.end != visible_tip {
@@ -1960,7 +2648,7 @@ fn validate_reorg_relationship(
     reverted: &ChainRangeReverted,
     committed: &ChainEpochCommitted,
 ) -> Result<(), IndexerError> {
-    validate_committed_range(committed)?;
+    validate_committed_range(committed, ChainEventStreamFamily::Visible)?;
     if reverted.block_range.start > reverted.block_range.end {
         return Err(IndexerError::malformed(
             "chain_reorged.reverted.block_range",
@@ -2000,21 +2688,91 @@ fn validate_reorg_relationship(
             "reverted epoch must precede the committed epoch",
         ));
     }
-    if reverted.chain_epoch.settled_tip_height != committed.chain_epoch.settled_tip_height
-        || reverted.chain_epoch.settled_tip_hash != committed.chain_epoch.settled_tip_hash
-    {
+    if !preserves_settlement(&reverted.chain_epoch, &committed.chain_epoch) {
         return Err(IndexerError::malformed(
             "chain_reorged.reverted.chain_epoch.settled_tip",
-            "reorg must preserve the settled tip identity",
+            "settlement must preserve or advance the previous settled tip",
         ));
     }
-    if reverted.block_range.start <= committed.chain_epoch.settled_tip_height {
+    Ok(())
+}
+
+fn validate_reverted_range_start(reverted: &ChainRangeReverted) -> Result<(), IndexerError> {
+    if reverted.block_range.start <= reverted.chain_epoch.settled_tip_height {
         return Err(IndexerError::malformed(
             "chain_reorged.reverted.block_range.start",
             "reorg range must begin above the settled tip",
         ));
     }
     Ok(())
+}
+
+fn preserves_settlement(previous: &ChainEpoch, next: &ChainEpoch) -> bool {
+    next.settled_tip_height > previous.settled_tip_height
+        || (next.settled_tip_height == previous.settled_tip_height
+            && next.settled_tip_hash == previous.settled_tip_hash)
+}
+
+struct ChainEventStreamProgression {
+    family: ChainEventStreamFamily,
+    address_filtered: bool,
+    events: EventStreamProgression,
+    previous_epoch: Option<ChainEpoch>,
+}
+
+impl ChainEventStreamProgression {
+    fn new(family: ChainEventStreamFamily, address_filtered: bool) -> Self {
+        Self {
+            family,
+            address_filtered,
+            events: EventStreamProgression::new(CHAIN_EVENT_STREAM_LABELS),
+            previous_epoch: None,
+        }
+    }
+
+    fn validate(&mut self, envelope: &ChainEventEnvelope) -> Result<(), IndexerError> {
+        if let Some(previous) = &self.previous_epoch {
+            if envelope.chain_epoch.id <= previous.id {
+                return Err(IndexerError::malformed(
+                    "chain_view.chain_epoch.chain_epoch_id",
+                    "chain event epochs must strictly increase",
+                ));
+            }
+            if !preserves_settlement(previous, &envelope.chain_epoch) {
+                return Err(IndexerError::malformed(
+                    "chain_view.chain_epoch.settled_tip",
+                    "settlement must preserve or advance the previous settled tip",
+                ));
+            }
+            if self.family == ChainEventStreamFamily::Settled
+                && let ChainEvent::ChainCommitted { committed } = &envelope.event
+            {
+                let start = committed.block_range.start;
+                if start <= previous.settled_tip_height
+                    || (!self.address_filtered && previous.settled_tip_height.next() != Some(start))
+                {
+                    return Err(IndexerError::malformed(
+                        "committed.block_range.start",
+                        "settled ranges must advance without gaps unless address-filtered",
+                    ));
+                }
+            }
+            // The cursor's own settlement is checked after detecting a legacy locator below it.
+            if let ChainEvent::ChainReorged { reverted, .. } = &envelope.event
+                && previous.settled_tip_height > reverted.chain_epoch.settled_tip_height
+                && reverted.block_range.start <= previous.settled_tip_height
+            {
+                return Err(IndexerError::malformed(
+                    "chain_reorged.reverted.block_range.start",
+                    "reorg would replace a previously reported settled block",
+                ));
+            }
+        }
+        self.events
+            .validate(envelope.event_sequence, envelope.cursor.as_bytes())?;
+        self.previous_epoch = Some(envelope.chain_epoch);
+        Ok(())
+    }
 }
 
 // Retain every accepted cursor for this stream so a server cannot move the
@@ -2266,9 +3024,7 @@ fn verify_transaction_absence(
     }
 }
 
-/// Returns whether `status` is a `NOT_FOUND` that a server below contract
-/// revision 6 used for every transaction miss, which cannot be told apart
-/// from a storage or history failure.
+/// Returns whether a `NOT_FOUND` lacks enough evidence to verify transaction absence.
 fn is_unverified_transaction_absence(code: tonic::Code, details: &ErrorDetails) -> bool {
     if code != tonic::Code::NotFound {
         return false;
@@ -2851,11 +3607,21 @@ mod tests {
     }
 
     fn committed_event_message(sequence: u64, cursor: Vec<u8>) -> wallet::ChainEventEnvelope {
-        let epoch = synthetic_chain_epoch(EXPECTED_NETWORK);
+        committed_event_at_epoch(synthetic_chain_epoch(EXPECTED_NETWORK), sequence, cursor)
+    }
+
+    fn committed_event_at_epoch(
+        epoch: wallet::ChainEpoch,
+        sequence: u64,
+        cursor: Vec<u8>,
+    ) -> wallet::ChainEventEnvelope {
         wallet::ChainEventEnvelope {
             cursor,
             event_sequence: sequence,
-            chain_view: Some(synthetic_chain_view(EXPECTED_NETWORK)),
+            chain_view: Some(wallet::ChainView {
+                chain_epoch: Some(epoch.clone()),
+                ..Default::default()
+            }),
             event: Some(wallet::chain_event_envelope::Event::ChainCommitted(
                 wallet::ChainCommitted {
                     committed: Some(wallet::ChainEpochCommitted {
@@ -2913,12 +3679,15 @@ mod tests {
 
     #[test]
     fn contract_revision_eight_is_the_minimum() {
-        assert!(matches!(
-            ensure_supported_contract_revision(7),
-            Err(IndexerError::FailedPrecondition { .. })
-        ));
-        assert!(ensure_supported_contract_revision(8).is_ok());
-        assert!(ensure_supported_contract_revision(9).is_ok());
+        for revision in 0..8 {
+            assert!(matches!(
+                ensure_supported_contract_revision(revision),
+                Err(IndexerError::FailedPrecondition { .. })
+            ));
+        }
+        for revision in [8, 9, zinder_proto::CONTRACT_REVISION] {
+            assert!(ensure_supported_contract_revision(revision).is_ok());
+        }
     }
 
     #[test]
@@ -3130,23 +3899,27 @@ mod tests {
         Ok(())
     }
 
+    fn decode_visible_event(
+        message: wallet::ChainEventEnvelope,
+    ) -> Result<ChainEventEnvelope, IndexerError> {
+        chain_event_envelope_from_message(
+            EXPECTED_NETWORK,
+            ChainEventStreamFamily::Visible,
+            message,
+        )
+    }
+
     #[test]
     fn chain_event_decoder_rejects_empty_cursor_and_zero_sequence() {
         assert!(matches!(
-            chain_event_envelope_from_message(
-                EXPECTED_NETWORK,
-                committed_event_message(1, Vec::new())
-            ),
+            decode_visible_event(committed_event_message(1, Vec::new())),
             Err(IndexerError::MalformedResponse {
                 field: "cursor",
                 ..
             })
         ));
         assert!(matches!(
-            chain_event_envelope_from_message(
-                EXPECTED_NETWORK,
-                committed_event_message(0, vec![1])
-            ),
+            decode_visible_event(committed_event_message(0, vec![1])),
             Err(IndexerError::MalformedResponse {
                 field: "event_sequence",
                 ..
@@ -3161,7 +3934,7 @@ mod tests {
         if let Some(committed) = committed_payload_mut(&mut wrong_tip) {
             committed.end_height = 41;
         }
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, wrong_tip).is_err());
+        assert!(decode_visible_event(wrong_tip).is_err());
 
         let mut malformed_empty = committed_event_message(1, vec![1]);
         assert!(committed_payload_mut(&mut malformed_empty).is_some());
@@ -3169,7 +3942,64 @@ mod tests {
             committed.start_height = 44;
             committed.end_height = 42;
         }
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, malformed_empty).is_err());
+        assert!(decode_visible_event(malformed_empty).is_err());
+    }
+
+    #[test]
+    fn settled_streams_reject_reorgs_empty_commits_and_wrong_range_ends() -> Result<(), IndexerError>
+    {
+        let family = ChainEventStreamFamily::Settled;
+        assert!(
+            chain_event_envelope_from_message(EXPECTED_NETWORK, family, reorg_event_message())
+                .is_err()
+        );
+        for (start, end, accepted) in [
+            (39, 40, true),
+            (41, 40, false),
+            (39, 39, false),
+            (40, 42, false),
+        ] {
+            let mut message = committed_event_message(1, vec![1]);
+            let committed = committed_payload_mut(&mut message)
+                .ok_or_else(|| IndexerError::malformed("event", "missing commit in fixture"))?;
+            committed.start_height = start;
+            committed.end_height = end;
+            assert_eq!(
+                chain_event_envelope_from_message(EXPECTED_NETWORK, family, message).is_ok(),
+                accepted
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn settled_ranges_cannot_overlap_and_only_address_filtered_ranges_can_skip_heights()
+    -> Result<(), IndexerError> {
+        let family = ChainEventStreamFamily::Settled;
+        let settled_event = |sequence: u8, start: u32, end: u32| {
+            let mut epoch = synthetic_chain_epoch(EXPECTED_NETWORK);
+            epoch.chain_epoch_id = u64::from(sequence);
+            epoch.settled_tip = Some(wallet::BlockTip {
+                height: end,
+                hash: "22".repeat(32),
+            });
+            let mut message = committed_event_at_epoch(epoch, u64::from(sequence), vec![sequence]);
+            let committed = committed_payload_mut(&mut message)
+                .ok_or_else(|| IndexerError::malformed("event", "missing commit in fixture"))?;
+            committed.start_height = start;
+            committed.end_height = end;
+            chain_event_envelope_from_message(EXPECTED_NETWORK, family, message)
+        };
+        for address_filtered in [false, true] {
+            let mut progression = ChainEventStreamProgression::new(family, address_filtered);
+            progression.validate(&settled_event(1, 36, 38)?)?;
+            assert!(progression.validate(&settled_event(2, 38, 39)?).is_err());
+            assert_eq!(
+                progression.validate(&settled_event(3, 40, 41)?).is_ok(),
+                address_filtered
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -3193,32 +4023,18 @@ mod tests {
             committed.end_height = max_height - 1;
         }
 
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, message).is_ok());
+        assert!(decode_visible_event(message).is_ok());
     }
 
     #[test]
     fn chain_event_stream_requires_increasing_sequences_and_unique_cursors_but_allows_gaps()
     -> Result<(), IndexerError> {
-        let first = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(1, vec![1]),
-        )?;
-        let gap = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(3, vec![3]),
-        )?;
-        let duplicate_sequence = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(3, vec![4]),
-        )?;
-        let nonadjacent_repeated_cursor = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(4, vec![1]),
-        )?;
-        let event_after_rejections = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(4, vec![4]),
-        )?;
+        let first = decode_visible_event(committed_event_message(1, vec![1]))?;
+        let gap = decode_visible_event(committed_event_message(3, vec![3]))?;
+        let duplicate_sequence = decode_visible_event(committed_event_message(3, vec![4]))?;
+        let nonadjacent_repeated_cursor =
+            decode_visible_event(committed_event_message(4, vec![1]))?;
+        let event_after_rejections = decode_visible_event(committed_event_message(4, vec![4]))?;
         let mut state = EventStreamProgression::new(CHAIN_EVENT_STREAM_LABELS);
         let mut validate = |envelope: &ChainEventEnvelope| {
             state.validate(envelope.event_sequence, envelope.cursor.as_bytes())
@@ -3235,14 +4051,8 @@ mod tests {
     #[test]
     fn chain_event_stream_fails_closed_before_cursor_retention_capacity_is_exceeded()
     -> Result<(), IndexerError> {
-        let first = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(1, vec![1]),
-        )?;
-        let over_capacity = chain_event_envelope_from_message(
-            EXPECTED_NETWORK,
-            committed_event_message(2, vec![2]),
-        )?;
+        let first = decode_visible_event(committed_event_message(1, vec![1]))?;
+        let over_capacity = decode_visible_event(committed_event_message(2, vec![2]))?;
         let mut state = EventStreamProgression {
             cursor_count_limit: 1,
             cursor_bytes_limit: usize::MAX,
@@ -3271,7 +4081,7 @@ mod tests {
 
     #[test]
     fn chain_event_decoder_enforces_reorg_range_epoch_and_settlement_relationships() {
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, reorg_event_message()).is_ok());
+        assert!(decode_visible_event(reorg_event_message()).is_ok());
 
         let mut misaligned = reorg_event_message();
         if let Some(wallet::chain_event_envelope::Event::ChainReorged(reorg)) =
@@ -3280,7 +4090,7 @@ mod tests {
         {
             committed.start_height = 42;
         }
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, misaligned).is_err());
+        assert!(decode_visible_event(misaligned).is_err());
 
         let mut settlement_changed = reorg_event_message();
         if let Some(wallet::chain_event_envelope::Event::ChainReorged(reorg)) =
@@ -3295,7 +4105,7 @@ mod tests {
                 hash: "55".repeat(32),
             });
         }
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, settlement_changed).is_err());
+        assert!(decode_visible_event(settlement_changed).is_ok());
 
         let mut zero_epoch = committed_event_message(1, vec![1]);
         if let Some(chain_epoch) = zero_epoch
@@ -3305,7 +4115,96 @@ mod tests {
         {
             chain_epoch.chain_epoch_id = 0;
         }
-        assert!(chain_event_envelope_from_message(EXPECTED_NETWORK, zero_epoch).is_err());
+        assert!(decode_visible_event(zero_epoch).is_err());
+    }
+
+    #[test]
+    fn reorg_may_settle_replacements_but_must_preserve_previously_settled_blocks()
+    -> Result<(), IndexerError> {
+        let envelope = decode_visible_event(reorg_event_message())?;
+        let ChainEvent::ChainReorged {
+            reverted,
+            mut committed,
+        } = envelope.event
+        else {
+            return Err(IndexerError::malformed("event", "expected a reorg"));
+        };
+        committed.chain_epoch.settled_tip_hash = BlockHash::from_bytes([0x55; 32]);
+        for (height, accepted) in [(39, false), (40, false), (41, true), (42, true)] {
+            committed.chain_epoch.settled_tip_height = BlockHeight::new(height);
+            assert_eq!(
+                validate_reorg_relationship(&reverted, &committed).is_ok(),
+                accepted
+            );
+        }
+        for start in [39, 40] {
+            let mut reverted = reverted;
+            reverted.block_range.start = BlockHeight::new(start);
+            assert!(validate_reverted_range_start(&reverted).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn chain_event_stream_requires_increasing_epochs_and_monotonic_settlement()
+    -> Result<(), IndexerError> {
+        let mut state = ChainEventStreamProgression::new(ChainEventStreamFamily::Visible, false);
+        let mut first = decode_visible_event(committed_event_message(1, vec![1]))?;
+        state.validate(&first)?;
+        first.event_sequence = 2;
+        first.cursor = ChainEventCursor::from_bytes([2]);
+        for (epoch, height, hash, accepted) in [
+            (7, 40, 0x22, false),
+            (6, 40, 0x22, false),
+            (8, 39, 0x33, false),
+            (8, 40, 0x33, false),
+            (8, 40, 0x22, true),
+        ] {
+            first.chain_epoch.id = ChainEpochId::new(epoch);
+            first.chain_epoch.settled_tip_height = BlockHeight::new(height);
+            first.chain_epoch.settled_tip_hash = BlockHash::from_bytes([hash; 32]);
+            assert_eq!(state.validate(&first).is_ok(), accepted);
+        }
+        first.event_sequence = 5;
+        first.cursor = ChainEventCursor::from_bytes([5]);
+        first.chain_epoch.id = ChainEpochId::new(11);
+        first.chain_epoch.settled_tip_height = BlockHeight::new(41);
+        first.chain_epoch.settled_tip_hash = BlockHash::from_bytes([0x33; 32]);
+        state.validate(&first)
+    }
+
+    #[test]
+    fn reorg_cannot_undo_settlement_reported_by_a_previous_event() -> Result<(), IndexerError> {
+        let mut previous_epoch = synthetic_chain_epoch(EXPECTED_NETWORK);
+        previous_epoch.chain_epoch_id = 5;
+        let previous = decode_visible_event(committed_event_at_epoch(previous_epoch, 5, vec![5]))?;
+        let mut progression =
+            ChainEventStreamProgression::new(ChainEventStreamFamily::Visible, false);
+        progression.validate(&previous)?;
+
+        let mut reorg = decode_visible_event(reorg_event_message())?;
+        let ChainEvent::ChainReorged {
+            reverted,
+            committed,
+        } = &mut reorg.event
+        else {
+            return Err(IndexerError::malformed("event", "expected a reorg"));
+        };
+        reverted.chain_epoch.settled_tip_height = BlockHeight::new(39);
+        reverted.block_range.start = BlockHeight::new(40);
+        committed.block_range.start = reverted.block_range.start;
+        committed.chain_epoch.settled_tip_height = BlockHeight::new(41);
+        reorg.chain_epoch = committed.chain_epoch;
+        reorg.settled_tip_height = committed.chain_epoch.settled_tip_height;
+        validate_reorg_relationship(reverted, committed)?;
+        assert!(matches!(
+            progression.validate(&reorg),
+            Err(IndexerError::MalformedResponse {
+                field: "chain_reorged.reverted.block_range.start",
+                ..
+            })
+        ));
+        Ok(())
     }
 
     #[test]
@@ -3408,12 +4307,10 @@ mod tests {
     #[test]
     fn transparent_unspent_header_rejects_a_response_from_another_epoch() {
         let mut pinned_epoch = None;
-        let header_seen = std::sync::atomic::AtomicBool::new(false);
         let outcome = transparent_unspent_output_stream_item(
             EXPECTED_NETWORK,
             Some(ChainEpochId::new(8)),
             &mut pinned_epoch,
-            &header_seen,
             wallet::TransparentUnspentOutputsChunk {
                 body: Some(wallet::transparent_unspent_outputs_chunk::Body::Header(
                     synthetic_chain_view(EXPECTED_NETWORK),
@@ -3425,7 +4322,7 @@ mod tests {
             outcome,
             Err(IndexerError::MalformedResponse { .. })
         ));
-        assert!(!header_seen.load(std::sync::atomic::Ordering::Acquire));
+        assert!(pinned_epoch.is_none());
     }
 
     #[test]
@@ -3533,12 +4430,10 @@ mod tests {
         assert!(missing_transparent_unspent_header_error(false).is_some());
 
         let mut pinned_epoch = None;
-        let header_seen = std::sync::atomic::AtomicBool::new(false);
         let outcome = transparent_unspent_output_stream_item(
             EXPECTED_NETWORK,
             Some(ChainEpochId::new(7)),
             &mut pinned_epoch,
-            &header_seen,
             wallet::TransparentUnspentOutputsChunk {
                 body: Some(wallet::transparent_unspent_outputs_chunk::Body::Header(
                     synthetic_chain_view(EXPECTED_NETWORK),
@@ -3547,7 +4442,7 @@ mod tests {
         );
 
         assert!(matches!(outcome, Ok(None)));
-        assert!(header_seen.load(std::sync::atomic::Ordering::Acquire));
+        assert!(pinned_epoch.is_some());
         assert!(missing_transparent_unspent_header_error(true).is_none());
     }
 
@@ -3605,7 +4500,7 @@ mod tests {
             .collect()
     }
 
-    fn is_malformed(decoded: &Result<BlockHeight, IndexerError>, expected_field: &str) -> bool {
+    fn is_malformed<T>(decoded: &Result<T, IndexerError>, expected_field: &str) -> bool {
         matches!(
             decoded,
             Err(IndexerError::MalformedResponse { field, .. }) if *field == expected_field
@@ -3662,7 +4557,26 @@ mod tests {
 
         assert_eq!(decoded.len(), 2, "the stream ends at its first error");
         assert!(matches!(decoded[0], Ok(height) if height == BlockHeight::new(40)));
-        assert!(is_malformed(&decoded[1], "compact_blocks_in_range.header"));
+        assert!(is_malformed(&decoded[1], "stream.header"));
+    }
+
+    #[test]
+    fn compact_nullifier_range_rejects_a_second_header() {
+        use wallet::compact_nullifiers_in_range_chunk::Body;
+
+        let mut state = CompactBlockRangeStreamState::new(
+            EXPECTED_NETWORK,
+            None,
+            BlockHeightRange::inclusive(BlockHeight::new(40), BlockHeight::new(41)),
+        );
+        let header = wallet::CompactNullifiersInRangeChunk {
+            body: Some(Body::Header(synthetic_chain_view(EXPECTED_NETWORK))),
+        };
+        assert!(matches!(state.accept_nullifiers(header.clone()), Ok(None)));
+        assert!(is_malformed(
+            &state.accept_nullifiers(header),
+            "stream.header"
+        ));
     }
 
     #[tokio::test]

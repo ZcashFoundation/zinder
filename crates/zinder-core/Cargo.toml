@@ -21,18 +21,20 @@ default = ["commitment-tree-codec"]
 commitment-tree-codec = [
     "dep:incrementalmerkletree",
     "dep:orchard",
-    "dep:parking_lot",
+    "dep:rayon",
     "dep:sapling",
     "dep:zcash_primitives",
 ]
 
 [dependencies]
+base16ct.workspace = true
 blake2b_simd.workspace = true
+chacha20.workspace = true
 hex.workspace = true
 incrementalmerkletree = { workspace = true, features = ["legacy-api"], optional = true }
 orchard = { workspace = true, default-features = false, optional = true }
-parking_lot = { workspace = true, optional = true }
 prost.workspace = true
+rayon = { workspace = true, optional = true }
 sapling = { workspace = true, optional = true }
 sha2.workspace = true
 thiserror.workspace = true
@@ -42,6 +44,7 @@ zcash_protocol = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 eyre.workspace = true
+pasta_curves.workspace = true
 
 [lints]
 workspace = true

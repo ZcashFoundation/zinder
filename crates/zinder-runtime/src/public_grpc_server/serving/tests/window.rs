@@ -1,0 +1,884 @@
+//! How a stream's piece waits for the client's flow-control window, driven by
+//! an h2 client that controls exactly when it grants window and when it
+//! changes its settings.
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use h2::client::{Connection, SendRequest};
+use tokio::{net::TcpStream, sync::watch};
+
+use super::*;
+use crate::MAX_CONCURRENT_STREAMS_PER_CONNECTION;
+use eyre::ensure;
+
+/// The client's side of one HTTP/2 connection, with its connection task.
+struct H2Client {
+    requests: SendRequest<Bytes>,
+    window: mpsc::UnboundedSender<(u32, oneshot::Sender<bool>)>,
+    connection: JoinHandle<()>,
+}
+
+impl H2Client {
+    async fn connect(address: SocketAddr, stream_window: u32) -> Result<Self> {
+        let (requests, connection) = h2::client::Builder::new()
+            .initial_window_size(stream_window)
+            .initial_connection_window_size(64 * 1024 * 1024)
+            .handshake::<_, Bytes>(TcpStream::connect(address).await?)
+            .await?;
+        let (window, changes) = mpsc::unbounded_channel();
+        let connection = tokio::spawn(drive(connection, changes));
+        Ok(Self {
+            requests,
+            window,
+            connection,
+        })
+    }
+
+    /// Opens a call to the scripted method and returns its response body once
+    /// its headers have arrived.
+    async fn open_stream(&self) -> Result<h2::RecvStream> {
+        self.open_stream_as("application/grpc", Bytes::from_static(&[0; 5]))
+            .await
+    }
+
+    async fn open_stream_as(
+        &self,
+        content_type: &'static str,
+        request_frame: Bytes,
+    ) -> Result<h2::RecvStream> {
+        let mut requests = within_wait_limit(self.requests.clone().ready()).await??;
+        let request = http::Request::post(format!("http://localhost{STREAM_PATH}"))
+            .header(http::header::CONTENT_TYPE, content_type)
+            .header(http::header::ACCEPT, content_type)
+            .header(http::header::TE, "trailers")
+            .body(())?;
+        let (response, mut request_body) = requests.send_request(request, false)?;
+        request_body.send_data(request_frame, true)?;
+        Ok(within_wait_limit(response).await??.into_body())
+    }
+
+    /// Asks the connection to send `SETTINGS_INITIAL_WINDOW_SIZE`, and
+    /// returns whether it did. It refuses while an earlier change waits for
+    /// the server's acknowledgement.
+    async fn set_stream_window(&self, size: u32) -> Result<bool> {
+        let (sent, outcome) = oneshot::channel();
+        self.window
+            .send((size, sent))
+            .map_err(|_| eyre!("the connection ended"))?;
+        Ok(within_wait_limit(outcome).await??)
+    }
+}
+
+/// Drives `connection`, changing its stream window on request.
+async fn drive(
+    mut connection: Connection<TcpStream, Bytes>,
+    mut changes: mpsc::UnboundedReceiver<(u32, oneshot::Sender<bool>)>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut connection => return,
+            change = changes.recv() => if let Some((size, sent)) = change {
+                let _ = sent.send(connection.set_initial_window_size(size).is_ok());
+            } else {
+                let _ = connection.await;
+                return;
+            },
+        }
+    }
+}
+
+/// A proxy to `server` whose server-to-client direction can be paused.
+struct PausableProxy {
+    address: SocketAddr,
+    flowing: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+async fn spawn_pausable_proxy(server: SocketAddr) -> Result<PausableProxy> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (flowing, mut flowing_now) = watch::channel(true);
+    let task = tokio::spawn(async move {
+        let Ok((client, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(upstream) = small_buffer_connection(server).await else {
+            return;
+        };
+        let (mut upstream_read, mut upstream_write) = upstream.into_split();
+        let (mut client_read, mut client_write) = client.into_split();
+        let to_server = async {
+            let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+        };
+        let to_client = async {
+            let mut buffer = vec![0; 64 * 1024];
+            loop {
+                if !*flowing_now.borrow_and_update() {
+                    if flowing_now.changed().await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                tokio::select! {
+                    changed = flowing_now.changed() => if changed.is_err() {
+                        return;
+                    },
+                    read = upstream_read.read(&mut buffer) => match read {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => {
+                            let chunk = buffer.get(..read).unwrap_or_default();
+                            if client_write.write_all(chunk).await.is_err() {
+                                return;
+                            }
+                        }
+                    },
+                }
+            }
+        };
+        tokio::join!(to_server, to_client);
+    });
+    Ok(PausableProxy {
+        address,
+        flowing,
+        task,
+    })
+}
+
+/// Connects to `server` with a 4 KiB receive buffer.
+async fn small_buffer_connection(server: SocketAddr) -> Result<TcpStream> {
+    let socket = TcpSocket::new_v4()?;
+    socket.set_recv_buffer_size(4096)?;
+    Ok(socket.connect(server).await?)
+}
+
+/// The stall deadline for the window-change tests: long enough that the
+/// client's window change and the server's acknowledgement always fall
+/// inside it, which each test checks before it relies on it.
+const WINDOW_CHANGE_STALL: Duration = Duration::from_secs(2);
+
+/// A response whose data waits behind a blocked socket, held back from its
+/// end until h2 has encoded its probe.
+struct WithheldEnd {
+    server: TestServer,
+    proxy: PausableProxy,
+    client: H2Client,
+    body: h2::RecvStream,
+    /// Closes once the server drops the gated response body, which happens
+    /// as its stream task ends.
+    body_dropped: mpsc::Sender<Result<Frame<Bytes>, Status>>,
+    /// Whether the gate let the end go before h2 encoded the probe, as a
+    /// gate without the departure wait does.
+    ended_early: bool,
+}
+
+impl WithheldEnd {
+    /// Fails unless the gate is still waiting for the probe to leave.
+    fn ensure_still_withheld(&self) -> Result<()> {
+        ensure!(!self.ended_early, "the gate released the end at once");
+        ensure!(
+            !self.body_dropped.is_closed(),
+            "the response body was already dropped"
+        );
+        ensure!(!self.server.all_freed(1), "the response's data was freed");
+        Ok(())
+    }
+}
+
+/// Opens a call whose response ends while its data waits for the socket.
+///
+/// The client stops reading its socket and the server sends 380 KiB, then
+/// ends the response. The window covers it all, so hyper takes the probe, but
+/// h2 cannot encode it while the data ahead of it waits for the socket. The
+/// call returns once the gate has started waiting for the probe to leave, or
+/// once a gate without that wait has released the end.
+async fn withhold_end(send_stall: Duration) -> Result<WithheldEnd> {
+    let mut server = serve(Bounds {
+        send_stall,
+        send_buffer: Some(4096),
+        ..Bounds::default()
+    })?;
+    let proxy = spawn_pausable_proxy(server.address).await?;
+    let client = H2Client::connect(proxy.address, 1024 * 1024).await?;
+    let body = client.open_stream().await?;
+    let mut script = server.next_script().await?;
+    proxy.flowing.send(false)?;
+    let body_dropped = script.frames.clone();
+    script.send_message(380 * 1024).await?;
+    script.finish().await?;
+    let mut departure_waits = server.departure_waits.clone();
+    let ended_early = within_wait_limit(async {
+        tokio::select! {
+            waited = departure_waits.wait_for(|waits| *waits >= 1) => waited.map(|_| false),
+            () = body_dropped.closed() => Ok(true),
+        }
+    })
+    .await??;
+    Ok(WithheldEnd {
+        server,
+        proxy,
+        client,
+        body,
+        body_dropped,
+        ended_early,
+    })
+}
+
+/// Runs `probe` until it returns true, within the wait limit.
+async fn wait_until_async<F, Fut>(what: &str, mut probe: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
+    let started = Instant::now();
+    while started.elapsed() < WAIT_LIMIT {
+        if probe().await? {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    bail!("{what} did not happen within {WAIT_LIMIT:?}")
+}
+
+/// Lowers the client's stream window to zero and waits until the server has
+/// applied it.
+///
+/// h2 applies a peer's setting as it buffers the acknowledgement, which can
+/// need write progress on a blocked connection, and it does so before it
+/// takes more DATA from any stream's queue. The socket flows again so the
+/// acknowledgement can be written; at most the frame already in h2's write
+/// buffer leaves ahead of it.
+async fn take_window_back(withheld: &WithheldEnd) -> Result<()> {
+    ensure!(
+        withheld.client.set_stream_window(0).await?,
+        "the window change was refused"
+    );
+    withheld.proxy.flowing.send(true)?;
+    wait_until_async("the server acknowledges the window change", || {
+        withheld.client.set_stream_window(0)
+    })
+    .await
+}
+
+#[tokio::test]
+async fn shutdown_replaces_a_status_held_behind_flow_control() -> Result<()> {
+    shutdown_while_sending("application/grpc", false, PAYLOAD).await
+}
+
+#[tokio::test]
+async fn shutdown_replaces_a_small_unary_status_held_behind_flow_control() -> Result<()> {
+    shutdown_while_sending("application/grpc", false, 1_653).await
+}
+
+#[tokio::test]
+async fn shutdown_replaces_a_status_before_grpc_web_encodes_it() -> Result<()> {
+    shutdown_while_sending("application/grpc-web+proto", false, PAYLOAD).await?;
+    shutdown_while_sending("application/grpc-web-text+proto", true, PAYLOAD).await
+}
+
+#[tokio::test]
+async fn shutdown_replaces_a_small_unary_status_before_grpc_web_encodes_it() -> Result<()> {
+    shutdown_while_sending("application/grpc-web+proto", false, 1_653).await?;
+    shutdown_while_sending("application/grpc-web-text+proto", true, 1_653).await
+}
+
+#[expect(
+    clippy::future_not_send,
+    reason = "the recorder guard stays on the current-thread test runtime"
+)]
+async fn shutdown_while_sending(
+    content_type: &'static str,
+    text: bool,
+    payload: usize,
+) -> Result<()> {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let calls = Arc::new(OpenGrpcCalls::default());
+    let shutdown = CancellationToken::new();
+    let mut server = serve(Bounds {
+        send_stall: NEVER,
+        shutdown: Some((Arc::clone(&calls), shutdown.clone())),
+        ..Bounds::default()
+    })?;
+    let message = message_frame(payload, 0);
+    let (message, request_frame) = if text {
+        (
+            STANDARD.encode(message).into_bytes(),
+            Bytes::from(STANDARD.encode([0; 5])),
+        )
+    } else {
+        (message, Bytes::from_static(&[0; 5]))
+    };
+    let window = u32::try_from(message.len() - 1)?;
+    let client = H2Client::connect(server.address, window).await?;
+    let mut body = client.open_stream_as(content_type, request_frame).await?;
+    let mut script = server.next_script().await?;
+    let producer = script.frames.clone();
+    script.send_message(payload).await?;
+    script.finish().await?;
+    within_wait_limit(producer.closed()).await?;
+
+    // Consume the entire window without returning any credit for the probe.
+    let mut received = Vec::new();
+    while received.len() < usize::try_from(window)? {
+        let chunk = within_wait_limit(body.data())
+            .await?
+            .ok_or_else(|| eyre!("the response ended before using its window"))??;
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received, message[..message.len() - 1]);
+    assert!(!body.is_end_stream());
+
+    shutdown.cancel();
+    wait_until_async("the listener stops accepting connections", || async {
+        Ok(TcpStream::connect(server.address).await.is_err())
+    })
+    .await?;
+    calls.terminate();
+    assert!(client.set_stream_window(window + 1024).await?);
+
+    while let Some(chunk) = within_wait_limit(body.data()).await? {
+        received.extend_from_slice(&chunk?);
+    }
+    let terminal = received
+        .strip_prefix(message.as_slice())
+        .ok_or_else(|| eyre!("the message changed"))?;
+    let trailers = within_wait_limit(body.trailers()).await??;
+    if content_type == "application/grpc" {
+        assert_eq!(terminal, b"");
+        assert_shutdown_status(
+            &trailers.ok_or_else(|| eyre!("the response ended without trailers"))?,
+        )?;
+    } else {
+        assert!(trailers.is_none());
+        assert_shutdown_status(&decode_web_trailers(terminal, text)?)?;
+    }
+
+    assert_shutdown_completion(&metrics.render())?;
+    within_wait_limit(server.server).await???;
+    Ok(())
+}
+
+fn assert_shutdown_completion(rendered: &str) -> Result<()> {
+    let mut completions = rendered.lines().filter(|line| {
+        line.starts_with("zinder_wallet_rpc_requests_total{")
+            && line.contains("method=\"GetBlockRange\"")
+    });
+    let completion = completions
+        .next()
+        .ok_or_else(|| eyre!("missing completion metric"))?;
+    assert!(
+        completion.contains("grpc_code=\"unavailable\""),
+        "{completion}"
+    );
+    assert!(
+        completion.contains("error_class=\"SERVICE_NOT_READY\""),
+        "{completion}"
+    );
+    assert!(completion.ends_with(" 1"), "{completion}");
+    assert_eq!(completions.next(), None);
+    Ok(())
+}
+
+fn assert_shutdown_status(trailers: &http::HeaderMap) -> Result<()> {
+    use tonic_types::StatusExt as _;
+
+    assert_eq!(
+        trailers
+            .get(Status::GRPC_STATUS)
+            .and_then(|code| code.to_str().ok()),
+        Some("14")
+    );
+    let status =
+        Status::from_header_map(trailers).ok_or_else(|| eyre!("missing shutdown status"))?;
+    let details = status
+        .get_details_error_info()
+        .ok_or_else(|| eyre!("missing shutdown details"))?;
+    assert_eq!(details.reason, "SERVICE_NOT_READY");
+    assert_eq!(
+        details.metadata.get("readiness_cause").map(String::as_str),
+        Some("shutting_down")
+    );
+    Ok(())
+}
+
+fn decode_web_trailers(bytes: &[u8], text: bool) -> Result<http::HeaderMap> {
+    let decoded;
+    let bytes = if text {
+        decoded = STANDARD.decode(bytes)?;
+        decoded.as_slice()
+    } else {
+        bytes
+    };
+    let (header, payload) = bytes
+        .split_at_checked(5)
+        .ok_or_else(|| eyre!("short trailer frame"))?;
+    let [0x80, size @ ..] = header else {
+        bail!("missing gRPC-Web trailer frame");
+    };
+    let size = u32::from_be_bytes(size.try_into()?);
+    assert_eq!(usize::try_from(size)?, payload.len());
+    let mut trailers = http::HeaderMap::new();
+    for line in std::str::from_utf8(payload)?.lines() {
+        let (name, field) = line
+            .split_once(':')
+            .ok_or_else(|| eyre!("malformed trailer"))?;
+        trailers.append(
+            http::HeaderName::from_bytes(name.as_bytes())?,
+            http::HeaderValue::from_str(field)?,
+        );
+    }
+    Ok(trailers)
+}
+
+/// A window taken back before the end leaves the stall timer to reset it.
+///
+/// Once the client takes its window back by `SETTINGS`, the data ahead of the
+/// probe can never be sent, so the probe stays with hyper, and the stall
+/// timer resets the stream: its data and its slot are freed while the
+/// connection stays open.
+#[tokio::test]
+async fn a_window_taken_back_before_the_end_resets_the_stream() -> Result<()> {
+    let withheld = withhold_end(WINDOW_CHANGE_STALL).await?;
+    if !withheld.ended_early {
+        withheld.ensure_still_withheld()?;
+    }
+    take_window_back(&withheld).await?;
+    // The server applied the change while the response was still held, so
+    // a reset can only come after it.
+    if !withheld.ended_early {
+        withheld.ensure_still_withheld()?;
+    }
+
+    let WithheldEnd {
+        mut server,
+        proxy,
+        client,
+        mut body,
+        body_dropped,
+        ended_early: _,
+    } = withheld;
+    within_wait_limit(body_dropped.closed()).await?;
+    wait_until("the stranded data is freed", || server.all_freed(1)).await?;
+    let ended_with = loop {
+        match within_wait_limit(body.data()).await? {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => break error.reason(),
+            None => break None,
+        }
+    };
+    assert_eq!(ended_with, Some(h2::Reason::CANCEL));
+
+    // The reset stream's slot is free again: the connection carries a full
+    // set of new streams at once.
+    let streams = usize::try_from(MAX_CONCURRENT_STREAMS_PER_CONNECTION)?;
+    let opened = within_wait_limit(futures_util::future::try_join_all(
+        (0..streams).map(|_| client.open_stream()),
+    ))
+    .await??;
+    for _ in 0..streams {
+        server.next_script().await?;
+    }
+    assert_eq!(opened.len(), streams);
+    drop(proxy);
+    Ok(())
+}
+
+/// A small unary response on a backpressured connection stays probe-gated.
+///
+/// Withdrawing window with `SETTINGS` then resets the stream and frees its slot
+/// instead of stranding queued data in h2.
+#[tokio::test]
+async fn a_window_taken_back_on_a_backpressured_connection_resets_a_small_unary_stream()
+-> Result<()> {
+    let mut server = serve(Bounds {
+        send_stall: WINDOW_CHANGE_STALL,
+        send_buffer: Some(4096),
+        ..Bounds::default()
+    })?;
+    let proxy = spawn_pausable_proxy(server.address).await?;
+    let client = H2Client::connect(proxy.address, 1024 * 1024).await?;
+    let mut body = client.open_stream().await?;
+    let mut script = server.next_script().await?;
+    let mut small_body = client.open_stream().await?;
+    let mut small_script = server.next_script().await?;
+
+    proxy.flowing.send(false)?;
+    let body_dropped = script.frames.clone();
+    let small_dropped = small_script.frames.clone();
+    script.send_message(380 * 1024).await?;
+    script.finish().await?;
+    small_script.send_message(1_653).await?;
+    small_script.finish().await?;
+
+    let mut departure_waits = server.departure_waits.clone();
+    let ended_early = within_wait_limit(async {
+        tokio::select! {
+            waited = departure_waits.wait_for(|waits| *waits >= 2) => waited.map(|_| false),
+            () = body_dropped.closed() => Ok(true),
+            () = small_dropped.closed() => Ok(true),
+        }
+    })
+    .await??;
+    ensure!(
+        !ended_early,
+        "a response bypassed probe gating on a backpressured connection"
+    );
+
+    ensure!(
+        client.set_stream_window(0).await?,
+        "the window change was refused"
+    );
+    proxy.flowing.send(true)?;
+    wait_until_async("the server acknowledges the window change", || {
+        client.set_stream_window(0)
+    })
+    .await?;
+
+    within_wait_limit(body_dropped.closed()).await?;
+    within_wait_limit(small_dropped.closed()).await?;
+    wait_until("both stranded streams' data is freed", || {
+        server.all_freed(2)
+    })
+    .await?;
+    for stream in [&mut body, &mut small_body] {
+        let ended_with = loop {
+            match within_wait_limit(stream.data()).await? {
+                Some(Ok(_)) => {}
+                Some(Err(error)) => break error.reason(),
+                None => break None,
+            }
+        };
+        assert_eq!(ended_with, Some(h2::Reason::CANCEL));
+    }
+
+    let streams = usize::try_from(MAX_CONCURRENT_STREAMS_PER_CONNECTION)?;
+    let opened = within_wait_limit(futures_util::future::try_join_all(
+        (0..streams).map(|_| client.open_stream()),
+    ))
+    .await??;
+    for _ in 0..streams {
+        server.next_script().await?;
+    }
+    assert_eq!(opened.len(), streams);
+    drop(proxy);
+    Ok(())
+}
+
+/// The control for the test above: the same withheld end, with the window
+/// left as it was, goes out once the socket flows, and nothing is reset.
+#[tokio::test]
+async fn a_withheld_end_goes_out_once_the_socket_flows() -> Result<()> {
+    let withheld = withhold_end(WINDOW_CHANGE_STALL).await?;
+    withheld.ensure_still_withheld()?;
+    let WithheldEnd {
+        server,
+        proxy,
+        client: _client,
+        mut body,
+        body_dropped,
+        ended_early: _,
+    } = withheld;
+    proxy.flowing.send(true)?;
+    let mut received = 0;
+    while let Some(chunk) = within_wait_limit(body.data()).await? {
+        let chunk = chunk?;
+        received += chunk.len();
+        body.flow_control().release_capacity(chunk.len())?;
+    }
+    let trailers = within_wait_limit(body.trailers()).await??;
+    let status = trailers
+        .as_ref()
+        .and_then(|trailers| trailers.get("grpc-status"));
+    assert_eq!(
+        status.map(http::HeaderValue::as_bytes),
+        Some(b"0".as_slice())
+    );
+    assert_eq!(received, message_frame(380 * 1024, 0).len());
+    within_wait_limit(body_dropped.closed()).await?;
+    wait_until("the response's data is freed", || server.all_freed(1)).await?;
+    Ok(())
+}
+
+/// A client that resets the stream while its end is held back ends the
+/// stream's task without the stall timer, which is out of reach here.
+#[tokio::test]
+async fn a_client_reset_while_the_end_is_held_back_frees_the_stream() -> Result<()> {
+    let withheld = withhold_end(NEVER).await?;
+    withheld.ensure_still_withheld()?;
+    let WithheldEnd {
+        server,
+        proxy,
+        client: _client,
+        body,
+        body_dropped,
+        ended_early: _,
+    } = withheld;
+    // Dropping the client's last handle to the stream resets it with CANCEL.
+    drop(body);
+    within_wait_limit(body_dropped.closed()).await?;
+    // h2 discarded the stream's queue. The frame it had already encoded
+    // leaves with the socket, which is the write stall bound's to limit.
+    proxy.flowing.send(true)?;
+    wait_until("the stream's data is freed", || server.all_freed(1)).await?;
+    Ok(())
+}
+
+/// Closing the connection while a response's end is held back ends the
+/// stream's task and frees its data, with the stall timer out of reach.
+#[tokio::test]
+async fn a_connection_closed_while_the_end_is_held_back_frees_the_stream() -> Result<()> {
+    let withheld = withhold_end(NEVER).await?;
+    withheld.ensure_still_withheld()?;
+    let WithheldEnd {
+        server,
+        proxy,
+        client,
+        body,
+        body_dropped,
+        ended_early: _,
+    } = withheld;
+    proxy.task.abort();
+    client.connection.abort();
+    drop((body, client));
+    within_wait_limit(body_dropped.closed()).await?;
+    wait_until("the stream's data is freed", || server.all_freed(1)).await?;
+    Ok(())
+}
+
+/// Reads a response of eight 64 KiB messages with a 64 KiB window, granting
+/// `credit` bytes of window back every `tick`, and returns the bytes read,
+/// the response's outcome, and the bytes the server sent.
+async fn read_with_credit(
+    credit: usize,
+    tick: Duration,
+) -> Result<(usize, Result<(), h2::Error>, usize)> {
+    const MESSAGES: usize = 8;
+    let mut server = serve(Bounds::default())?;
+    let client = H2Client::connect(server.address, 64 * 1024).await?;
+    let mut body = client.open_stream().await?;
+    let mut script = server.next_script().await?;
+    // A reset drops the handler, so a send fails once it happens.
+    let producer = tokio::spawn(async move {
+        for _ in 0..MESSAGES {
+            if script.send_message(PAYLOAD).await.is_err() {
+                return script.sent.len();
+            }
+        }
+        let sent = script.sent.len();
+        let _ = script.finish().await;
+        sent
+    });
+
+    let mut received = 0;
+    let mut unreleased = 0;
+    let mut ticks = tokio::time::interval(tick);
+    // One deadline for the whole exchange: the tick only grants credit.
+    let outcome = within_wait_limit(async {
+        loop {
+            tokio::select! {
+                chunk = body.data() => match chunk {
+                    Some(Ok(chunk)) => {
+                        received += chunk.len();
+                        unreleased += chunk.len();
+                    }
+                    Some(Err(error)) => return Ok::<_, eyre::Report>(Err(error)),
+                    None => return Ok(body.trailers().await.map(|_| ())),
+                },
+                _ = ticks.tick() => {
+                    let grant = unreleased.min(credit);
+                    if grant > 0 {
+                        body.flow_control().release_capacity(grant)?;
+                        unreleased -= grant;
+                    }
+                }
+            }
+        }
+    })
+    .await??;
+    let sent = within_wait_limit(producer).await??;
+    drop(client);
+    Ok((received, outcome, sent))
+}
+
+/// A reader granting enough window within the timeout is never reset.
+///
+/// hyper sends a waiting piece once the window covers everything queued ahead
+/// of it plus one byte. Here that shortfall is at most the 64 KiB piece queued
+/// ahead, so granting that much within the timeout keeps the stream alive,
+/// however small each grant is.
+#[tokio::test]
+async fn a_reader_granting_a_piece_of_window_within_the_timeout_is_never_reset() -> Result<()> {
+    let (received, outcome, sent) = read_with_credit(16 * 1024, STALL / 16).await?;
+    outcome?;
+    assert_eq!(received, sent);
+    Ok(())
+}
+
+/// Window updates that come well within the timeout still end the stream
+/// when together they grant less than the waiting piece needs: window for
+/// everything queued ahead of it plus one byte.
+#[tokio::test]
+async fn a_reader_granting_less_than_a_piece_of_window_within_the_timeout_is_reset() -> Result<()> {
+    let (received, outcome, sent) = read_with_credit(4 * 1024, STALL / 8).await?;
+    let error = outcome
+        .err()
+        .ok_or_else(|| eyre!("the response ended normally"))?;
+    assert_eq!(error.reason(), Some(h2::Reason::CANCEL), "{error}");
+    assert!(received < sent, "every byte arrived");
+    Ok(())
+}
+
+/// Reads the `initial_window` prefix of a response while asserting its probe
+/// has neither released `END_STREAM` nor freed the server's tracked storage.
+async fn read_partial_window_prefix(
+    server: &TestServer,
+    body: &mut h2::RecvStream,
+    expected_prefix: &[u8],
+) -> Result<Vec<u8>> {
+    let mut received = Vec::with_capacity(expected_prefix.len());
+    while received.len() < expected_prefix.len() {
+        let chunk = within_wait_limit(body.data())
+            .await?
+            .ok_or_else(|| eyre!("the response ended before filling its initial window"))??;
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received.as_slice(), expected_prefix);
+    assert!(
+        !body.is_end_stream(),
+        "END_STREAM arrived with partial window"
+    );
+    assert!(
+        !server.all_freed(1),
+        "partial Buf::advance dropped ProbeChunk before the remainder was sent"
+    );
+    Ok(received)
+}
+
+/// A partial initial window below h2's 256-byte chain threshold advances into
+/// `ProbeChunk` without dropping it; withholding the rest resets the stream and
+/// frees both the buffer and the stream slot.
+#[tokio::test]
+async fn a_partial_window_on_a_small_unary_response_holds_back_the_end_and_resets_when_stalled()
+-> Result<()> {
+    const PARTIAL_WINDOW: u32 = 100;
+    const TREE_STATE_PAYLOAD: usize = 1_500;
+    let mut server = serve(Bounds::default())?;
+    let client = H2Client::connect(server.address, PARTIAL_WINDOW).await?;
+    let mut body = client.open_stream().await?;
+    let mut script = server.next_script().await?;
+    let expected = message_frame(TREE_STATE_PAYLOAD, 0);
+    script.send_message(TREE_STATE_PAYLOAD).await?;
+    script.finish().await?;
+
+    let prefix_len = usize::try_from(PARTIAL_WINDOW)?;
+    let _ = read_partial_window_prefix(&server, &mut body, &expected[..prefix_len]).await?;
+
+    let ended_with = match within_wait_limit(body.data()).await? {
+        Some(Ok(_)) => bail!("unexpected bytes arrived without window credit"),
+        Some(Err(error)) => error.reason(),
+        None => None,
+    };
+    assert_eq!(ended_with, Some(h2::Reason::CANCEL));
+    wait_until("the stalled whole-probed chunk is freed", || {
+        server.all_freed(1)
+    })
+    .await?;
+
+    let streams = usize::try_from(MAX_CONCURRENT_STREAMS_PER_CONNECTION)?;
+    let opened = within_wait_limit(futures_util::future::try_join_all(
+        (0..streams).map(|_| client.open_stream()),
+    ))
+    .await??;
+    for _ in 0..streams {
+        server.next_script().await?;
+    }
+    assert_eq!(opened.len(), streams);
+    Ok(())
+}
+
+/// After a partial window consumes the first 100 bytes of `ProbeChunk`,
+/// granting the remaining window delivers the exact suffix and `OK` trailers.
+#[tokio::test]
+async fn a_partial_window_on_a_small_unary_response_completes_once_remaining_window_arrives()
+-> Result<()> {
+    const PARTIAL_WINDOW: u32 = 100;
+    const TREE_STATE_PAYLOAD: usize = 1_500;
+    let mut server = serve(Bounds {
+        send_stall: WINDOW_CHANGE_STALL,
+        ..Bounds::default()
+    })?;
+    let client = H2Client::connect(server.address, PARTIAL_WINDOW).await?;
+    let mut body = client.open_stream().await?;
+    let mut script = server.next_script().await?;
+    let expected = message_frame(TREE_STATE_PAYLOAD, 0);
+    script.send_message(TREE_STATE_PAYLOAD).await?;
+    script.finish().await?;
+
+    let prefix_len = usize::try_from(PARTIAL_WINDOW)?;
+    let mut received =
+        read_partial_window_prefix(&server, &mut body, &expected[..prefix_len]).await?;
+    body.flow_control().release_capacity(prefix_len)?;
+    assert!(client.set_stream_window(64 * 1024).await?);
+
+    while let Some(chunk) = within_wait_limit(body.data()).await? {
+        let chunk = chunk?;
+        body.flow_control().release_capacity(chunk.len())?;
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received, expected);
+    let trailers = within_wait_limit(body.trailers()).await??;
+    let status = trailers
+        .as_ref()
+        .and_then(|trailers| trailers.get("grpc-status"));
+    assert_eq!(
+        status.map(http::HeaderValue::as_bytes),
+        Some(b"0".as_slice())
+    );
+    wait_until("the completed whole-probed chunk is freed", || {
+        server.all_freed(1)
+    })
+    .await?;
+    Ok(())
+}
+
+/// A multi-frame stream whose trailing `<= 4 KiB` chunk stalls mid-frame behind
+/// a partial window still resets and frees every chunk.
+#[tokio::test]
+async fn a_stream_with_a_small_trailing_chunk_resets_when_partial_window_stalls_its_tail()
+-> Result<()> {
+    const FIRST_PAYLOAD: usize = 32 * 1024;
+    const TRAILING_PAYLOAD: usize = 1_500;
+    const TAIL_PREFIX: usize = 100;
+    let first = message_frame(FIRST_PAYLOAD, 0);
+    let tail = message_frame(TRAILING_PAYLOAD, 1);
+    let window = u32::try_from(first.len() + TAIL_PREFIX)?;
+    let mut server = serve(Bounds::default())?;
+    let client = H2Client::connect(server.address, window).await?;
+    let mut body = client.open_stream().await?;
+    let mut script = server.next_script().await?;
+    script.send_message(FIRST_PAYLOAD).await?;
+    script.send_message(TRAILING_PAYLOAD).await?;
+    script.finish().await?;
+
+    let mut expected_prefix = first;
+    expected_prefix.extend_from_slice(&tail[..TAIL_PREFIX]);
+    let mut received = Vec::with_capacity(expected_prefix.len());
+    while received.len() < expected_prefix.len() {
+        let chunk = within_wait_limit(body.data())
+            .await?
+            .ok_or_else(|| eyre!("the stream ended before using its window"))??;
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received, expected_prefix);
+    assert!(!body.is_end_stream());
+    assert!(!server.all_freed(2), "trailing ProbeChunk freed early");
+
+    let ended_with = match within_wait_limit(body.data()).await? {
+        Some(Ok(_)) => bail!("unexpected bytes arrived without window credit"),
+        Some(Err(error)) => error.reason(),
+        None => None,
+    };
+    assert_eq!(ended_with, Some(h2::Reason::CANCEL));
+    wait_until("both stream chunks are freed", || server.all_freed(2)).await?;
+    Ok(())
+}

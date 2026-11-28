@@ -13,28 +13,33 @@ mod block_methods;
 mod block_range;
 mod compact_block_messages;
 mod compact_blocks_grpc;
+mod encoded_range;
 mod grpc;
 mod mempool;
 mod network_tip_estimate;
 mod node_tip_witness;
 mod ping;
 mod request_limits;
+pub mod runtime;
 mod stale_tip;
+mod tip_wait;
 
 pub use block_range::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES,
     DEFAULT_BLOCK_RANGE_ADMISSION_WAIT, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
 };
 pub use compact_blocks_grpc::{CanonicalReaderSlot, CompactBlocksGrpcAdapter};
+pub use grpc::light_wallet::NodeBackedLightWallet;
 pub use grpc::{
     DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS, DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS,
     LightwalletdAdmissionError, LightwalletdGrpcAdapter, LightwalletdResponseLimits,
+    address_utxo_height_limit_exceeded,
 };
 pub use mempool::{
-    IngestControlMempoolSurface, MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface,
-    MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface, SharedTipChangeWatcher,
-    TipChangeWatcher, TipChangeWatcherError, WatchTipChangeWatcher,
-    spawn_ingest_control_tip_change_publisher,
+    IngestControlMempoolSurface, MempoolEventEnvelopeStream, MempoolExclusions,
+    MempoolExclusionsError, MempoolSnapshotPage, MempoolSurface, MempoolSurfaceError,
+    MempoolTransactionLookup, SharedMempoolSurface, SharedTipChangeWatcher, TipChangeWatcher,
+    TipChangeWatcherError, WatchTipChangeWatcher, spawn_ingest_control_tip_change_publisher,
 };
 pub use network_tip_estimate::estimated_network_height;
 pub use node_tip_witness::{
@@ -44,3 +49,6 @@ pub use node_tip_witness::{
 pub use ping::LightwalletdPing;
 pub use request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;
 pub use stale_tip::{DEFAULT_STALE_TIP_LIMIT, StaleTipLimit};
+pub use tip_wait::{
+    DEFAULT_TIP_WAIT, DEFAULT_TIP_WAIT_MAX_BLOCKS, DEFAULT_TIP_WAIT_MAX_WAITERS, TipWait,
+};

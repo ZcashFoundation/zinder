@@ -18,19 +18,263 @@ concurrency:
 
 # Swatinem/rust-cache hashes every CARGO_* and RUST* variable into its key, so
 # jobs that share a cache key must keep this block identical, and tool versions
-# live in .github/ci-tools.lock rather than in CARGO_-prefixed variables.
+# live in .github/ci-tools.lock rather than in CARGO_-prefixed variables. The
+# test key is shared with live-tests.yml and protocol-contracts.yml. Line
+# tables keep file and line numbers in panics and backtraces at a fraction of
+# full debug info's size.
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   PROTOC: /does/not/exist
-  PROTOC_VERSION: "36.2"
 
 jobs:
-  rust:
-    name: rust
+  # Skips the Rust jobs only when every changed file is prose that no test
+  # reads. docs/runbooks, docs/reference, CLAUDE.md, and .config/nextest.toml
+  # stay in scope because doc-contract tests include them at compile time.
+  # Anything the job cannot classify runs the Rust jobs.
+  changes:
+    name: changes
     runs-on: ubuntu-latest
-    # A cold run (no cache under this key) measured 43 minutes. A timeout below
-    # that would skip the post-step cache save and keep every later run cold.
+    timeout-minutes: 5
+    outputs:
+      rust_needed: ${{ steps.scope.outputs.rust_needed }}
+    steps:
+      # A pull_request checkout is GitHub's merge commit. Depth 2 fetches both
+      # parents: HEAD^1 is the base branch and HEAD^2 the pull request head.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Classify changed files
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          prose_only='^(\.changes/|AGENTS\.md$|README\.md$|docs/(adrs|architecture)/|scripts/wallet-clients/.*\.md$)'
+          rust_needed=true
+          if [[ "${EVENT_NAME}" == pull_request ]] \
+            && git rev-parse --verify --quiet 'HEAD^2' >/dev/null \
+            && changed="$(git diff --no-renames --name-only 'HEAD^1' HEAD)" \
+            && [[ -n "${changed}" ]] \
+            && ! grep -qvE "${prose_only}" <<< "${changed}"; then
+            rust_needed=false
+          fi
+          echo "rust_needed=${rust_needed}" | tee -a "${GITHUB_OUTPUT}"
+
+  fmt:
+    name: fmt
+    needs: changes
+    if: needs.changes.outputs.rust_needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Diff hygiene
+        run: git diff --check
+
+  lint:
+    name: lint
+    needs: changes
+    if: needs.changes.outputs.rust_needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          components: clippy
+          cache-key: lint
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check
+        run: cargo check --workspace --all-targets --all-features
+
+      - name: Check hermetic protobuf consumer build
+        run: cargo check --locked -p zinder-proto
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --all-features --no-deps
+
+  pasta-parity:
+    name: Pasta commitment-tree parity (${{ matrix.backend }})
+    needs: changes
+    if: needs.changes.outputs.rust_needed == 'true'
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            backend: x86-64
+            rustflags: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
+          - runner: ubuntu-24.04-arm
+            backend: aarch64
+            rustflags: ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rust
+      - name: Check portable and assembly commitment-tree vectors
+        env:
+          ASSEMBLY_BACKEND: ${{ matrix.backend }}
+        shell: bash
+        run: |
+          vector=commitment_tree_codec::tests::accumulator_appends_known_commitments_with_protocol_root_order
+          for backend in portable "$ASSEMBLY_BACKEND"; do
+            features=()
+            if [[ "$backend" != portable ]]; then
+              features=(--features pasta_curves/asm)
+            fi
+            ZINDER_TEST_EXPECT_PASTA_BACKEND="$backend" cargo test --locked -p zinder-core --lib "${features[@]}" \
+              -- "$vector" --exact --format pretty | tee "$RUNNER_TEMP/pasta-$backend.log"
+            grep -Fx "test $vector ... ok" "$RUNNER_TEMP/pasta-$backend.log"
+          done
+
+      # The assembly build is the only one that selects the runtime's Pasta
+      # guard, so it runs here beside the assembly vectors.
+      - name: Test the assembly-enabled Pasta guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p zinder-runtime --lib --features pasta_curves/asm \
+            -- pasta_ --format pretty | tee "$RUNNER_TEMP/pasta-guard.log"
+          grep -Eq '^test .*pasta_[a-z_]+ \.\.\. ok$' "$RUNNER_TEMP/pasta-guard.log"
+
+  lthash16-parity:
+    name: LtHash16 expansion backends (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.rust_needed == 'true'
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86-64
+            rustflags: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            rustflags: ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-rust
+      - name: Check every ChaCha backend against the pinned expansion vectors
+        run: scripts/test-lthash16-backends.sh
+
+  # Compiles every workspace test once. The shards and tiers below run the
+  # archive with the prebuilt cargo-nextest alone; they install no toolchain,
+  # and they call `cargo-nextest nextest` so rustup never reads
+  # rust-toolchain.toml.
+  test-build:
+    name: test build
+    needs: changes
+    if: needs.changes.outputs.rust_needed == 'true'
+    runs-on: ubuntu-latest
+    # A cold build (no cache under this key) runs long. A timeout below it
+    # would skip the post-step cache save and keep every later run cold.
     timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: test
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+          tools: cargo-nextest
+
+      - name: Build and archive the workspace tests
+        run: |
+          set -euo pipefail
+          archive_dir="${RUNNER_TEMP}/nextest-archive"
+          mkdir -p "${archive_dir}"
+          cargo build --locked --workspace --all-features --example wallet-reader-fixture
+          cargo nextest archive --locked --workspace --all-features \
+            --archive-file "${archive_dir}/nextest.tar.zst" --zstd-level 1
+          cp target/debug/examples/wallet-reader-fixture "${archive_dir}/"
+          ls -l "${archive_dir}"
+
+      # Reads the runtime binaries that the archive build leaves in
+      # target/debug.
+      - name: Check canonical store defaults across runtimes
+        run: python3 scripts/test-canonical-storage-defaults.py
+
+      - name: Upload the test archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  test:
+    name: test (shard ${{ matrix.shard }}/4)
+    needs: [changes, test-build]
+    if: needs.changes.outputs.rust_needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install cargo-nextest
+        run: scripts/install-ci-tool.sh cargo-nextest
+
+      - name: Download the test archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive
+
+      - name: Test (unit + integration)
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/nextest-extracted"
+          cargo-nextest nextest run --profile=ci \
+            --archive-file "${RUNNER_TEMP}/nextest-archive/nextest.tar.zst" \
+            --extract-to "${RUNNER_TEMP}/nextest-extracted" \
+            --workspace-remap "${GITHUB_WORKSPACE}" \
+            --partition "hash:${SHARD}/4"
+
+  # Every check here reuses the archive extracted once in the first step, and
+  # each takes seconds against the 4-way shards above.
+  test-tiers:
+    name: test tiers
+    needs: [changes, test-build]
+    if: needs.changes.outputs.rust_needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402
@@ -50,55 +294,65 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
-        with:
-          components: clippy, rustfmt
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
       - name: Install cargo-nextest
         run: scripts/install-ci-tool.sh cargo-nextest
 
-      - name: Format
-        run: cargo fmt --all --check
+      - name: Download the test archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive
 
-      - name: Check
-        run: cargo check --workspace --all-targets --all-features
+      # `archived-nextest <list|run> ...` runs nextest against the extracted
+      # archive without extracting it again.
+      - name: Extract the test archive
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/nextest-archive"
+          extracted="${RUNNER_TEMP}/nextest-extracted"
+          mkdir -p "${extracted}" "${RUNNER_TEMP}/bin"
+          chmod +x "${archive}/wallet-reader-fixture"
+          cargo-nextest nextest list --archive-file "${archive}/nextest.tar.zst" \
+            --extract-to "${extracted}" --workspace-remap "${GITHUB_WORKSPACE}" \
+            --list-type=binaries-only >/dev/null
+          cat > "${RUNNER_TEMP}/bin/archived-nextest" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          command=\$1
+          shift
+          exec cargo-nextest nextest "\${command}" \\
+            --cargo-metadata "${extracted}/target/nextest/cargo-metadata.json" \\
+            --binaries-metadata "${extracted}/target/nextest/binaries-metadata.json" \\
+            --target-dir-remap "${extracted}/target" \\
+            --workspace-remap "${GITHUB_WORKSPACE}" \\
+            "\$@"
+          EOF
+          chmod +x "${RUNNER_TEMP}/bin/archived-nextest"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          echo "NEXTEST_EXTRACTED=${extracted}" >> "${GITHUB_ENV}"
 
-      - name: Check hermetic protobuf consumer build
+      - name: Check configured nextest selectors
         env:
-          PROTOC: /does/not/exist
-        run: cargo check --locked -p zinder-proto
+          NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/nextest-archive/nextest.tar.zst
+        run: scripts/test-nextest-selectors.sh
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Test (unit + integration)
-        run: cargo nextest run --profile=ci
+      - name: Verify paired wallet reader measurement
+        run: |
+          python3 -B scripts/test-wallet-reader-comparison.py \
+            --reader "${NEXTEST_EXTRACTED}/target/debug/zinder-compat-lightwalletd" \
+            --bench "${NEXTEST_EXTRACTED}/target/debug/zinder-bench" \
+            --writer "${RUNNER_TEMP}/nextest-archive/wallet-reader-fixture"
 
       - name: Test (PostgreSQL driver)
         env:
           ZINDER_TEST_POSTGRES_DATABASE_URL: postgresql://zinder_bench:zinder_bench_ci_only@127.0.0.1:5432/zinder_bench
-        run: cargo nextest run -p zinder-bench --profile=ci-postgres --run-ignored=all
+        run: archived-nextest run --profile=ci-postgres --run-ignored=all -E 'package(=zinder-bench)'
 
       - name: Test (consumer parity)
-        run: cargo nextest run --profile=ci-parity
+        run: archived-nextest run --profile=ci-parity
 
       - name: Test (perf)
-        run: cargo nextest run --profile=ci-perf
-
-      - name: Docs
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --workspace --all-features --no-deps
-
-      - name: Diff hygiene
-        run: git diff --check
+        run: archived-nextest run --profile=ci-perf
 
   dependencies:
     name: dependency hygiene
@@ -114,7 +368,11 @@ jobs:
         run: scripts/test-workflow-action-pins.sh
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: policy
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+          tools: cargo-deny cargo-machete
 
       - name: Install Changie
         uses: miniscruff/changie-action@3223cb29b92a0972dedc864ace3da01e04780ae4 # v3.0.1
@@ -128,7 +386,10 @@ jobs:
         run: scripts/test-install-ci-tool.sh
 
       - name: Lint runbook shell blocks
-        run: scripts/runbook-lint.sh docs/runbooks/testing.md
+        run: |
+          scripts/test-runbook-lint.sh
+          scripts/runbook-lint.sh docs/runbooks/testing.md
+          scripts/runbook-lint.sh docs/runbooks/exposing-over-tls.md
 
       - name: Require release note fragment or waiver
         if: github.event_name == 'pull_request'
@@ -149,12 +410,6 @@ jobs:
         if: github.event_name != 'pull_request'
         run: scripts/validate-changelog.sh fragments
 
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: policy
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
       - name: Verify Zcash upstream alignment
         run: scripts/check-zcash-upstream-alignment.sh
 
@@ -173,23 +428,51 @@ jobs:
       - name: Test deployment admission
         run: scripts/test-deployment-admission.sh
 
-      - name: Test wallet-serving entrypoint
-        run: scripts/test-wallet-serving-entrypoint.sh
+      - name: Test native systemd listener defaults
+        run: scripts/test-native-systemd-config.sh
 
-      - name: Test wallet-serving Explorer entrypoint
-        run: scripts/test-wallet-serving-explorer-entrypoint.sh
-
-      - name: Test indexer TLS entrypoints
-        run: scripts/test-indexer-tls-entrypoints.sh
+      - name: Test compatibility Caddyfile
+        run: scripts/test-compat-lightwalletd-caddyfile.sh
 
       - name: Test release image publication
         run: scripts/test-release-image-publication.sh
+
+      - name: Test observability contracts
+        run: |
+          python3 scripts/test-observability-rules.py
+          python3 scripts/test-metric-names.py
+
+      - name: Test wallet round-trip contracts
+        run: |
+          python3 -B scripts/wallet-clients/test-wallet-roundtrip.py
+          python3 -B scripts/wallet-clients/test-roundtrip-wallets.py
+          python3 -B scripts/wallet-clients/test-audit-wallet-roundtrip.py
+          python3 -B scripts/wallet-clients/test-roundtrip-regtest-command.py
+          python3 -B scripts/wallet-clients/coverage_test.py
+          python3 -B scripts/wallet-clients/test-coverage-counterparty-roles.py
+          python3 -B scripts/wallet-clients/test-payment-roles.py
+          python3 -B scripts/wallet-clients/test-zally-payment.py
+          python3 -B scripts/wallet-clients/test-devtool-endpoint-identity.py
+          python3 -B scripts/wallet-clients/test-zkool-payment-matrix.py
+          python3 -B scripts/wallet-clients/test-coverage-zkool-payments.py
+          python3 -B scripts/wallet-clients/test-coverage-evidence.py
+          python3 -B scripts/wallet-clients/payment-recovery-test.py
+          python3 -B scripts/wallet-clients/transport-payment-test.py
+          python3 -B scripts/wallet-clients/test-coverage-payment-recovery.py
+          python3 -B scripts/release-wallet-tests.py
+          python3 -B scripts/wallet-clients/coverage.py check
 
       - name: Test storage benchmark contracts
         run: |
           scripts/test-container-resource-evidence.sh
           scripts/test-storage-benchmark-campaign-validator.sh
+          python3 -B scripts/test-benchmark-campaign.py
+          python3 -B scripts/test-compare-benchmark-campaign.py
           scripts/test-observability-smoke-safety.sh
+          python3 scripts/test-publication-delay.py
+          python3 -B scripts/test-mainnet-fixture.py
+          python3 scripts/test-wallet-lifecycle.py
+          python3 scripts/wallet-clients/test-wallet-fixture.py
           env \
             ZINDER_BENCH_IMAGE=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             ZINDER_BENCH_SOFTWARE_REVISION=ci \
@@ -199,40 +482,34 @@ jobs:
             ZINDER_BENCH_FIXTURE_CACHE_POLICY=warm \
             docker compose \
               --env-file deploy/.env.storage-benchmark.example \
-              -f deploy/docker-compose.storage-benchmark.yml \
+              -f deploy/bench/docker-compose.storage-benchmark.yml \
               --profile comparison \
               --profile postgres \
               --profile rocksdb \
               config >/dev/null
 
+      - name: Test the CBB interoperability report contract
+        run: scripts/test-cbb-interop-report.sh
+
       - name: Test deployment Compose contract
         env:
-          ZINDER_INGEST_IMAGE: zinder-ingest:ci-proof
-          ZINDER_PROJECTOR_IMAGE: zinder-projector:ci-proof
-          ZINDER_QUERY_IMAGE: zinder-query:ci-proof
-          ZINDER_COMPAT_IMAGE: zinder-compat-lightwalletd:ci-proof
-          ZINDER_SINGLE_HOST_DATA_VOLUME_NAME: zinder-ci-proof-data
-          ZINDER_PROMETHEUS_VOLUME_NAME: zinder-ci-proof-prometheus
-          ZINDER_GRAFANA_VOLUME_NAME: zinder-ci-proof-grafana
-          ZINDER_OBSERVABILITY_NETWORK_NAME: zinder-ci-proof-observability
+          DEPLOY_IMAGE: zinder:ci-proof
+          DEPLOY_DATA_VOLUME: zinder-ci-proof-data
+          DEPLOY_PROMETHEUS_VOLUME: zinder-ci-proof-prometheus
+          DEPLOY_GRAFANA_VOLUME: zinder-ci-proof-grafana
+          DEPLOY_OBSERVABILITY_NETWORK: zinder-ci-proof-observability
         run: |
           docker compose \
-            --env-file deploy/.env.testnet \
+            --env-file deploy/profiles/testnet/deploy.env \
             -f deploy/docker-compose.yml \
             --profile observability \
             config --format json \
           | jq -e '
-              .services["zinder-ingest"].command == ["--config", "/etc/zinder/config.toml"]
-              and .services["zinder-projector"].command == ["--config", "/etc/zinder/config.toml"]
-              and .services["zinder-query"].command == ["--config", "/etc/zinder/config.toml"]
-              and .services["zinder-compat-lightwalletd"].command == ["--config", "/etc/zinder/config.toml"]
-              and .services["zinder-ingest"].image == "zinder-ingest:ci-proof"
-              and .services["zinder-projector"].image == "zinder-projector:ci-proof"
-              and .services["zinder-query"].image == "zinder-query:ci-proof"
-              and .services["zinder-compat-lightwalletd"].image == "zinder-compat-lightwalletd:ci-proof"
-              and .services["zinder-projector"].network_mode == "service:zinder-ingest"
-              and .services["zinder-query"].network_mode == "service:zinder-ingest"
-              and .services["zinder-compat-lightwalletd"].network_mode == "service:zinder-ingest"
+              .services["zinder-index"].command == ["index"]
+              and .services["zinder-serve"].command == ["serve", "--readers-only"]
+              and .services["zinder-index"].image == "zinder:ci-proof"
+              and .services["zinder-serve"].image == "zinder:ci-proof"
+              and .services["zinder-serve"].network_mode == "service:zinder-index"
               and .volumes.data.name == "zinder-ci-proof-data"
               and .volumes.prometheus.name == "zinder-ci-proof-prometheus"
               and .volumes.grafana.name == "zinder-ci-proof-grafana"
@@ -248,7 +525,7 @@ jobs:
           ZINDER_BENCH_TRIAL_ID: ci-compose
           ZINDER_BENCH_FIXTURE_CACHE_POLICY: warm
           ZINDER_BENCH_PROJECT_NAME: zinder-storage-observer-ci
-          ZINDER_BENCH_RESULTS_PATH: ../benchmark-results
+          ZINDER_BENCH_RESULTS_PATH: ../../benchmark-results
           ZINDER_BENCH_POSTGRES_DATABASE_CPUS: "2.0"
         run: |
           set -euo pipefail
@@ -257,7 +534,7 @@ jobs:
           cleanup() {
             docker compose \
               --env-file deploy/.env.storage-benchmark.example \
-              -f deploy/docker-compose.storage-benchmark.yml \
+              -f deploy/bench/docker-compose.storage-benchmark.yml \
               --profile postgres \
               down --volumes --remove-orphans
           }
@@ -265,25 +542,25 @@ jobs:
 
           docker compose \
             --env-file deploy/.env.storage-benchmark.example \
-            -f deploy/docker-compose.storage-benchmark.yml \
+            -f deploy/bench/docker-compose.storage-benchmark.yml \
             --profile postgres \
             up -d --wait postgres-database
           docker compose \
             --env-file deploy/.env.storage-benchmark.example \
-            -f deploy/docker-compose.storage-benchmark.yml \
+            -f deploy/bench/docker-compose.storage-benchmark.yml \
             exec -T postgres-database \
             pg_isready --username zinder_bench --dbname zinder_bench
           published_postgres_endpoint="$(
             docker compose \
               --env-file deploy/.env.storage-benchmark.example \
-              -f deploy/docker-compose.storage-benchmark.yml \
+              -f deploy/bench/docker-compose.storage-benchmark.yml \
               port postgres-database 5432
           )"
           test "${published_postgres_endpoint}" = "127.0.0.1:55432"
           python3 -c 'import socket; connection = socket.create_connection(("127.0.0.1", 55432), timeout=5); connection.close()'
           docker compose \
             --env-file deploy/.env.storage-benchmark.example \
-            -f deploy/docker-compose.storage-benchmark.yml \
+            -f deploy/bench/docker-compose.storage-benchmark.yml \
             --profile postgres \
             stop postgres-database
 
@@ -298,12 +575,6 @@ jobs:
             and .sources.storage.support == "sampled"
           ' "$evidence_path" >/dev/null
 
-      - name: Install cargo-deny
-        run: scripts/install-ci-tool.sh cargo-deny
-
-      - name: Install cargo-machete
-        run: scripts/install-ci-tool.sh cargo-machete
-
       - name: Deny
         run: cargo deny check
 
@@ -312,6 +583,8 @@ jobs:
 
   sdk-packages:
     name: public SDK packages
+    needs: changes
+    if: needs.changes.outputs.rust_needed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -319,19 +592,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.100.0
+          cache-key: sdk
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: sdk
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check domain-only SDK for WebAssembly
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --locked -p zinder-core -p zinder-client --no-default-features --target wasm32-unknown-unknown
 
       - name: Verify registry packages and extracted consumer
-        env:
-          PROTOC: /does/not/exist
         run: scripts/verify-sdk-packages.sh
 
   vendored-proto:
@@ -368,10 +639,29 @@ jobs:
             diff -u "${tempdir}/${proto}.local" "${tempdir}/${proto}.upstream"
           done
 
+      - name: Verify Darkside protocol pin
+        run: |
+          set -euo pipefail
+          vendor_dir=crates/zinder-proto/proto/compat/darkside
+          upstream_commit="$(cat "$vendor_dir/COMMIT")"
+          tempdir="$(mktemp -d)"
+          trap 'rm -rf "${tempdir}"' EXIT
+          curl -fsSL "https://raw.githubusercontent.com/zcash/lightwalletd/${upstream_commit}/walletrpc/darkside.proto" \
+            | perl -pe 's/[ \t]+$//' > "$tempdir/darkside.proto"
+          diff -u "$vendor_dir/darkside.proto" "$tempdir/darkside.proto"
+
       - name: Verify Zebra indexer protocol pin
         run: |
           set -euo pipefail
           upstream_commit="$(cat crates/zinder-proto/proto/external/zebra/COMMIT)"
+          upstream_version="$(cat crates/zinder-proto/proto/external/zebra/VERSION)"
+          tagged_commit="$(git ls-remote https://github.com/ZcashFoundation/zebra \
+            "refs/tags/${upstream_version}" "refs/tags/${upstream_version}^{}" \
+            | sort -k2 | tail -n 1 | cut -f1)"
+          if [ "${tagged_commit}" != "${upstream_commit}" ]; then
+            echo "Zebra ${upstream_version} is ${tagged_commit:-missing}, not ${upstream_commit}" >&2
+            exit 1
+          fi
           upstream_url="https://raw.githubusercontent.com/ZcashFoundation/zebra/${upstream_commit}/zebra-rpc/proto/indexer.proto"
           tempdir="$(mktemp -d)"
           trap 'rm -rf "${tempdir}"' EXIT
@@ -396,46 +686,35 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+        uses: ./.github/actions/setup-rust
         with:
           components: llvm-tools-preview
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: coverage
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Install cargo-llvm-cov
-        run: scripts/install-ci-tool.sh cargo-llvm-cov
+          cache-key: coverage
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+          tools: cargo-llvm-cov
 
       - name: Coverage
         run: cargo llvm-cov --workspace --all-features --no-report
 
   mutation:
-    name: mutation (shard ${{ matrix.shard }}/3)
+    name: mutation (shard ${{ matrix.shard }}/4)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2]
+        shard: [0, 1, 2, 3]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: ./.github/actions/setup-rust
         with:
-          shared-key: mutation
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Install cargo-mutants
-        run: scripts/install-ci-tool.sh cargo-mutants
+          cache-key: mutation
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+          tools: cargo-mutants
 
       - name: Mutate critical contracts
         run: |
@@ -445,18 +724,83 @@ jobs:
             --cap-lints true \
             --jobs 3 \
             --timeout 180 \
-            --shard ${{ matrix.shard }}/3 \
+            --shard ${{ matrix.shard }}/4 \
             --file crates/zinder-store/src/canonical_store/live_commit.rs \
             --file crates/zinder-store/src/canonical_store/live_replacement.rs \
             --file crates/zinder-store/src/canonical_store/event_lifecycle.rs \
             --file crates/zinder-store/src/format/stream_cursor.rs \
             --file crates/zinder-store/src/canonical_store/rocksdb.rs \
+            --file crates/zinder-store/src/canonical_store/block_replay.rs \
             --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
             --file crates/zinder-store/src/canonical_store/control.rs \
+            --file crates/zinder-store/src/canonical_store/block_load/codec.rs \
+            --file crates/zinder-store/src/canonical_store/reader.rs \
             --file crates/zinder-store/src/canonical_store/served_tree_state.rs \
             --file crates/zinder-store/src/canonical_store/tree_state_replay.rs \
             --file crates/zinder-store/src/canonical_store/tree_state_densification.rs \
             --file crates/zinder-core/src/network_upgrade_activations.rs \
             --file crates/zinder-source/src/source_block.rs \
+            --file crates/zinder-source/src/source_transaction.rs \
+            --file crates/zinder-store/src/canonical_store/encoded_compact_range.rs \
+            --file crates/zinder-store/src/settled_shielded_segment/wire_projection.rs \
             --file services/zinder-ingest/src/artifact_builder.rs \
-            --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer|framed_tree_size|skip_framed_node|read_tree_state_checkpoint_at|lookup_tree_state|find_tree_state|replay_tree_state|refuse_unadmitted_activations|reconstruct|required_seed_height|replay_compact_blocks|append_compact_block_commitments|requires_checkpoint|after_seed|scan_tree_state_strides|stride_ending_at_satisfied|next_tree_state_stride|first_seed_at_or_above|stride_satisfies|stored_heights_through_end|stored_tree_sizes|densify_tree_state_stride|replay_stride|append_stored_block|commitment_count|recorded_tree_sizes|commit_tree_state_stride|StoredStrideRows::read|StoredStrideRows::at|ReplayedTrees::append_block|ReplayedTrees::canonical_block_time|ReplayedTrees::checkpoint'
+            --file crates/zinder-rocksdb-bulk-load/src/bulk_load/variable_value_sort.rs \
+            --file crates/zinder-wallet-rocksdb/src/accumulator_hashing.rs \
+            --file crates/zinder-wallet-rocksdb/src/projection_load.rs \
+            --file crates/zinder-wallet-rocksdb/src/store.rs \
+            --file crates/zinder-core/src/utxo_set_commitment.rs \
+            --file crates/zinder-wallet-projection/src/digest.rs \
+            --file crates/zinder-core/src/lthash16.rs \
+            --re 'encoded_compact_range\.rs:.*\b(stream_ascending|stream_descending|read_settled_segment_step|verify_step_linkage|project_live_wire)\b' \
+            --re 'wire_projection\.rs:.*\b(project_shielded_block_wire_into|validate_shielded_block_wire|project_compact_tx_wire|extract_action_nullifier_wire)\b' \
+            --re 'variable_value_sort\.rs:.*\b(next_record|RunReader|SortedRunSource|remove_runs|merge_group|merge_run_group|read_run_head|ParallelVariableValueSorter|VariableValueSortShard|SharedRunBudget)\b' \
+            --re 'block_replay\.rs:.*\b(CanonicalReplaySliceSource|CanonicalReplaySliceScan|expected_visible_block_count)\b' \
+            --re 'projection_load\.rs:.*\b(partition_settled_height_chunks|parallel_scan_worker_count|verify_completed_chunks|scan_one_settled_chunk|spawn_canonical_scan_worker)\b' \
+            --re 'accumulator_hashing\.rs:.*\b(append_row|insert_unspent_output|settle|make_room|submit|spawn|drain|combine|push_row|push_unspent_output|hash_partial|HashingWorkers::start)\b' \
+            --re 'zinder-wallet-rocksdb/src/store\.rs:.*\b(hash_prefix_key_ranges|HashPrefixKeyRange|scan_range_count|primary_output_scan_range_count|address_transaction_scan_range_count|read_back_primary_output_rows|scan_primary_output_range|read_back_address_transaction_rows|scan_address_transaction_range|AddressTransactionTotals|PrimaryOutputTotals|PrimaryScanRange|SharedExpectedReorgUndoSuffix|spawn_validation_scan)\b' \
+            --re '(utxo_set_commitment|zinder-wallet-projection/src/digest)\.rs:.*\b(combine|fold_lanes)\b' \
+            --re '(artifact_builder|source_transaction)\.rs:.*\b(parse_source_block|bytes_consumed|validate_transaction_byte_layout|transaction_identifiers|witnessed_transaction_identifiers)\b' \
+            --re 'lthash16\.rs:.*\bexpand_lthash16_element\b' \
+            --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer|read_stored_final_note_commitment_roots_in_range|decode_stored_tree_state_roots|decode_checked_stored_roots|resolve_stored_roots_headers|framed_tree_size|skip_framed_node|read_tree_state_checkpoint_at|lookup_tree_state|find_tree_state|replay_tree_state|refuse_unadmitted_activations|reconstruct|required_seed_height|replay_compact_blocks|append_compact_block_commitments|requires_checkpoint|after_seed|scan_tree_state_strides|stride_ending_at_satisfied|next_tree_state_stride|first_seed_at_or_above|stride_satisfies|stored_heights_through_end|stored_tree_sizes|densify_tree_state_stride|replay_stride|append_stored_block|commitment_count|recorded_tree_sizes|commit_tree_state_stride|StoredStrideRows::read|StoredStrideRows::at|ReplayedTrees::append_block|ReplayedTrees::canonical_block_time|ReplayedTrees::checkpoint'
+
+  # The one check to require on main. Coverage and mutation run only on the
+  # weekly schedule and stay outside it.
+  ci-gate:
+    name: ci gate
+    if: always()
+    needs:
+      - changes
+      - fmt
+      - lint
+      - pasta-parity
+      - lthash16-parity
+      - sdk-packages
+      - test-build
+      - test
+      - test-tiers
+      - dependencies
+      - vendored-proto
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to pass or to be skipped for a prose-only change
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          RUST_NEEDED: ${{ needs.changes.outputs.rust_needed }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "${NEEDS}"
+          failures="$(jq -r --arg rust_needed "${RUST_NEEDED}" '
+            ["changes", "dependencies", "vendored-proto"] as $always
+            | to_entries[]
+            | .key as $job
+            | (if ($always | index($job)) != null or $rust_needed == "true"
+                then "success" else "skipped" end) as $expected
+            | select(.value.result != $expected)
+            | "\($job) is \(.value.result), expected \($expected)"' <<< "${NEEDS}")"
+          if [[ -n "${failures}" ]]; then
+            while IFS= read -r failure; do
+              echo "::error::${failure}"
+            done <<< "${failures}"
+            exit 1
+          fi

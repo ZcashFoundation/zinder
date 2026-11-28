@@ -310,7 +310,7 @@ pub(crate) async fn a_wallet_reader_keeps_its_source_while_the_projection_advanc
     )?;
     let before = harness.wallet_reader()?;
     let before_source = WalletCanonicalSourceIdentity::from_ready_evidence(before.ready_evidence());
-    harness.append_live_block(&wallet_chain.chain)?;
+    harness.append_live_block(&wallet_chain.chain, before_source.settled_tip())?;
     let after = harness.wallet_reader()?;
 
     assert_eq!(
@@ -439,7 +439,7 @@ impl WalletChain {
 /// outputs.
 fn wallet_chain() -> eyre::Result<WalletChain> {
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(2);
     let block_one = fixture_block(&chain, 1)?;
     let block_two = fixture_block(&chain, 2)?;

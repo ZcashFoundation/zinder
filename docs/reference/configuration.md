@@ -1,62 +1,49 @@
 # Configuration
 
-This page lists the settings each Zinder runtime reads, how they combine, and
-the fixed limits that public listeners enforce. It is for operators who deploy
-Zinder and for client developers who need to know why a request was refused.
+This page lists the settings each Zinder runtime reads, how they combine, and the fixed limits that public listeners enforce. It is for operators who deploy Zinder and for client developers who need to know why a request was refused.
 
 ## Settings for a first deployment
 
-Most settings have working defaults. A wallet-serving deployment of
-`zinder-ingest`, `zinder-projector`, `zinder-query`, and
-`zinder-compat-lightwalletd` needs the settings below.
+Most settings have working defaults. A wallet-serving deployment of `zinder-ingest`, `zinder-projector`, `zinder-query`, and `zinder-compat-lightwalletd` needs the settings below.
 
 | Setting | Runtimes | Value |
 | --- | --- | --- |
+| `deployment.profile` | ingest, projector, query, compat | `wallet` (recommended production default: complete history without raw blobs; requires a verified primary `[node]`), `explorer` (adds Explorer views, `ExplorerQuery`, and `zinder-compat-cipherscan`), or `light-wallet` (ingest and compat only). Combine any preset with `storage.full_blocks = true` (`--full-blocks`) to retain full serialized blocks and transaction slices locally (`storage.raw_blob_policy = "all"`). |
 | `network.name` | all | `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest` |
-| `node.json_rpc_addr` | ingest; query and compat to broadcast | JSON-RPC URL of an archive Zebra or Zakura node |
+| `node.json_rpc_addr` | ingest; query and compat to broadcast and serve lean-mode transaction bytes | JSON-RPC URL of an archive Zebra or Zakura node |
 | `node.auth.method` | wherever `[node]` is set | `cookie`, with a cookie file in `node.auth.path`; or `basic`, with `node.auth.username` and `node.auth.password` |
-| `ingest.source` | ingest | `zebra-json-rpc`, the only supported value |
-| `ingest.run_overrides.coverage` | ingest | `wallet-serving`, so ingest keeps the history and transaction bytes that wallets need |
-| `storage.path` | ingest, query, compat, explorer | Canonical store directory |
-| `storage.canonical_path` | projector | The same canonical store directory |
+| `ingest.source` | ingest | `"zebra-json-rpc"` (default) or `"zebra-indexer-grpc"` (binary block fetch; requires `node.indexer_grpc_addr`) |
+| `storage.path` | ingest, projector, query, compat, explorer | Canonical store directory |
 | `wallet.path` | projector, query, compat | Wallet store directory |
-| `storage.secondary_path`, `wallet.secondary_path` | query, compat | A directory for each process, never shared |
+| `storage.secondary_path`, `wallet.secondary_path` | projector, query, compat, explorer | A directory for each process, never shared (`wallet.secondary_path` applies to `query` and `compat`) |
 | `projector.build_owner_hex` | projector | A stable value of 32 hexadecimal characters |
 | `projector.lease_duration_seconds` | projector | At least `14400` |
 | `ingest_control.bearer_token_path` | ingest, projector, query, compat | File holding a shared secret. Ingest requires it when `ingest_control.listen_addr` is not a loopback address. |
 | `security.allow_public_bind` | any runtime bound to `0.0.0.0`, `::`, or a public address | `true`, and only behind a proxy that terminates TLS |
 
-The `*.toml` files directly in `deploy/config/` are complete examples for the
-Compose topology, and [Deploying Zinder](../runbooks/deploying.md) walks
-through them. Run any binary with `--print-config` to see the merged result
-before you start it.
+Most deployments need no TOML files at all and configure everything through `ZINDER_*` environment variables (with `[storage].data_dir` path derivation). Combined TOML files passed via `--config <path>` tolerate sibling service sections, and [Deploying Zinder](../runbooks/deploying.md) walks through the zero-TOML Compose setup. Run `zinder config print` or `zinder serve --print-config` (or `--print-config` on any role binary) to see the merged result before starting.
 
-Every listener binds to loopback by default. The
-[security boundary](../architecture/service-operations.md#security-boundary)
-explains which addresses `security.allow_public_bind` admits and why a public
-listener needs your own proxy.
+Every standalone listener binds to loopback by default. The [security boundary](../architecture/service-operations.md#security-boundary) explains which addresses `security.allow_public_bind` admits and why a public listener needs your own proxy.
 
-The runtime images change those defaults. Each image installs a file from
-`deploy/config/images/` at `/etc/zinder/config.toml` and starts with
-`--config /etc/zinder/config.toml`. The file sets
-`security.allow_public_bind = true` and these listeners:
+The unified `ghcr.io/zcashfoundation/zinder` OCI image runs `zinder serve` (or `zinder index` in [deploy/docker-compose.yml](../../deploy/docker-compose.yml)) without a baked-in `/etc/zinder/config.toml`. Compose configures public container listeners on `[::]` with `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true` and publishes loopback host ports for `:9108` (`zinder serve` ops), `:9105` (`zinder index` ops), `:9102` (`WalletQuery`), `:9067` (`CompactTxStreamer`), `:9068` (`ExplorerQuery`, `explorer` preset), and `:9070` (Cipherscan REST, `explorer` preset), while `ingest_control.listen_addr` keeps its loopback default (see [Integration surfaces](integration-surfaces.md#endpoints)).
 
-| Image | Listeners |
-| --- | --- |
-| `zinder-ingest` | `ops.listen_addr = "[::]:9105"` |
-| `zinder-projector` | `ops.listen_addr = "[::]:9110"` |
-| `zinder-query` | `query.listen_addr = "[::]:9102"`, `ops.listen_addr = "[::]:9106"` |
-| `zinder-compat-lightwalletd` | `compat.listen_addr = "[::]:9067"`, `ops.listen_addr = "[::]:9107"` |
-| `zinder-explorer` | `explorer.listen_addr = "[::]:9068"`, `ops.listen_addr = "[::]:9069"` |
+## Deployment profiles
 
-Other listeners, such as `ingest_control.listen_addr`, keep their loopback
-defaults. The image files set no network, node, or storage values, so supply
-those with `ZINDER_*` variables or a mounted file. A file you mount at
-`/etc/zinder/config.toml` replaces the image file whole. A listener it does
-not set then binds loopback, and without `allow_public_bind = true` a
-listener on `[::]` or a public address is refused. Arguments after the image
-name replace `--config /etc/zinder/config.toml`, so repeat it when you pass
-your own.
+Set `deployment.profile` on each participating runtime, or pass `--preset` to `zinder serve` / `zinder index` (`light-wallet`, `wallet` default, or `explorer`; add `--full-blocks` or `storage.full_blocks = true` on any preset to retain full raw blocks). Matching explicit settings are accepted; conflicting settings fail configuration resolution. `--print-config` prints the profile and omits the settings it supplies.
+
+| Profile | Canonical modules & views | Raw blobs | Serving |
+| --- | --- | --- | --- |
+| `light-wallet` | `ZSHRNG02` + `ZSTSUP01` (plus optional `ingest.explorer_views = true`) | None (or All with `ZSBLKB01` / `live_tail_raw_block` when `storage.full_blocks = true`) | Ingest and node-backed lightwalletd compatibility |
+| `wallet` | `ZSHRNG02` + `ZSTSUP01` (plus optional `ingest.explorer_views = true`) | None (or All with `ZSBLKB01` / `live_tail_raw_block` when `storage.full_blocks = true`) | Ingest, projector, native query, and wallet compatibility |
+| `explorer` | `ZSHRNG02` + `ZSTSUP01` + `ingest.explorer_views = true` | None (or All with `ZSBLKB01` / `live_tail_raw_block` when `storage.full_blocks = true`) | Ingest (with Explorer views), projector, native query, wallet compatibility, Explorer, and Cipherscan compat |
+
+All profiles build complete canonical history, and changing retention requires a new store. `light-wallet` and `wallet` forward mined transaction body reads (plus address history in `light-wallet`) to `[node]` through a bounded call budget, wait queue, and verified byte cache (`forwarded_read_*` and `forwarded_transaction_cache_bytes` under `[query]` or `[compat]`; see [Node-forwarded reads](lightwalletd-compatibility.md#node-forwarded-reads)). When your node is remote, pruning, or shared, or under heavy public traffic, add `storage.full_blocks = true` (`--full-blocks`, resolving `storage.raw_blob_policy = "all"`), which stores single-copy full consensus blocks in `ZSBLKB01` / `live_tail_raw_block` without duplicate transaction copies. Canonical Schema `v2` removes `storage.raw_blob_policy = "transactions"`; setting it fails startup.
+
+## Light-wallet profile
+
+Set `deployment.profile = "light-wallet"` (or `ZINDER_DEPLOYMENT__PROFILE=light-wallet` / `--preset light-wallet`) on `zinder serve`, `zinder index`, or standalone `zinder-ingest` and `zinder-compat-lightwalletd`. Give both the same network, canonical primary path, and reorg window, plus a unique secondary path, `ingest_control.addr`, and one archive node with transparent address indexes.
+
+Compatibility requires complete block history and a complete subtree-root prefix, and also admits a store with retained blobs (`all`). Without the profile, setting `compat.serving = "light-wallet"` applies the same requirements against `storage.raw_blob_policy` (which defaults to `none`; set `all` or `storage.full_blocks = true` when requiring local raw blocks). See [Lightwalletd compatibility](lightwalletd-compatibility.md#runtime-serving-selection) and [Node-forwarded reads](lightwalletd-compatibility.md#node-forwarded-reads).
 
 ## How configuration is loaded
 
@@ -67,67 +54,43 @@ Every binary merges four layers. Each layer overrides the one before it:
 3. `ZINDER_*` environment variables.
 4. Command-line flags.
 
-An environment variable name is `ZINDER_` followed by the TOML path in
-uppercase, with `__` between levels. A single `_` stays inside a key. For
-example, `ingest.follow.poll_interval_ms` becomes
-`ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS`.
+An environment variable name is `ZINDER_` followed by the TOML path in uppercase, with `__` between levels. A single `_` stays inside a key. For example, `ingest.follow.poll_interval_ms` becomes `ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS`.
 
 The loader enforces these rules:
 
-- An unknown key fails startup, whether it comes from the file or the
-  environment. For a rejected variable, the error names it and suggests a
-  correction.
+- Every runtime and the unified `zinder` supervisor deserialize into one strict typed `ZinderConfig` schema covering all 18 sections (`deployment`, `observability`, `network`, `ops`, `security`, `storage`, `wallet`, `node`, `node_fallbacks`, `retention`, `ingest_control`, `projector_control`, `ingest`, `projector`, `query`, `compat`, `explorer`, `cipherscan`). Unknown sections, unknown fields, and typos fail startup even in inactive roles' sections. Empty or whitespace-only environment values and literal `[REDACTED]` placeholders fail closed; use `"none"` to opt out of a default-enabled toggle such as `ops.listen_addr`. For a rejected variable, the error names it and suggests a correction.
 - Cross-field rules are checked before storage opens or a listener binds.
-- `--print-config` prints the merged configuration as TOML without opening
-  storage or binding. Passwords and inline cookies are redacted.
+- `--print-config` prints the merged configuration as TOML without opening storage, creating persisted state on disk, or binding. Passwords, inline cookies, inline TLS PEMs (`*_pem`), and inline bearer tokens (`bearer_token`, `checkpoint_bearer_token`) are redacted.
 - `ZINDER_TEST_*` variables never reach the loader. They are test-only knobs.
-- `RUST_LOG` sets the log filter and has no TOML field. Unset or blank means
-  `info`. A value that does not parse fails startup.
-- The single-volume image entrypoints read `ZINDER_WALLET_SERVING__*` and the
-  `ZINDER_NODE__INDEXER_TLS__*_PEM` forms themselves. The binaries refuse the
-  `*_PEM` variables. See
-  [single-volume deployment](../runbooks/deploying-single-volume.md).
+- `RUST_LOG` sets the log filter and has no TOML field. Unset or blank means `info`. A value that does not parse fails startup.
+- Every binary directly accepts both `*_path` and inline (`*_pem`, `bearer_token`) credentials natively, and derives unset canonical/wallet/explorer storage paths from `storage.data_dir` (defaulting to `/var/lib/zinder` when neither `storage.data_dir` nor explicit storage paths are overridden). See [single-volume deployment](../runbooks/deploying-single-volume.md).
 
-[ADR-0021](../adrs/0021-shared-configuration-sections.md) records why sections
-such as `[node]`, `[ops]`, and `[security]` are shared by every runtime.
+[ADR-0021](../adrs/0021-shared-configuration-sections.md) records why sections such as `[node]`, `[ops]`, and `[security]` are shared by every runtime.
 
 ## Sections by runtime
 
 | Runtime | Sections |
 | --- | --- |
-| `zinder-ingest` | `network`, `node`, `node_fallbacks.N`, `storage`, `ingest`, `retention`, `ingest_control`, `ops`, `security` |
-| `zinder-projector` | `network`, `storage`, `wallet`, `projector`, `ingest_control`, `projector_control`, `ops`, `security` |
-| `zinder-query` | `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `query`, `ingest_control`, `ops`, `security` |
-| `zinder-compat-lightwalletd` | `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `compat`, `ingest_control`, `ops`, `security` |
+| `zinder-ingest` | `deployment`, `network`, `node`, `node_fallbacks.N`, `storage`, `ingest`, `retention`, `ingest_control`, `ops`, `security` |
+| `zinder-projector` | `deployment`, `network`, `storage`, `wallet`, `projector`, `ingest_control`, `projector_control`, `ops`, `security` |
+| `zinder-query` | `deployment`, `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `query`, `ingest_control`, `ops`, `security` |
+| `zinder-compat-lightwalletd` | `deployment`, `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `compat`, `ingest_control`, `ops`, `security` |
 | `zinder-explorer` | `network`, `node`, `node_fallbacks.N`, `storage`, `explorer`, `ops`, `security` |
 | `zinder-compat-cipherscan` | `network`, `cipherscan`, `ops`, `security` |
 
-`[ingest]` has the subsections `construction`, `follow`, `mempool`,
-`phase_classification`, `run_overrides`, `tree_state_densification`, and
-`tree_state_verification`. `[projector]` has `build` and `follow`.
+`[ingest]` has the subsections `construction`, `follow`, `mempool`, `phase_classification`, `run_overrides`, `tree_state_densification`, and `tree_state_verification`. `[projector]` has `build` and `follow`.
 
 ### The node sections
 
 Each runtime uses `[node]` differently:
 
-- Ingest requires it.
-- Query and wallet-mode compatibility use it only to broadcast transactions
-  and, in compatibility, to read the recommended fee, for which a pruned node
-  works. They start without contacting the node. Without `[node]` they serve
-  stored data and do not advertise broadcast, and compatibility answers
-  `GetStandardFee` with `UNIMPLEMENTED`. Any node setting requires
-  `node.json_rpc_addr`.
+- Ingest requires it. Both `"zebra-json-rpc"` and `"zebra-indexer-grpc"` values of `ingest.source` require `node.json_rpc_addr` (control plane); selecting `"zebra-indexer-grpc"` also requires `indexer_grpc_addr` on `[node]` and every `[node_fallbacks.N]`.
+- Query and wallet-mode compatibility use it only to broadcast transactions and, in compatibility, to read the recommended fee, for which a pruned node works. They start without contacting the node. Without `[node]` they serve stored data and do not advertise broadcast, and compatibility answers `GetStandardFee` with `UNIMPLEMENTED`. Any node setting requires `node.json_rpc_addr`.
+- Light-wallet serving requires one `[node]` and rejects fallbacks. For the methods it forwards, see [Lightwalletd serving modes](lightwalletd-compatibility.md#runtime-serving-selection).
 - Explorer uses it only to report the node's tip in its freshness envelope.
-- The projector, and compatibility with `compat.serving = "compact-blocks"`,
-  reject it.
+- The projector does not contact or read `[node]` (and ignores sibling `[node]` entries in shared configs); compatibility with `compat.serving = "compact-blocks"` explicitly rejects `[node]` and `[node_fallbacks.*]`.
 
-`[node_fallbacks.N]` adds fallback endpoints. `[node]` is position 0, and the
-fallbacks count from 1 without a gap. Each fallback table takes the fields of
-`[node]`, and its environment names start with `ZINDER_NODE_FALLBACKS__<N>__`.
-A fallback does not inherit `broadcast_timeout_secs` from `[node]`, so set it
-on each endpoint. Positions are table keys, not a TOML array, so a file and the
-environment merge field by field. A TOML array of tables
-(`[[node_fallbacks]]`) is refused:
+`[node_fallbacks.N]` adds fallback endpoints. `[node]` is position 0, and the fallbacks count from 1 without a gap. Each fallback table takes the fields of `[node]`, and its environment names start with `ZINDER_NODE_FALLBACKS__<N>__`. A fallback does not inherit `broadcast_timeout_secs` or `max_concurrent_requests` from `[node]`, so set them on each endpoint. Positions are table keys, not a TOML array, so a file and the environment merge field by field. A TOML array of tables (`[[node_fallbacks]]`) is refused:
 
 ```toml
 [node]
@@ -142,29 +105,58 @@ method = "cookie"
 path = "/var/run/auth-fallback/.cookie"
 ```
 
-[Node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover)
-describes how each runtime uses the list.
+[Node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover) describes how each runtime uses the list.
+
+`max_concurrent_requests` caps the JSON-RPC calls one process has in flight to one node endpoint. It defaults to 64 and accepts 1 to 1024. Zebra accepts 100 JSON-RPC connections by default and refuses more with HTTP 429, which Zinder reports as `NODE_RATE_LIMITED`. A call beyond the cap waits for a free slot for at most its own timeout, then fails with `NODE_UNAVAILABLE` without reaching the node. Readiness probes use a slot of their own, so a busy node does not fail readiness. When ingest and readers share one node, keep the sum of their caps below the node's connection limit:
+
+```toml
+[node]
+json_rpc_addr = "http://zebra:8232"
+max_concurrent_requests = 32
+```
+
+## Trace export
+
+Set an OTLP gRPC collector origin to enable trace export for the runtime roles
+in your deployment. Use HTTPS with the system trust roots or HTTP on a trusted
+network. Supply an origin such as `https://collector.internal:4317`. The origin
+can contain a port. Credentials, additional path segments, queries, and
+fragments are rejected.
+
+```toml
+[observability]
+otlp_endpoint = "https://collector.internal:4317"
+sampling_rate = 0.1
+```
+
+You can also use `ZINDER_OBSERVABILITY__OTLP_ENDPOINT` and
+`ZINDER_OBSERVABILITY__SAMPLING_RATE`. Omit or set `observability.otlp_endpoint = "none"`
+to disable export; empty environment values are rejected.
+The sampling rate defaults to 0.1 and applies to new traces. Private control
+calls follow the sampling decision of their W3C trace parent. Configuration
+printing redacts the collector endpoint.
 
 ## Environment variables
 
-Every `ZINDER_*` variable a binary accepts is listed below, with its TOML
-field. The table is generated by
-`zinder_runtime::render_environment_variable_table()`. A test checks that the
-table matches, and each binary's `env_var_contract` test checks that it
-accepts exactly the variables whose "Used by" column names it. The tests do
-not check descriptions or defaults.
+Every `ZINDER_*` variable maps directly into the unified `ZinderConfig` schema (`<SECTION>__<FIELD>`). Empty or whitespace-only `ZINDER_*` values are rejected; opt out of default-enabled endpoints or allowlists explicitly with `"none"`. The table below is generated by `zinder_runtime::render_environment_variable_table()`. Tests check both that every leaf field in `ZinderConfig` matches a documented variable bijectively and that the generated Markdown table matches this document.
 
 <!-- env-var-table:public-interfaces:start -->
 | Variable | Used by | Requirement | TOML field | Description |
 | -------- | ------- | ----------- | ---------- | ----------- |
+| `ZINDER_DEPLOYMENT__PROFILE` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `deployment.profile` | Coordinates the consumer preset (`light-wallet`, `wallet`, or `explorer`; defaults to `wallet` when configuring a preset). Combine with `ZINDER_STORAGE__FULL_BLOCKS=true` to retain full raw blocks. See [deployment profiles](#deployment-profiles). |
+| `ZINDER_OBSERVABILITY__OTLP_ENDPOINT` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Optional | `observability.otlp_endpoint` | OTLP gRPC collector origin. Omit or set to `"none"` to disable trace export; empty values are rejected. See [trace export](#trace-export). (sensitive; redacted) |
+| `ZINDER_OBSERVABILITY__SAMPLING_RATE` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Optional | `observability.sampling_rate` | Fraction of new traces to sample when OTLP export is enabled. Accepts 0 through 1 and defaults to 0.1. |
 | `ZINDER_NETWORK__NAME` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Required | `network.name` | Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Note: live-test gating reads the bare `ZINDER_NETWORK` env var directly and never reaches the config loader, so test runbooks still quote that form. |
-| `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `running zinder-ingest, or broadcasting transactions or reading the recommended fee from a reader` | `node.json_rpc_addr` | Upstream Zebra JSON-RPC URL. `zinder-ingest` requires it. `zinder-query` and wallet-mode `zinder-compat-lightwalletd` broadcast transactions through it, compatibility also reads the recommended fee for `GetStandardFee` through it, and both start without contacting it. Without it they serve storage only and advertise no broadcast, and compatibility answers `GetStandardFee` with `UNIMPLEMENTED`. Compact-blocks compatibility rejects every `ZINDER_NODE__*` variable. Optional for `zinder-explorer`: without it the upstream-observation probe stays off and `ExplorerFreshness.chain_view.upstream_tip` is always unset. |
-| `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. Falls back to JSON-RPC mempool polling when unset or empty. An `https://` URL negotiates TLS, configured by the `ZINDER_NODE__INDEXER_TLS__*` variables; without them the node is verified against the system roots. |
-| `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | zinder-ingest | Optional | `node.indexer_tls.ca_cert_path` | PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Read at startup and whenever an indexer stream reconnects. |
-| `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH` | zinder-ingest | When `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH is set` | `node.indexer_tls.client_cert_path` | PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`. |
-| `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` | zinder-ingest | When `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH is set` | `node.indexer_tls.client_key_path` | Path to the PEM private key for the indexer client certificate. The path is shown in `--print-config`; the key is read at startup and whenever an indexer stream reconnects. The `*_PEM` variables that the single-volume image entrypoints convert into these files are refused by the binaries. |
+| `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `running ingest, light-wallet serving, or lean wallet serving, or using broadcast or fee reads` | `node.json_rpc_addr` | Upstream node JSON-RPC URL. Light-wallet serving forwards transparent address reads, omitted transaction bodies, broadcasts, and fee reads to this node. Query and wallet-mode compatibility use a configured node for broadcasts and verified mined transaction bytes in lean wallet mode. Wallet-mode compatibility also reads the fee. Compact-blocks serving rejects node settings. Explorer uses the address for upstream tip observation. See [The node sections](#the-node-sections). |
+| `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source and required when `ingest.source = "zebra-indexer-grpc"` for binary `GetBlock` block reads. Omit or set to `"none"` to fall back to JSON-RPC mempool polling; empty values are rejected. An `https://` URL negotiates TLS, configured by the `ZINDER_NODE__INDEXER_TLS__*` variables; without them the node is verified against the system roots. |
+| `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | zinder-ingest | Optional | `node.indexer_tls.ca_cert_path` | Path to the PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`. Read at startup and whenever an indexer stream reconnects. |
+| `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM` | zinder-ingest | Optional | `node.indexer_tls.ca_cert_pem` | Inline PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
+| `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH` | zinder-ingest | When `indexer client key is configured` | `node.indexer_tls.client_cert_path` | Path to the PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with a client private key. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`. |
+| `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM` | zinder-ingest | When `indexer client key is configured` | `node.indexer_tls.client_cert_pem` | Inline PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with a client private key. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
+| `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` | zinder-ingest | When `indexer client certificate is configured` | `node.indexer_tls.client_key_path` | Path to the PEM private key for the indexer client certificate. The path is shown in `--print-config`; the key is read at startup and whenever an indexer stream reconnects. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM`. |
+| `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM` | zinder-ingest | When `indexer client certificate is configured` | `node.indexer_tls.client_key_pem` | Inline PEM private key for the indexer client certificate. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
 | `ZINDER_NODE__INDEXER_TLS__SERVER_NAME` | zinder-ingest | Optional | `node.indexer_tls.server_name` | Name verified against the indexer's certificate when it differs from the host in `ZINDER_NODE__INDEXER_GRPC_ADDR`. |
-| `ZINDER_NODE__AUTH__METHOD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.auth.method` | Upstream-node auth shape: `basic`, `cookie`, or unset for no auth. |
+| `ZINDER_NODE__AUTH__METHOD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.auth.method` | Upstream-node auth shape: `basic`, `cookie`, or `none` / unset for no auth. |
 | `ZINDER_NODE__AUTH__USERNAME` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE__AUTH__METHOD=basic` | `node.auth.username` | Basic-auth username. Paired with `ZINDER_NODE__AUTH__PASSWORD`. |
 | `ZINDER_NODE__AUTH__PASSWORD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE__AUTH__METHOD=basic` | `node.auth.password` | Basic-auth password. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
 | `ZINDER_NODE__AUTH__PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE__AUTH__METHOD=cookie` | `node.auth.path` | Path to a cookie file. Mutually exclusive with `ZINDER_NODE__AUTH__COOKIE`. |
@@ -172,15 +164,19 @@ not check descriptions or defaults.
 | `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.request_timeout_secs` | Upstream-node JSON-RPC request timeout in seconds. Defaults to 30. |
 | `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. Defaults to 67108864 (64 MiB). This is a ceiling on what Zinder accepts, not a request size: Zebra 7.1.0 and Zakura 1.8.6 refuse responses above 50 MiB by default, and ingest splits a source segment the node refuses. |
 | `ZINDER_NODE__BROADCAST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.broadcast_timeout_secs` | Per-call timeout (seconds) applied only to `sendrawtransaction`. When unset, the global `request_timeout_secs` applies instead. Recommended: 7. With fallback endpoints, a broadcast moves to the next endpoint only after the endpoint's own timeout, so keep it well below wallet request deadlines. Fallback endpoints do not inherit it; set `ZINDER_NODE_FALLBACKS__<N>__BROADCAST_TIMEOUT_SECS` for each. |
-| `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, ingest, the wallet-serving readers, and `zinder-explorer` poll it as the primary upstream-sync signal; when unset, they fall back to `getblockchaininfo.verificationprogress`/`estimatedheight`. Compatibility with `compat.serving = "compact-blocks"` rejects every node setting. See [ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md). |
+| `ZINDER_NODE__MAX_CONCURRENT_REQUESTS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.max_concurrent_requests` | Most JSON-RPC calls the process has in flight to this node at once, from 1 to 1024. Defaults to 64, below Zebra's default limit of 100 JSON-RPC connections, above which Zebra answers HTTP 429. A call beyond the limit waits for a free slot for at most its own timeout. Readiness probes use a separate slot. When several Zinder processes share one node, keep their sum below the node's connection limit. Fallback endpoints do not inherit it. |
+| `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, ingest, the wallet-serving readers, and `zinder-explorer` poll it as the primary upstream-sync signal; when omitted or set to `"none"`, they fall back to `getblockchaininfo.verificationprogress`/`estimatedheight` (empty values are rejected). Compatibility with `compat.serving = "compact-blocks"` rejects every node setting. See [ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md). |
 | `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. Query and wallet-serving compatibility use it to verify every broadcast endpoint, `[node]` and each fallback, on first contact and then refresh the node dependency their readiness reports; compact-blocks compatibility rejects it; `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.chain_view.upstream_tip`). |
 | `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.verification_progress_floor` | Lower bound on `getblockchaininfo.verificationprogress` below which the fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in `(0.0, 1.0)`. |
 | `ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.estimated_gap_floor_blocks` | Block gap between `estimatedheight` and the local tip above which the fallback path reports `upstream_not_ready`. Defaults to 10. |
 | `ZINDER_NODE_FALLBACKS__<N>__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `any ZINDER_NODE_FALLBACKS__<N>__* is set` | `node_fallbacks.<N>.json_rpc_addr` | JSON-RPC URL of fallback node endpoint `<N>`. Endpoints form one ordered list: `[node]` is position 0 and `[node_fallbacks.N]` is position `N`, starting at 1 with no gap. Every `ZINDER_NODE__*` field has a `ZINDER_NODE_FALLBACKS__<N>__*` counterpart. `zinder-ingest` switches to a fallback when its active endpoint fails. `zinder-query` and wallet-mode `zinder-compat-lightwalletd` broadcast, and compatibility reads the recommended fee, through the next verified endpoint when one is unreachable. `zinder-explorer` validates the list and reads only `[node]`. |
 | `ZINDER_NODE_FALLBACKS__<N>__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node_fallbacks.<N>.indexer_grpc_addr` | Same as `ZINDER_NODE__INDEXER_GRPC_ADDR`, for fallback endpoint `<N>`. After a switch, ingest follows the mempool of the new endpoint through it. |
-| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CA_CERT_PATH` | zinder-ingest | Optional | `node_fallbacks.<N>.indexer_tls.ca_cert_path` | Same as `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`, for fallback endpoint `<N>`. The single-volume image entrypoints also accept the `_PEM` form of this file. |
-| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PATH` | zinder-ingest | When `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PATH is set` | `node_fallbacks.<N>.indexer_tls.client_cert_path` | Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`, for fallback endpoint `<N>`. The single-volume image entrypoints also accept the `_PEM` form of this file. |
-| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PATH` | zinder-ingest | When `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PATH is set` | `node_fallbacks.<N>.indexer_tls.client_key_path` | Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`, for fallback endpoint `<N>`. The single-volume image entrypoints also accept the `_PEM` form of this file. |
+| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CA_CERT_PATH` | zinder-ingest | Optional | `node_fallbacks.<N>.indexer_tls.ca_cert_path` | Same as `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CA_CERT_PEM` | zinder-ingest | Optional | `node_fallbacks.<N>.indexer_tls.ca_cert_pem` | Same as `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`, for fallback endpoint `<N>`. (sensitive; redacted) |
+| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PATH` | zinder-ingest | When `fallback indexer client key is configured` | `node_fallbacks.<N>.indexer_tls.client_cert_path` | Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PEM` | zinder-ingest | When `fallback indexer client key is configured` | `node_fallbacks.<N>.indexer_tls.client_cert_pem` | Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`, for fallback endpoint `<N>`. (sensitive; redacted) |
+| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PATH` | zinder-ingest | When `fallback indexer client certificate is configured` | `node_fallbacks.<N>.indexer_tls.client_key_path` | Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PEM` | zinder-ingest | When `fallback indexer client certificate is configured` | `node_fallbacks.<N>.indexer_tls.client_key_pem` | Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM`, for fallback endpoint `<N>`. (sensitive; redacted) |
 | `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__SERVER_NAME` | zinder-ingest | Optional | `node_fallbacks.<N>.indexer_tls.server_name` | Same as `ZINDER_NODE__INDEXER_TLS__SERVER_NAME`, for fallback endpoint `<N>`. |
 | `ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.auth.method` | Same as `ZINDER_NODE__AUTH__METHOD`, for fallback endpoint `<N>`. |
 | `ZINDER_NODE_FALLBACKS__<N>__AUTH__USERNAME` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD=basic` | `node_fallbacks.<N>.auth.username` | Same as `ZINDER_NODE__AUTH__USERNAME`, for fallback endpoint `<N>`. |
@@ -190,33 +186,35 @@ not check descriptions or defaults.
 | `ZINDER_NODE_FALLBACKS__<N>__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.request_timeout_secs` | Same as `ZINDER_NODE__REQUEST_TIMEOUT_SECS`, for fallback endpoint `<N>`. |
 | `ZINDER_NODE_FALLBACKS__<N>__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.max_response_bytes` | Same as `ZINDER_NODE__MAX_RESPONSE_BYTES`, for fallback endpoint `<N>`. |
 | `ZINDER_NODE_FALLBACKS__<N>__BROADCAST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.broadcast_timeout_secs` | Same as `ZINDER_NODE__BROADCAST_TIMEOUT_SECS`, for fallback endpoint `<N>`. It is not inherited from `[node]`: when unset, this endpoint's own `request_timeout_secs` applies. Recommended: 7. |
+| `ZINDER_NODE_FALLBACKS__<N>__MAX_CONCURRENT_REQUESTS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.max_concurrent_requests` | Same as `ZINDER_NODE__MAX_CONCURRENT_REQUESTS`, for fallback endpoint `<N>`. It is not inherited from `[node]`: when unset, the default of 64 applies. |
 | `ZINDER_NODE_FALLBACKS__<N>__HEALTH__ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.health.addr` | Same as `ZINDER_NODE__HEALTH__ADDR`, for fallback endpoint `<N>`. |
 | `ZINDER_NODE_FALLBACKS__<N>__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.health.poll_interval_ms` | Same as `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS`, for fallback endpoint `<N>`, in ingest. Query and wallet-serving compatibility ignore it and verify and observe every endpoint on `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS`. |
 | `ZINDER_NODE_FALLBACKS__<N>__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.health.verification_progress_floor` | Same as `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR`, for fallback endpoint `<N>`. |
 | `ZINDER_NODE_FALLBACKS__<N>__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.health.estimated_gap_floor_blocks` | Same as `ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS`, for fallback endpoint `<N>`. |
-| `ZINDER_OPS__LISTEN_ADDR` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Optional | `ops.listen_addr` | Listen address for the operational HTTP endpoint (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service loopback address (`127.0.0.1:9105` ingest, `9110` projector, `9106` query, `9107` compat, `9069` explorer, `9108` cipherscan). Set to an empty string to disable the endpoint entirely. |
+| `ZINDER_OPS__LISTEN_ADDR` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Optional | `ops.listen_addr` | Listen address for the operational HTTP endpoint (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service loopback address (`127.0.0.1:9105` ingest, `9110` projector, `9106` query, `9107` compat, `9069` explorer, `9108` cipherscan). Set to `"none"` to disable the endpoint entirely; empty values are rejected. |
 | `ZINDER_SECURITY__ALLOW_PUBLIC_BIND` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Optional | `security.allow_public_bind` | Opts a binary in to binding its plaintext serving and operational surfaces to a public or unspecified (`0.0.0.0`, `::`) address. Defaults to `false`: a loopback or private-range bind is always allowed, but a public or unspecified bind is refused at startup unless this is `true`. Zinder ships no server TLS (ADR-0011); set this only when a reverse proxy terminates TLS and authorization in front of the listener. |
-| `ZINDER_INGEST_CONTROL__LISTEN_ADDR` | zinder-ingest | Optional | `ingest_control.listen_addr` | Listen address of the private IngestControl gRPC endpoint. Localhost-only by default; cross-host deployments must add bearer-token auth per ADR-0011. Set to an empty string to disable the endpoint for diagnostic one-shot runs (such as `--target-height` pre-seed). |
+| `ZINDER_INGEST_CONTROL__LISTEN_ADDR` | zinder-ingest | Optional | `ingest_control.listen_addr` | Listen address of the private IngestControl gRPC endpoint. Localhost-only by default; cross-host deployments must add bearer-token auth per ADR-0011. Set to `"none"` to disable the endpoint for diagnostic one-shot runs (such as `--target-height` pre-seed); empty values are rejected. |
 | `ZINDER_INGEST_CONTROL__ADDR` | zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `ingest_control.addr` | URL of the colocated IngestControl writer (`http://host:port`). Readers use it for tip-change subscriptions, mempool reads, and writer-status lookups. Defaults to `http://127.0.0.1:9100`. |
-| `ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `ingest_control.bearer_token_path` | Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0011). The writer reads it to verify; the readers read the same file to present. File-only by policy; inline secrets are rejected at config load. |
-| `ZINDER_INGEST_CONTROL__CHECKPOINT_STAGING_ROOT` | zinder-ingest | Optional | `ingest_control.checkpoint_staging_root` | Directory containing freshly prepared state-bundle candidate directories. CanonicalControl accepts only an opaque candidate id and creates its canonical checkpoint at `<root>/<candidate-id>/canonical.rocksdb`; production mounts this path from a dedicated staging volume into ingest and projector only, never query or compatibility. Defaults to `/var/lib/zinder/checkpoints`. |
-| `ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH` | zinder-ingest | When `canonical checkpoint capture is enabled` | `ingest_control.checkpoint_bearer_token_path` | Path to the separate method-level token required by CanonicalControl.CreateOwnerCheckpoint and ReadmitOwnerCheckpoint. Mount this file only into ingest and projector; query and compatibility must not receive it. |
-| `ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR` | zinder-projector | Optional | `projector_control.listen_addr` | Loopback-only private ProjectorControl gRPC endpoint for coherent capture. Empty or unset disables it; an enabled endpoint requires projector_control.bearer_token_path. |
-| `ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH` | zinder-projector | When `projector control is enabled` | `projector_control.bearer_token_path` | Path to the token required by ProjectorControl and presented as the canonical checkpoint capability. Mount it only into projector and ingest; query and compatibility never read it. |
-| `ZINDER_PROJECTOR_CONTROL__CHECKPOINT_STAGING_ROOT` | zinder-projector | Optional | `projector_control.checkpoint_staging_root` | Shared candidate root whose realpath must match ingest_control.checkpoint_staging_root. The projector sends only a SHA-256 root binding to canonical control, never a path. |
-| `ZINDER_STORAGE__PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `storage.path` | Canonical RocksDB store path. Writers open it as primary; readers open it as a secondary. |
-| `ZINDER_STORAGE__SECONDARY_PATH` | zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `storage.secondary_path` | Process-unique RocksDB secondary metadata directory. Never share this path across reader processes. |
+| `ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `ingest_control.bearer_token_path` | Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0011). Mutually exclusive with `ZINDER_INGEST_CONTROL__BEARER_TOKEN`. |
+| `ZINDER_INGEST_CONTROL__BEARER_TOKEN` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd | When `ingest enforces auth` | `ingest_control.bearer_token` | Inline shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0011). Mutually exclusive with `ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
+| `ZINDER_INGEST_CONTROL__CHECKPOINT_STAGING_ROOT` | zinder-ingest | Optional | `ingest_control.checkpoint_staging_root` | Directory containing freshly prepared state-bundle candidate directories. CanonicalControl accepts only an opaque candidate id and creates its canonical checkpoint at `<root>/<candidate-id>/canonical.rocksdb`; production mounts this path from a dedicated staging volume into ingest and projector only, never query or compatibility. Defaults to `<storage.data_dir>/checkpoints` when `storage.data_dir` is set, or `/var/lib/zinder/checkpoints`. |
+| `ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH` | zinder-ingest | When `canonical checkpoint capture is enabled` | `ingest_control.checkpoint_bearer_token_path` | Path to the separate method-level token required by CanonicalControl.CreateOwnerCheckpoint and ReadmitOwnerCheckpoint. Mutually exclusive with `ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN`. |
+| `ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN` | zinder-ingest | When `canonical checkpoint capture is enabled` | `ingest_control.checkpoint_bearer_token` | Inline separate method-level token required by CanonicalControl.CreateOwnerCheckpoint and ReadmitOwnerCheckpoint. Mutually exclusive with `ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
+| `ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR` | zinder-projector | Optional | `projector_control.listen_addr` | Loopback-only private ProjectorControl gRPC endpoint for coherent capture. Omit or set to `"none"` to disable it (empty values are rejected); an enabled endpoint requires projector_control.bearer_token_path or projector_control.bearer_token. |
+| `ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH` | zinder-projector | When `projector control is enabled` | `projector_control.bearer_token_path` | Path to the token required by ProjectorControl and presented as the canonical checkpoint capability. Mutually exclusive with `ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN`. |
+| `ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN` | zinder-projector | When `projector control is enabled` | `projector_control.bearer_token` | Inline token required by ProjectorControl and presented as the canonical checkpoint capability. Mutually exclusive with `ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
+| `ZINDER_PROJECTOR_CONTROL__CHECKPOINT_STAGING_ROOT` | zinder-projector | Optional | `projector_control.checkpoint_staging_root` | Shared candidate root whose realpath must match ingest_control.checkpoint_staging_root (defaults to `<storage.data_dir>/checkpoints` when `storage.data_dir` is set, or `/var/lib/zinder/checkpoints`). The projector sends only a SHA-256 root binding to canonical control, never a path. |
+| `ZINDER_STORAGE__PATH` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.path` | Canonical RocksDB store directory. Defaults to `<storage.data_dir>/canonical` or `/var/lib/zinder/canonical` unless explicit secondary paths omit it. Ingest writes the primary store here; Explorer locates its materialized-view store beneath this directory; projector, query, and lightwalletd open the canonical store as a secondary. |
+| `ZINDER_STORAGE__SECONDARY_PATH` | zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.secondary_path` | Process-unique RocksDB secondary metadata directory. Defaults under `storage.data_dir` (`<data_dir>/canonical-secondary/<service>` or `<data_dir>/explorer`) or `/var/lib/zinder` when all storage paths are omitted; required when explicit storage paths omit it. Never share this path across reader processes. |
 | `ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS` | zinder-query, zinder-compat-lightwalletd | Optional | `storage.initial_catchup_timeout_ms` | Maximum startup RocksDB secondary catchup duration before a reader starts with the opened secondary and lets /readyz report replica lag. Defaults to 30000. |
 | `ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS` | zinder-query, zinder-compat-lightwalletd | Optional | `storage.secondary_catchup_interval_ms` | Cadence of RocksDB secondary catchup ticks in milliseconds. Defaults to 1000. Must be greater than zero. |
 | `ZINDER_STORAGE__SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS` | zinder-query, zinder-compat-lightwalletd | Optional | `storage.secondary_replica_lag_threshold_chain_epochs` | Chain epochs the secondary may trail the primary before `/readyz` reports replica lag. Defaults to 4. |
 | `ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS` | zinder-query, zinder-compat-lightwalletd | Optional | `storage.serving_pair_staleness_ceiling_ms` | Longest a wallet-serving pair keeps admitting traffic, in milliseconds, after the last writer attestation. The reader refreshes at least every half ceiling, even if `storage.secondary_catchup_interval_ms` is longer, so a writer that answers attests it again before the ceiling passes. Traffic stops when the ceiling passes, even while a refresh is still waiting for the writer. Defaults to 300000. Must be greater than zero. |
-| `ZINDER_STORAGE__CANONICAL_PATH` | zinder-projector | Optional | `storage.canonical_path` | Canonical primary RocksDB path the projector opens as a read-only secondary. Defaults to `/var/lib/zinder/canonical`. |
-| `ZINDER_STORAGE__CANONICAL_SECONDARY_PATH` | zinder-projector | Optional | `storage.canonical_secondary_path` | Projector-local RocksDB secondary metadata directory for canonical reads. Defaults to `/var/lib/zinder/projector/canonical-secondary`; never share it with another process. |
-| `ZINDER_WALLET__PATH` | zinder-projector, zinder-query, zinder-compat-lightwalletd | When `running a wallet-serving reader` | `wallet.path` | Wallet-projection RocksDB primary path. The projector owns it as the primary writer and defaults to `/var/lib/zinder/wallet`; both serving runtimes open it as a read-only secondary and require an explicit path. |
-| `ZINDER_WALLET__SECONDARY_PATH` | zinder-query, zinder-compat-lightwalletd | Required | `wallet.secondary_path` | Wallet-serving reader root for immutable wallet-secondary generations. Must be distinct from every primary and canonical-secondary path. |
+| `ZINDER_WALLET__PATH` | zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `wallet.path` | Wallet-projection RocksDB primary path. Defaults to `<storage.data_dir>/wallet` or `/var/lib/zinder/wallet` unless explicit storage paths omit it; the projector owns it as primary writer and serving runtimes open it as read-only secondary. |
+| `ZINDER_WALLET__SECONDARY_PATH` | zinder-query, zinder-compat-lightwalletd | Optional | `wallet.secondary_path` | Wallet-serving reader root for immutable wallet-secondary generations. Defaults to `<storage.data_dir>/wallet-secondary/<service>` or `/var/lib/zinder/wallet-secondary/<service>` when all storage paths are omitted; required when explicit storage paths omit it. Must be distinct from every primary and canonical-secondary path. |
 | `ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES` | zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.block_cache_bytes` | Wallet-projection RocksDB block cache budget in bytes. Defaults to 268435456 for the writer and 67108864 for the wallet-serving reader. In zinder-query and zinder-compat-lightwalletd, one cache of this size serves every wallet secondary generation of the process. |
-| `ZINDER_WALLET__ROCKSDB__MAX_WAL_BYTES` | zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.max_wal_bytes` | Wallet-projection RocksDB live WAL ceiling in bytes. Defaults to 268435456 for the writer and 16777216 for the wallet-serving reader. |
-| `ZINDER_WALLET__ROCKSDB__MAX_OPEN_FILES` | zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.max_open_files` | Wallet-projection RocksDB open SST file cap. Defaults to 512 for the writer and 64 for the wallet-serving reader. |
+| `ZINDER_WALLET__ROCKSDB__MAX_WAL_BYTES` | zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.max_wal_bytes` | Wallet-projection RocksDB live WAL ceiling in bytes. Defaults to 33554432 for the writer and 16777216 for the wallet-serving reader. |
+| `ZINDER_WALLET__ROCKSDB__MAX_OPEN_FILES` | zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.max_open_files` | Wallet-projection RocksDB open SST file cap. Defaults to 512 for the writer and 1024 for the wallet-serving reader. |
 | `ZINDER_WALLET__ROCKSDB__WRITE_BUFFER_BYTES` | zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.write_buffer_bytes` | Wallet-projection RocksDB per-column-family write buffer size. Defaults to 16777216 for the writer and 4194304 for the wallet-serving reader. |
 | `ZINDER_WALLET__ROCKSDB__MAX_WRITE_BUFFER_COUNT` | zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.max_write_buffer_count` | Wallet-projection RocksDB mutable plus immutable write buffer count. Defaults to 4 for the writer and 2 for the wallet-serving reader. |
 | `ZINDER_WALLET__ROCKSDB__MAX_BACKGROUND_JOBS` | zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.max_background_jobs` | Wallet-projection primary-writer RocksDB background job cap shared by flush and compaction work. Defaults to 2 and is not applied to secondary opens, including wallet-serving readers. |
@@ -224,28 +222,49 @@ not check descriptions or defaults.
 | `ZINDER_WALLET__ROCKSDB__STATISTICS_LEVEL` | zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `wallet.rocksdb.statistics_level` | Wallet-projection RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__BLOCK_CACHE_BYTES` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.block_cache_bytes` | Canonical-store RocksDB block cache budget in bytes. Defaults to 536870912 for writers. Readers default to one eighth of the detected cgroup memory limit, clamped between 134217728 and 536870912, and to 134217728 without a limit. In zinder-query and zinder-compat-lightwalletd, one cache of this size serves every canonical secondary generation of the process. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WAL_BYTES` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.max_wal_bytes` | Canonical-store RocksDB live WAL ceiling in bytes. Defaults to 268435456 for writers and 33554432 for readers. |
-| `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.max_open_files` | Canonical-store RocksDB open SST file cap. Defaults to 512 for writers and 128 for readers. |
+| `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.max_open_files` | Canonical-store RocksDB open SST file cap. Defaults to 512 for writers. Readers default to 1024 to 2048 based on the detected container memory limit, or 2048 without a limit. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__WRITE_BUFFER_BYTES` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.write_buffer_bytes` | Canonical-store per-column-family RocksDB write buffer size. Defaults to 16777216 for writers and 8388608 for readers. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WRITE_BUFFER_COUNT` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.max_write_buffer_count` | Canonical-store per-column-family mutable plus immutable RocksDB write buffer count. Defaults to 2. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_BACKGROUND_JOBS` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.max_background_jobs` | Canonical-store primary-writer RocksDB background job cap shared by flush and compaction work. Defaults to 2 and is not applied to secondary opens. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__MEMTABLE_BUDGET_BYTES` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.memtable_budget_bytes` | Canonical-store total RocksDB memtable budget across column families. Defaults to 268435456 for writers and 16777216 for readers. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__STATISTICS_LEVEL` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.statistics_level` | Canonical-store RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
 | `ZINDER_QUERY__LISTEN_ADDR` | zinder-query | Optional | `query.listen_addr` | Listen address for the native WalletQuery gRPC endpoint. Defaults to `127.0.0.1:9102`. |
+| `ZINDER_QUERY__BROWSER_ORIGINS` | zinder-query | Optional | `query.browser_origins` | Enables gRPC-Web on the WalletQuery listener for the configured origins. Use comma-separated HTTP or HTTPS origins in the environment, or an array in TOML. Omit or set to `"none"` (or `[]` in TOML) to disable browser access (the default); empty environment values are rejected. See [Browser origins](#browser-origins). |
 | `ZINDER_QUERY__REORG_WINDOW_BLOCKS` | zinder-query | Optional | `query.reorg_window_blocks` | Exact canonical replacement-depth identity expected by native query. Must be greater than zero and match the canonical writer. Defaults to 1000. |
 | `ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS` | zinder-query | Optional | `query.pair_convergence_attempts` | Maximum bounded attempts to converge and admit native query's canonical and wallet secondary pair. Must be in 1..=64; defaults to 12. |
+| `ZINDER_QUERY__EPOCH_PIN_RETENTION_SECONDS` | zinder-query | Optional | `query.epoch_pin_retention_seconds` | Seconds an exposed epoch can still answer pins after replacement. Must be in 60..=300. Defaults to 60. A longer window can delay publication when all four serving generation slots are occupied. |
 | `ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS` | zinder-query | Optional | `query.tree_state_replay_wait_ms` | Milliseconds a tree-state rebuild waits for a rebuild slot before it is refused with `TREE_STATE_REPLAY_LIMIT_REACHED`. Must be in 0..=5000; 0 refuses at once; defaults to 2000. |
 | `ZINDER_QUERY__TREE_STATE_REPLAY_WAITERS_PER_SLOT` | zinder-query | Optional | `query.tree_state_replay_waiters_per_slot` | Tree-state rebuilds that may wait for each rebuild slot; a rebuild that finds every waiting place taken is refused at once with `TREE_STATE_REPLAY_LIMIT_REACHED`. Must be in 1..=256; defaults to 64, enough for one slot to serve its waiters at a 30 ms rebuild within the default 2-second wait. |
+| `ZINDER_QUERY__FORWARDED_READ_MAX_CONCURRENT` | zinder-query | Optional | `query.forwarded_read_max_concurrent` | Node calls that reads of mined transaction bodies forwarded to `[node]` run at once, per process, when the store omits the bodies. Transaction lookups reserve 3/8 of the slots and hold at most 3/4. Must be in 1..=256; defaults to 32, below Zebra's default limit of 100 JSON-RPC connections. |
+| `ZINDER_QUERY__FORWARDED_READ_WAIT_MS` | zinder-query | Optional | `query.forwarded_read_wait_ms` | Milliseconds a forwarded transaction read waits for a node-call slot before it is refused with `FORWARDED_READ_LIMIT_REACHED`. Must be in 0..=30000; 0 refuses at once when every slot is taken; defaults to 10000. |
+| `ZINDER_QUERY__FORWARDED_READ_WAITERS_PER_SLOT` | zinder-query | Optional | `query.forwarded_read_waiters_per_slot` | Forwarded reads that may wait for each node-call slot of their kind's cap; a read that finds every waiting place taken is refused at once with `FORWARDED_READ_LIMIT_REACHED`. Must be in 1..=256; defaults to 64. |
+| `ZINDER_QUERY__FORWARDED_TRANSACTION_CACHE_BYTES` | zinder-query | Optional | `query.forwarded_transaction_cache_bytes` | Bytes of verified mined transaction bodies kept after they are read from the node, evicted least recently used first. Must be in 0..=1073741824; 0 disables the cache; defaults to 67108864 (64 MiB). |
+| `ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS` | zinder-query | Optional | `query.proxy_protocol_trusted_cidrs` | Comma-separated CIDRs for trusted TCP proxies. Requires a PROXY v1 or v2 preface on every connection. Disabled when omitted or set to `"none"`; empty values are rejected. (sensitive; redacted) |
+| `ZINDER_QUERY__RANGE_ADMISSION__MAX_STREAMS_PER_CLIENT` | zinder-query | Optional | `query.range_admission.max_streams_per_client` | Maximum concurrent block-range calls per client, including calls waiting to start. Must be greater than zero. Defaults to 4. |
+| `ZINDER_QUERY__RANGE_ADMISSION__CLIENT_KEY` | zinder-query | Optional | `query.range_admission.client_key` | Quota key for block-range calls. Use `connection` for IP and port, or `subnet` to group IPv4 /32 and IPv6 /64. Defaults to `connection`. |
+| `ZINDER_QUERY__RANGE_ADMISSION__MAX_SCHEDULING_DELAY_MS` | zinder-query | Optional | `query.range_admission.max_scheduling_delay_ms` | Scheduling delay in milliseconds that triggers refusal of new block-range calls. Must be greater than zero. Disabled when omitted. |
 | `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS` | zinder-query | Optional | `query.trust_proxy_client_address` | Counts each WalletQuery request against the client connection that a reverse proxy names in the `x-zinder-client-address` header, instead of the proxy's own connection, when the receive limit picks which client to refuse. Set it only when clients reach the listener solely through a proxy that replaces the header. Defaults to false. |
 | `ZINDER_COMPAT__LISTEN_ADDR` | zinder-compat-lightwalletd | Optional | `compat.listen_addr` | Listen address for the lightwalletd-compatible gRPC endpoint. Defaults to `127.0.0.1:9067`. |
-| `ZINDER_COMPAT__BROWSER_ORIGINS` | zinder-compat-lightwalletd | Optional | `compat.browser_origins` | Enables gRPC-Web for the listed browser origins. Use comma-separated HTTP or HTTPS origins in the environment, or an array in TOML. An empty list disables browser access (the default). Use `*` alone to allow every origin. |
-| `ZINDER_COMPAT__SERVING` | zinder-compat-lightwalletd | Optional | `compat.serving` | Runtime serving selection: exactly `wallet` or `compact-blocks`; defaults to `wallet`. `compact-blocks` rejects wallet and node settings, and no canonical or legacy aliases are accepted. |
+| `ZINDER_COMPAT__BROWSER_ORIGINS` | zinder-compat-lightwalletd | Optional | `compat.browser_origins` | Enables gRPC-Web for the listed browser origins. Use comma-separated HTTP or HTTPS origins in the environment, or an array in TOML. Omit or set to `"none"` (or `[]` in TOML) to disable browser access (the default); empty environment values are rejected. Use `*` alone to allow every origin. |
+| `ZINDER_COMPAT__SERVING` | zinder-compat-lightwalletd | Optional | `compat.serving` | Accepts `wallet`, `compact-blocks`, or `light-wallet`. Defaults to `wallet` without a profile. `compact-blocks` rejects wallet and node settings. Prefer `deployment.profile = "light-wallet"` for a coordinated deployment. |
 | `ZINDER_COMPAT__REORG_WINDOW_BLOCKS` | zinder-compat-lightwalletd | Optional | `compat.reorg_window_blocks` | Exact canonical replacement-depth identity expected by compatibility. Must be greater than zero and match the canonical writer. Defaults to 1000. |
 | `ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS` | zinder-compat-lightwalletd | Optional | `compat.pair_convergence_attempts` | Maximum bounded attempts to converge and admit compatibility's wallet-serving pair or compact-serving canonical secondary. Must be in 1..=64; defaults to 12. |
-| `ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS` | zinder-compat-lightwalletd | Optional | `compat.max_concurrent_block_range_streams` | Maximum concurrent `GetBlockRange` and `GetBlockRangeNullifiers` streams the compatibility server serves. A valid request past the limit waits up to 10 seconds for a slot, then fails with `UNAVAILABLE`. Must be in 1..=65536; defaults to 100. |
-| `ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_wait_ms` | Milliseconds a lightwalletd `GetTreeState` rebuild waits for a rebuild slot before it is refused with `UNAVAILABLE`. Wallet serving only; compact-blocks serving rejects it. Must be in 0..=5000; 0 refuses at once; defaults to 2000. |
-| `ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_waiters_per_slot` | lightwalletd `GetTreeState` rebuilds that may wait for each rebuild slot; a rebuild that finds every waiting place taken fails at once with `UNAVAILABLE`. Wallet serving only; compact-blocks serving rejects it. Must be in 1..=256; defaults to 64. |
+| `ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS` | zinder-compat-lightwalletd | Optional | `compat.max_concurrent_block_range_streams` | Maximum concurrent `GetBlockRange` and `GetBlockRangeNullifiers` streams the compatibility server serves. A valid request past the limit waits in a bounded queue of up to three times this limit (300 waiters by default, holding no chunk buffers) for up to 10 seconds for a slot, then fails with `UNAVAILABLE`. Raise this setting (for example to 200) on higher-concurrency public endpoints when memory allows and slot wait or refusal metrics rise. Must be in 1..=65536; defaults to 100. |
+| `ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_wait_ms` | Milliseconds a lightwalletd `GetTreeState` rebuild waits for a rebuild slot before it is refused with `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 0 to 5000 and defaults to 2000. A value of 0 refuses at once. |
+| `ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_waiters_per_slot` | Number of lightwalletd `GetTreeState` rebuilds that may wait for each rebuild slot. A rebuild that finds every waiting place taken fails at once with `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 1 to 256 and defaults to 64. |
+| `ZINDER_COMPAT__FORWARDED_READ_MAX_CONCURRENT` | zinder-compat-lightwalletd | Optional | `compat.forwarded_read_max_concurrent` | Node calls that wallet reads forwarded to `[node]` run at once, per process: mined transaction bodies the store omits and, in light-wallet serving, address UTXO and history lookups. Each kind reserves a share and the rest is shared. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 1 to 256 and defaults to 32. |
+| `ZINDER_COMPAT__FORWARDED_READ_WAIT_MS` | zinder-compat-lightwalletd | Optional | `compat.forwarded_read_wait_ms` | Milliseconds a forwarded read waits for a slot before it fails with `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 0 to 30000 and defaults to 10000. A value of 0 refuses at once when every slot is taken. |
+| `ZINDER_COMPAT__FORWARDED_READ_WAITERS_PER_SLOT` | zinder-compat-lightwalletd | Optional | `compat.forwarded_read_waiters_per_slot` | Forwarded reads that may wait for each node-call slot of their kind's cap. A read that finds every waiting place taken fails at once with `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 1 to 256 and defaults to 64. |
+| `ZINDER_COMPAT__FORWARDED_TRANSACTION_CACHE_BYTES` | zinder-compat-lightwalletd | Optional | `compat.forwarded_transaction_cache_bytes` | Bytes of verified mined transaction bodies kept after they are read from the node, shared by `GetTransaction` and address history. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 0 to 1073741824 and defaults to 67108864 (64 MiB). A value of 0 disables the cache. |
 | `ZINDER_COMPAT__STALE_TIP_LIMIT_MS` | zinder-compat-lightwalletd | Optional | `compat.stale_tip_limit_ms` | Milliseconds the served tip may age, counted from its block time or from when the process first served it, whichever is earlier, while the writer cannot vouch for it because its node is unreachable, behind the network, or ahead of the writer, before lightwalletd `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE`, so wallets stop building transactions on a stale tip. A tip the node still reports is never refused. 0 disables it; otherwise at least 300000. Defaults to 1500000 (25 minutes). |
+| `ZINDER_COMPAT__TIP_WAIT_MS` | zinder-compat-lightwalletd | Optional | `compat.tip_wait_ms` | Milliseconds a height-selected lightwalletd block read, or a light-wallet forwarded UTXO or balance read whose node answered ahead of the served tip, waits for a height just past the visible tip before continuing or failing. Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`, `GetBlockRangeNullifiers`, the encoded block range methods, `GetTreeState` by height (wallet and light-wallet serving), and forwarded `GetAddressUtxos`, `GetAddressUtxosStream`, `GetTaddressBalance`, and `GetTaddressBalanceStream` (light-wallet serving). Applies to every serving mode. The worst delay before a block-range response's headers is this wait plus the existing 10-second block-range admission wait. A value of 0 disables the wait. A nonzero value must be at least twice `storage.secondary_catchup_interval_ms`. There is no upper bound. Defaults to 3000, which is provisional pending cross-region skew measurement. |
+| `ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS` | zinder-compat-lightwalletd | Optional | `compat.tip_wait_max_blocks` | Furthest past the visible tip, in blocks, that a read may name or observe and still wait for the tip. A read naming or observing a height further ahead runs or refuses at once. Applies to every serving mode. Must be at least 1, with no upper bound. Defaults to 2. |
+| `ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS` | zinder-compat-lightwalletd | Optional | `compat.tip_wait_max_waiters` | Most lightwalletd reads that may wait for the tip at once. A read that finds every waiting place taken is refused at once with `UNAVAILABLE`. Applies to every serving mode. Must be at least 1. Defaults to 256. |
 | `ZINDER_COMPAT__PING_VERY_INSECURE` | zinder-compat-lightwalletd | Optional | `compat.ping_very_insecure` | Answers the lightwalletd `Ping` load-testing RPC, as `lightwalletd --ping-very-insecure` does. Each call holds a server task for as long as the client asks, so enable it only on a server you are load testing. Defaults to false, which refuses `Ping` with `FAILED_PRECONDITION`. |
+| `ZINDER_COMPAT__PROXY_PROTOCOL_TRUSTED_CIDRS` | zinder-compat-lightwalletd | Optional | `compat.proxy_protocol_trusted_cidrs` | Comma-separated CIDRs for trusted TCP proxies. Requires a PROXY v1 or v2 preface on every connection. Disabled when omitted or set to `"none"`; empty values are rejected. (sensitive; redacted) |
+| `ZINDER_COMPAT__RANGE_ADMISSION__MAX_STREAMS_PER_CLIENT` | zinder-compat-lightwalletd | Optional | `compat.range_admission.max_streams_per_client` | Maximum concurrent block-range calls per client, including calls waiting to start. Must be greater than zero. Defaults to 4. |
+| `ZINDER_COMPAT__RANGE_ADMISSION__CLIENT_KEY` | zinder-compat-lightwalletd | Optional | `compat.range_admission.client_key` | Quota key for block-range calls. Use `connection` for IP and port, or `subnet` to group IPv4 /32 and IPv6 /64. Defaults to `connection`. |
+| `ZINDER_COMPAT__RANGE_ADMISSION__MAX_SCHEDULING_DELAY_MS` | zinder-compat-lightwalletd | Optional | `compat.range_admission.max_scheduling_delay_ms` | Scheduling delay in milliseconds that triggers refusal of new block-range calls. Must be greater than zero. Disabled when omitted. |
 | `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS` | zinder-compat-lightwalletd | Optional | `compat.trust_proxy_client_address` | Counts each lightwalletd-compatible request against the client connection that a reverse proxy names in the `x-zinder-client-address` header, instead of the proxy's own connection, when the receive limit picks which client to refuse. Set it only when clients reach the listener solely through a proxy that replaces the header. Defaults to false. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.block_cache_bytes` | Materialized-view store RocksDB block cache budget in bytes. Defaults to 268435456 for writers and 67108864 for readers. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WAL_BYTES` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_wal_bytes` | Materialized-view store RocksDB live WAL ceiling in bytes. Defaults to 268435456 for writers and 16777216 for readers. |
@@ -255,23 +274,26 @@ not check descriptions or defaults.
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_BACKGROUND_JOBS` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_background_jobs` | Materialized-view store primary-writer RocksDB background job cap shared by flush and compaction work. Defaults to 2 and is not applied to secondary opens, including `zinder-explorer`. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MEMTABLE_BUDGET_BYTES` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.memtable_budget_bytes` | Materialized-view store total RocksDB memtable budget across column families. Defaults to 536870912 for writers and 16777216 for readers. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__STATISTICS_LEVEL` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.statistics_level` | Materialized-view store RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
-| `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0006](../adrs/0006-node-source-boundary.md). |
-| `ZINDER_INGEST__EXPLORER_VIEWS` | zinder-ingest | Optional | `ingest.explorer_views` | Boolean request for the complete bundled Explorer materialized-view workload. Defaults to `false` for every coverage. `true` requires genesis-complete canonical history or the authenticated `checkpoint_height = 0`; checkpoint heights above zero are rejected before storage mutation. The request appears in `--print-config`; admission evidence appears only after the Explorer store opens successfully. |
+| `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector (`"zebra-json-rpc"` or `"zebra-indexer-grpc"`; default `"zebra-json-rpc"`). Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. Selecting `"zebra-indexer-grpc"` requires `indexer_grpc_addr` on `[node]` and every `[node_fallbacks.N]`. See [ADR-0006](../adrs/0006-node-source-boundary.md). |
+| `ZINDER_INGEST__EXPLORER_VIEWS` | zinder-ingest | Optional | `ingest.explorer_views` | Requests the bundled Explorer materialized views. Defaults to `false`, or `true` under `deployment.profile = "explorer"`. `true` requires genesis-complete canonical history or the authenticated `checkpoint_height = 0`, and may be combined with `wallet` or `light-wallet`. `--print-config` shows the setting unless implied by `deployment.profile`. Admission evidence appears after the Explorer store opens successfully. |
 | `ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES` | zinder-ingest | Optional | `ingest.explorer_views_min_free_bytes` | Available bytes on the volume holding `storage.path` below which Explorer view replay, the transparent-address ranking build, and historical view backfills pause, so the views cannot fill the volume canonical ingest and wallet serving need. Replay resumes once at least a tenth more than this is available. Defaults to 10737418240 (10 GiB); `0` disables the guard. |
-| `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `storage.raw_blob_policy` | Immutable raw-blob retention contract: `none`, `transactions`, or `all`. Defaults to `none` for explicit coverage so canonical indexing does not write raw block or transaction blobs unless a deployment explicitly needs raw export. Wallet-serving coverage defaults to `transactions` and rejects `none`, because native and lightwalletd-compatible transaction and transparent-history methods require retained bytes. Projector, query, and compatibility readers use the same value as an exact admission expectation; Zallet full-block serving requires `all`. The first canonical commit fixes historical coverage; changing a non-empty store requires a rebuild and blue-green cutover. |
+| `ZINDER_STORAGE__DATA_DIR` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.data_dir` | Base storage directory from which unset canonical, wallet, and explorer paths are derived (`<data_dir>/canonical`, `<data_dir>/canonical-secondary/<service>`, `<data_dir>/wallet`, `<data_dir>/wallet-secondary/<service>`, and `<data_dir>/explorer`). Defaults to `/var/lib/zinder` when neither `storage.data_dir` nor explicit storage paths are configured. Explicit paths take precedence. |
+| `ZINDER_STORAGE__FULL_BLOCKS` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `storage.full_blocks` | Opts any deployment preset (`light-wallet`, `wallet`, or `explorer`) or manual storage configuration into retaining full serialized blocks (`storage.raw_blob_policy = "all"`). |
+| `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `storage.raw_blob_policy` | The raw-blob policy accepts `none` or `all` (legacy `transactions` was removed in Canonical Schema v2 and is refused). The ingest writer and consumer presets default to `none`, or `all` when `storage.full_blocks = true`. Projector, query, and compatibility readers use the value as a minimum retention requirement. Full-block serving requires `all`. Changing the retention of an existing canonical store requires a rebuild. |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds settlement, classifier default, and replacement traversal. Must be greater than zero. Defaults to 1000, Zebra's maximum finalization depth. A larger value raises an existing store's window in place; a smaller one is refused. |
 | `ZINDER_INGEST__MEMPOOL__MAX_TRANSACTION_COUNT` | zinder-ingest | Optional | `ingest.mempool.max_transaction_count` | Maximum number of transactions admitted into one coherent live mempool. Exceeding the bound withdraws the serving generation and retries source hydration. Must be greater than zero. Defaults to 8000. |
 | `ZINDER_INGEST__MEMPOOL__MAX_TOTAL_RAW_TRANSACTION_BYTES` | zinder-ingest | Optional | `ingest.mempool.max_total_raw_transaction_bytes` | Maximum cumulative raw transaction bytes admitted into one coherent live mempool. Exceeding the bound withdraws the serving generation and retries source hydration. Must be greater than zero. Defaults to 80000000. |
 | `ZINDER_INGEST__MEMPOOL__RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES` | zinder-ingest | Optional | `ingest.mempool.reconciliation_batch_target_raw_transaction_bytes` | Target raw transaction bytes for one durable mempool reconciliation write. A single protocol-valid transaction above the target is written alone so reconciliation can make progress. Must be greater than zero. Defaults to 16000000. |
 | `ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS` | zinder-projector | Optional | `projector.reorg_window_blocks` | Wallet undo suffix depth and expected canonical replacement policy. Must match the canonical writer. Defaults to 1000. |
-| `ZINDER_PROJECTOR__BUILD_OWNER_HEX` | zinder-projector | Required | `projector.build_owner_hex` | Stable 16-byte wallet-build lease owner encoded as exactly 32 hexadecimal characters. A restart with the same value reclaims its own construction leases immediately. Use a distinct value for each concurrently provisioned lane. |
+| `ZINDER_PROJECTOR__BUILD_OWNER_HEX` | zinder-projector | Optional | `projector.build_owner_hex` | Stable 16-byte wallet-build lease owner encoded as 32 hexadecimal characters. When unset, `zinder-projector` reads a persisted `<wallet_path>.build-owner` file if present, or generates a cryptographic random 16-byte owner once at startup (never during `--print-config`) and persists it atomically beside `wallet.path`. |
 | `ZINDER_PROJECTOR__LEASE_DURATION_SECONDS` | zinder-projector | Required | `projector.lease_duration_seconds` | Wallet-build and canonical-retention lease duration in seconds. Must be at least 14400 so a durable construction phase cannot outlive its lease. |
 | `ZINDER_PROJECTOR__FENCE_CONVERGENCE_TIMEOUT_SECONDS` | zinder-projector | Optional | `projector.fence_convergence_timeout_seconds` | Deadline for each attempt of the projector's canonical secondary to reach the writer's fence. A projector with a wallet open, including one that resumes after a restart, stops waiting once its secondary holds a block the wallet has not applied, even while the writer is ahead; a fresh wallet build waits for the writer to attest the secondary's exact fence. An attempt that passes the deadline logs `canonical_secondary_behind_writer`, reports `replica_lagging`, or `writer_status_unavailable` when the writer did not answer, until the secondary gives the wallet a block to apply, and starts another attempt; the projector does not exit. A same-sequence mismatch or a secondary ahead of the writer fails immediately. Readiness while the wallet trails is described in [Readiness](readiness.md#projector). Must be greater than zero. Defaults to 30. |
-| `ZINDER_PROJECTOR__BUILD__MAX_OUTPOINT_SORT_MEMORY_BYTES` | zinder-projector | Optional | `projector.build.max_outpoint_sort_memory_bytes` | Memory ceiling for the wallet builder's outpoint sorter. Defaults to 4294967296. |
-| `ZINDER_PROJECTOR__BUILD__MAX_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER` | zinder-projector | Optional | `projector.build.max_secondary_sort_memory_bytes_per_sorter` | Memory ceiling for each wallet secondary-index sorter. Defaults to 1073741824. |
+| `ZINDER_PROJECTOR__BUILD__MAX_OUTPOINT_SORT_MEMORY_BYTES` | zinder-projector | Optional | `projector.build.max_outpoint_sort_memory_bytes` | Memory ceiling for the wallet builder's outpoint sorter. Defaults to 40% of the detected container memory limit clamped between 64 MiB (or half the limit below 128 MiB) and 4294967296 (4 GiB), and to 4294967296 without a container limit. |
+| `ZINDER_PROJECTOR__BUILD__MAX_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER` | zinder-projector | Optional | `projector.build.max_secondary_sort_memory_bytes_per_sorter` | Memory ceiling for each wallet secondary-index sorter (the address-transaction sorter may also recycle up to half of `projector.build.max_outpoint_sort_memory_bytes` once the outpoint sorter has flushed to disk). Defaults to 10% of the detected container memory limit clamped between 32 MiB (or an eighth of the limit below 256 MiB) and 1073741824 (1 GiB), and to 1073741824 without a container limit. |
 | `ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER` | zinder-projector | Optional | `projector.build.max_temporary_file_bytes_per_sorter` | Temporary spill-file ceiling for each wallet builder sorter. Defaults to 206158430208. |
 | `ZINDER_PROJECTOR__BUILD__SST_TARGET_LOGICAL_BYTES` | zinder-projector | Optional | `projector.build.sst_target_logical_bytes` | Target logical payload per externally built wallet SST file. Defaults to 134217728. |
-| `ZINDER_PROJECTOR__BUILD__MAX_ACCOUNTED_REORG_UNDO_BYTES` | zinder-projector | Optional | `projector.build.max_accounted_reorg_undo_bytes` | Maximum logical wallet undo bytes admitted during fixed-tip construction. Defaults to 536870912. |
+| `ZINDER_PROJECTOR__BUILD__MAX_ACCOUNTED_REORG_UNDO_BYTES` | zinder-projector | Optional | `projector.build.max_accounted_reorg_undo_bytes` | Maximum logical wallet undo bytes admitted during fixed-tip construction. Defaults to 5% of the detected container memory limit clamped between 16 MiB (or a sixteenth of the limit below 256 MiB) and 536870912 (512 MiB), and to 536870912 without a container limit. |
+| `ZINDER_PROJECTOR__BUILD__ACCUMULATOR_HASHING_WORKERS` | zinder-projector | Optional | `projector.build.accumulator_hashing_workers` | Threads that scan settled canonical replay chunks, shard key-prefix outpoint and address-transaction drains, hash wallet rows into the projection digest and the UTXO set commitment, parallelize SST writing/digesting and secondary address derivation, and split cold validation during a fresh wallet build. Defaults to the number of logical CPUs the projector may use, at most 4, and to 1 when that count cannot be detected. With 1, scanning, hashing, SST writing, and secondary drains run synchronously. A higher value partitions outpoint events (`txid` prefix) and secondary address rows (`address_script_hash` prefix) into disjoint ascending key-prefix shards across up to that many workers (at most 8, clamped by a 256 MiB per-shard drain sort-memory floor, 64 MiB per `address_index` push partition, and active `MAX_MERGE_FAN_IN` headroom), drains outpoints and address transactions concurrently across shards while overlapping address-index and address-transaction derivation, hashes batches of rows on workers, and pipelines `SstFileWriter` compression and dual SHA-256 hashing behind per-writer queues whose cumulative budget across all open pipelined writers in a phase never exceeds 16 MiB (falling back to synchronous SST writes if below 64 KiB per writer). Each hashing batch is allocated once and takes at most 512 KiB, and at most twice that many batches, never more than 64, plus two on the build thread exist at once: at most 5 MiB at 4 threads and 33 MiB at 64. A row larger than a batch is hashed on the build thread. Cold validation also reads the unspent and spent output families and the address-transaction family back in up to that many hash-prefix key ranges at once, at most one per 65,536 of each scan's rows. The published rows, digest, commitment, and SST contents do not change. Must be between 1 and 64; the projector refuses a larger value at startup. |
 | `ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES` | zinder-projector | Optional | `projector.follow.max_transition_logical_bytes` | Maximum logical bytes one atomic wallet following transition may plan. Each distinct wallet row the transition touches counts twice, as its key and final value in the plan and again in the write batch, and the control record counts once. Must be greater than zero and at most 1073741824. Defaults to 536870912. A transition that needs more leaves the wallet unchanged and parks the projector, not ready, with `wallet_transition_limit_exceeded` until it restarts with a larger value; see [Wallet transition exceeds its logical-byte limit](../runbooks/deploying-single-volume.md#wallet-transition-exceeds-its-logical-byte-limit). |
 | `ZINDER_INGEST__PHASE_CLASSIFICATION__CATCHUP_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.phase_classification.catchup_threshold_blocks` | Gap (in blocks) above which `zinder-ingest probe` reports `BulkCatchup` instead of `FollowingTip`. Defaults to `ingest.reorg_window_blocks`. See [ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md). |
 | `ZINDER_INGEST__CONSTRUCTION__SOURCE_SEGMENT_MAX_BLOCKS` | zinder-ingest | Optional | `ingest.construction.source_segment_max_blocks` | Diagnostic override for the hard ceiling on connected blocks requested from the source in one segment. The resource-resolved default is 64. Values above 1000 are rejected at startup, because each block is one JSON-RPC batch entry and Zakura refuses batches above 1,000 entries. |
@@ -280,11 +302,13 @@ not check descriptions or defaults.
 | `ZINDER_INGEST__CONSTRUCTION__SOURCE_FETCH_MAX_IN_FLIGHT_BYTES` | zinder-ingest | Optional | `ingest.construction.source_fetch_max_in_flight_bytes` | Diagnostic override for predicted active source responses plus measured completed reassembly. The default is `max(node.max_response_bytes, clamp(container_memory / 64, 134217728, 402653184))`; with `[node_fallbacks.N]` endpoints, the largest `max_response_bytes` in the list replaces `node.max_response_bytes`, and an override must be at least that large. |
 | `ZINDER_INGEST__CONSTRUCTION__BLOCK_PREPARE_CONCURRENCY` | zinder-ingest | Optional | `ingest.construction.block_prepare_concurrency` | Diagnostic override for parallel canonical block-prepare slots. The default is `min(available_parallelism(), 16)`. |
 | `ZINDER_INGEST__CONSTRUCTION__BLOCK_PREPARE_MEMORY_WATERMARK_BYTES` | zinder-ingest | Optional | `ingest.construction.block_prepare_memory_watermark_bytes` | Diagnostic override for the prepare and resident-handoff admission watermark. The default is `clamp(container_memory / 64, 134217728, 536870912)`. |
+| `ZINDER_INGEST__CONSTRUCTION__TREE_HASHING_WORKERS` | zinder-ingest | Optional | `ingest.construction.tree_hashing_workers` | Threads that hash note-commitment trees for the ordered construction loader. Defaults to the detected logical CPU count, at most 8, when fresh construction stores checkpoints beyond the 100-block cadence and build tip, and to 1 otherwise or when the CPU count cannot be detected. With 1, hashing runs on the loader thread. The automatic count reserves no CPU for a node or projector on the same host; in one measured Mainnet build, 8 workers sharing 8 cores with a node pinned to 2 of them reached READY in 1 h 40 min 30 s. An explicit value may exceed 8. A higher value hashes up to 64 blocks' commitment batches and distinct pool checkpoints in parallel while staging up to 64 completed blocks into RocksDB. The stored trees, checkpoints, and subtree roots do not change. Must be greater than zero. |
 | `ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS` | zinder-ingest | Optional | `ingest.follow.poll_interval_ms` | Canonical follower poll cadence in milliseconds. Must be greater than zero. Defaults to 1000. |
 | `ZINDER_INGEST__FOLLOW__LAG_THRESHOLD_BLOCKS` | zinder-ingest | Optional | `ingest.follow.lag_threshold_blocks` | Block lag at which the canonical follower reports `cause=syncing`. Defaults to 1. |
 | `ZINDER_INGEST__FOLLOW__MAX_REPLACEMENT_BYTES` | zinder-ingest | Optional | `ingest.follow.max_replacement_bytes` | Maximum estimated bytes one canonical replacement may hold before its atomic commit: fetched source blocks not yet prepared plus prepared blocks. A deeper or heavier replacement fails with `ReplacementBytesExceeded` before any write; raise the limit to follow it. Defaults to 2147483648. |
-| `ZINDER_INGEST__TREE_STATE_DENSIFICATION__ENABLED` | zinder-ingest | Optional | `ingest.tree_state_densification.enabled` | Whether ingest fills settled history built by a first sync with stored tree-state checkpoints in the background, so a tree-state read there needs no replay. Runs only with `ingest_control.listen_addr` set. Defaults to `true`. |
-| `ZINDER_INGEST__TREE_STATE_DENSIFICATION__SELECTION` | zinder-ingest | Optional | `ingest.tree_state_densification.selection` | Which settled blocks receive a stored tree-state checkpoint: `every-block` stores one for every block, so no tree-state read in a completed stride replays (heights in the stride the settled tip has not yet passed still do), and `commitment-budget` stores one each time `commitment_budget` note commitments have accumulated. Defaults to `every-block`, or to `commitment-budget` when only `commitment_budget` is set. An operator who wants `commitment-budget` selects it before the first start of a version that defaults to `every-block`; switching later keeps every stored row, because a dense stride already satisfies the looser budget and the pass only inserts missing rows, and only changes the work still outstanding. The `every-block` cost on Mainnet is an estimate pending measurement: about 2.4 GB of rows before compression and 4 to 5 CPU-hours for the one-time pass. |
+| `ZINDER_INGEST__TREE_STATE_DENSIFICATION__ENABLED` | zinder-ingest | Optional | `ingest.tree_state_densification.enabled` | Enables tree-state densification. The background pass requires `ingest_control.listen_addr`. Defaults to `true`. |
+| `ZINDER_INGEST__TREE_STATE_DENSIFICATION__DURING_CONSTRUCTION` | zinder-ingest | Optional | `ingest.tree_state_densification.during_construction` | Defaults to `true` for `wallet-serving` coverage with Explorer views off, and to `false` otherwise. When `true` with densification enabled, fresh construction applies the densification selection before READY, which with `every-block` stores a checkpoint at every height. When `false`, it stores checkpoints every 100 blocks and at the build tip. In the measured Mainnet runs, with 6 hashing workers on 8 physical cores and one thread per core, `every-block` and 256-commitment-budget construction reached READY within three hours; hosts with fewer logical CPUs take longer, as the bulk-catchup tuning runbook describes. Changing this setting leaves stored checkpoints in place. |
+| `ZINDER_INGEST__TREE_STATE_DENSIFICATION__SELECTION` | zinder-ingest | Optional | `ingest.tree_state_densification.selection` | Which checkpoints densification adds. The default `every-block` fills every height. The `commitment-budget` selection stores a checkpoint when at least `commitment_budget` note commitments have accumulated since the previous checkpoint. Setting only the budget selects this policy. Changing selection retains existing rows. |
 | `ZINDER_INGEST__TREE_STATE_DENSIFICATION__COMMITMENT_BUDGET` | zinder-ingest | Optional | `ingest.tree_state_densification.commitment_budget` | Note commitments, over every pool, between two stored tree-state checkpoints under the `commitment-budget` selection, which setting it selects when `selection` is unset. Must be greater than zero and is refused with `selection = "every-block"`. Defaults to 1024. |
 | `ZINDER_INGEST__TREE_STATE_DENSIFICATION__WORKERS` | zinder-ingest | Optional | `ingest.tree_state_densification.workers` | Settled 100-block strides densified at once, each on one CPU. Must be greater than zero. Defaults to 2. |
 | `ZINDER_INGEST__TREE_STATE_DENSIFICATION__MAX_BLOCKS_PER_SECOND` | zinder-ingest | Optional | `ingest.tree_state_densification.max_blocks_per_second` | Average ceiling on stored blocks the tree-state densification pass replays per second, with a scan charged one block for every two reads it makes, counting each checkpoint row it visits and each compact block it reads as one read. Each block costs about two reads and adds at most one row, so this bounds the pass's reads and writes. Must be greater than zero. Defaults to 500. |
@@ -301,96 +325,109 @@ not check descriptions or defaults.
 | `ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS` | zinder-ingest | Optional | `retention.mempool_event_retention_check_interval_ms` | Mempool-event retention sweep cadence in milliseconds. Must be greater than zero. Defaults to 30000. |
 | `ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_MAX_EVENTS_PER_STEP` | zinder-ingest | Optional | `retention.mempool_event_retention_max_events_per_step` | Maximum event rows examined by one bounded mempool-retention step. Must be greater than zero. Defaults to 1024. |
 | `ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_MAX_ENCODED_BYTES_PER_STEP` | zinder-ingest | Optional | `retention.mempool_event_retention_max_encoded_bytes_per_step` | Target maximum encoded event bytes examined by one bounded mempool-retention step. The first row may exceed the target to guarantee progress. Must be greater than zero. Defaults to 16000000. |
-| `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | zinder-explorer | Optional | `explorer.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0011). |
+| `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | zinder-explorer | Optional | `explorer.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0011). Mutually exclusive with `ZINDER_EXPLORER__BEARER_TOKEN`. |
+| `ZINDER_EXPLORER__BEARER_TOKEN` | zinder-explorer | Optional | `explorer.bearer_token` | Inline shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0011). Mutually exclusive with `ZINDER_EXPLORER__BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | zinder-explorer | Optional | `explorer.listen_addr` | Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068. |
+| `ZINDER_EXPLORER__BROWSER_ORIGINS` | zinder-explorer | Optional | `explorer.browser_origins` | Enables gRPC-Web on the ExplorerQuery listener for the configured origins. Use comma-separated HTTP or HTTPS origins in the environment, or an array in TOML. Omit or set to `"none"` (or `[]` in TOML) to disable browser access (the default); empty environment values are rejected. See [Browser origins](#browser-origins). |
 | `ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS` | zinder-explorer | Optional | `explorer.trust_proxy_client_address` | Counts each ExplorerQuery request against the client connection that a reverse proxy names in the `x-zinder-client-address` header, instead of the proxy's own connection, when the receive limit picks which client to refuse. Set it only when clients reach the listener solely through a proxy that replaces the header. Defaults to false. |
-| `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Optional | `explorer.wallet_query_endpoint` | WalletQuery gRPC endpoint backing the explorer's wallet-composed reads (transaction detail, block views, search, mempool activity). Empty/unset disables the explorer capabilities that compose canonical wallet reads. |
+| `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Optional | `explorer.wallet_query_endpoint` | WalletQuery gRPC endpoint backing the explorer's wallet-composed reads (transaction detail, block views, search, mempool activity). Omit or set to `"none"` to disable the explorer capabilities that compose canonical wallet reads; empty values are rejected. |
 | `ZINDER_CIPHERSCAN__LISTEN_ADDR` | zinder-compat-cipherscan | Optional | `cipherscan.listen_addr` | Listen address for the Cipherscan-compatible REST endpoint. Defaults to 127.0.0.1:9070. A public or unspecified address needs `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`. |
 | `ZINDER_CIPHERSCAN__EXPLORER_QUERY_ENDPOINT` | zinder-compat-cipherscan | Optional | `cipherscan.explorer_query_endpoint` | ExplorerQuery gRPC endpoint the adapter reads explorer views from. Defaults to http://127.0.0.1:9068. |
 | `ZINDER_CIPHERSCAN__WALLET_QUERY_ENDPOINT` | zinder-compat-cipherscan | Optional | `cipherscan.wallet_query_endpoint` | WalletQuery gRPC endpoint the adapter reads chain and transaction data from. Defaults to http://127.0.0.1:9102. |
 | `ZINDER_CIPHERSCAN__CURRENT_PRICE_ENDPOINT` | zinder-compat-cipherscan | Optional | `cipherscan.current_price_endpoint` | HTTP or HTTPS URL of the external market-price provider queried for the current ZEC price. Defaults to the CoinGecko simple-price URL. |
 | `ZINDER_CIPHERSCAN__HISTORICAL_PRICE_ENDPOINT_TEMPLATE` | zinder-compat-cipherscan | Optional | `cipherscan.historical_price_endpoint_template` | URL template for historical market-price lookups; `{date}` is replaced with the requested date. Defaults to the CoinGecko history URL. |
-| `ZINDER_CIPHERSCAN__BEARER_TOKEN_PATH` | zinder-compat-cipherscan | Optional | `cipherscan.bearer_token_path` | Path to the shared-secret bearer token the adapter presents to both the ExplorerQuery and WalletQuery endpoints (ADR-0011). Unset sends no token. |
+| `ZINDER_CIPHERSCAN__BEARER_TOKEN_PATH` | zinder-compat-cipherscan | Optional | `cipherscan.bearer_token_path` | Path to the shared-secret bearer token the adapter presents to both the ExplorerQuery and WalletQuery endpoints (ADR-0011). Mutually exclusive with `ZINDER_CIPHERSCAN__BEARER_TOKEN`. Unset sends no token. |
+| `ZINDER_CIPHERSCAN__BEARER_TOKEN` | zinder-compat-cipherscan | Optional | `cipherscan.bearer_token` | Inline shared-secret bearer token the adapter presents to both the ExplorerQuery and WalletQuery endpoints (ADR-0011). Mutually exclusive with `ZINDER_CIPHERSCAN__BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
 <!-- env-var-table:public-interfaces:end -->
+
+### Browser origins
+
+Set `query.browser_origins`, `explorer.browser_origins`, or
+`compat.browser_origins` on each listener that needs gRPC-Web. Use a TOML array
+such as `["https://wallet.example.org", "http://localhost:5173"]` or a
+comma-separated list in the matching environment variable. Origins include the
+scheme, host, and any nondefault port.
+
+An omitted setting, `"none"`, or a TOML empty array (`[]`) keeps the listener on
+native HTTP/2 gRPC (empty environment values are rejected). A nonempty list also
+enables HTTP/1.1 and accepts gRPC-Web over either HTTP version. A gRPC-Web
+request with an unlisted `Origin` receives HTTP 403. Use `*` alone to allow
+every origin on a listener without Explorer bearer authentication. When you
+configure an inline or file-backed Explorer bearer token, list specific
+origins to enable gRPC-Web. ExplorerQuery checks the token on each RPC.
+See [Browser clients for the native APIs](integration-surfaces.md#browser-clients-for-the-native-apis)
+for the response headers used by browser clients.
 
 ## Listener and request limits
 
-These limits are compiled in. No setting changes them unless the entry names
-one. A refusal from the transport carries no `ErrorInfo` reason; a refusal
-from a handler carries one of the reasons in
-[Error vocabulary](error-vocabulary.md).
+These limits are compiled in. No setting changes them unless the entry names one. A refusal from the transport carries no `ErrorInfo` reason; a refusal from a handler carries one of the reasons in [Error vocabulary](error-vocabulary.md).
 
 ### Public gRPC listeners
 
-`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` share one
-transport policy.
+`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` share one transport policy.
 
 | Limit | Value | Client sees |
 | --- | --- | --- |
-| Request message size, including gRPC reflection | 2 MiB | `OUT_OF_RANGE` |
+| Request frame payload size, including gRPC reflection | 2 MiB | `OUT_OF_RANGE` |
+| Decompressed gRPC request message size | 2 MiB | `RESOURCE_EXHAUSTED` |
+| Zstd request decoder window | 2 MiB | `RESOURCE_EXHAUSTED` |
 | Concurrent streams on one HTTP/2 connection | 200 | Queued stream or a new connection, depending on the client |
 | Unary and server-streaming requests still arriving, per process | 32 | `UNAVAILABLE` |
 | Client-streaming and bidirectional calls open, per process | 32 | `UNAVAILABLE` |
 | Time for a request to arrive after its stream opens | 20 s | `DEADLINE_EXCEEDED` |
 | Time a client stream may go without sending a whole message | 20 s | `DEADLINE_EXCEEDED` |
-| Time a response may wait for its client to read it | 60 s | `DEADLINE_EXCEEDED` |
+| Time a response may wait for its client to read it | 60 s | Stream reset with `CANCEL`, after the data already sent; most clients report `CANCELLED` |
+| Time a connection has to write 16 KiB once a write blocks | 60 s | Connection closed |
 | HTTP/2 keepalive | Ping after 60 s without a frame; close if unanswered for 20 s | Connection closed |
-| Open `grpc.health.v1.Health/Watch` streams, per process (`zinder-query` and `zinder-compat-lightwalletd`) | 1,024 | `RESOURCE_EXHAUSTED` |
+| Streams the server resets because of the client's protocol errors, per HTTP/2 connection | 1,024 | Connection closed with `ENHANCE_YOUR_CALM` |
+| Open `grpc.health.v1.Health/Watch` streams, per process (`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer`) | 1,024 | `RESOURCE_EXHAUSTED` |
 
-A unary or server-streaming call holds its receive slot only until its request
-has arrived. Long response streams such as `ChainEvents`,
-`CompactBlocksInRange`, and `GetBlockRange` therefore hold no slot. When a
-pool is full, a request from a client that holds fewer slots takes the
-oldest slot of the client that holds the most. The request that loses its
-slot fails with `UNAVAILABLE`. A request from a client that holds no slot is
-therefore always admitted, and a client is refused only while it holds at
-least as many slots as every other client. Retry these refusals with backoff.
+A unary or server-streaming call holds its receive slot only until its request has arrived. Long response streams such as `ChainEvents`, `CompactBlocksInRange`, and `GetBlockRange` therefore hold no slot. When a pool is full, a request from a client that holds fewer slots takes the oldest slot of the client that holds the most. The request that loses its slot fails with `UNAVAILABLE`. A request from a client that holds no slot is therefore always admitted, and a client is refused only while it holds at least as many slots as every other client. Retry these refusals with backoff.
 
-A client is the connection a request arrives on. A proxy reaches Zinder over
-a few pooled connections, so behind one every client looks like the same few.
-Set `query.trust_proxy_client_address`, `compat.trust_proxy_client_address`,
-or `explorer.trust_proxy_client_address` to `true` when the listener is
-reachable only through a proxy that sets the `x-zinder-client-address`
-request header to the client connection's IP address and port. Zinder then
-counts each request against that connection. A request that carries the
-header more than once, as a comma-separated list, or as anything but one IP
-address and port, or that carries none, counts against the proxy's own
-connection instead, and `zinder_grpc_proxy_client_address_fallbacks_total`
-counts it. With the setting off, the default, Zinder ignores the header.
-[Exposing over TLS](../runbooks/exposing-over-tls.md#keep-wallets-apart-in-the-receive-limit)
-lists the proxy settings this depends on.
+A client is the connection a request arrives on. A proxy reaches Zinder over a few pooled connections, so behind one every client looks like the same few. Set `query.trust_proxy_client_address`, `compat.trust_proxy_client_address`, or `explorer.trust_proxy_client_address` to `true` when the listener is reachable only through a proxy that sets the `x-zinder-client-address` request header to the client connection's IP address and port, or to a bare IP address. Zinder then counts each request against that connection, or against that whole address when the header names only a bare IP, as a load balancer's `{client_ip_address}` does. A request that carries the header more than once, as a comma-separated list, or as anything that is neither one `ip:port` address nor one bare IP address, or that carries none, counts against the proxy's own connection instead, and `zinder_grpc_proxy_client_address_fallbacks_total` counts it. A loopback `grpc.health.v1.Health/Check` with no header uses its own connection for the receive limit and leaves the fallback counter unchanged. With the setting off, the default, Zinder ignores the header. [Exposing over TLS](../runbooks/exposing-over-tls.md#keep-wallets-apart-in-the-receive-limit) lists the proxy settings this depends on.
 
-These limits count all clients together, and a client that opens many
-connections counts as many clients. Limit connections per client in the
-proxy.
+For a TCP proxy in front of `WalletQuery` or the lightwalletd compatibility listener, set `query.proxy_protocol_trusted_cidrs` or `compat.proxy_protocol_trusted_cidrs` to enable PROXY protocol. The value is a comma-separated string of 1 to 64 CIDRs with nonzero prefixes. The listener checks the TCP peer against the allowlist before reading its preface and closes untrusted connections. A trusted peer has one second to send a valid preface, limited to 107 bytes for v1 and 4,096 bytes for v2. At most 128 connections per listener may await prefaces simultaneously. TCP4 and TCP6 prefaces supply the client IP and port. The v1 `UNKNOWN` and v2 `LOCAL`, `UNSPEC`, UDP, and UNIX forms use the TCP peer address. Effective configuration redacts the allowlist. Leave `trust_proxy_client_address` off for this listener.
 
-A response that the client stops reading, by withholding HTTP/2 flow-control
-window, ends after 60 seconds. A response that is waiting for the server to
-produce its next message is not affected.
-[ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md)
-records this policy.
+The combined explorer preset requires a query listener that accepts direct gRPC connections. Remove `query.proxy_protocol_trusted_cidrs` and unset `ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS` to use this preset. To keep PROXY protocol enabled, run the roles separately and point `explorer.wallet_query_endpoint` and `cipherscan.wallet_query_endpoint` at a TCP proxy that sends the preface.
+
+These limits count all clients together. A client that opens many connections counts as many clients when Zinder keys it by connection, as it does for a direct connection or an `ip:port` proxy header. When a proxy names only a bare IP address, every connection from that address counts as one client. Limit connections per client in the proxy.
+
+A response ends once one piece of it has waited 60 seconds to go out. A piece waits either for the client's flow-control window to cover everything queued ahead of it plus one byte, or, once it has that window, for HTTP/2 to write out the data queued ahead of it. The listener then resets the response's HTTP/2 stream with `RST_STREAM` and `CANCEL`. The reset drops the call, so it starts no further work. HTTP/2 discards the data it holds for the response, and frees the stream's place among its connection's 200 streams, the next time it writes to the connection; a connection that cannot write is closed by the write rule below. A read already in flight finishes first, and a `GetBlockRange` stream returns its range-stream slot once that read is done. The connection and its other streams stay open. A response that is waiting for the server to produce its next message is reset only if data it already sent is still waiting to go out.
+
+A client that reads slowly is reset when a piece waits 60 seconds for window. The shortfall comes from the piece queued just ahead of the waiting one, so window updates that arrive often but grant too little in total can still end the stream. In the worst case, when the connection's window is not the limit and the client's settings do not change, the waiting piece needs a whole piece of new window: 64 KiB for gRPC and binary gRPC-Web, or 87,384 bytes for gRPC-Web text. Shorter pieces need less. How fast a client must then read depends on how it grants window. Rust's h2, which tonic and hyper use, sends a window update once the capacity it has released reaches half of its remaining window, roughly a third of the configured window for a steady reader. Under those assumptions, a worst-case reader with a 1 MiB window must read about 341 KiB within 60 seconds, about 5.7 KiB/s, and one with a 64 KiB window must read about 64 KiB, about 1.1 KiB/s.
+
+A piece that has window still waits while the connection cannot write out the data ahead of it. Before the server ends a response or waits for its producer, it waits for HTTP/2 to encode everything queued ahead of the last byte. If that takes 60 seconds, because the client's socket takes data slowly or other busy streams on the connection share it, the stream is reset with `CANCEL` and counted in `zinder_grpc_response_send_stalls_total`, even while the connection writes enough to meet the 16 KiB rule below. As an illustration, assume a stream has its 1 MiB send buffer and one 64 KiB piece queued ahead of that byte, about 1,088 KiB (about 1,109 KiB for gRPC-Web text), and that HTTP/2 shares the socket evenly among busy streams. Then a socket that takes less than about 18.1 KiB/s over 60 seconds resets a stream that is alone on its connection, and with n busy streams the socket must take about n times that.
+
+A client that reads again receives the data that reached it before the reset, then the reset. grpc-go, grpc-java, and tonic built with its `server` feature report the reset as `CANCELLED`. gRPC Swift on SwiftNIO reports `UNAVAILABLE`, and other clients, or a proxy in front of Zinder, may report it differently.
+
+While a response is open, the transport holds less than about 1,216 KiB of its payload, or 1,280 KiB and 8 bytes for a gRPC-Web text response: the 1 MiB HTTP/2 send buffer, the piece queued past it, the piece waiting for window, and the next piece. These are estimates of transport payload. The listener also keeps the response chunk it is splitting into pieces until it hands out that chunk's last piece; for `GetBlockRange` that chunk is one encoded block, or a batch of smaller ones. A gRPC-Web response's trailers add a frame of their own. One connection holds at most 200 responses, about 237.5 MiB of transport payload, or 250 MiB in gRPC-Web text mode. An identity-encoded `GetBlockRange` response on the lightwalletd listener hands HTTP/2 slices of its stored blocks instead of copies, so a stalled range stream can keep up to about 3,456 KiB of block allocations alive, and one connection about 675 MiB ([lightwalletd compatibility](lightwalletd-compatibility.md)). That data is held only until the stream's reset.
+
+The server ends a response, or waits for its producer, only once HTTP/2 has encoded every byte sent so far. It sends the last byte as a frame of its own, which HTTP/2 encodes only after everything queued ahead of it on the stream. A response that has ended therefore waits for nothing but the client's socket. A client that lowers its stream window with an HTTP/2 `SETTINGS` frame before that point leaves the rest waiting for window again, and the stream is reset if that still keeps the rest from being encoded when its piece has waited 60 seconds. Zinder sets no process-wide bound on the data responses hold, because a client can open many connections. Limit connections per client at your proxy.
+
+Once a write to a connection blocks, the connection must write 16 KiB, or finish writing everything it had buffered, within 60 seconds or it is closed. This closes a connection whose client has stopped reading every stream on it, which not even a reset can reach. A client that reads its socket a few bytes at a time stays within the memory bounds above but has no deadline: its connection stays open while it reads 16 KiB a minute, and HTTP/2 frees a reset stream's data only when it next writes to that connection. An HTTP/1.1 connection on a browser-enabled listener carries one response at a time, so a stalled response closes its connection. [ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md) records this policy.
+
+### Wallet block-range admission
+
+`compat.range_admission` covers `GetBlockRange` and `GetBlockRangeNullifiers` together. `query.range_admission` covers `CompactBlocksInRange`, `CompactNullifiersInRange`, and `FullBlocksInRange` together. The listener admits up to four concurrent calls per client by default, counting calls waiting to start and calls streaming a response. Keep the per-client cap below the shared stream limit to reserve capacity for other wallets. Each listener tracks up to 4,096 clients with open calls and removes entries as soon as their last call ends.
+
+The default `connection` key groups calls by source IP and port, so wallets behind the same Tor exit can use separate connections. A trusted HTTP proxy supplying only a bare IP groups all calls from that address. Select `subnet` to share a quota across ports and connections by IPv4 address or IPv6 /64. Apply connection limits at your edge when using connection keys.
+
+To shed new ranges during runtime saturation, set `max_scheduling_delay_ms` on either listener. A Tokio task samples scheduling delay every 25 ms. A sample at or above the configured threshold starts shedding. The first sample below the threshold resumes admission. Open responses and other RPCs continue under their existing limits. Range admission refusals return `UNAVAILABLE` with [`grpc-retry-pushback-ms`](https://github.com/grpc/proposal/blob/master/A6-client-retries.md#pushback) set to 250.
 
 ### Request list bounds
 
-The server counts the elements of every repeated request field before it
-decodes the request. Without that bound, one 2 MiB request could decode into
-tens of MiB of empty elements. The count covers every frame of the request and
-the lists inside nested messages, and allocates nothing.
+The server counts the elements of every repeated request field before it decodes the request. Without that bound, one 2 MiB request could decode into tens of MiB of empty elements. The count covers every frame of the request and nested lists. The guard scans compressed messages after bounded decompression and before allocating repeated protobuf values.
 
-A request over a bound fails with `INVALID_ARGUMENT` and the message
-`<Method> request field <field> carries <count> elements; at most <bound> are
-accepted`. `INVALID_ARGUMENT` fits because the same request can never
-succeed.
+A request over a bound fails with `INVALID_ARGUMENT` and the message `<Method> request field <field> carries <count> elements; at most <bound> are accepted`. `INVALID_ARGUMENT` fits because the same request can never succeed.
 
-A field that its handler also caps gets a bound of twice the cap. A request
-just over the cap therefore still reaches the handler and gets its typed
-reason. An enum list that no handler caps gets 1,000
-(`zinder_runtime::MAX_UNCAPPED_ENUM_LIST_ELEMENTS`).
+A field that its handler also caps gets a bound of twice the cap. A request just over the cap therefore still reaches the handler and gets its typed reason. An enum list that no handler caps gets 1,000 (`zinder_runtime::MAX_UNCAPPED_ENUM_LIST_ELEMENTS`).
 
 | Service | Method | Field | Bound | Handler cap |
 | --- | --- | --- | --- | --- |
 | `WalletQuery` | `ChainEvents` | `address_filter` | 512 | 256 |
 | `WalletQuery` | `TransparentOutpointSpendStatus` | `outpoints` | 2,048 | 1,024 |
+| `WalletQuery` | `CompactBlocksInRange`, `CompactNullifiersInRange` | `pool_types` | 8 | 4 |
+| `WalletQuery` | `TransparentAddressBalances`, `TransparentAddressesUnspentOutputs` | `addresses` | 512 | 256 |
 | `ExplorerQuery` | `ValuePoolFlowHistory` | `filter.directions`, `filter.pools` | 1,000 each | none |
 | `ExplorerQuery` | `ValuePoolFlowEventsInRange` | `directions`, `pools` | 1,000 each | none |
 | `ExplorerQuery` | `ValuePoolFlowSummary`, `ValuePoolFlowRoundedAmountSummary` | `pools` | 1,000 | none |
@@ -398,12 +435,7 @@ reason. An enum list that no handler caps gets 1,000
 | `ExplorerQuery` | `ValuePoolFlowAmountThresholdSummary` | `minimum_amounts_zat` | 64 | 32 |
 | `ExplorerQuery` | `TransactionHistory` | `filter.privacy_shapes`, `filter.contains_any_protocol` | 1,000 each | none |
 
-[Lightwalletd compatibility](lightwalletd-compatibility.md) lists the
-`CompactTxStreamer` bounds. Each adapter keeps its table in
-`WALLET_QUERY_FIELD_LIMITS`, `EXPLORER_QUERY_FIELD_LIMITS`, or
-`COMPACT_TX_STREAMER_FIELD_LIMITS`. A test compares each table with the
-service descriptor, so a new repeated request field fails the tests until it
-has a bound.
+[Lightwalletd compatibility](lightwalletd-compatibility.md) lists the `CompactTxStreamer` bounds. Each adapter keeps its table in `WALLET_QUERY_FIELD_LIMITS`, `EXPLORER_QUERY_FIELD_LIMITS`, or `COMPACT_TX_STREAMER_FIELD_LIMITS`. A test compares each table with the service descriptor, so a new repeated request field fails the tests until it has a bound.
 
 ### Per-request caps
 
@@ -418,47 +450,30 @@ has a bound.
 | Transaction bytes being broadcast at once, per process | 16 MiB | `BROADCAST_BUDGET_EXHAUSTED` |
 | Open `WalletQuery.CompactBlocksInRange` streams, per process | 100 | `COMPACT_BLOCK_STREAM_LIMIT_REACHED` |
 | Tree states rebuilt at once for heights without a stored checkpoint | One per CPU; a rebuild waits for a slot up to 2 s by default (`query.tree_state_replay_wait_ms` in `zinder-query`, `compat.tree_state_replay_wait_ms` in wallet-serving `zinder-compat-lightwalletd`), with at most 64 waiting per slot by default (`query.tree_state_replay_waiters_per_slot` and `compat.tree_state_replay_waiters_per_slot`, 1 to 256) and any further rebuild refused at once | `TREE_STATE_REPLAY_LIMIT_REACHED` natively; `UNAVAILABLE` with no reason in lightwalletd `GetTreeState` |
+| Node calls that forwarded wallet reads run at once, per process | 32 by default (`query.forwarded_read_max_concurrent`, `compat.forwarded_read_max_concurrent`, 1 to 256), split into a reserved floor and cap per kind; a read waits up to 10 s by default (`forwarded_read_wait_ms`) with 64 waiting per slot of its kind's cap by default (`forwarded_read_waiters_per_slot`, 1 to 256) | `FORWARDED_READ_LIMIT_REACHED` natively; `UNAVAILABLE` with no reason in lightwalletd |
+| Forwarded unspent-output responses and address-history streams open at once, per process | 16 (with 1,024 waiting places) and 32 (with 128 waiting places), with the same wait | `UNAVAILABLE` |
 
-The broadcast budget covers native `BroadcastTransaction` and lightwalletd
-`SendTransaction`. A broadcast holds its transaction's bytes until the node
-answers or the broadcast times out. One that does not fit is refused at once,
-without reaching any node. The budget always fits one maximum-size
-transaction.
+The broadcast budget covers native `BroadcastTransaction` and lightwalletd `SendTransaction`. A broadcast holds its transaction's bytes until the node answers or the broadcast times out. One that does not fit is refused at once, without reaching any node. The budget always fits one maximum-size transaction.
 
-`zinder-compat-lightwalletd` adds `compat.max_concurrent_block_range_streams`,
-`compat.tree_state_replay_wait_ms`, `compat.tree_state_replay_waiters_per_slot`,
-`compat.stale_tip_limit_ms`, and `compat.ping_very_insecure`, which
-[Lightwalletd compatibility](lightwalletd-compatibility.md) describes with the
-methods they govern.
+`zinder-compat-lightwalletd` adds `compat.max_concurrent_block_range_streams`, `compat.tree_state_replay_wait_ms`, `compat.tree_state_replay_waiters_per_slot`, `compat.stale_tip_limit_ms`, `compat.tip_wait_ms`, `compat.tip_wait_max_blocks`, `compat.tip_wait_max_waiters`, and `compat.ping_very_insecure`, which [Lightwalletd compatibility](lightwalletd-compatibility.md) describes with the methods they govern.
 
 ### HTTP listeners
 
-The operational endpoint of every runtime (`/healthz`, `/readyz`, `/metrics`)
-and the Cipherscan adapter use one hardened HTTP/1 listener.
+The operational endpoint of every runtime (`/healthz`, `/readyz`, `/metrics`) and the Cipherscan adapter use one hardened HTTP/1 listener.
 
 | Limit | Cipherscan adapter | Operational endpoint |
 | --- | --- | --- |
 | Time to receive a complete request head, and idle keep-alive | 10 s | 10 s |
 | Time to receive a request body | 30 s | 30 s |
-| Time a write may stall behind a client that is not reading | 30 s | 30 s |
+| Time a connection has to write 16 KiB once a write blocks | 30 s | 30 s |
 | Open connections | 2,048 | 64 |
 | Request body size | 2 MiB | 4 KiB |
 
-The operational endpoint must stay private. `ops.listen_addr` sets its
-address, and an empty value disables it.
+The operational endpoint must stay private. `ops.listen_addr` sets its address; set it to `"none"` to disable the endpoint. Empty values are rejected.
 
 ### Dials between Zinder runtimes
 
-A runtime that calls another Zinder runtime, such as a reader dialing
-`ingest_control.addr` or the Cipherscan adapter dialing
-`cipherscan.explorer_query_endpoint`, gives each dial 5 seconds. The dial must
-finish the name lookup, the TCP connect, and the TLS handshake and receive the
-peer's whole initial HTTP/2 `SETTINGS` frame within that time. A peer that
-opens with any other frame fails the dial at once. The dial sends no request,
-so a TLS-terminating proxy in front of the peer needs no route or credential
-for it. A reconnect that the open channel makes on its own gets the same 5
-seconds, from the name lookup until the peer's `SETTINGS` frame is complete, so
-a call that waits on it fails within that time when the peer stalls.
+A runtime that calls another Zinder runtime, such as a reader dialing `ingest_control.addr` or the Cipherscan adapter dialing `cipherscan.explorer_query_endpoint`, gives each dial 5 seconds. The dial must finish the name lookup, the TCP connect, and the TLS handshake and receive the peer's whole initial HTTP/2 `SETTINGS` frame within that time. A peer that opens with any other frame fails the dial at once. The dial sends no request, so a TLS-terminating proxy in front of the peer needs no route or credential for it. A reconnect that the open channel makes on its own gets the same 5 seconds, from the name lookup until the peer's `SETTINGS` frame is complete, so a call that waits on it fails within that time when the peer stalls.
 
 | Caller | When a dial runs out of time |
 | --- | --- |
@@ -466,6 +481,4 @@ a call that waits on it fails within that time when the peer stalls.
 | `zinder-query` and `zinder-compat-lightwalletd` dialing `ingest_control.addr` at startup | Startup fails with the connect timeout. |
 | Mempool reads in `zinder-compat-lightwalletd` and wallet reads in `zinder-explorer` | The request fails as unavailable, and the next request dials again. Requests that arrive during a dial wait for that dial. |
 
-The bound is not configurable.
-[ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md)
-records this policy.
+The bound is not configurable. [ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md) records this policy.

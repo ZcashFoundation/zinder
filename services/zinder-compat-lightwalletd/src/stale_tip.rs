@@ -20,6 +20,7 @@ use std::{
 use arc_swap::ArcSwapOption;
 use tonic::Status;
 use zinder_core::{BlockHeight, ChainEpochId};
+use zinder_runtime::RetryPushback;
 
 /// Default stale-tip limit on every network: 25 minutes.
 ///
@@ -86,13 +87,13 @@ impl StaleTipLimit {
             return Ok(());
         }
         metrics::counter!(STALE_TIP_REFUSALS_COUNTER, "method" => method).increment(1);
-        Err(Status::unavailable(format!(
+        Err(RetryPushback::Backoff.apply(Status::unavailable(format!(
             "the newest block this server serves is {} minutes old, past its {}-minute stale-tip \
              limit, and its node has not confirmed that block as the chain tip; retry later or use \
              another server",
             age_seconds / 60,
             limit.as_secs() / 60,
-        )))
+        ))))
     }
 }
 

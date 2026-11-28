@@ -24,7 +24,7 @@ EOF
   chmod 0755 "$tool"
 done
 
-image=ghcr.io/example/zinder-query
+image=ghcr.io/example/zinder
 root_digest="sha256:$(printf root | sha256sum | awk '{print $1}')"
 amd64_digest="sha256:$(printf amd64 | sha256sum | awk '{print $1}')"
 arm64_digest="sha256:$(printf arm64 | sha256sum | awk '{print $1}')"

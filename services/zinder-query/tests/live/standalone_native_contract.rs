@@ -185,6 +185,7 @@ async fn verify_compact_tip(
             start_height: settled_tip.height,
             end_height: settled_tip.height,
             at_epoch_id: Some(current_epoch_id),
+            pool_types: Vec::new(),
         })
         .await?
         .into_inner();

@@ -5,6 +5,12 @@ consumers. It keeps generated protobuf messages and transport status values
 behind `ChainIndex`, `ChainSnapshot`, `EndpointBackedIndex`, `ServerInfo`, and
 `IndexerError`.
 
+The [quickstart](https://github.com/ZcashFoundation/zinder/blob/main/docs/reference/integration-surfaces.md#quickstart)
+builds a complete program with this crate: the `Cargo.toml` dependencies, a
+`main` function, the endpoint and network to pass, and the output to expect.
+The SDK speaks Zinder's native `WalletQuery` protocol, so it needs a
+`zinder-query` endpoint, not a lightwalletd one.
+
 Connect to a native `WalletQuery` endpoint and pin related reads to one chain
 epoch:
 
@@ -24,6 +30,34 @@ async fn read_visible_tip(endpoint: String) -> Result<(), IndexerError> {
     Ok(())
 }
 ```
+
+For a server behind a private CA and a SOCKS5 proxy, supply the connection
+settings when opening the client:
+
+```no_run
+use zinder_client::{
+    ChainIndex, IndexerError, Network, RemoteChainIndex, RemoteClientOptions, RemoteOpenOptions,
+};
+
+async fn read_private_tip(ca_pem: Vec<u8>, spki_sha256: [u8; 32]) -> Result<(), IndexerError> {
+    let index = RemoteChainIndex::connect_with_options(
+        RemoteOpenOptions {
+            endpoint: "https://wallet.internal:443".to_owned(),
+            network: Network::ZcashTestnet,
+        },
+        RemoteClientOptions::default()
+            .with_tls_ca_pem(ca_pem)
+            .with_tls_spki_pin(spki_sha256)
+            .with_socks5_proxy("socks5h://127.0.0.1:9050")
+            .with_read_retries(),
+    )?;
+    let _ = index.visible_tip_block(None).await?;
+    Ok(())
+}
+```
+
+See the [remote client settings](https://github.com/ZcashFoundation/zinder/blob/main/docs/reference/integration-surfaces.md#remote-client-settings)
+for trust, proxy, retry, and WebAssembly behavior.
 
 A wallet syncs a range of compact blocks through the same snapshot, so the
 blocks share an epoch with the tree states and other reads it pairs them with:

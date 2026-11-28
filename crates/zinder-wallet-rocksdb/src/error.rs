@@ -3,7 +3,10 @@
 use std::{io, path::PathBuf};
 
 use thiserror::Error;
-use zinder_core::{CanonicalBlockFactsSequenceLengthOverflow, Network, UnixTimestampMillis};
+use zinder_core::{
+    CanonicalBlockFactsSequenceLengthOverflow, Network, UnixTimestampMillis,
+    UtxoSetCommitmentSchemeMismatch,
+};
 use zinder_rocksdb_bulk_load::BulkLoadError;
 use zinder_store::CanonicalStoreError;
 use zinder_wallet_projection::{
@@ -110,7 +113,7 @@ pub enum RocksDbWalletError {
     },
     /// The database does not contain exactly the wallet families.
     #[error(
-        "wallet RocksDB column families do not match version 1; expected {expected:?}, observed {observed:?}"
+        "wallet RocksDB column families are not the wallet store's families; expected {expected:?}, observed {observed:?}"
     )]
     ColumnFamilyContractMismatch {
         /// Exact required family names.
@@ -202,6 +205,55 @@ pub enum RocksDbWalletError {
     /// The monotonic lease-generation domain is exhausted.
     #[error("wallet projection build lease generation exceeds u64::MAX")]
     WalletProjectionBuildLeaseGenerationOverflow,
+    /// The build options ask for more accumulator hashing threads than a build
+    /// may use.
+    #[error(
+        "accumulator_hashing_workers is {workers}; a wallet build uses at most {maximum} hashing threads"
+    )]
+    AccumulatorHashingWorkersOutOfRange {
+        /// Requested `accumulator_hashing_workers`.
+        workers: u32,
+        /// [`crate::MAX_ACCUMULATOR_HASHING_WORKERS`].
+        maximum: u32,
+    },
+    /// The build's accumulator hashing threads could not be started.
+    #[error("could not start {workers} wallet accumulator hashing threads: {reason}")]
+    AccumulatorHashingWorkersUnavailable {
+        /// Configured `accumulator_hashing_workers`.
+        workers: u32,
+        /// Thread-pool construction failure.
+        reason: String,
+    },
+    /// Partial UTXO set commitments of different schemes could not be combined.
+    #[error(transparent)]
+    UtxoSetCommitmentScheme(#[from] UtxoSetCommitmentSchemeMismatch),
+    /// Cold validation could not start one of its scan threads.
+    #[error("could not start a wallet cold-validation thread: {reason}")]
+    ColdValidationThreadUnavailable {
+        /// Thread-start failure reported by the operating system.
+        reason: String,
+    },
+    /// Parallel canonical replay could not start one of its scan threads.
+    #[error("could not start a wallet canonical-scan thread: {reason}")]
+    CanonicalScanThreadUnavailable {
+        /// Thread-start failure reported by the operating system.
+        reason: String,
+    },
+    /// A canonical-scan worker thread stopped before finishing its chunks.
+    #[error("a wallet canonical-scan worker thread stopped before finishing its chunks")]
+    CanonicalScanWorkerStopped,
+    /// Secondary projection derivation could not start its worker thread.
+    #[error("could not start a wallet secondary-derivation thread: {reason}")]
+    SecondaryDerivationThreadUnavailable {
+        /// Thread-start failure reported by the operating system.
+        reason: String,
+    },
+    /// A secondary-derivation worker thread stopped before finishing.
+    #[error("a wallet secondary-derivation worker thread stopped before finishing")]
+    SecondaryDerivationWorkerStopped,
+    /// An accumulator hashing thread stopped before returning its batch.
+    #[error("a wallet accumulator hashing thread stopped before finishing its rows")]
+    AccumulatorHashingWorkerStopped,
     /// A caller stopped a projection build before READY promotion.
     #[error("wallet projection build was cancelled")]
     ProjectionBuildCancelled,
@@ -307,5 +359,23 @@ impl RocksDbWalletError {
 
     pub(crate) fn rocksdb(operation: &'static str, source: rust_rocksdb::Error) -> Self {
         Self::RocksDbOperation { operation, source }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_family_mismatch_names_the_expected_and_observed_families() {
+        let error = RocksDbWalletError::ColumnFamilyContractMismatch {
+            expected: vec!["default".to_owned(), "reorg_undo".to_owned()],
+            observed: vec!["default".to_owned()],
+        };
+        assert_eq!(
+            error.to_string(),
+            "wallet RocksDB column families are not the wallet store's families; \
+             expected [\"default\", \"reorg_undo\"], observed [\"default\"]"
+        );
     }
 }

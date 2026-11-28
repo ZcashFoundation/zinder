@@ -4,13 +4,14 @@ This page lists what each Zinder runtime reports on its health and readiness
 endpoints, what every readiness cause means, and what you should do about it.
 It is for operators who wire probes and alerts or who triage an incident.
 
-Each runtime serves three routes on its operational endpoint,
+Each runtime serves these routes on its operational endpoint,
 `ops.listen_addr`:
 
 | Route | Answers | Status code |
 | --- | --- | --- |
 | `/healthz` | Whether the process is alive, with its identity. | Always 200 while the process answers HTTP. |
 | `/readyz` | Whether the runtime should receive traffic, and why not. | 200 when the cause admits traffic, 503 otherwise. |
+| `/status` | Public JSON summary of readiness, build identity, and known served heights. | 200 while the process answers HTTP. |
 | `/metrics` | Prometheus metrics. See [Metrics](metrics.md). | 200 |
 
 A live process is not always ready. A writer can be alive while it catches
@@ -21,13 +22,15 @@ The operational endpoint serves without authentication. Keep it private, as
 [Service operations](../architecture/service-operations.md#security-boundary)
 describes.
 
-`zinder-query` and `zinder-compat-lightwalletd` also answer the same question
-on their gRPC listeners, as [gRPC health](#grpc-health) describes.
+`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` also report
+readiness on their gRPC listeners, as [gRPC health](#grpc-health) describes.
 
 ## Response bodies
 
 `/healthz` returns `status` (`alive`), `service`, `version`, `git_commit`,
 `network`, and `capabilities`, the capability strings the runtime advertises.
+The Explorer snapshots these at startup. Query `ExplorerQuery.ServerInfo` for
+its current [capabilities](capabilities.md#explorer-capabilities).
 A local build reports `git_commit` as `unknown`.
 
 `/readyz` returns these fields. Fields without a value are omitted.
@@ -71,30 +74,62 @@ A wallet-serving reader during a node outage answers like this:
 `cause`. A script that reads the first `"cause"` key therefore gets the
 runtime's own cause.
 
+## Public status
+
+`GET /status` returns JSON from the existing ops listener. Read `status` to
+determine whether the runtime is ready. You can expose this summary publicly
+by configuring your reverse proxy to forward the exact `/status` path to the
+private ops listener. Keep the remaining ops routes on the private network.
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `ready` or `not_ready`, using the same admission decision as `/readyz`. |
+| `cause` | A readiness cause label for a standalone role or a startup-stage label for the supervisor. |
+| `service`, `version`, `git_commit`, `network` | Role and build identity and the configured network. |
+| `mode`, `preset` | Supervisor command and deployment preset. Standalone roles omit these fields. |
+| `served_visible_tip_height`, `served_settled_tip_height` | Heights from the same served chain epoch. Omitted until a reader publishes a chain epoch. |
+| `served_epoch_age_seconds` | Seconds since the writer committed the served epoch. Omitted when unknown. |
+
+The supervisor reports the chain epoch of its native wallet query role when
+available, followed by its compact-block compatibility role. The last
+published epoch can still appear while a role is degraded. Status includes
+only the fields listed above.
+
+## Supervisor endpoint (`zinder serve` / `zinder index`)
+
+When running under the unified `zinder serve` (default `:9108`) or `zinder index` (default `:9105`) supervisor, the parent process binds its operational HTTP endpoint at **T=0** before child stores finish constructing:
+
+- `/healthz`: returns HTTP 200 immediately with `{"status":"alive","service":"zinder","version":...,"git_commit":...,"network":...}` so container liveness and startup probes succeed while initial sync runs.
+- `/readyz`: aggregates every supervised role into `{"status":"ready"|"not_ready","mode":...,"preset":...,"network":...,"phase":"bootstrapping_canonical"|"catching_up_wallet_projection"|"waiting_for_explorer_views"|"waiting_for_serving_listeners"|"ready"|"shutting_down"|"failed","roles":[...]}` and returns HTTP 200 only once every required role reports ready.
+- `/metrics`: exports `zinder_supervisor_ready` and `zinder_supervisor_role_ready` alongside scraped child role metrics.
+
 ## Container healthcheck
 
-The runtime images have no shell or HTTP client, so every runtime binary
-except `zinder-compat-cipherscan` probes its own endpoint with a `healthcheck`
-subcommand:
+The unified distroless image has no shell or HTTP client, so probes invoke `zinder healthcheck` directly:
 
 ```bash
-zinder-query --config /etc/zinder/config.toml healthcheck
-zinder-ingest healthcheck --addr 127.0.0.1:9105 --path /healthz
+zinder healthcheck
+zinder healthcheck --ready --addr 127.0.0.1:9108
+zinder healthcheck --addr 127.0.0.1:9105 --path /healthz
 ```
 
-The probe sends one HTTP/1.1 `GET` and exits 0 only when the endpoint answers
-200. Otherwise it exits 1 and prints the reason to stderr, which Docker
-records as the failure reason.
+The probe sends one HTTP/1.1 `GET` and exits 0 only when the endpoint answers 200. Otherwise it exits 1 and prints the reason to stderr, which Docker records as the failure reason.
 
-| Flag | Default |
+The flags and defaults below apply to `zinder healthcheck`:
+
+| Flag | Default (`zinder healthcheck`) |
 | --- | --- |
-| `--path` | `/readyz`. Use `/healthz` to check liveness only. |
-| `--addr` | `ZINDER_OPS__LISTEN_ADDR`, then `[ops] listen_addr` in the `--config` file, then the runtime's built-in ops address. |
+| `--ready` | Probes `/readyz` instead of `/healthz` (unless `--path` is passed). |
+| `--path` | `/healthz`. Override with `--path /readyz` or pass `--ready`. |
+| `--addr` | `ZINDER_OPS__LISTEN_ADDR`, then `[ops] listen_addr` in the `--config` file, then `127.0.0.1:9108`. |
+
+Standalone role binaries have two CLI differences:
+- `zinder-ingest`, `zinder-projector`, `zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` accept `healthcheck --addr <ADDR> --path <PATH> --config <PATH>`, default `--path` to `/readyz` (with no `--ready` flag; pass `--path /healthz` for liveness), and default `--addr` to each role's own ops port.
+- `zinder-compat-cipherscan` has no `healthcheck` subcommand.
 
 - The probe reads only `[ops] listen_addr` from the config file. It skips a
   file that is missing, unreadable, or not TOML.
-- It ignores the runtime's `--ops-listen-addr` flag. Pass that address with
-  `--addr`.
+- It ignores `--ops-listen-addr`. Pass a non-default address with `--addr`.
 - An unspecified host probes loopback. `0.0.0.0` probes `127.0.0.1`, and
   `[::]` probes `[::1]`, then `127.0.0.1`.
 - An empty address disables the endpoint, so the probe fails without
@@ -102,27 +137,16 @@ records as the failure reason.
 - The whole probe takes at most 3 seconds, below the 5-second timeout of the
   image and Compose healthchecks.
 
-Each runtime image runs `zinder-<runtime> --config /etc/zinder/config.toml
-healthcheck`. The ingest image adds `--path /healthz`, because ingest reports
-`syncing` throughout a first sync. The reference Compose file probes `/readyz`
-for every runtime. If you start a container with a config file at another
-path that changes the ops address, override the healthcheck with the same
-`--config`. The `zinder-canonical-runtime` image runs
-`zinder-ingest healthcheck --path /healthz`. The two wallet-serving images
-run their own healthcheck script, described in
-[Single-volume deployment](../runbooks/deploying-single-volume.md).
+In `deploy/docker-compose.yml`, `zinder-index` (`:9105`) and `zinder-serve` (`:9108`) both run `zinder healthcheck` without `--ready`, probing `/healthz` liveness so Docker can keep containers marked healthy while initial construction and catch-up run. Always check readiness separately via `/readyz` (`http://127.0.0.1:9108/readyz`, `zinder healthcheck --ready --addr 127.0.0.1:9108`, or `grpc.health.v1.Health`) before routing client traffic. The single OCI image sets `HEALTHCHECK ... CMD ["/usr/local/bin/zinder", "healthcheck"]` for `/healthz`, while Kubernetes readiness probes query `/readyz` on `:9108` (see [Deploying the single-volume container](../runbooks/deploying-single-volume.md)).
 
 ## gRPC health
 
-`zinder-query` and `zinder-compat-lightwalletd`, in both of its serving modes,
-serve [`grpc.health.v1.Health`](https://github.com/grpc/grpc/blob/master/doc/health-checking.md)
-(`Check` and `Watch`) on their wallet gRPC listener. gRPC-aware load
+`zinder-query`, `zinder-explorer`, and all three serving modes of
+`zinder-compat-lightwalletd` serve [`grpc.health.v1.Health`](https://github.com/grpc/grpc/blob/master/doc/health-checking.md)
+(`Check` and `Watch`) on their public gRPC listeners. gRPC-aware load
 balancers, Envoy, and Kubernetes `grpc` probes can then ask the serving port
-directly, without an HTTP probe on the ops port. `zinder-ingest`,
-`zinder-projector`, and `zinder-explorer` do not serve it.
-
-The status comes from the same readiness state as `/readyz`, so the two never
-disagree:
+directly. Each gRPC listener reads the same readiness state as its own
+`/readyz` endpoint.
 
 | Status | When |
 | --- | --- |
@@ -130,15 +154,22 @@ disagree:
 | `NOT_SERVING` | `/readyz` answers 503, including `shutting_down` once shutdown starts. |
 
 An empty service name asks about the whole listener. The name of the service
-the listener serves (`zinder.v1.wallet.WalletQuery` or
-`cash.z.wallet.sdk.rpc.CompactTxStreamer`) returns the same status. Any other
-name fails `Check` with `NOT_FOUND`, and `Watch` reports `SERVICE_UNKNOWN`.
+the listener serves (`zinder.v1.wallet.WalletQuery`,
+`cash.z.wallet.sdk.rpc.CompactTxStreamer`, or `zinder.v1.explorer.ExplorerQuery`)
+returns the same status. Any other name fails `Check` with `NOT_FOUND`, and
+`Watch` reports `SERVICE_UNKNOWN`.
 There is no per-method or per-capability status.
 
+Use `zinder-query grpc-healthcheck <ADDR>` to probe any of these plaintext gRPC
+listeners. For example, `zinder-query grpc-healthcheck '[::1]:9067'`
+checks the single-volume lightwalletd listener. The command exits 0 for
+`SERVING`, 3 for a non-serving health response, and 1 if the call fails.
+Connecting and receiving the reply share a three-second deadline.
+
 The health service and gRPC reflection stay reachable while the runtime
-refuses wallet calls with `SERVICE_NOT_READY`. Reflection describes
-`grpc.health.v1.Health` beside the wallet service, so `grpcurl` needs no proto
-files to call it.
+refuses wallet or Explorer calls with `SERVICE_NOT_READY`. Both accept calls
+without an Explorer bearer token. Reflection describes `grpc.health.v1.Health`,
+so `grpcurl` needs no proto files to call it.
 
 `Watch` sends the current status at once and again on every change, as soon
 as readiness publishes it. Changes that land before the stream can send them
@@ -161,8 +192,8 @@ listener while it closes. A `SERVING` the stream was already sending as the
 drain began can still arrive just before that final `NOT_SERVING`. A stream that reported `SERVICE_UNKNOWN` ends
 without another message.
 
-A Kubernetes `grpc` probe needs no `service` field. Probe the wallet port of
-the runtime, not its ops port:
+A Kubernetes `grpc` probe needs no `service` field. This example probes the
+lightwalletd port directly.
 
 ```yaml
 readinessProbe:
@@ -192,15 +223,15 @@ protobuf message, and in the `cause` label of `zinder_readiness_state`. Only
 
 | Cause | Traffic | Meaning | What you do |
 | --- | --- | --- | --- |
-| `starting` | Refused | Initialization has not finished. | Wait. If ingest stays here with `[node.health]` set, check that the health endpoint answers. |
-| `syncing` | Refused | The runtime is healthy but behind its target. Ingest includes `lag_blocks`. | Wait. A first sync takes hours; see [Initial sync](../runbooks/initial-sync.md). |
+| `starting` | Refused | Initialization has not finished. | If ingest stays here with `node.health.addr` set, check the health endpoint and its JSON-RPC fallback. |
+| `syncing` | Refused | The runtime is catching up. Ingest reports `lag_blocks` and can also be waiting for a mempool snapshot at the node's tip. | Check [ingest's wait reason](#ingest). A first sync takes hours. See [Initial sync](../runbooks/initial-sync.md). |
 | `ready` | Admitted | The runtime serves its contract. | Nothing. |
 | `node_unavailable` | Refused | The node or its transport failed. Detail: `failure_class`, `last_reason`, `consecutive_failures`, `outage_seconds`. | Check the node, its address, and its credentials. |
 | `node_capability_missing` | Refused | The node lacks a capability the runtime needs. Detail: `capability`. | Configure or upgrade the node to provide it. |
 | `upstream_not_ready` | Refused | The node answers but is not synchronized. Detail: node heights, verification progress, and the health source and reason. | Wait for the node to sync. |
-| `storage_unavailable` | Refused | A required store cannot be opened or read. | Check the volume, free space, and permissions. If the store is damaged, rebuild it; see [Recovery](../architecture/service-operations.md#recovery). |
+| `storage_unavailable` | Refused | A required store cannot be opened or read. | Check the volume, free space, and permissions. If the store is damaged, rebuild it; see [Recovery](../architecture/service-operations.md#recovery). After an in-place canonical store replacement, restart the reader; see [Canonical store replacement](#canonical-store-replacement). |
 | `canonical_store_damaged` | Refused | Ingest found a stored row of the canonical store that fails verification. Ingest and the store's wallet-serving readers report it. Detail: `height`, absent when ingest cannot read its verification record, and, when one pool's frontier failed, `pool`. | Rebuild the canonical store; see [Recovery](../architecture/service-operations.md#recovery). Restarting does not help: ingest reports the recorded damage again until it checks it. |
-| `schema_mismatch` | Refused | A store's identity or schema differs from what the binary expects. | Run a binary that matches the store, or rebuild the store. See [Recovery](../architecture/service-operations.md#recovery). |
+| `schema_mismatch` | Refused | A store's identity or schema differs from what the binary expects. | Run a binary that matches the store, or rebuild the store. See [Recovery](../architecture/service-operations.md#recovery). After an in-place canonical store replacement, restart the reader; see [Canonical store replacement](#canonical-store-replacement). |
 | `reorg_window_exceeded` | Refused | Ingest refused a reorg deeper than its reorg window and stopped following. Detail: `depth`, `configured`, and `covered`. | Look for a replaced, resynced, or misbehaving node. Confirm the correct chain, then rebuild the stores; see [Recovery](../architecture/service-operations.md#recovery). Restarting ingest parks it again. |
 | `wallet_transition_limit_exceeded` | Refused | The projector parked because its next wallet update needs more memory than `projector.follow.max_transition_logical_bytes` allows. Detail: `required_bytes`, `configured_bytes`. | Restart the projector with a larger limit, as in [Wallet transition exceeds its logical-byte limit](../runbooks/deploying-single-volume.md#wallet-transition-exceeds-its-logical-byte-limit). It resumes without a rebuild. |
 | `replica_lagging` | Refused | A reader's copy of a store is more chain epochs behind the writer than allowed. Detail: `lag_chain_epochs`. | Check the writer and projector, then disk and CPU pressure. |
@@ -246,18 +277,48 @@ snapshot for up to 30 seconds while it loads the next one.
 
 | Cause | When |
 | --- | --- |
-| `starting` | Until startup finishes. With `[node.health]` set, also until the first successful health probe. |
-| `syncing` | During fresh construction, while trailing the node, or while the mempool snapshot trails the tip for more than 30 seconds. |
+| `starting` | Until startup finishes. With `node.health.addr` set, also until the first successful health probe. |
+| `syncing` | During fresh construction, while trailing the node, when the certified mempool snapshot trails the tip for 30 seconds, or when a replacement has waited 30 seconds for certification. |
 | `node_unavailable` | The active node fails. Ingest keeps its state and retries. |
 | `upstream_not_ready` | The `[node.health]` probe reports the node not synchronized. |
 | `reorg_window_exceeded` | A reorg was deeper than the window. Only shutdown replaces it. |
 | `canonical_store_damaged` | The tree-state verification pass found a damaged checkpoint row, logged as `tree_state_verification_mismatch`. Ingest keeps following but stays not ready until it stops. Every `CanonicalControl.WriterStatus` answer reports the damage, so readers refuse traffic on their next refresh. After a restart, writer status reports the recorded damage from its first answer, and ingest reports this cause again once the verification pass confirms it, which it checks as soon as the store is published. A verification record ingest cannot read is damage without a height until a full verification cycle passes. Rebuild the canonical store. See [Chain ingestion](../architecture/chain-ingestion.md#tree-state-verification). |
 | `cursor_at_risk` | Explorer view replay falls near the event-retention limit. |
 
-`IngestControl.WriterStatus` reports the health probe's latest observation
-even while `/readyz` shows a refusing admission state such as `syncing`. With
-fallback nodes, a switch resets the probe's input to `starting` until the new
-endpoint is probed. Node failover is described in
+During fresh construction, `/readyz` stays `not_ready` (`503`) with
+`phase: "bulk_catchup"` and `cause: { "syncing": { "lag_blocks": ... } }`:
+
+- While resolving the construction range from the node, `current_height`,
+  `target_height`, and `cause.syncing.lag_blocks` are absent or `null`.
+- Once the fixed build tip is resolved, `target_height` holds that build tip,
+  `current_height` starts at the build predecessor height (`0` for a genesis
+  build, or the configured checkpoint height), and `lag_blocks` starts at
+  `target_height - current_height`.
+- As block loading stages blocks into the builder, ingest updates
+  `current_height`, `lag_blocks`, and `zinder_readiness_sync_lag_blocks` at a
+  bounded cadence until `current_height` reaches `target_height` and
+  `lag_blocks` reaches `0`.
+- Ingest stays `not_ready` in `bulk_catchup` through subtree verification,
+  baseline publication, and store installation, then transitions to
+  `following_tip`. See [Fresh construction](metrics.md#fresh-construction) for
+  the matching Prometheus gauges.
+
+While ingest follows the node, its `/readyz` can include the optional field
+`cause.syncing.wait_reason`. It has two values.
+
+- `mempool_hydration_at_tip` means canonical ingest has reached the node's
+  tip and is waiting for a mempool snapshot there.
+- `canonical_progress` means the current iteration is checking or advancing
+  the canonical chain, including preparing the next block. The last reported
+  heights can still match during preparation.
+
+`IngestControl.WriterStatus` reports `upstream_not_ready` when the latest
+health probe says the node is syncing, even while ingest's own `/readyz`
+shows `syncing`. If a later probe fails to obtain a health response, its
+input becomes `node_unavailable` and writer status clears `upstream_not_ready`.
+Ingest then keeps retrying until the node synchronizes.
+With fallback nodes, a switch resets the probe's input to `starting` until
+the first successful observation of the new endpoint. See
 [Chain ingestion](../architecture/chain-ingestion.md#node-endpoint-failover).
 
 ### Projector
@@ -304,21 +365,44 @@ traffic stops. When the reader refuses traffic, new gRPC calls fail with
 `UNAVAILABLE`, `SERVICE_NOT_READY`, and the cause in
 `ErrorInfo.metadata["readiness_cause"]`.
 
-Two dependencies are reported under `degraded` instead of refusing traffic:
+### Reader dependency health
+
+The readiness report lists reader dependency failures under `degraded`.
 
 | Input | Used by | When degraded |
 | --- | --- | --- |
-| `node_source` | Transaction broadcast, and `GetStandardFee` in wallet-mode compatibility | No verified node endpoint answers (`node_unavailable`), the node reports it is not synchronized (`upstream_not_ready`), or it lacks a required method (`node_capability_missing`). Not present without `[node]`. |
+| `node_source` | Transaction broadcast, `GetStandardFee` in wallet-mode compatibility, and cold transaction bytes in lean wallet serving | No verified node endpoint answers (`node_unavailable`), the node reports it is not synchronized (`upstream_not_ready`), or it lacks a required method (`node_capability_missing`). Lean wallet readiness checks the primary node because it supplies cold bytes. A healthy broadcast fallback can still accept broadcasts during a primary outage. |
+| `node_source` in light-wallet serving | [Forwarded wallet calls](lightwalletd-compatibility.md#runtime-serving-selection) | The configured node fails the dependency probe. The report carries its cause under `degraded`. |
 | `ingest_control` | Mempool snapshots and events, unmined transaction lookups | Ingest control fails (`ingest_control_unavailable`), the writer's mempool waits on its node (`node_unavailable`), or the writer reports `upstream_not_ready`. |
 
-A reader verifies each node endpoint before it broadcasts through it or reads
-the recommended fee from it, as
-[Node source boundary](../architecture/node-source-boundary.md#capabilities)
-describes.
+See [Node source boundary](../architecture/node-source-boundary.md#capabilities)
+for endpoint verification.
 
-Compatibility in compact-blocks mode reads only the canonical store, declares
-no dependencies, and rejects every node setting. Its readiness follows the
-same rules for its canonical copy.
+### Canonical-only compatibility readers
+
+Compact-blocks and light-wallet readiness follow the published canonical
+generation and its writer attestation. At admission, both check the writer's
+canonical fence. Light-wallet also checks the writer's admitted upgrade
+schedule and reports the `node_source` and `ingest_control` dependencies under
+`degraded`. Compact-blocks declares neither dependency. See
+[During a node outage](#during-a-node-outage) for how degradation affects calls.
+
+### Canonical store replacement
+
+Readers pin the canonical stored set they admit at startup. A replacement
+with a different workload, raw-blob retention, first retained block height,
+subtree-root coverage mode, or first retained subtree-root index for any
+shielded pool (Sapling, Orchard, or Ironwood) cannot take over while the
+reader is running. Compact-blocks and
+light-wallet compatibility report `schema_mismatch` when a replacement
+passes normal admission and then fails the pin. Native query and wallet-mode
+compatibility report `storage_unavailable` for that refusal.
+
+After a stored-set refusal, the reader keeps checking writer status on its
+normal cadence and waits at least 30 seconds before trying another cold open.
+Restart the reader to adopt the new stored set. The replacement still has to
+meet the reader's configured minimum, writer attestation, and, for paired
+readers, wallet projection admission.
 
 ### Explorer
 
@@ -332,9 +416,10 @@ once per second.
 | `schema_mismatch` | The view store's format or consumer schemas no longer match the binary. |
 | `storage_unavailable` | Any other catch-up failure. |
 
-Explorer keeps answering gRPC in both failure cases; only `/readyz` refuses.
-How far the views trail the chain is reported per response in
-`ExplorerFreshness`, not through readiness.
+On a catch-up failure, `/readyz` returns 503, gRPC health reports
+`NOT_SERVING`, and new `ExplorerQuery` calls fail with `UNAVAILABLE` and
+the readiness cause. The next successful catch-up reopens the gate.
+`ExplorerFreshness` reports how far the views trail the chain in each response.
 
 ### Cipherscan adapter
 
@@ -352,27 +437,32 @@ unreachable.
 | --- | --- | --- | --- |
 | `zinder-ingest` | `node_unavailable` | Its private control API, including writer status. | Committing blocks. The chain tip stops advancing. |
 | `zinder-projector` | `ready` | Its last wallet state. | Nothing new to apply. |
-| `zinder-query`, wallet-mode compatibility | `ready`, with `node_source` under `degraded` | Compact blocks, blocks, transactions, transparent address queries, tree states at any height, subtree roots, chain events, and server info, from storage. | Broadcasts, and `GetStandardFee` in wallet-mode compatibility, which fail with `UNAVAILABLE` and `NODE_UNAVAILABLE`. In compatibility serving, wallet and compact-blocks alike, `GetLatestBlock` and `GetLightdInfo` once the served tip is older than `compat.stale_tip_limit_ms`, 25 minutes by default ([Stale tip](lightwalletd-compatibility.md#stale-tip)), because the writer cannot reach its node to vouch for the tip. |
+| `zinder-query`, wallet-mode compatibility | `ready` while writer attestation holds, with configured `node_source` under `degraded` | Stored blocks, retained transactions, transparent address queries, tree states, and subtree roots. Native query also serves chain events and server info. | Broadcasts and wallet-mode `GetStandardFee` fail with `UNAVAILABLE` and `NODE_UNAVAILABLE`. |
+| Light-wallet compatibility | `ready` while writer attestation holds, with `node_source` under `degraded` after the node probe fails | Local block ranges, tree states, subtree roots, retained transaction bodies, and cached verified transaction bodies. | Calls that need the forwarding node fail with `UNAVAILABLE`, including broadcast. A history stream can fail after delivering rows. See the [method contracts](lightwalletd-compatibility.md#method-behavior). |
+| Compact-blocks compatibility | `ready` while writer attestation holds | Canonical block and range reads. | The tip calls follow the stale-tip rule below. |
 | `zinder-explorer` | `ready` | Stored views. | Observing the node's tip for `ExplorerFreshness`. |
 
-Watch `served_epoch_age_seconds` during an outage. It grows while the chain
-stands still, and it is the readiness signal that shows the served view is
-stale. A wallet that builds a transaction on a tip more than about 40 blocks
-behind the network creates one that has already expired, which is why
-lightwalletd tip calls stop answering a tip older than
-`compat.stale_tip_limit_ms` that the node cannot vouch for.
+When ingest loses its live mempool because its node is unavailable, wallet
+and light-wallet compatibility refuse new mempool calls through ingest
+control. Losing only the forwarding node does not withdraw ingest's mempool.
+
+In all three compatibility modes, `GetLatestBlock` and `GetLightdInfo`
+can fail with `UNAVAILABLE` while `/readyz` returns 200. The
+[stale-tip rule](lightwalletd-compatibility.md#stale-tip) applies when the tip
+is too old and the writer's node cannot vouch for it. Watch
+`served_epoch_age_seconds` while the chain stands still.
 
 Readers stop serving in these cases:
 
 - **Ingest stops.** Readers lose the writer's status RPC and keep serving for
   `storage.serving_pair_staleness_ceiling_ms`, 5 minutes by default. Then
-  they report `writer_status_unavailable` and refuse traffic.
+  they report `writer_status_unavailable` and refuse traffic (and under
+  `zinder serve`, an unexpected child exit triggers fail-fast shutdown so the
+  orchestrator restarts cleanly).
 - **Ingest restarts while the node is down.** Ingest needs a node to start and
   to confirm its tip. Readers report `canonical_tip_unconfirmed` until it
   does.
-- **The single-volume container's node stays unreachable for 24 hours.** Its
-  entrypoint then ends the container, so a stuck node client restarts. See
-  [Single-volume deployment](../runbooks/deploying-single-volume.md).
 
-A reader that restarts during a node outage serves again once its pair
-converges, because readers start without contacting a node.
+A reader that restarts during a node outage serves local data once its pair
+or canonical generation converges and the writer attests it. Readers can open
+their local stores without contacting their configured node.

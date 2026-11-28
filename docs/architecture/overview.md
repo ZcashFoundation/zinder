@@ -19,17 +19,23 @@ lightwalletd, and other indexers, see the
 
 ## Runtimes and stores
 
-Zinder runs as separate processes, called runtimes. They share one host
-filesystem and three RocksDB stores. Each store has exactly one writer. Every
-other runtime opens it read-only as a RocksDB secondary.
+Operators run the unified `zinder` binary (`services/zinder`):
 
-| Runtime | Role | Writes | Reads | Required |
+- `zinder serve [--preset <light-wallet|wallet|explorer>]`: supervises the selected role processes in one container or host process, exposing T=0 `/healthz`, `/readyz`, and aggregated `/metrics` on `:9108`. Adding `--readers-only` runs only serving readers against an existing writer.
+- `zinder index [--preset <light-wallet|wallet|explorer>]`: runs the canonical writer (and projector for `wallet` and `explorer`) cleanly separated from reader processes, as in the two-container [Docker Compose deployment](../../deploy/docker-compose.yml).
+- `zinder run <role>`: invokes an individual role process directly (`ingest`, `projector`, `query`, `compat-lightwalletd`, `explorer`, or `compat-cipherscan`). Thin per-crate binaries also remain in the workspace.
+
+Inside those presets, Zinder separates storage writes from reads cleanly. A deployment keeps the RocksDB stores its runtimes need on one host filesystem. Each store has exactly one writer, and every other runtime opens it read-only as a RocksDB secondary.
+
+| Role | What it does | Writes | Reads | Presets |
 | --- | --- | --- | --- | --- |
-| `zinder-ingest` | Follows the node, builds the canonical index, handles reorgs, tracks the mempool, and serves a private control API to the other runtimes | Canonical store; materialized-view store when `ingest.explorer_views = true` | Node JSON-RPC, and the node's indexer gRPC for the mempool when configured | Yes |
-| `zinder-projector` | Builds and follows the wallet store from canonical chain events | Wallet store | Canonical store, ingest control | Yes, for wallet serving |
-| `zinder-query` | Serves the native `WalletQuery` gRPC protocol and broadcasts transactions | Nothing | Canonical and wallet stores, ingest control, node for broadcast | For native and Rust SDK clients |
-| `zinder-compat-lightwalletd` | Serves lightwalletd's `CompactTxStreamer` protocol | Nothing | Canonical and wallet stores, ingest control, node for broadcast and `GetStandardFee`; with `compat.serving = "compact-blocks"`, only the canonical store and ingest control | For lightwalletd clients |
-| `zinder-explorer` | Serves `ExplorerQuery` for block explorers | Nothing | Materialized-view store, `WalletQuery` over gRPC, optional `[node]` for tip observation | No |
+| `zinder-ingest` | Follows the node, builds the canonical index, handles reorgs, tracks the mempool, and serves a private control API | Canonical store; materialized-view store when `ingest.explorer_views = true` | Node JSON-RPC and indexer gRPC (for mempool when configured) | All |
+| `zinder-projector` | Builds and follows the wallet store from canonical chain events | Wallet store | Canonical store, ingest control | `wallet`, `explorer` |
+| `zinder-query` | Serves the native `WalletQuery` gRPC protocol and broadcasts transactions | Nothing | Canonical and wallet stores, ingest control, node for broadcast | `wallet`, `explorer` |
+| `zinder-compat-lightwalletd` | Serves the lightwalletd `CompactTxStreamer` protocol (plus gRPC-Web) | Nothing | Canonical store and ingest control (plus wallet store and optional node in `wallet`/`explorer`; node forwarding in `light-wallet`) | All |
+| `zinder-explorer` | Serves `ExplorerQuery` for block explorers | Nothing | Canonical secondary store, optional materialized-view store, optional `WalletQuery`, optional `[node]` for tip observation | `explorer` (or standalone) |
+| `zinder-compat-cipherscan` | Serves Cipherscan-compatible REST and WebSocket endpoints | Nothing | `ExplorerQuery` and `WalletQuery` | `explorer` (or standalone) |
+| `zinder-compat-lightwalletd` | Translates `CompactTxStreamer` gRPC queries and streams canonical `ZSHRNG02` settled segments and `live_tail_block` wire payloads directly | gRPC endpoint | Canonical/wallet secondaries + `IngestControl` (and node for `light-wallet`) | Optional (`light-wallet` / `wallet`) |
 
 The three stores hold different things:
 
@@ -39,30 +45,47 @@ The three stores hold different things:
 - The **wallet store** holds transparent address indexes: unspent outputs,
   spent outputs, address history, and balances. It is derived entirely from the
   canonical store and can be rebuilt from it.
-- The **materialized-view store** holds explorer aggregates. It is optional and
-  rebuildable.
+- The **materialized-view store** holds optional explorer aggregates. It is
+  rebuildable, isolated from wallet storage, and never blocks wallet data reads when run separately; under `zinder serve --preset explorer`, Explorer and Cipherscan share the supervisor's `/readyz` and fail-fast exit boundary.
+
+### Logical architecture & presets
 
 ```mermaid
 flowchart LR
-    Node["Zebra or Zakura<br/>archive node"] --> Ingest["zinder-ingest"]
-    Ingest --> Canonical[("Canonical store")]
-    Ingest -. optional .-> Views[("Materialized-view store")]
+    Node["Zebra 7.1.0 or Zakura 1.8.6 node"] --> Ingest["zinder index / ingest role"]
+    Ingest --> Canonical[("Canonical RocksDB")]
+    Ingest -. explorer preset .-> Views[("Materialized Views RocksDB")]
     Canonical --> Projector["zinder-projector"]
-    Projector --> Wallet[("Wallet store")]
-    Canonical --> Query["zinder-query<br/>WalletQuery"]
+    Projector --> Wallet[("Wallet RocksDB")]
+    Canonical --> Query["WalletQuery (:9102)"]
     Wallet --> Query
-    Canonical --> Compat["zinder-compat-lightwalletd<br/>CompactTxStreamer"]
-    Wallet --> Compat
-    Views -.-> Explorer["zinder-explorer<br/>ExplorerQuery"]
+    Canonical --> Compat["CompactTxStreamer (:9067)"]
+    Wallet -. wallet or explorer preset .-> Compat
+    Canonical --> Explorer["ExplorerQuery (:9068)"]
+    Views -. explorer_views .-> Explorer
     Query -.-> Explorer
+    Explorer --> Cipherscan["Cipherscan REST (:9070)"]
+    Query --> Cipherscan
+    Wallets["Light, Browser, and Native Wallets"] --> Compat
+    Wallets --> Query
+    Explorers["Block Explorers and UIs"] --> Explorer
+    Explorers --> Cipherscan
 ```
 
-The supported deployment runs every runtime on one host, because a RocksDB
-secondary reads the primary's files on the same filesystem. Remote consumers
-connect over gRPC. For the
-supported topologies and their requirements, see
-[service operations](service-operations.md) and
-[deploying Zinder](../runbooks/deploying.md).
+### Single-host deployment modes vs. M3 boundary
+
+The supported deployment runs every runtime against stores on one host or `ReadWriteOnce` persistent volume, because a RocksDB secondary reads the primary's files on the same filesystem. Remote consumers connect over gRPC or REST.
+
+```mermaid
+flowchart TD
+    Disk["Persistent Host Disk or RWO Volume (/var/lib/zinder)"]
+    Disk --> Compose["Linux VM / Compose: zinder-index + zinder-serve --readers-only"]
+    Disk --> PaaS["Single-Volume PaaS (Railway): zinder serve"]
+    Disk --> K8s["Kubernetes StatefulSet (replicas: 1, ReadWriteOnce PVC)"]
+    Serverless["Stateless Serverless (Cloud Run / Cloudflare Containers)"] --> Boundary["Unsupported on RocksDB until M3 PostgreSQL ([ADR-0004])"]
+```
+
+For deployment topologies and host sizing, see [service operations](service-operations.md), [deploy/README.md](../../deploy/README.md), and [deploying Zinder](../runbooks/deploying.md).
 
 ## From a block to a wallet response
 
@@ -84,14 +107,16 @@ supported topologies and their requirements, see
 [Chain ingestion](chain-ingestion.md) explains steps 1 and 2 in detail, and the
 [wallet data plane](wallet-data-plane.md) explains steps 4 and 5.
 
+For a deployment running ingest and a canonical-only compatibility reader, see the `light-wallet` preset in [Deployment profiles](../reference/configuration.md#deployment-profiles).
+
 ## Consistent reads
 
 Ingest publishes the chain as a sequence of complete snapshots called chain
 epochs (`ChainEpoch`), so a reader sees the previous epoch or the new one,
-never half of a write. Every read is pinned to one epoch, and native clients
-can pin several calls to one epoch with `at_epoch_id`;
-[Wallet data plane](wallet-data-plane.md#how-reads-stay-consistent) gives the
-rules.
+never half of a write. Native clients can pin related calls to one epoch with
+`at_epoch_id`. See [Wallet data plane](wallet-data-plane.md#how-reads-stay-consistent)
+for native reads and [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#method-behavior)
+for the view checks on forwarded reads.
 
 ## What stays in the wallet
 
@@ -126,10 +151,7 @@ the wallet's.
 | `zinder-runtime` | Shared configuration loader, `/healthz`, `/readyz`, and `/metrics`, readiness, and the public gRPC listener. |
 | `zinder-testkit` | Test fixtures for chains, stores, and nodes. |
 
-Each runtime in the table above is a crate under `services/`.
-`zinder-compat-cipherscan` is an optional adapter that is not released as an
-image, and `zinder-bench` is the benchmark harness. The
-[public interfaces](public-interfaces.md) page owns naming and API rules.
+`services/zinder` builds the unified `zinder` binary and `ghcr.io/zcashfoundation/zinder` OCI image covering every serving and indexing preset (`serve`, `index`, `run`, `snapshot`, `backup`, `config`, and `healthcheck`). Each runtime above also remains its own crate under `services/` (including `zinder-compat-cipherscan`), and `zinder-bench` is the benchmark harness. The [public interfaces](public-interfaces.md) page owns naming and API rules.
 
 ## Where a new capability belongs
 

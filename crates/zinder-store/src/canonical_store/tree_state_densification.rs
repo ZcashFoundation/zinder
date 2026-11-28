@@ -1,16 +1,17 @@
 //! Densifying the tree-state checkpoints of settled history.
 //!
-//! Construction stores a tree-state checkpoint at its history predecessor,
-//! every [`TREE_STATE_CHECKPOINT_STRIDE`] blocks, and at its build tip, so a
-//! read between two of them replays stored compact blocks. Densification fills
-//! a stride, from one stored checkpoint to the next cadence checkpoint, with
-//! the checkpoints a [`TreeStateCheckpointSelection`] picks. It replays the
-//! stride with the per-block step a tree-state reconstruction runs, and
-//! accepts the result only when the replay reproduces every checkpoint already
-//! stored in the stride, including the one that ends it, byte for byte. Each
-//! stride commits in one batch, so a stride is either complete or untouched,
-//! and only settled strides are densified, so no reorg can remove a densified
-//! row.
+//! Sparse construction stores a tree-state checkpoint at its history
+//! predecessor, every [`TREE_STATE_CHECKPOINT_STRIDE`] blocks, and at its
+//! build tip, so a read between two of them replays stored compact blocks;
+//! dense construction stores one for every loaded block directly.
+//! Densification fills any incomplete stride, from one stored checkpoint to
+//! the next cadence checkpoint, with the checkpoints a
+//! [`TreeStateCheckpointSelection`] picks. It replays the stride with the
+//! per-block step a tree-state reconstruction runs, and accepts the result
+//! only when the replay reproduces every checkpoint already stored in the
+//! stride, including the one that ends it, byte for byte. Each stride commits
+//! in one batch, so a stride is either complete or untouched, and only settled
+//! strides are densified, so no reorg can remove a densified row.
 
 use std::{collections::BTreeMap, num::NonZeroU32};
 
@@ -56,6 +57,38 @@ pub enum TreeStateCheckpointSelection {
 }
 
 impl TreeStateCheckpointSelection {
+    /// Returns whether the selection calls for a checkpoint after the given
+    /// tree sizes advance from the previous checkpoint.
+    #[must_use]
+    pub fn requires_checkpoint_since(
+        self,
+        previous: ChainTipMetadata,
+        current: ChainTipMetadata,
+    ) -> bool {
+        self.requires_checkpoint(
+            commitment_count(current).saturating_sub(commitment_count(previous)),
+        )
+    }
+
+    /// Checks whether the last miss before `next` stayed below the selection.
+    pub(super) fn gap_satisfies(
+        self,
+        previous: BlockHeight,
+        next: BlockHeight,
+        reads: &mut u32,
+        mut tree_sizes: impl FnMut(BlockHeight) -> Result<ChainTipMetadata, CanonicalStoreError>,
+    ) -> Result<bool, CanonicalStoreError> {
+        let gap_end = BlockHeight::new(next.value() - 1);
+        if gap_end <= previous {
+            return Ok(true);
+        }
+        if self == Self::EveryBlock {
+            return Ok(false);
+        }
+        *reads = reads.saturating_add(2);
+        Ok(!self.requires_checkpoint_since(tree_sizes(previous)?, tree_sizes(gap_end)?))
+    }
+
     /// Returns whether a gap that starts after `committed_since_checkpoint`
     /// commitments still needs a checkpoint before its next stored one.
     fn requires_checkpoint(self, committed_since_checkpoint: u64) -> bool {
@@ -517,18 +550,10 @@ fn stride_satisfies_counting_reads(
     }
     let mut previous = stride.seed_height;
     for height in stored_heights {
-        let gap_end = height.value() - 1;
-        if gap_end > previous.value() {
-            if selection == TreeStateCheckpointSelection::EveryBlock {
-                return Ok(false);
-            }
-            *reads = reads.saturating_add(2);
-            let anchored = commitment_count(stored_tree_sizes(store, stride, previous)?);
-            let reached =
-                commitment_count(stored_tree_sizes(store, stride, BlockHeight::new(gap_end))?);
-            if selection.requires_checkpoint(reached.saturating_sub(anchored)) {
-                return Ok(false);
-            }
+        if !selection.gap_satisfies(previous, height, reads, |height| {
+            stored_tree_sizes(store, stride, height)
+        })? {
+            return Ok(false);
         }
         previous = height;
     }
@@ -577,12 +602,13 @@ fn stored_tree_sizes(
     if height == predecessor.block_id.height {
         return Ok(predecessor.tip_metadata());
     }
-    let compact_block = read_compact_block_at(store, height)?.ok_or_else(|| {
-        stride_mismatch(
-            stride,
-            format!("compact block at height {} is absent", height.value()),
-        )
-    })?;
+    let compact_block =
+        read_compact_block_at(store.serving_context(), height)?.ok_or_else(|| {
+            stride_mismatch(
+                stride,
+                format!("compact block at height {} is absent", height.value()),
+            )
+        })?;
     Ok(recorded_tree_sizes(&compact_block))
 }
 
@@ -742,7 +768,10 @@ fn commitment_count(tree_sizes: ChainTipMetadata) -> u64 {
 /// Attributes store damage found while reading a stride, such as a row that
 /// does not decode, to that stride, so the pass can skip it.
 fn within_stride(stride: TreeStateStride, error: CanonicalStoreError) -> CanonicalStoreError {
-    if let CanonicalStoreError::PublicationRefused { reason } = error {
+    if let CanonicalStoreError::PublicationRefused { reason }
+    | CanonicalStoreError::SettledSegment { reason }
+    | CanonicalStoreError::ArtifactCorrupt { reason, .. } = error
+    {
         return stride_mismatch(stride, reason);
     }
     error

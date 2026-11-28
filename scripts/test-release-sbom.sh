@@ -18,6 +18,21 @@ expect_rejected() {
   fi
 }
 
+cargo_package() {
+  jq -c -n --arg name "$1" '{
+    SPDXID: ("SPDXRef-Package-" + $name),
+    name: $name,
+    versionInfo: "0.0.0",
+    downloadLocation: "NOASSERTION",
+    filesAnalyzed: false,
+    externalRefs: [{
+      referenceCategory: "PACKAGE-MANAGER",
+      referenceType: "purl",
+      referenceLocator: ("pkg:cargo/" + $name + "@0.0.0")
+    }]
+  }'
+}
+
 version=0.0.0
 tag=v0.0.0
 commit=0123456789abcdef0123456789abcdef01234567
@@ -64,7 +79,14 @@ cp "$apply_fixture" "$fake_syft"
 
 fixture="$scratch/syft-fixture.json"
 jq -n \
-  --arg rocksdb_version "$rocksdb_version" '{
+  --arg rocksdb_version "$rocksdb_version" \
+  --argjson zinder "$(cargo_package zinder)" \
+  --argjson ingest "$(cargo_package zinder-ingest)" \
+  --argjson projector "$(cargo_package zinder-projector)" \
+  --argjson query "$(cargo_package zinder-query)" \
+  --argjson compat "$(cargo_package zinder-compat-lightwalletd)" \
+  --argjson explorer "$(cargo_package zinder-explorer)" \
+  --argjson cipherscan "$(cargo_package zinder-compat-cipherscan)" '{
     spdxVersion: "SPDX-2.3",
     dataLicense: "CC0-1.0",
     SPDXID: "SPDXRef-DOCUMENT",
@@ -81,21 +103,20 @@ jq -n \
         externalRefs: [{referenceCategory: "PACKAGE-MANAGER", referenceType: "purl", referenceLocator: ("pkg:cargo/rust-librocksdb-sys@" + $rocksdb_version)}]
       },
       {
-        SPDXID: "SPDXRef-Package-Service",
-        name: "zinder-query",
-        versionInfo: "0.0.0",
-        downloadLocation: "NOASSERTION",
-        filesAnalyzed: false,
-        externalRefs: [{referenceCategory: "PACKAGE-MANAGER", referenceType: "purl", referenceLocator: "pkg:cargo/zinder-query@0.0.0"}]
-      },
-      {
         SPDXID: "SPDXRef-Package-Libstdcpp",
         name: "libstdc++6",
         versionInfo: "12.2.0",
         downloadLocation: "NOASSERTION",
         filesAnalyzed: false,
         externalRefs: [{referenceCategory: "PACKAGE-MANAGER", referenceType: "purl", referenceLocator: "pkg:deb/debian/libstdc%2B%2B6@12.2.0"}]
-      }
+      },
+      $zinder,
+      $ingest,
+      $projector,
+      $query,
+      $compat,
+      $explorer,
+      $cipherscan
     ],
     relationships: []
   }' > "$fixture"
@@ -115,8 +136,27 @@ cmp "$sbom" "$second_sbom"
 "$repository_root/scripts/check-release-sbom.sh" "$sbom" \
   --archive "$archive" --version "$version" --platform "$platform" --commit "$commit"
 
+for archive_platform in aarch64-apple-darwin x86_64-unknown-linux-gnu; do
+  platform_options=(--target "$archive_platform")
+  if [[ "$archive_platform" == x86_64-unknown-linux-gnu ]]; then
+    platform_options+=(--cpu-baseline x86-64 --pasta-asm 0)
+  fi
+  "$repository_root/scripts/build-release-binary-archive.sh" \
+    --binaries "$scratch/bin" --output "$archive_directory" \
+    --version "$version" --tag "v$version" --commit "$commit" --source-date-epoch 1700000000 \
+    "${platform_options[@]}"
+  platform_archive="$archive_directory/zinder-${version}-${archive_platform}.tar.gz"
+  platform_sbom="$scratch/zinder-${version}-${archive_platform}.spdx.json"
+  ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$fixture" \
+    "$repository_root/scripts/generate-release-sbom.sh" \
+      --archive "$platform_archive" --output "$platform_sbom" \
+      --version "$version" --platform "$archive_platform" --commit "$commit"
+  "$repository_root/scripts/check-release-sbom.sh" "$platform_sbom" \
+    --archive "$platform_archive" --version "$version" --platform "$archive_platform" --commit "$commit"
+done
+
 missing_file="$scratch/zinder-${version}-${platform}.missing-file.spdx.json"
-jq 'del(.files[] | select(.fileName == "./bin/zinder-query"))' "$sbom" > "$missing_file"
+jq 'del(.files[] | select(.fileName == "./bin/zinder"))' "$sbom" > "$missing_file"
 cp "$missing_file" "$sbom"
 expect_rejected "a missing executable file record" \
   "$repository_root/scripts/check-release-sbom.sh" "$sbom" \
@@ -154,7 +194,7 @@ expect_rejected "an excluded workspace package" \
   "$repository_root/scripts/check-release-sbom.sh" "$sbom" \
     --archive "$archive" --version "$version" --platform "$platform" --commit "$commit"
 
-image=ghcr.io/example/zinder-query
+image=ghcr.io/example/zinder
 image_tag=v0.0.0
 amd64_digest="sha256:$(printf amd64 | sha256sum | awk '{print $1}')"
 arm64_digest="sha256:$(printf arm64 | sha256sum | awk '{print $1}')"
@@ -196,199 +236,27 @@ expect_rejected "an image package without explicit license evidence" \
     --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
     --amd64-sbom "$missing_image_license_sbom" --arm64-sbom "$arm64_sbom"
 
-missing_service_sbom="$scratch/missing-service.spdx.json"
-jq 'del(.packages[] | select(.name == "zinder-query"))' "$amd64_sbom" > "$missing_service_sbom"
-expect_rejected "an image SBOM without its service executable package" \
-  "$repository_root/scripts/check-release-image-evidence.sh" "$manifest" \
-    --image "$image" --tag "$image_tag" --commit "$commit" --root-digest "$root_digest" \
-    --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
-    --amd64-sbom "$missing_service_sbom" --arm64-sbom "$arm64_sbom"
-
-foreign_service_sbom="$scratch/foreign-service.spdx.json"
-jq '.packages += [{SPDXID:"SPDXRef-ForeignService",name:"zinder-ingest",versionInfo:"0.0.0",downloadLocation:"NOASSERTION",filesAnalyzed:false,externalRefs:[{referenceCategory:"PACKAGE-MANAGER",referenceType:"purl",referenceLocator:"pkg:cargo/zinder-ingest@0.0.0"}]}]' \
-  "$amd64_sbom" > "$foreign_service_sbom"
-expect_rejected "an image SBOM containing another service executable package" \
-  "$repository_root/scripts/check-release-image-evidence.sh" "$manifest" \
-    --image "$image" --tag "$image_tag" --commit "$commit" --root-digest "$root_digest" \
-    --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
-    --amd64-sbom "$foreign_service_sbom" --arm64-sbom "$arm64_sbom"
-
-compat_image=ghcr.io/example/zinder-compat-lightwalletd
-compat_fixture="$scratch/compat-syft-fixture.json"
-jq '.packages += [{
-  SPDXID:"SPDXRef-Package-CompatService",
-  name:"zinder-compat-lightwalletd",
-  versionInfo:"0.0.0",
-  downloadLocation:"NOASSERTION",
-  filesAnalyzed:false,
-  externalRefs:[{
-    referenceCategory:"PACKAGE-MANAGER",
-    referenceType:"purl",
-    referenceLocator:"pkg:cargo/zinder-compat-lightwalletd@0.0.0"
-  }]
-}]' "$fixture" > "$compat_fixture"
-compat_amd64_sbom="$scratch/compat-amd64.spdx.json"
-compat_arm64_sbom="$scratch/compat-arm64.spdx.json"
-for architecture in amd64 arm64; do
-  digest_variable="${architecture}_digest"
-  output_variable="compat_${architecture}_sbom"
-  ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$compat_fixture" \
-    "$repository_root/scripts/generate-release-sbom.sh" \
-      --image "$compat_image" --tag "$image_tag" --commit "$commit" \
-      --architecture "$architecture" --digest "${!digest_variable}" \
-      --output "${!output_variable}"
+for required_package in zinder zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd zinder-explorer zinder-compat-cipherscan; do
+  missing_runtime_sbom="$scratch/missing-${required_package}.spdx.json"
+  jq --arg name "$required_package" 'del(.packages[] | select(.name == $name))' \
+    "$amd64_sbom" > "$missing_runtime_sbom"
+  expect_rejected "an image SBOM missing runtime package ${required_package}" \
+    "$repository_root/scripts/check-release-image-evidence.sh" "$manifest" \
+      --image "$image" --tag "$image_tag" --commit "$commit" --root-digest "$root_digest" \
+      --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
+      --amd64-sbom "$missing_runtime_sbom" --arm64-sbom "$arm64_sbom"
 done
-"$repository_root/scripts/check-release-image-evidence.sh" "$manifest" \
-  --image "$compat_image" --tag "$image_tag" --commit "$commit" --root-digest "$root_digest" \
-  --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
-  --amd64-sbom "$compat_amd64_sbom" --arm64-sbom "$compat_arm64_sbom"
 
-compat_missing_query_sbom="$scratch/compat-missing-query.spdx.json"
-jq 'del(.packages[] | select(.name == "zinder-query"))' \
-  "$compat_amd64_sbom" > "$compat_missing_query_sbom"
-expect_rejected "a compatibility image SBOM without its declared query dependency" \
-  "$repository_root/scripts/check-release-image-evidence.sh" "$manifest" \
-    --image "$compat_image" --tag "$image_tag" --commit "$commit" --root-digest "$root_digest" \
-    --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
-    --amd64-sbom "$compat_missing_query_sbom" --arm64-sbom "$compat_arm64_sbom"
-
-compat_foreign_service_sbom="$scratch/compat-foreign-service.spdx.json"
-jq '.packages += [{
-  SPDXID:"SPDXRef-ForeignCompatService",
-  name:"zinder-ingest",
-  versionInfo:"0.0.0",
-  downloadLocation:"NOASSERTION",
-  filesAnalyzed:false,
-  externalRefs:[{
-    referenceCategory:"PACKAGE-MANAGER",
-    referenceType:"purl",
-    referenceLocator:"pkg:cargo/zinder-ingest@0.0.0"
-  }]
-}]' "$compat_amd64_sbom" > "$compat_foreign_service_sbom"
-expect_rejected "a compatibility image SBOM containing an undeclared service package" \
-  "$repository_root/scripts/check-release-image-evidence.sh" "$manifest" \
-    --image "$compat_image" --tag "$image_tag" --commit "$commit" --root-digest "$root_digest" \
-    --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
-    --amd64-sbom "$compat_foreign_service_sbom" --arm64-sbom "$compat_arm64_sbom"
-
-cargo_package() {
-  jq -c -n --arg name "$1" '{
-    SPDXID: ("SPDXRef-Package-" + $name),
-    name: $name,
-    versionInfo: "0.0.0",
-    downloadLocation: "NOASSERTION",
-    filesAnalyzed: false,
-    externalRefs: [{
-      referenceCategory: "PACKAGE-MANAGER",
-      referenceType: "purl",
-      referenceLocator: ("pkg:cargo/" + $name + "@0.0.0")
-    }]
-  }'
-}
-
-check_single_volume_image_evidence() {
-  local single_volume_image="$1"
-  local single_volume_amd64_sbom="$2"
-  local single_volume_arm64_sbom="$3"
-  "$repository_root/scripts/check-release-image-evidence.sh" "$manifest" \
-    --image "$single_volume_image" --tag "$image_tag" --commit "$commit" --root-digest "$root_digest" \
-    --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
-    --amd64-sbom "$single_volume_amd64_sbom" --arm64-sbom "$single_volume_arm64_sbom"
-}
-
-wallet_serving_image=ghcr.io/example/zinder-wallet-serving
-wallet_serving_fixture="$scratch/wallet-serving-syft-fixture.json"
-jq --argjson ingest "$(cargo_package zinder-ingest)" \
-  --argjson projector "$(cargo_package zinder-projector)" \
-  --argjson compat "$(cargo_package zinder-compat-lightwalletd)" \
-  '.packages += [$ingest, $projector, $compat]' "$fixture" > "$wallet_serving_fixture"
-wallet_serving_explorer_image=ghcr.io/example/zinder-wallet-serving-explorer
-wallet_serving_explorer_fixture="$scratch/wallet-serving-explorer-syft-fixture.json"
-jq --argjson explorer "$(cargo_package zinder-explorer)" \
-  '.packages += [$explorer]' "$wallet_serving_fixture" > "$wallet_serving_explorer_fixture"
-explorer_image=ghcr.io/example/zinder-explorer
-explorer_fixture="$scratch/explorer-syft-fixture.json"
-jq --argjson explorer "$(cargo_package zinder-explorer)" \
-  'del(.packages[] | select(.name == "zinder-query")) | .packages += [$explorer]' \
-  "$fixture" > "$explorer_fixture"
-canonical_runtime_image=ghcr.io/example/zinder-canonical-runtime
-canonical_runtime_fixture="$scratch/canonical-runtime-syft-fixture.json"
-jq --argjson ingest "$(cargo_package zinder-ingest)" \
-  'del(.packages[] | select(.name == "zinder-query")) | .packages += [$ingest]' \
-  "$fixture" > "$canonical_runtime_fixture"
-for architecture in amd64 arm64; do
-  digest_variable="${architecture}_digest"
-  ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$wallet_serving_fixture" \
-    "$repository_root/scripts/generate-release-sbom.sh" \
-      --image "$wallet_serving_image" --tag "$image_tag" --commit "$commit" \
-      --architecture "$architecture" --digest "${!digest_variable}" \
-      --output "$scratch/wallet-serving-${architecture}.spdx.json"
-  ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$wallet_serving_explorer_fixture" \
-    "$repository_root/scripts/generate-release-sbom.sh" \
-      --image "$wallet_serving_explorer_image" --tag "$image_tag" --commit "$commit" \
-      --architecture "$architecture" --digest "${!digest_variable}" \
-      --output "$scratch/wallet-serving-explorer-${architecture}.spdx.json"
-  ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$explorer_fixture" \
-    "$repository_root/scripts/generate-release-sbom.sh" \
-      --image "$explorer_image" --tag "$image_tag" --commit "$commit" \
-      --architecture "$architecture" --digest "${!digest_variable}" \
-      --output "$scratch/explorer-${architecture}.spdx.json"
-  ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$canonical_runtime_fixture" \
-    "$repository_root/scripts/generate-release-sbom.sh" \
-      --image "$canonical_runtime_image" --tag "$image_tag" --commit "$commit" \
-      --architecture "$architecture" --digest "${!digest_variable}" \
-      --output "$scratch/canonical-runtime-${architecture}.spdx.json"
+for forbidden_package in zinder-bench zinder-testkit zinder-proto-codegen; do
+  forbidden_sbom="$scratch/forbidden-${forbidden_package}.spdx.json"
+  jq --argjson forbidden "$(cargo_package "$forbidden_package")" '.packages += [$forbidden]' \
+    "$amd64_sbom" > "$forbidden_sbom"
+  expect_rejected "an image SBOM containing forbidden package ${forbidden_package}" \
+    "$repository_root/scripts/check-release-image-evidence.sh" "$manifest" \
+      --image "$image" --tag "$image_tag" --commit "$commit" --root-digest "$root_digest" \
+      --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
+      --amd64-sbom "$forbidden_sbom" --arm64-sbom "$arm64_sbom"
 done
-check_single_volume_image_evidence "$wallet_serving_image" \
-  "$scratch/wallet-serving-amd64.spdx.json" "$scratch/wallet-serving-arm64.spdx.json"
-check_single_volume_image_evidence "$canonical_runtime_image" \
-  "$scratch/canonical-runtime-amd64.spdx.json" "$scratch/canonical-runtime-arm64.spdx.json"
-check_single_volume_image_evidence "$wallet_serving_explorer_image" \
-  "$scratch/wallet-serving-explorer-amd64.spdx.json" "$scratch/wallet-serving-explorer-arm64.spdx.json"
-check_single_volume_image_evidence "$explorer_image" \
-  "$scratch/explorer-amd64.spdx.json" "$scratch/explorer-arm64.spdx.json"
-
-wallet_serving_with_explorer_sbom="$scratch/wallet-serving-with-explorer.spdx.json"
-jq --argjson explorer "$(cargo_package zinder-explorer)" '.packages += [$explorer]' \
-  "$scratch/wallet-serving-amd64.spdx.json" > "$wallet_serving_with_explorer_sbom"
-expect_rejected "a wallet-serving image SBOM containing the Explorer executable package" \
-  check_single_volume_image_evidence "$wallet_serving_image" \
-    "$wallet_serving_with_explorer_sbom" "$scratch/wallet-serving-arm64.spdx.json"
-
-wallet_serving_explorer_missing_explorer_sbom="$scratch/wallet-serving-explorer-missing-explorer.spdx.json"
-jq 'del(.packages[] | select(.name == "zinder-explorer"))' \
-  "$scratch/wallet-serving-explorer-amd64.spdx.json" > "$wallet_serving_explorer_missing_explorer_sbom"
-expect_rejected "a wallet-serving Explorer image SBOM without the Explorer executable package" \
-  check_single_volume_image_evidence "$wallet_serving_explorer_image" \
-    "$wallet_serving_explorer_missing_explorer_sbom" "$scratch/wallet-serving-explorer-arm64.spdx.json"
-
-explorer_query_sbom="$scratch/explorer-query.spdx.json"
-jq --argjson query "$(cargo_package zinder-query)" '.packages += [$query]' \
-  "$scratch/explorer-amd64.spdx.json" > "$explorer_query_sbom"
-expect_rejected "an Explorer image SBOM containing the native query executable package" \
-  check_single_volume_image_evidence "$explorer_image" \
-    "$explorer_query_sbom" "$scratch/explorer-arm64.spdx.json"
-
-wallet_serving_missing_projector_sbom="$scratch/wallet-serving-missing-projector.spdx.json"
-jq 'del(.packages[] | select(.name == "zinder-projector"))' \
-  "$scratch/wallet-serving-amd64.spdx.json" > "$wallet_serving_missing_projector_sbom"
-expect_rejected "a wallet-serving image SBOM without the projector executable package" \
-  check_single_volume_image_evidence "$wallet_serving_image" \
-    "$wallet_serving_missing_projector_sbom" "$scratch/wallet-serving-arm64.spdx.json"
-
-wallet_serving_missing_compat_sbom="$scratch/wallet-serving-missing-compat.spdx.json"
-jq 'del(.packages[] | select(.name == "zinder-compat-lightwalletd"))' \
-  "$scratch/wallet-serving-amd64.spdx.json" > "$wallet_serving_missing_compat_sbom"
-expect_rejected "a wallet-serving image SBOM without the compatibility executable package" \
-  check_single_volume_image_evidence "$wallet_serving_image" \
-    "$wallet_serving_missing_compat_sbom" "$scratch/wallet-serving-arm64.spdx.json"
-
-canonical_runtime_query_sbom="$scratch/canonical-runtime-query.spdx.json"
-jq --argjson query "$(cargo_package zinder-query)" '.packages += [$query]' \
-  "$scratch/canonical-runtime-amd64.spdx.json" > "$canonical_runtime_query_sbom"
-expect_rejected "a canonical-runtime image SBOM containing a reader executable package" \
-  check_single_volume_image_evidence "$canonical_runtime_image" \
-    "$canonical_runtime_query_sbom" "$scratch/canonical-runtime-arm64.spdx.json"
 
 three_platform_manifest="$scratch/three-platforms.json"
 jq '.manifests += [.manifests[0] | .platform.architecture = "s390x"]' \

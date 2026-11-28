@@ -7,6 +7,7 @@
 
 use std::{
     num::{NonZeroU16, NonZeroU32},
+    sync::{Arc, atomic::AtomicBool},
     time::Instant,
 };
 
@@ -15,29 +16,38 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use zinder_core::{
     BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
-    ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
-    MAX_SUBTREE_ROOTS_PER_REQUEST, NetworkUpgradeActivations, RawTransactionBytes,
+    ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact, CompactBlockNullifiers,
+    CompactPool, MAX_SUBTREE_ROOTS_PER_REQUEST, NetworkUpgradeActivations, RawTransactionBytes,
     ShieldedProtocol, StandardFee, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
     TransactionBlobArtifact, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
     TransparentOutPoint, TransparentOutpointSpendStatus, TxStatus,
 };
 use zinder_proto::capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1;
+use zinder_proto::compat::lightwalletd::EncodedBlock;
 use zinder_source::SourceError;
 use zinder_store::{
     ArtifactFamily, ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume,
-    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EventStreamStartPosition, HeightOrder, StoreError,
+    CompactBlockSpliceSelection, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EncodedCompactBlockRange,
+    EncodedCompactBlockRangeRequest, EventStreamStartPosition, HeightOrder, StoreError,
     StreamCursorTokenV1,
 };
 
 mod broadcast_byte_budget;
+mod cold_transaction;
+mod compact_range_stream;
+mod forwarded_read;
 mod grpc;
 mod ingest_control;
+mod light_wallet;
 mod native_wallet_endpoint_capabilities;
 mod node_broadcast;
 #[cfg(test)]
 mod observed_canonical_reader;
+mod ordered_transactions;
+pub use light_wallet::{LightWalletNodeQuery, VerifiedNodeTarget};
 mod rocksdb_serving_readers;
+pub mod runtime;
 mod serving_read;
 mod serving_readers;
 mod transparent_unspent_output_stream;
@@ -47,6 +57,14 @@ mod wallet_serving_pair_publisher;
 mod wallet_serving_query;
 
 pub use broadcast_byte_budget::BROADCAST_BYTE_BUDGET;
+pub use forwarded_read::{
+    DEFAULT_FORWARDED_READ_MAX_CONCURRENT, DEFAULT_FORWARDED_READ_WAIT,
+    DEFAULT_FORWARDED_READ_WAITERS_PER_SLOT, DEFAULT_FORWARDED_TRANSACTION_CACHE_BYTES,
+    FORWARDED_HISTORY_DEADLINE, ForwardedReadConfig, ForwardedReadConfigError, ForwardedReadKind,
+    ForwardedReadLimit, ForwardedReadRefused, ForwardedResponseKind, ForwardedResponsePermit,
+    ForwardedTransactionError, MAX_FORWARDED_READ_MAX_CONCURRENT, MAX_FORWARDED_READ_WAIT,
+    MAX_FORWARDED_READ_WAITERS_PER_SLOT, MAX_FORWARDED_TRANSACTION_CACHE_BYTES,
+};
 pub use grpc::{
     DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS, TransactionStatusLookup,
     WALLET_QUERY_FIELD_LIMITS, WalletEndpointMetadata, WalletQueryGrpcAdapter,
@@ -57,39 +75,50 @@ pub use grpc::{
     build_wallet_server_info, chain_events_response, chain_value_pools_at_tip_response,
     compact_block_response, compact_blocks_in_range_header, compact_blocks_in_range_item,
     full_block_response, latest_tree_state_checkpoint_response,
-    network_upgrade_activations_response, status_from_query_error, subtree_roots_response,
-    transaction_response, transparent_address_tx_ids_response,
-    transparent_address_unspent_outputs_response, transparent_outpoint_spend_status_response,
-    tree_state_at_response, visible_tip_block_response,
+    network_upgrade_activations_response, parse_receivable_transparent_address,
+    status_from_query_error, subtree_roots_response, transaction_response,
+    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
+    transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
 };
 pub use ingest_control::{
     AdmittedIngestControl, IngestControlAdmissionError, WALLET_INGEST_CONTROL_REQUEST_TIMEOUT,
-    wallet_ingest_control_request,
+    wallet_ingest_control_request, wallet_mempool_events_request,
 };
 pub use native_wallet_endpoint_capabilities::{
     NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
 };
 pub use node_broadcast::OrderedBroadcaster;
+pub use ordered_transactions::{
+    CanonicalRefill, CompletedCanonicalRefill, PendingTransaction, TransactionsInOrder,
+};
+pub use rocksdb_serving_readers::MinedTransactionDigest;
 pub use rocksdb_serving_readers::{RocksDbCanonicalReader, RocksDbWalletReader};
 pub use serving_readers::{
-    CanonicalReader, IndexedTransaction, SpendStatusReadEnd, StorageReadError,
-    WalletProjectionReader, read_on_blocking_thread,
+    CanonicalReader, EncodedCompactBlockLookup, IndexedTransaction, SpendStatusReadEnd,
+    StorageReadError, WalletProjectionReader, read_on_blocking_thread,
 };
 pub use transparent_unspent_output_stream::{
     TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressUnspentOutputs,
 };
 pub use tree_state_replay_limit::{
     DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
-    MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+    MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT, ServedTreeStateHex,
 };
 pub use wallet_serving_pair::{WalletServingAdmissionError, WalletServingReadPair};
 pub use wallet_serving_pair_publisher::{
-    WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
+    EpochPinRetention, WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
     WalletServingPairPublisher, WalletServingPairSlot, WalletServingPairTeardownError,
     WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
     spawn_wallet_node_readiness_probe,
 };
 pub use wallet_serving_query::WalletServingQuery;
+pub use zinder_store::{
+    EncodedCompactBlockLink as CanonicalEncodedCompactBlockLink,
+    EncodedCompactBlockOutput as CanonicalEncodedCompactBlockOutput,
+    EncodedCompactBlockPayload as CanonicalEncodedCompactBlockPayload,
+    EncodedCompactBlockRange as CanonicalEncodedCompactBlockRange,
+    EncodedCompactBlockRangeRequest as CanonicalEncodedCompactBlockRangeRequest,
+};
 /// Wallet-facing read API backed by epoch-bound canonical reads.
 ///
 /// Canonical reads take `at_epoch_id: Option<ChainEpochId>`. `None` resolves to
@@ -98,6 +127,38 @@ pub use wallet_serving_query::WalletServingQuery;
 /// instead of accepting a pin.
 #[async_trait]
 pub trait WalletQueryApi: Send + Sync + 'static {
+    /// Subscribes to replacements of the serving data this query reads, so a
+    /// caller can wait for a newer visible tip without polling.
+    ///
+    /// The receiver reports a change for every replacement made after this
+    /// call. `None` means the query publishes no replacements, and a caller
+    /// must not wait for one.
+    fn subscribe_publications(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        None
+    }
+
+    /// Returns the visible tip height of the serving data current now,
+    /// without keeping that data readable for epoch pins.
+    ///
+    /// A caller that only compares heights, such as one waiting for a newer
+    /// tip, reads it this way so its checks never retain a replaced
+    /// generation. `None` means the query has no such read, and the caller
+    /// reads the tip through [`Self::visible_tip_block`].
+    fn current_visible_tip_height(&self) -> Option<BlockHeight> {
+        None
+    }
+
+    /// Returns the chain epoch of the serving data current now, without
+    /// keeping that data readable for epoch pins.
+    ///
+    /// A probe that exposes no epoch, such as a tip or staleness check, reads
+    /// it this way. The caller must not pin a read to the returned epoch.
+    /// `None` means the query has no such read, and the caller reads the
+    /// epoch through [`Self::visible_tip_block`].
+    fn current_chain_epoch(&self) -> Option<ChainEpoch> {
+        None
+    }
+
     /// Returns the immutable structural capability set derived when this query
     /// was composed and admitted.
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities;
@@ -125,6 +186,24 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<VisibleTipBlock, QueryError>;
+
+    /// Reads the visible tip and its block time for one single-shot answer,
+    /// such as a latest-block or server-info response.
+    ///
+    /// The caller must not read again by the returned epoch. A query that
+    /// serves from a pair slot answers from one pair without keeping that
+    /// pair readable for pins, so frequent tip calls never hold a serving
+    /// generation. The default composes the pinned reads.
+    async fn served_tip_snapshot(&self) -> Result<ServedTipSnapshot, QueryError> {
+        let tip = self.visible_tip_block(None).await?;
+        let header = self
+            .block_header_by_selector(BlockSelector::Height(tip.height), Some(tip.chain_epoch.id))
+            .await?;
+        Ok(ServedTipSnapshot {
+            chain_epoch: tip.chain_epoch,
+            block_time_unix_seconds: header.block_header.block_time,
+        })
+    }
 
     /// Reads the block at the chain epoch's settled finality watermark.
     /// Mirrors `visible_tip_block` but resolves to
@@ -154,6 +233,18 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlock, QueryError>;
+
+    /// Reads one pre-encoded lightwalletd compact-block wire payload at `height`
+    /// directly from canonical `ZSHRNG02` + `ZSTSUP01` or `live_tail_block`, or
+    /// returns `Ok(None)` when the implementation does not expose segment framing.
+    async fn encoded_compact_block_at(
+        &self,
+        _height: BlockHeight,
+        _selection: CompactBlockSpliceSelection,
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<Option<EncodedCompactBlock>, QueryError> {
+        Ok(None)
+    }
 
     /// Reads compact block artifacts for an inclusive height range.
     async fn compact_blocks_in_range(
@@ -192,6 +283,34 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         })
     }
 
+    /// Streams compact blocks in the requested height order at one epoch.
+    async fn ordered_compact_block_stream(
+        &self,
+        block_range: BlockHeightRange,
+        order: HeightOrder,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockStream, QueryError> {
+        if order == HeightOrder::Ascending {
+            return self.compact_block_stream(block_range, at_epoch_id).await;
+        }
+        Err(QueryError::EndpointCapabilityUnavailable {
+            capability: zinder_proto::capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V3,
+        })
+    }
+
+    /// Streams shielded nullifiers in height order at one chain epoch.
+    async fn compact_nullifier_stream(
+        &self,
+        _block_range: BlockHeightRange,
+        _order: HeightOrder,
+        _pools: Vec<CompactPool>,
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockStream<CompactBlockNullifiers>, QueryError> {
+        Err(QueryError::EndpointCapabilityUnavailable {
+            capability: zinder_proto::capabilities::WALLET_READ_COMPACT_NULLIFIER_RANGE_V1,
+        })
+    }
+
     /// Reads compact block artifacts from one end of an inclusive height
     /// range, up to a byte budget.
     ///
@@ -213,6 +332,21 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         max_bytes: usize,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError>;
+
+    /// Reads pre-encoded lightwalletd compact-block wire payloads or batched frames
+    /// directly from canonical `ZSHRNG02` settled segments and `live_tail_block`,
+    /// bounded by `request.max_bytes` while always keeping at least one block.
+    ///
+    /// Implementations without direct canonical segment access keep the default
+    /// `Ok(None)` so callers can fall back to [`Self::compact_blocks_in_range_up_to`].
+    async fn encoded_compact_block_range_up_to(
+        &self,
+        _request: EncodedCompactBlockRangeRequest,
+        _at_epoch_id: Option<ChainEpochId>,
+        _cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<EncodedCompactBlockRange>, QueryError> {
+        Ok(None)
+    }
 
     /// Reads one full serialized block at a given height.
     ///
@@ -257,6 +391,55 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransactionStatus, QueryError>;
 
+    /// Opens an ordered reader for `transaction_ids` at `at_epoch_id`.
+    ///
+    /// Canonical locations, block headers, and retained bodies are read in
+    /// bounded multi-get batches, and uncached cold bodies are fetched as
+    /// independent [`PendingTransaction`] futures charged to
+    /// [`ForwardedReadKind::History`].
+    ///
+    /// The default implementation resolves the current visible epoch once when
+    /// `at_epoch_id` is `None` and starts [`Self::transaction`] futures pinned
+    /// to that single epoch on demand as the caller polls
+    /// [`TransactionsInOrder`], never materializing more transaction bodies than
+    /// the caller's batch capacity. An implementation that wraps another should
+    /// forward this method to keep batched canonical reads active.
+    async fn transactions_in_order(
+        &self,
+        transaction_ids: Vec<TransactionId>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransactionsInOrder, QueryError>
+    where
+        Self: Sized + Clone,
+    {
+        let resolved_epoch_id = match at_epoch_id {
+            Some(epoch_id) => epoch_id,
+            None => self.visible_tip_block(None).await?.chain_epoch.id,
+        };
+        Ok(TransactionsInOrder::from_lazy_query(
+            self.clone(),
+            transaction_ids,
+            resolved_epoch_id,
+        ))
+    }
+
+    /// Verifies the node that supplies this query's transaction bytes against
+    /// the served tip of `at_epoch_id`, or of the current epoch when `None`.
+    ///
+    /// A caller consults the live mempool after a canonical miss only once
+    /// this succeeds, so a lookup never reports a pending answer or an
+    /// absence while the forwarding node is unreachable, behind the served
+    /// tip, or on a different chain from the served tip. A node that holds
+    /// the served tip on its best chain passes even when it has mined further.
+    /// A query whose store retains transaction bodies, or that
+    /// has no forwarding node, has nothing to verify and succeeds.
+    async fn verify_forwarding_node(
+        &self,
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<(), QueryError> {
+        Ok(())
+    }
+
     /// Reads the indexed transaction at `(height, tx_index)`.
     ///
     /// `tx_index` is the transaction's position within the full block, as
@@ -288,6 +471,19 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         request: TransparentAddressUnspentOutputsRequest,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError>;
+
+    /// Streams unspent outputs at one epoch across a bounded list of addresses.
+    async fn transparent_addresses_unspent_outputs(
+        &self,
+        _addresses: Vec<TransparentAddressScriptHash>,
+        _start_height: BlockHeight,
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+        Err(QueryError::EndpointCapabilityUnavailable {
+            capability:
+                zinder_proto::capabilities::WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1,
+        })
+    }
 
     /// Streams the outputs [`Self::transparent_address_unspent_outputs`]
     /// streams, in the same order and at the same pinned epoch, reading
@@ -348,9 +544,7 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// addresses at a single pinned chain epoch.
     ///
     /// Folds the complete unspent transparent output set of every requested
-    /// address into one saturating `confirmed_zat` total. The lightwalletd
-    /// compatibility adapter is the only consumer; the native endpoint does
-    /// not serve a balance.
+    /// address into one saturating `confirmed_zat` total.
     ///
     /// Rejects an empty address list and any list above
     /// [`MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES`] with
@@ -379,11 +573,43 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError>;
 
+    /// Reads the tree state at exactly `height`, pre-encoded in lowercase
+    /// hexadecimal for lightwalletd `GetTreeState` serving.
+    ///
+    /// Validation and errors match [`Self::tree_state_at`]. Because the
+    /// returned value exposes no chain epoch, an unpinned (`None`) read need
+    /// not retain its serving generation for future epoch pins. The default
+    /// encodes [`Self::tree_state_at`].
+    async fn tree_state_hex_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<ServedTreeStateHex, QueryError> {
+        let tree_state = self.tree_state_at(height, at_epoch_id).await?;
+        Ok(ServedTreeStateHex::from_tree_state(&tree_state))
+    }
+
     /// Reads the latest tree-state checkpoint at the visible chain epoch tip.
     async fn latest_tree_state_checkpoint(
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError>;
+
+    /// Reads the latest tree-state checkpoint at the visible chain epoch tip,
+    /// pre-encoded in lowercase hexadecimal for lightwalletd
+    /// `GetLatestTreeState` serving.
+    ///
+    /// Validation and errors match [`Self::latest_tree_state_checkpoint`].
+    /// Because the returned value exposes no chain epoch, an unpinned (`None`)
+    /// read need not retain its serving generation for future epoch pins. The
+    /// default encodes [`Self::latest_tree_state_checkpoint`].
+    async fn latest_tree_state_checkpoint_hex(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<ServedTreeStateHex, QueryError> {
+        let tree_state = self.latest_tree_state_checkpoint(at_epoch_id).await?;
+        Ok(ServedTreeStateHex::from_tree_state(&tree_state))
+    }
 
     /// Reads subtree-root artifacts for a bounded subtree range.
     ///
@@ -426,6 +652,12 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// configured, and [`SourceError::SourceProtocolMismatch`] when the node
     /// answers with a zero fee or a reply of another shape.
     async fn standard_fee(&self) -> Result<StandardFee, QueryError>;
+
+    /// Returns the retained canonical history bounds of the current serving
+    /// view without observing or pinning it, when available synchronously.
+    fn canonical_history_bounds(&self) -> Option<zinder_core::CanonicalHistoryBounds> {
+        None
+    }
 }
 
 /// Default maximum compact-block count returned by one range call.
@@ -465,7 +697,12 @@ pub const FULL_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 4;
 /// gRPC adapter, one mempool point lookup), so an unbounded list would let one
 /// request issue thousands of reads. `u32` matches the `address_count` field
 /// on the response so the bound check happens in the wire type's native width.
-pub const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 = 256;
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "The shared cap is 256 selectors and fits this preexisting u32 constant."
+)]
+pub const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 =
+    zinder_core::MAX_TRANSPARENT_ADDRESSES_PER_BATCH as u32;
 
 /// Metric pair the `WalletQuery` adapter emits per request.
 const QUERY_RPC_METRICS: zinder_runtime::RpcMetricNames =
@@ -493,6 +730,7 @@ pub fn describe_request_metrics() {
     tree_state_replay_limit::describe_metrics();
     grpc::describe_compact_block_stream_metrics();
     broadcast_byte_budget::describe_metrics();
+    forwarded_read::describe_metrics();
 }
 
 pub(crate) fn record_wallet_query_outcome<Response>(
@@ -551,7 +789,6 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::UnsupportedBlockSelector { .. }) => "unsupported_block_selector",
         Some(QueryError::UnsupportedTransactionStatus { .. }) => "unsupported_transaction_status",
         Some(QueryError::UnsupportedWalletEncoding { .. }) => "unsupported_wallet_encoding",
-        Some(QueryError::TransactionBroadcastDisabled) => "transaction_broadcast_disabled",
         Some(QueryError::BroadcastTransactionTooLarge { .. }) => "broadcast_transaction_too_large",
         Some(QueryError::BroadcastBudgetExhausted { .. }) => "broadcast_budget_exhausted",
         Some(QueryError::MaterializedViewUnavailable { .. }) => "materialized_view_unavailable",
@@ -560,6 +797,7 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::CompactBlockStreamLimitReached { .. }) => {
             "compact_block_stream_limit_reached"
         }
+        Some(QueryError::ForwardedReadLimitReached { .. }) => "forwarded_read_limit_reached",
         Some(QueryError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(QueryError::ArtifactCorrupt { .. }) => "artifact_corrupt",
         Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
@@ -634,6 +872,19 @@ pub struct VisibleTipBlock {
     pub block_hash: zinder_core::BlockHash,
 }
 
+/// The visible tip and the Unix time in its header, read from one pair for a
+/// single-shot answer.
+///
+/// Its epoch identifies the tip for caching. Reads by that epoch are not
+/// guaranteed to be served.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServedTipSnapshot {
+    /// Chain epoch of the pair that answered.
+    pub chain_epoch: ChainEpoch,
+    /// Unix time in the visible-tip block header.
+    pub block_time_unix_seconds: i64,
+}
+
 /// Settled-tip block metadata bound to one chain epoch. The block sits at
 /// `chain_epoch.settled_tip_height` and marks the reorg-window finality boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -671,6 +922,15 @@ pub struct CompactBlock {
     pub chain_epoch: ChainEpoch,
     /// Compact block artifact at the requested height.
     pub compact_block: CompactBlockArtifact,
+}
+
+/// Pre-encoded single compact block wire payload bound to one chain epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedCompactBlock {
+    /// Chain epoch used to answer the query.
+    pub chain_epoch: ChainEpoch,
+    /// Length-delimited gRPC-framed protobuf `CompactBlock` payload.
+    pub compact_block: EncodedBlock,
 }
 
 /// Compact block range response bound to one chain epoch.
@@ -713,15 +973,15 @@ pub struct FullBlockStream {
 ///
 /// [`chain_epoch`](Self::chain_epoch) is resolved once and describes every
 /// delivered block. [`blocks`](Self::blocks) yields compact blocks in
-/// ascending, contiguous height order until the range is exhausted; a store
+/// the requested, contiguous height order until the range is exhausted; a store
 /// failure arrives as a terminal `Err` after the blocks already delivered,
 /// and dropping the receiver stops the backing producer.
 #[derive(Debug)]
-pub struct CompactBlockStream {
+pub struct CompactBlockStream<Block = CompactBlockArtifact> {
     /// Chain epoch every delivered block is read under.
     pub chain_epoch: ChainEpoch,
-    /// Ascending compact blocks, then optionally one terminal error.
-    pub blocks: mpsc::Receiver<Result<CompactBlockArtifact, QueryError>>,
+    /// Compact blocks in the requested order, then optionally one terminal error.
+    pub blocks: mpsc::Receiver<Result<Block, QueryError>>,
 }
 
 /// Single mined-transaction response bound to one chain epoch. Used by
@@ -1101,10 +1361,6 @@ pub enum QueryError {
         value_kind: &'static str,
     },
 
-    /// Transaction broadcast is disabled for this query handle.
-    #[error("transaction broadcast is disabled")]
-    TransactionBroadcastDisabled,
-
     /// Raw transaction exceeds the maximum serialized size accepted for broadcast.
     #[error("raw transaction is too large: {actual} bytes exceeds maximum {maximum}")]
     BroadcastTransactionTooLarge {
@@ -1156,6 +1412,18 @@ pub enum QueryError {
     CompactBlockStreamLimitReached {
         /// Most streams the adapter serves at once.
         max_streams: NonZeroU32,
+    },
+
+    /// A read forwarded to the node found every slot of its kind taken, and
+    /// either no slot freed within the wait or every waiting place was taken.
+    #[error(
+        "forwarded {kind} reads are at their limit of {max_concurrent} at once; retry with backoff"
+    )]
+    ForwardedReadLimitReached {
+        /// The refused kind, as the `kind` metric label names it.
+        kind: &'static str,
+        /// Most reads of the kind that run at once.
+        max_concurrent: u32,
     },
 
     /// A blocking read task failed unexpectedly (panic or runtime shutdown).
@@ -1246,8 +1514,12 @@ impl QueryError {
                 Self::ChainEventCursorInvalid { reason }
             }
             StorageReadError::ReadTaskFailed { reason } => Self::BlockingTaskFailed { reason },
+            StorageReadError::ArtifactCorrupt { family, reason } => {
+                Self::ArtifactCorrupt { family, reason }
+            }
             failure @ (StorageReadError::ReaderInvalidated { .. }
-            | StorageReadError::Unavailable { .. }) => storage_failure(failure),
+            | StorageReadError::Unavailable { .. }
+            | StorageReadError::Cancelled) => storage_failure(failure),
         }
     }
 }
@@ -1277,7 +1549,6 @@ impl zinder_proto::BoundaryError for QueryError {
             }
             Self::InvalidAddress { .. } => ErrorReason::InvalidAddress,
             Self::UnsupportedShieldedProtocol { .. } => ErrorReason::UnsupportedShieldedProtocol,
-            Self::TransactionBroadcastDisabled => ErrorReason::BroadcastDisabled,
             Self::BroadcastTransactionTooLarge { .. } => ErrorReason::BroadcastTransactionTooLarge,
             Self::BroadcastBudgetExhausted { .. } => ErrorReason::BroadcastBudgetExhausted,
             Self::MaterializedViewUnavailable { .. } => ErrorReason::MaterializedViewUnavailable,
@@ -1299,10 +1570,12 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::CompactBlockStreamLimitReached { .. } => {
                 ErrorReason::CompactBlockStreamLimitReached
             }
+            Self::ForwardedReadLimitReached { .. } => ErrorReason::ForwardedReadLimitReached,
             Self::BlockingTaskFailed { .. } => ErrorReason::BlockingTaskFailed,
             Self::Node(source_error) if source_error.is_node_capability_missing() => {
                 ErrorReason::NodeCapabilityMissing
             }
+            Self::Node(SourceError::NodeRateLimited { .. }) => ErrorReason::NodeRateLimited,
             Self::Node(_) => ErrorReason::NodeUnavailable,
             Self::Store(_)
             | Self::WalletProjectionRead { .. }
@@ -1424,7 +1697,6 @@ mod error_reason_tests {
             QueryError::UnsupportedWalletEncoding {
                 value_kind: "probe",
             },
-            QueryError::TransactionBroadcastDisabled,
             QueryError::BroadcastTransactionTooLarge {
                 actual: MAX_RAW_TRANSACTION_BYTES + 1,
                 maximum: MAX_RAW_TRANSACTION_BYTES,
@@ -1443,6 +1715,10 @@ mod error_reason_tests {
             },
             QueryError::CompactBlockStreamLimitReached {
                 max_streams: NonZeroU32::MIN,
+            },
+            QueryError::ForwardedReadLimitReached {
+                kind: "transaction",
+                max_concurrent: 24,
             },
             QueryError::BlockingTaskFailed {
                 reason: "probe".to_owned(),
@@ -1551,6 +1827,20 @@ mod error_reason_tests {
     }
 
     #[test]
+    fn forwarded_read_refusal_is_resource_exhausted_on_the_wire() {
+        let status = crate::status_from_query_error(&QueryError::ForwardedReadLimitReached {
+            kind: "transaction",
+            max_concurrent: 24,
+        });
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            tonic_types::StatusExt::get_details_error_info(&status)
+                .map(|error_info| error_info.reason),
+            Some("FORWARDED_READ_LIMIT_REACHED".to_owned())
+        );
+    }
+
+    #[test]
     fn broadcast_budget_refusal_is_unavailable_on_the_wire() {
         let status = crate::status_from_query_error(&QueryError::BroadcastBudgetExhausted {
             budget_bytes: crate::BROADCAST_BYTE_BUDGET,
@@ -1604,6 +1894,29 @@ mod error_reason_tests {
             reason: "probe".to_owned(),
         });
         assert_eq!(transient.error_reason(), ErrorReason::NodeUnavailable);
+    }
+
+    #[test]
+    fn node_rate_limited_maps_to_retryable_unavailable_with_its_own_reason() -> eyre::Result<()> {
+        let error = QueryError::Node(SourceError::NodeRateLimited {
+            operation: "getrawtransaction",
+        });
+        assert_eq!(error.error_reason(), ErrorReason::NodeRateLimited);
+        let status = crate::status_from_query_error(&error);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            tonic_types::StatusExt::get_details_error_info(&status)
+                .map(|error_info| error_info.reason),
+            Some("NODE_RATE_LIMITED".to_owned())
+        );
+        let delay_ms = status
+            .metadata()
+            .get("grpc-retry-pushback-ms")
+            .ok_or_else(|| eyre::eyre!("missing retry pushback"))?
+            .to_str()?
+            .parse::<i32>()?;
+        assert!((500..=1500).contains(&delay_ms));
+        Ok(())
     }
 }
 

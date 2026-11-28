@@ -1,0 +1,39 @@
+services:
+  zinder-index:
+    environment:
+      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "false"
+      ZINDER_OPS__LISTEN_ADDR: "127.0.0.1:9105"
+    ports: !reset []
+
+  zinder-serve:
+    environment:
+      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "false"
+      ZINDER_OPS__LISTEN_ADDR: "127.0.0.1:9108"
+      ZINDER_COMPAT__LISTEN_ADDR: "127.0.0.1:9067"
+      ZINDER_QUERY__LISTEN_ADDR: "127.0.0.1:9102"
+      ZINDER_EXPLORER__LISTEN_ADDR: "127.0.0.1:9068"
+      ZINDER_CIPHERSCAN__LISTEN_ADDR: "127.0.0.1:9070"
+      ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS: "false"
+      ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS: "false"
+      ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS: "false"
+      ZINDER_COMPAT__PROXY_PROTOCOL_TRUSTED_CIDRS: "none"
+      ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS: "none"
+
+  zinder-tor:
+    profiles: [tor]
+    build: ./tor
+    network_mode: "service:zinder-index"
+    depends_on:
+      zinder-serve:
+        condition: service_healthy
+    restart: on-failure
+    read_only: true
+    mem_limit: 256m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - tor-state:/var/lib/tor
+      - ./tor/torrc:/etc/tor/torrc:ro
+
+volumes:
+  tor-state:

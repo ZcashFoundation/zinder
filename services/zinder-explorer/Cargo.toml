@@ -13,9 +13,8 @@ publish.workspace = true
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
-config.workspace = true
+parking_lot.workspace = true
 prost.workspace = true
-serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
@@ -51,6 +50,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "test-util", "time"] }
 tokio-stream.workspace = true
 tonic = { workspace = true, features = ["transport"] }
+tonic-health.workspace = true
 tracing.workspace = true
 zinder-ingest.workspace = true
 zinder-query.workspace = true

@@ -7,9 +7,12 @@
 # The pinned release checkout is expected at /opt/zinder; adjust
 # WorkingDirectory below if your operator-chosen layout differs.
 #
-# /etc/zinder/env is a copy of one deploy/.env.* file. Its
-# ZINDER_DEPLOY_NETWORK names the Compose project that ExecStartPre removes
-# with --remove-orphans, so Compose refuses to run when it is unset.
+# /etc/zinder/deploy.env is a copy of one deploy/profiles/<name>/deploy.env
+# file with DEPLOY_ZINDER_ENV=/etc/zinder/zinder.env (copied from the matching
+# zinder.env) and optional writer-only DEPLOY_INDEX_ENV=/etc/zinder/index.env.
+# DEPLOY_NETWORK names the Compose project, so Compose refuses to run when it
+# is unset. Optionally set COMPOSE_PROFILES=observability in
+# /etc/zinder/deploy.env to include Prometheus and Grafana.
 
 [Unit]
 Description=Zinder Zcash indexer (Compose topology)
@@ -21,15 +24,14 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/zinder/deploy
-EnvironmentFile=-/etc/zinder/env
+EnvironmentFile=-/etc/zinder/deploy.env
 
-# `docker compose up` blocks while the topology runs, so Type=simple is
-# correct. ExecStop tears down the topology on stop; ExecStartPre prunes
-# any stale containers so a half-restarted state does not strand the
-# named volume on a previous container's lifecycle.
-ExecStartPre=-/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml down --remove-orphans
-ExecStart=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml up
-ExecStop=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml down
+# `docker compose up --no-build` blocks while the topology runs, so Type=simple
+# is correct. `--no-build` avoids unintended image builds during unit restarts,
+# and ExecStop tears down the topology on explicit stop without wiping an
+# active non-resumable sync before startup.
+ExecStart=/usr/bin/docker compose --env-file /etc/zinder/deploy.env -f docker-compose.yml up --no-build
+ExecStop=/usr/bin/docker compose --env-file /etc/zinder/deploy.env -f docker-compose.yml down
 
 Restart=on-failure
 RestartSec=30

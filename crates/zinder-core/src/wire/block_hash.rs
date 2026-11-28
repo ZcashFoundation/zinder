@@ -15,8 +15,10 @@
 //! Pick the function whose name matches the wire surface:
 //! - Lightwalletd-compat `bytes` fields carry internal byte order. Use
 //!   [`encode_internal_block_hash`] and [`decode_internal_block_hash`].
-//!   The exception is `SubtreeRoot.completingBlockHash`, which reference
-//!   lightwalletd fills in RPC byte order. Use [`encode_rpc_block_hash_bytes`].
+//!   Two exceptions follow reference lightwalletd's RPC byte order on `bytes`
+//!   fields: `SubtreeRoot.completingBlockHash` in responses
+//!   ([`encode_rpc_block_hash_bytes`]) and `GetTreeState(BlockID { height: 0, hash })`
+//!   in requests ([`decode_rpc_block_hash_bytes`]).
 //! - Native zinder protobuf `string` hash fields, JSON, log records, and
 //!   any human-facing surface carry RPC byte order hex. Use
 //!   [`encode_rpc_block_hash_hex`] and [`decode_rpc_block_hash_hex`].
@@ -93,9 +95,14 @@ pub fn decode_rpc_block_hash_hex(input: &str) -> Result<BlockHash, WireDecodeErr
         });
     }
     let mut buffer = [0u8; BLOCK_HASH_BYTE_COUNT];
-    hex::decode_to_slice(input, &mut buffer).map_err(|hex_error| WireDecodeError::InvalidHex {
-        reason: hex_error.to_string(),
-    })?;
+    if base16ct::mixed::decode(input, &mut buffer).is_err() {
+        // Preserve the offending character and its position in wire errors.
+        hex::decode_to_slice(input, &mut buffer).map_err(|hex_error| {
+            WireDecodeError::InvalidHex {
+                reason: hex_error.to_string(),
+            }
+        })?;
+    }
     buffer.reverse();
     Ok(BlockHash::from_bytes(buffer))
 }
@@ -119,8 +126,10 @@ pub fn encode_rpc_block_hash_bytes(block_hash: BlockHash) -> [u8; 32] {
 ///
 /// The raw-bytes analogue of [`decode_rpc_block_hash_hex`]. Zebra's
 /// indexer gRPC surface (`zebra_indexer_rpc`) fills hash `bytes` fields
-/// with `bytes_in_display_order`, so the input is reversed into internal
-/// byte order before constructing the domain value.
+/// with `bytes_in_display_order`, and reference lightwalletd reads
+/// `GetTreeState(BlockID { height: 0, hash })` in RPC byte order, so the
+/// input is reversed into internal byte order before constructing the domain
+/// value.
 ///
 /// Reference: Zcash protocol spec, term `\rpcByteOrder` (protocol.tex:1127, :4036).
 ///
@@ -209,8 +218,14 @@ mod tests {
 
     #[test]
     fn rpc_hex_decode_matches_storage_form_for_testnet_block() -> TestResult {
-        let decoded = decode_rpc_block_hash_hex(TESTNET_BLOCK_HASH_RPC_HEX)?;
-        assert_eq!(decoded.as_bytes(), TESTNET_BLOCK_HASH_INTERNAL_BYTES);
+        for input in [
+            TESTNET_BLOCK_HASH_RPC_HEX.to_owned(),
+            TESTNET_BLOCK_HASH_RPC_HEX.to_ascii_uppercase(),
+            TESTNET_BLOCK_HASH_RPC_HEX.replacen('f', "F", 1),
+        ] {
+            let decoded = decode_rpc_block_hash_hex(&input)?;
+            assert_eq!(decoded.as_bytes(), TESTNET_BLOCK_HASH_INTERNAL_BYTES);
+        }
         Ok(())
     }
 
@@ -286,10 +301,13 @@ mod tests {
 
     #[test]
     fn rpc_hex_rejects_non_hex_characters() {
-        let invalid = "z".repeat(BLOCK_HASH_HEX_LEN);
-        assert!(matches!(
+        let mut invalid = TESTNET_BLOCK_HASH_RPC_HEX.to_owned();
+        invalid.replace_range(17..18, "z");
+        assert_eq!(
             decode_rpc_block_hash_hex(&invalid),
-            Err(WireDecodeError::InvalidHex { .. })
-        ));
+            Err(WireDecodeError::InvalidHex {
+                reason: "Invalid character 'z' at position 17".to_owned(),
+            })
+        );
     }
 }

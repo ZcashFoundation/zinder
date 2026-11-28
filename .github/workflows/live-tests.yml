@@ -18,25 +18,36 @@ on:
     # Keep this list identical in live-tests.yml and parity-compat.yml. It
     # covers every crate the live and parity tests exercise, the workspace
     # manifest and lockfile that pin the consensus cohort, the node
-    # configurations, the mining and indexer TLS scripts, the CI tool installer
-    # and its lock (which pins cargo-nextest), and both workflows.
+    # configurations, the mining and indexer TLS scripts, the CBB report
+    # validator, the CI tool installer and its lock (which pins cargo-nextest),
+    # the shared Rust setup action, and both workflows.
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".config/nextest.toml"
       - "crates/**"
+      - "services/zinder/**"
       - "services/zinder-bench/**"
+      - "services/zinder-compat-cipherscan/**"
       - "services/zinder-compat-lightwalletd/**"
       - "services/zinder-explorer/**"
       - "services/zinder-ingest/**"
+      - "services/zinder-projector/**"
       - "services/zinder-query/**"
+      - "deploy/systemd/**"
       - "deploy/zakura/**"
       - "deploy/zebra/**"
+      - "scripts/build-release-binary-archive.sh"
+      - "scripts/release-binary-platform.sh"
+      - "scripts/test-native-systemd-regtest.sh"
       - "scripts/mine-live-regtest.sh"
+      - "scripts/test-light-wallet-qualification.sh"
       - "scripts/generate-live-indexer-tls.sh"
+      - "scripts/validate-cbb-interop-report.sh"
       - "scripts/install-ci-tool.sh"
       - ".github/ci-tools.lock"
+      - ".github/actions/setup-rust/**"
       - ".github/workflows/live-tests.yml"
       - ".github/workflows/parity-compat.yml"
   schedule:
@@ -65,8 +76,11 @@ concurrency:
 
 # Swatinem/rust-cache hashes every CARGO_* and RUST* variable into its key.
 # The test cache is shared with ci-pr.yml, so keep this block identical there.
+# ci-pr.yml's test build saves that cache from main; these jobs only read it.
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   PROTOC: /does/not/exist
 
 jobs:
@@ -103,18 +117,21 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
-
-      # Both legs restore the shared test cache. Only the Zebra leg saves it,
-      # and only from the default branch (the scheduled nightly run).
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: ./.github/actions/setup-rust
         with:
-          shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.node == 'zebra' }}
+          cache-key: test
+          tools: cargo-nextest
 
-      - name: Install cargo-nextest
-        run: scripts/install-ci-tool.sh cargo-nextest
+      # The live tests compile while the node starts and mines. The wait step
+      # below fails the job if this build failed.
+      - name: Start compiling the live tests
+        run: |
+          # The inner shell expands its own variables.
+          # shellcheck disable=SC2016
+          nohup bash -c '
+            cargo nextest run --locked --workspace --profile=ci-live --no-run
+            echo "$?" > "$RUNNER_TEMP/live-build.status"
+          ' > "$RUNNER_TEMP/live-build.log" 2>&1 < /dev/null &
 
       # Zebra runs as a step rather than a service container because its
       # Regtest activation heights and funding streams come from a mounted
@@ -231,6 +248,20 @@ jobs:
       - name: Advance regtest chain to a testable height
         run: scripts/mine-live-regtest.sh "${ZINDER_NODE__JSON_RPC_ADDR}" 120
 
+      - name: Wait for the live tests to compile
+        timeout-minutes: 30
+        run: |
+          for _ in $(seq 1 360); do
+            [[ -f "$RUNNER_TEMP/live-build.status" ]] && break
+            sleep 5
+          done
+          cat "$RUNNER_TEMP/live-build.log"
+          if [[ ! -f "$RUNNER_TEMP/live-build.status" ]]; then
+            echo "::error::The live tests did not finish compiling within 30 minutes"
+            exit 1
+          fi
+          exit "$(cat "$RUNNER_TEMP/live-build.status")"
+
       # The activation test runs first and alone: it broadcasts below NU7,
       # mines across the activation, and broadcasts again after it, so it needs
       # the pre-NU7 tip that the rest of the suite would otherwise mine past.
@@ -239,28 +270,40 @@ jobs:
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
             -E 'test(/^live::nu7_activation::/)'
 
+      - name: Smoke-test the native systemd installation
+        if: matrix.node == 'zebra'
+        timeout-minutes: 8
+        run: |
+          scripts/install-ci-tool.sh grpcurl
+          cargo build --locked -p zinder
+          scratch="$(mktemp -d)"
+          trap 'rm -rf -- "$scratch"' EXIT
+          install -D -m 0755 target/debug/zinder "$scratch/bin/zinder"
+          scripts/build-release-binary-archive.sh \
+            --binaries "$scratch/bin" --output "$scratch" \
+            --version 0.0.0-ci --tag v0.0.0-ci --commit "$(git rev-parse HEAD)" \
+            --target x86_64-unknown-linux-gnu --cpu-baseline x86-64 --pasta-asm 0 \
+            --source-date-epoch "$(git show -s --format=%ct HEAD)"
+          scripts/test-native-systemd-regtest.sh "$scratch/zinder-0.0.0-ci-x86_64-unknown-linux-gnu.tar.gz"
+
       - name: Run T3 live tests against regtest
         env:
           ZINDER_NODE__INDEXER_GRPC_ADDR: ${{ matrix.indexer_grpc_addr }}
-          ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH: ${{ env.INDEXER_TLS_CA_CERT_PATH }}
-          ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH: ${{ env.INDEXER_TLS_CLIENT_CERT_PATH }}
-          ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH: ${{ env.INDEXER_TLS_CLIENT_KEY_PATH }}
-        # Run every live test except mainnet-only ones, the activation test
-        # above, and the node restart test below. Regtest is the only network
-        # where deep_chain and latency fit in CI budgets without checkpoint
-        # backfill. Mainnet-only tests are excluded by explicit behavior name
-        # because live test names avoid network labels unless the behavior
-        # itself is network-specific.
+        # Exclude the hosted-network checkpoint tracer, mainnet-only cases,
+        # the activation test above, and the node restart test below.
+        # Regtest runs deep_chain and latency within the CI budget.
         run: |
+          if [[ -n "${INDEXER_TLS_CA_CERT_PATH:-}" ]]; then
+            export ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH="${INDEXER_TLS_CA_CERT_PATH}"
+            export ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH="${INDEXER_TLS_CLIENT_CERT_PATH}"
+            export ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH="${INDEXER_TLS_CLIENT_KEY_PATH}"
+          fi
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
-            -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(backfills_last_1000_blocks_from_checkpoint) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
+            -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(canonical_blocks_load_requested_range_from_fixed_checkpoint) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
 
       - name: Run the node restart test against regtest
         env:
           ZINDER_NODE__INDEXER_GRPC_ADDR: ${{ matrix.indexer_grpc_addr }}
-          ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH: ${{ env.INDEXER_TLS_CA_CERT_PATH }}
-          ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH: ${{ env.INDEXER_TLS_CLIENT_CERT_PATH }}
-          ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH: ${{ env.INDEXER_TLS_CLIENT_KEY_PATH }}
           ZINDER_TEST_INDEXER_CONTAINER_NAME: ${{ matrix.container }}
         # This test restarts the node container, so it runs alone after every
         # other live test has finished. A nextest group only serializes its own
@@ -269,6 +312,11 @@ jobs:
         # most every 5 seconds, so the step waits past the last mined block
         # before the restart.
         run: |
+          if [[ -n "${INDEXER_TLS_CA_CERT_PATH:-}" ]]; then
+            export ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH="${INDEXER_TLS_CA_CERT_PATH}"
+            export ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH="${INDEXER_TLS_CLIENT_CERT_PATH}"
+            export ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH="${INDEXER_TLS_CLIENT_KEY_PATH}"
+          fi
           sleep 6
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
             -E 'test(streaming_source_recovers_after_zebra_indexer_restart)'
@@ -289,33 +337,33 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: ./.github/actions/setup-rust
         with:
-          shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Install cargo-nextest
-        run: scripts/install-ci-tool.sh cargo-nextest
+          cache-key: test
+          tools: cargo-nextest
 
       - name: Run T3 live tests against testnet
         env:
           ZINDER_TEST_LIVE: "1"
           ZINDER_NETWORK: zcash-testnet
           ZINDER_NODE__JSON_RPC_ADDR: ${{ secrets.NODE_TESTNET_JSON_RPC_ADDR }}
-          ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_TESTNET_AUTH_METHOD }}
-          ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_TESTNET_AUTH_USERNAME }}
-          ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_TESTNET_AUTH_PASSWORD }}
-        # Filter out tests scoped to other networks. Tests under deep_chain
-        # and latency need checkpoint backfill before they fit in hosted-
-        # network CI budgets. Network-constrained tests are excluded by
-        # explicit behavior name because live test names avoid network labels
-        # unless the behavior itself is network-specific.
+          NODE_AUTH_METHOD: ${{ secrets.NODE_TESTNET_AUTH_METHOD }}
+          NODE_AUTH_USERNAME: ${{ secrets.NODE_TESTNET_AUTH_USERNAME }}
+          NODE_AUTH_PASSWORD: ${{ secrets.NODE_TESTNET_AUTH_PASSWORD }}
+        # Filter out tests scoped to other networks. The checkpoint tracer,
+        # deep_chain, and latency are outside the weekly lane's budget.
         run: |
+          if [[ -n "${NODE_AUTH_METHOD:-}" ]]; then
+            export ZINDER_NODE__AUTH__METHOD="${NODE_AUTH_METHOD}"
+          fi
+          if [[ -n "${NODE_AUTH_USERNAME:-}" ]]; then
+            export ZINDER_NODE__AUTH__USERNAME="${NODE_AUTH_USERNAME}"
+          fi
+          if [[ -n "${NODE_AUTH_PASSWORD:-}" ]]; then
+            export ZINDER_NODE__AUTH__PASSWORD="${NODE_AUTH_PASSWORD}"
+          fi
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
-            -E 'test(/^live::/) and not test(_on_regtest) and not test(mainnet) and not test(backfills_from_checkpoint) and not test(backfills_last_1000_blocks_from_checkpoint) and not test(deep_chain) and not test(latency)'
+            -E 'test(/^live::/) and not test(fetch_chain_checkpoint_at_tip_reflects_supported_tree_sizes) and not test(mainnet) and not test(canonical_blocks_load_requested_range_from_fixed_checkpoint) and not test(deep_chain) and not test(latency)'
 
   mainnet:
     name: live mainnet
@@ -331,29 +379,32 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: ./.github/actions/setup-rust
         with:
-          shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Install cargo-nextest
-        run: scripts/install-ci-tool.sh cargo-nextest
+          cache-key: test
+          tools: cargo-nextest
 
       - name: Run T3 live tests against mainnet
         env:
           ZINDER_TEST_LIVE: "1"
           ZINDER_NETWORK: zcash-mainnet
           ZINDER_NODE__JSON_RPC_ADDR: ${{ secrets.NODE_MAINNET_JSON_RPC_ADDR }}
-          ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_MAINNET_AUTH_METHOD }}
-          ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_MAINNET_AUTH_USERNAME }}
-          ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_MAINNET_AUTH_PASSWORD }}
+          NODE_AUTH_METHOD: ${{ secrets.NODE_MAINNET_AUTH_METHOD }}
+          NODE_AUTH_USERNAME: ${{ secrets.NODE_MAINNET_AUTH_USERNAME }}
+          NODE_AUTH_PASSWORD: ${{ secrets.NODE_MAINNET_AUTH_PASSWORD }}
         # Mainnet runs only tests that explicitly opt in via
         # require_live_for(&[Network::ZcashMainnet]) or require_live_mainnet().
         # Keep this allowlist explicit because live test names avoid network
         # names unless the behavior itself is network-specific.
         run: |
+          if [[ -n "${NODE_AUTH_METHOD:-}" ]]; then
+            export ZINDER_NODE__AUTH__METHOD="${NODE_AUTH_METHOD}"
+          fi
+          if [[ -n "${NODE_AUTH_USERNAME:-}" ]]; then
+            export ZINDER_NODE__AUTH__USERNAME="${NODE_AUTH_USERNAME}"
+          fi
+          if [[ -n "${NODE_AUTH_PASSWORD:-}" ]]; then
+            export ZINDER_NODE__AUTH__PASSWORD="${NODE_AUTH_PASSWORD}"
+          fi
           cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
-            -E 'test(mainnet) or test(backfills_last_1000_blocks_from_checkpoint) or test(canonical_blocks_load_requested_range_from_fixed_checkpoint) or test(upgrade_activations_keep_advertised_order) or test(latest_completed_subtree_roots_derive_from_their_completing_blocks)'
+            -E 'test(mainnet) or test(canonical_blocks_load_requested_range_from_fixed_checkpoint) or test(upgrade_activations_keep_advertised_order) or test(latest_completed_subtree_roots_derive_from_their_completing_blocks)'

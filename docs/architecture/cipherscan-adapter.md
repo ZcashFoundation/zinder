@@ -14,7 +14,7 @@ Cipherscan UI
         -> market-price provider    CoinGecko by default
 ```
 
-The adapter is optional. Build it from the workspace as the `zinder-compat-cipherscan` binary; the release images do not include it. It needs a running [Explorer](explorer-plane.md), which in turn needs `[ingest].explorer_views = true`, and a `zinder-query` endpoint. It opens no storage and keeps only bounded in-memory caches, so it restarts without a backfill. The [service README](../../services/zinder-compat-cipherscan/README.md) shows how to run it.
+The adapter is optional. Enable it via `zinder serve --preset explorer` (or `zinder run compat-cipherscan`) from the unified `zinder` binary and `ghcr.io/zcashfoundation/zinder` OCI image, or run the `zinder-compat-cipherscan` binary directly from the workspace. It pairs with [Explorer](explorer-plane.md) and `zinder-query`, opens no storage of its own, and keeps only bounded in-memory caches, so it restarts without a backfill. The [service README](../../services/zinder-compat-cipherscan/README.md) documents standalone flags and environment variables.
 
 ## Boundaries
 
@@ -26,36 +26,37 @@ When a page needs a reusable chain fact that the native APIs cannot supply, the 
 
 ## How failures reach Cipherscan
 
-The Explorer does not advertise seven methods that need canonical-store reads, including `BlockProductionSeries`, `BlockTransactions`, and `CommitmentRootSearch` ([Explorer plane](explorer-plane.md#unadvertised-methods)). It also does not advertise `explorer.transaction.history_v2` or `explorer.transaction.intrinsic_value_balances_v1`. A route that depends on one of these fails in one of three ways:
+`zinder-explorer` serves the canonical-backed explorer methods (`BlockProductionSeries`, `BlockProductionInTimeRange`, `BlockTransactions`, `CommitmentRootSearch`, `DisplacedBlockHistory`, and `DisplacedBlockDetail`), plus `intrinsic_value_balances` and `explorer.transaction.history_v2` once its canonical secondary and view coverage match the canonical tip ([Explorer plane](explorer-plane.md)). `PaidFeeDistribution`, `ValuePoolBalanceHistory`, and `MempoolEventCounts` remain unadvertised. When a route's required capability is unadvertised or the canonical/view coverage is not ready yet, it responds in one of three ways:
 
-- If the adapter calls the method directly, the native `FAILED_PRECONDITION` becomes HTTP 502 with code `upstream_error`.
+- If the adapter calls the method directly, a native `FAILED_PRECONDITION` becomes HTTP 502 with code `upstream_error`.
 - If the adapter checks the capability first, it returns HTTP 503 with code `upstream_field_unavailable`.
 - If a weaker native source exists, the route answers HTTP 200 with `degraded: true` and an `unavailable` list.
 
 ## Coverage matrix
 
-Status is what each route family does against the current Explorer runtime. Any `/api/*` route not listed returns 404 with a "not implemented" error.
+Status is what each route family does against the current Explorer runtime when both the materialized-view store and the canonical secondary are open. Any `/api/*` route not listed returns 404 with a "not implemented" error.
 
 | Routes | Status | Native source |
 | --- | --- | --- |
 | `/api/info`, `/api/blockchain-info`, `/api/network/health` | Works | `VisibleTipBlock`, `ServerInfo`, readiness |
-| `/api/blocks`, `/api/blocks/list`, `/api/network/blocks/recent`, `/api/block/:heightOrHash` | 502: needs `BlockProductionSeries` or `BlockTransactions` | Explorer block methods |
+| `/api/blocks`, `/api/blocks/list`, `/api/network/blocks/recent`, `/api/block/:heightOrHash` | Works (`BlockDetail` / `BlockTransactions` / `DisplacedBlockDetail` for orphaned hashes) | `BlockProductionSeries`, `BlockTransactions`, `DisplacedBlockDetail` |
 | `/api/tx/:txid`, `/api/tx/:txid/raw`, `/api/tx/raw/batch`, `/api/tx/:txid/verbose` | Works for retained bytes. Verbose decoding is degraded. Output `spent` is `null` while the spend view does not cover the response epoch | `TransactionDetail`, `WalletQuery.Transaction` |
 | `/api/tx/broadcast` | Works | `WalletQuery.BroadcastTransaction` |
-| `/api/transactions/list`, `/api/tx/shielded`, `/api/scan/orchard` | 503: needs `explorer.transaction.history_v2` | `TransactionHistory` |
-| `/api/search/anchor/:root` | 502: needs `CommitmentRootSearch` | Explorer |
+| `/api/transactions/list`, `/api/tx/shielded`, `/api/scan/orchard` | Works once transaction history covers the canonical tip (`explorer.transaction.history_v2`) | `TransactionHistory` |
+| `/api/search/anchor/:root` | Works, including retained displaced matches since archive activation | `CommitmentRootSearch` |
 | `/api/mempool`, `/api/mempool/tx/:txid` | Works | `MempoolSnapshot`, `TransactionDetail` |
-| Root WebSocket | `mempool_tx` and `mempool_removed` frames work. At the next block, `new_block` hydration fails and subscribers are closed with code 1013 | `WalletQuery.ChainEvents`, `WalletQuery.MempoolEvents`, `BlockProductionSeries` |
+| Root WebSocket | Works (`mempool_tx`, `mempool_removed`, and `new_block` frames) | `WalletQuery.ChainEvents`, `WalletQuery.MempoolEvents`, `BlockProductionSeries` |
 | `/api/address/:address`, `/api/rich-list`, `/api/supply/transparent-breakdown` | Works | `TransparentAddressActivity`, `TransparentAddressRanking` |
 | `/api/labels`, `/api/label/:address` | Degraded: needs a label sidecar | None |
-| `/api/supply`, `/api/circulating-supply`, `/api/network/halving` | Works | `ValuePoolSummary` plus local consensus rules |
-| `/api/network/emission`, `/api/pools/overview`, `/api/network/pool-history` | Current values work. History and deltas are degraded because `ValuePoolBalanceHistory` has no rows | `ValuePoolSummary`, `ValuePoolBalanceHistory` |
-| `/api/network/stats` | 502: needs `BlockProductionSeries` | Explorer |
+| `/api/supply` | Requires a wallet endpoint that serves chain value pools | `ValuePoolSummary` |
+| `/api/circulating-supply`, `/api/network/halving` | Works | Visible tip height and local consensus rules |
+| `/api/network/emission`, `/api/pools/overview`, `/api/network/pool-history` | 503 while the Explorer omits `explorer.value_pool.balance_history_v1` | `ValuePoolSummary`, `ValuePoolBalanceHistory` |
+| `/api/network/stats` | Works | `BlockProductionSeries` |
 | `/api/network/fees` | Works | `FeeSummary` |
 | `/api/network/fee-distribution` | Degraded to conventional fees, because `PaidFeeDistribution` is never advertised | `ConventionalFeeDistribution` |
 | `/api/shielded/list`, `/api/pools/flows` | Works | `ValuePoolFlowHistory`, `ValuePoolFlowSummary` |
-| `/api/mining/rewards`, `/api/network/mining-metrics` | 502: needs `BlockProductionSeries` | Explorer |
-| `/api/mining/pool-distribution` | 503: needs `explorer.block.production_time_range_v1` | `BlockProductionInTimeRange` |
+| `/api/mining/rewards`, `/api/network/mining-metrics` | Works | `BlockProductionSeries` |
+| `/api/mining/pool-distribution` | Works once block production time view has coverage | `BlockProductionInTimeRange` |
 | `/api/mining/pool-ranking`, `/api/mining/hashrate-share`, `/api/mining/miner-behavior`, `/api/mining/zodl-leaderboard` | Degraded: needs a sidecar | None |
 | `/api/network/protocol-stats`, `/api/stats/shielded-count`, `/api/stats/shielded-daily`, `/api/analytics/usage-clock`, `/api/privacy-stats`, `/api/analytics/anonymity-set`, `/api/analytics/shielding-distribution` | Works once the underlying views have coverage | `TransactionComponentSummary`, `BlockActivityDistribution`, value-pool methods |
 | `/api/blend-check`, `/api/blend-check/split`, `/api/privacy/common-amounts`, `/api/tx/:txid/linkability` | Works once coverage is complete. Results are heuristics, not identity or safety claims | Value-pool flow summaries, `TransactionDetail` |
@@ -63,10 +64,10 @@ Status is what each route family does against the current Explorer runtime. Any 
 | `/api/pools/turnstile` | 503 "rebuilding" response, as Cipherscan returns | None |
 | `/api/price`, `/api/price/at` | Works through the configured price provider | None |
 | `/api/crosschain/*`, `/api/name/*` | Unavailable: needs a sidecar | None |
-| `/api/uncles/stats`, `/api/uncles/forks` | Degraded: observed reorgs only, without displaced-block rows | `ChainReorgHistory` |
-| `/api/uncles`, `/api/uncle/:hash` | 503: needs the displaced-block archive | `DisplacedBlockHistory`, `DisplacedBlockDetail` |
+| `/api/uncles/stats`, `/api/uncles/forks` | Degraded: observed reorgs without explicit external uncle counts | `ChainReorgHistory` |
+| `/api/uncles`, `/api/uncle/:hash` | Works | `DisplacedBlockHistory`, `DisplacedBlockDetail` |
 | `/api/uncle/report`, `/api/uncles/nodes`, `/api/network/peers`, `/api/network/nodes*`, `/api/crosslink/*`, `/api/finalizers*` | Degraded or unavailable: needs crawler, fork-monitor, or Crosslink data | None |
-| `/api/migration/*` | Supply audit works. Migration analytics are degraded because they need `explorer.transaction.intrinsic_value_balances_v1` | `ValuePoolSummary`, `TransactionHistory` |
+| `/api/migration/*` | Supply audit works. Migration analytics work once transaction history covers canonical tip with intrinsic value balances | `ValuePoolSummary`, `TransactionHistory` |
 | `/api/lightwalletd/scan` | 404: not implemented. Compact-block scans belong to `zinder-compat-lightwalletd` | None |
 | `/api/network/chain-size-history` | Degraded: needs operational telemetry | None |
 

@@ -6,6 +6,7 @@
 //! directly. Splitting these out as free functions instead of a blanket trait
 //! impl keeps the [`WalletQueryApi`] boundary free of `zinder_proto` types.
 
+use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::{
     BlockBlobArtifact, BlockHeight, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
@@ -373,30 +374,42 @@ pub fn address_lookup_to_script_hash(
             Ok(TransparentAddressScriptHash::from_bytes(hash_bytes))
         }
         wallet::address_lookup::Selector::Address(address_text) => {
-            let zebra_address = parse_transparent_address(&address_text).map_err(|error| {
-                QueryError::InvalidAddress {
-                    reason: if matches!(error, TransparentAddressParseError::TooLong { .. }) {
-                        "transparent address is longer than any valid encoding"
-                    } else {
-                        "transparent address could not be parsed"
-                    },
-                }
-            })?;
-            if !transparent_address_matches_network(zebra_address.network_kind(), network) {
-                return Err(QueryError::InvalidAddress {
-                    reason: "transparent address network does not match server network",
-                });
-            }
-            let script_pub_key = zebra_address.script().as_raw_bytes().to_vec();
-            if script_pub_key.is_empty() {
-                return Err(QueryError::InvalidAddress {
-                    reason: "transparent address does not produce a receivable script",
-                });
-            }
+            let address = parse_receivable_transparent_address(&address_text, network)?;
             Ok(TransparentAddressScriptHash::of_script_pub_key(
-                &script_pub_key,
+                address.script().as_raw_bytes(),
             ))
         }
+    }
+}
+
+/// Parses a P2PKH or P2SH address that the wallet can look up on `network`.
+///
+/// # Errors
+///
+/// Returns [`QueryError::InvalidAddress`] for an oversized or malformed encoding,
+/// a different network, or a TEX address that has no receivable script.
+pub fn parse_receivable_transparent_address(
+    text: &str,
+    network: Network,
+) -> Result<ZebraTransparentAddress, QueryError> {
+    let address = parse_transparent_address(text).map_err(|error| QueryError::InvalidAddress {
+        reason: if matches!(error, TransparentAddressParseError::TooLong { .. }) {
+            "transparent address is longer than any valid encoding"
+        } else {
+            "transparent address could not be parsed"
+        },
+    })?;
+    if !transparent_address_matches_network(address.network_kind(), network) {
+        return Err(QueryError::InvalidAddress {
+            reason: "transparent address network does not match server network",
+        });
+    }
+    match address {
+        ZebraTransparentAddress::PayToPublicKeyHash { .. }
+        | ZebraTransparentAddress::PayToScriptHash { .. } => Ok(address),
+        ZebraTransparentAddress::Tex { .. } => Err(QueryError::InvalidAddress {
+            reason: "transparent address does not produce a receivable script",
+        }),
     }
 }
 
@@ -880,7 +893,7 @@ mod server_info_tests {
         .await?;
         let metadata = WalletEndpointMetadata::default();
         let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             &admitted_ingest_control,
         );
         let mut upstream = UpstreamNodeCapabilities::from_probed(NodeCapabilities::new([
@@ -924,7 +937,7 @@ mod server_info_tests {
         .await?;
         let metadata = WalletEndpointMetadata::default();
         let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             &admitted_ingest_control,
         );
         let descriptor = build_wallet_server_info(metadata, &capabilities, None);
@@ -953,33 +966,36 @@ mod server_info_tests {
             zinder_core::Network::ZcashRegtest,
         )
         .await?;
-        let transactions = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
-            RawBlobRetention::Transactions,
+        let lean = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+            RawBlobRetention::None,
             &admitted_ingest_control,
         );
         for always_supported in [
             WALLET_READ_VISIBLE_TIP_BLOCK_V1,
             WALLET_READ_SETTLED_TIP_BLOCK_V1,
             WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
+            WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
             WALLET_READ_COMPACT_BLOCK_RANGE_V2,
             WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
             WALLET_READ_SERVER_INFO_V2,
             WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
             WALLET_READ_TRANSACTION_BY_ID_V2,
-            WALLET_READ_TRANSACTION_BYTES_V1,
             WALLET_SNAPSHOT_MEMPOOL_V3,
             WALLET_EVENTS_MEMPOOL_V2,
         ] {
-            assert!(transactions.contains(always_supported));
+            assert!(lean.contains(always_supported));
         }
         for structurally_absent in [
+            WALLET_READ_TRANSACTION_BYTES_V1,
             WALLET_READ_FULL_BLOCK_AT_V1,
             WALLET_READ_FULL_BLOCK_RANGE_V1,
             WALLET_BROADCAST_TRANSACTION_V1,
-            WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
         ] {
-            assert!(!transactions.contains(structurally_absent));
+            assert!(!lean.contains(structurally_absent));
         }
+        let with_verified_node = lean.with_cold_transaction_bytes();
+        assert!(with_verified_node.contains(WALLET_READ_TRANSACTION_BYTES_V1));
+        assert!(!with_verified_node.contains(WALLET_READ_FULL_BLOCK_AT_V1));
 
         let all = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
             RawBlobRetention::All,

@@ -1,9 +1,9 @@
-//! Operational HTTP endpoints (`/healthz`, `/readyz`, `/metrics`) shared by services.
+//! Operational HTTP endpoints shared by services.
 
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{Json, Router, http::StatusCode, routing::get};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     net::TcpListener,
@@ -202,7 +202,7 @@ pub async fn spawn_ops_endpoint(
     })
 }
 
-/// Serves `/healthz`, `/readyz`, and `/metrics` until `cancel` fires.
+/// Serves `/healthz`, `/readyz`, `/status`, and `/metrics` until `cancel` fires.
 ///
 /// `readiness` is shared with the runtime so updates are visible to HTTP
 /// handlers without copying.
@@ -271,6 +271,8 @@ fn build_router(server: &OpsServer, readiness: Readiness, metrics: MetricsHandle
         readiness: readiness.clone(),
         metrics,
     };
+    let status_readiness = readiness.clone();
+    let status_identity = server.clone();
     let healthz_body = HealthzBody {
         status: "alive",
         service: server.service_name,
@@ -300,12 +302,63 @@ fn build_router(server: &OpsServer, readiness: Readiness, metrics: MetricsHandle
             }),
         )
         .route(
+            "/status",
+            get(move || {
+                let status = status_readiness.ops_status(&status_identity);
+                async move { Json(status) }
+            }),
+        )
+        .route(
             "/metrics",
             get(move || {
                 let metrics_state = metrics_state.clone();
                 async move { metrics_handler(&metrics_state) }
             }),
         )
+}
+
+/// Public operational status shared by standalone roles and the supervisor.
+///
+/// Identity and cause strings come from compiled role, build, network, and
+/// readiness labels. The schema carries only those labels and numeric chain
+/// observations, so callers must never substitute raw diagnostics.
+#[derive(Debug, Serialize)]
+pub struct OpsStatus {
+    /// Whether the process is admitting traffic, as `ready` or `not_ready`.
+    pub status: &'static str,
+    /// Role or supervisor label.
+    pub service: &'static str,
+    /// Release version.
+    pub version: &'static str,
+    /// Build commit.
+    pub git_commit: &'static str,
+    /// Canonical network name.
+    pub network: &'static str,
+    /// Closed readiness cause or supervisor startup-stage label.
+    pub cause: &'static str,
+    /// Supervisor execution mode, when supervising a preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'static str>,
+    /// Supervisor preset, when supervising a preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<&'static str>,
+    /// Public chain observations, omitted until a serving reader publishes an epoch.
+    #[serde(flatten)]
+    pub served_chain: ServedChainStatus,
+}
+
+/// Heights and age from one published serving epoch.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+pub struct ServedChainStatus {
+    /// Height of the last visible block in the served epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_visible_tip_height: Option<u32>,
+    /// Height of the last settled block in the served epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_settled_tip_height: Option<u32>,
+    /// Seconds since the writer committed the served epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_epoch_age_seconds: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -467,9 +520,12 @@ fn readiness_sync_lag_blocks(cause: &crate::ReadinessCause) -> f64 {
     match cause {
         crate::ReadinessCause::Syncing {
             lag_blocks: Some(lag_blocks),
+            ..
         } => u64_to_f64(*lag_blocks),
         crate::ReadinessCause::Starting
-        | crate::ReadinessCause::Syncing { lag_blocks: None }
+        | crate::ReadinessCause::Syncing {
+            lag_blocks: None, ..
+        }
         | crate::ReadinessCause::Ready
         | crate::ReadinessCause::NodeUnavailable(_)
         | crate::ReadinessCause::NodeCapabilityMissing { .. }

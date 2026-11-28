@@ -3,15 +3,15 @@
 //!
 //! Spawned once at writer startup per [ADR-0009 §Upstream sync detection].
 //! The task is independent of the ingest loop: probe failures never cancel
-//! the loop and never propagate beyond a warning log. The probe owns the
+//! the loop. The probe owns the
 //! [`ReadinessInput::NodeSource`] input of the writer's
 //! [`ComposedReadiness`]: a non-ready snapshot publishes
 //! [`ReadinessCause::UpstreamNotReady`] and a healthy snapshot publishes
 //! [`ReadinessCause::Ready`]. The follow loop owns the admission state, so its
 //! lag-derived writes cannot clear the probe's observation.
 //!
-//! A failed probe keeps the last observation, because an unreachable or
-//! malformed health response is not evidence that the upstream is ready.
+//! After the first observation, a failed probe publishes
+//! [`ReadinessCause::NodeUnavailable`] until a new health response arrives.
 //! When the node failover switches endpoints it resets the input to
 //! `starting` as part of the switch, before the probe can observe it, and the
 //! probe observes the new endpoint at once instead of at its next tick. A
@@ -31,13 +31,15 @@ use zinder_runtime::{
 };
 use zinder_source::{NodeSource, SourceError, UpstreamHealthSnapshot};
 
+use crate::source_recovery::{SourceOutage, sanitize_reason};
+
 /// Spawns the upstream-health probe task.
 ///
 /// The task ticks every `poll_interval`, calls
 /// [`NodeSource::poll_upstream_health`] on `source`, and publishes the
 /// snapshot as the [`ReadinessInput::NodeSource`] input of `readiness`.
-/// Probe errors keep the last published observation and log a warning; the
-/// ingest loop continues to own the admission state. When `endpoint_switches`
+/// Probe errors invalidate the previous health observation. The ingest loop
+/// continues to own the admission state. When `endpoint_switches`
 /// is supplied, each change of the active node endpoint abandons the probe in
 /// flight and probes the new endpoint immediately; the switch already reset
 /// the input for the new endpoint. Cancellation also abandons a probe in
@@ -55,6 +57,7 @@ where
 {
     tokio::spawn(async move {
         let mut endpoint_switches = endpoint_switches;
+        let mut outage = None;
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -66,6 +69,7 @@ where
                 () = run_upstream_health_probe_once(
                     source.as_ref(),
                     &readiness,
+                    &mut outage,
                     endpoint_switches.as_mut(),
                 ) => {}
             }
@@ -85,12 +89,13 @@ async fn endpoint_switched(endpoint_switches: Option<&mut watch::Receiver<usize>
 async fn run_upstream_health_probe_once<Source>(
     source: &Source,
     readiness: &ComposedReadiness,
+    outage: &mut Option<SourceOutage>,
     endpoint_switches: Option<&mut watch::Receiver<usize>>,
 ) where
     Source: NodeSource,
 {
     let Some(endpoint_switches) = endpoint_switches else {
-        publish_probe_outcome(source.poll_upstream_health().await, readiness);
+        publish_probe_outcome(source.poll_upstream_health().await, readiness, outage);
         return;
     };
     endpoint_switches.mark_unchanged();
@@ -109,23 +114,45 @@ async fn run_upstream_health_probe_once<Source>(
     // that reset, and a probe of the new endpoint always follows it.
     let probed_endpoint_still_active = endpoint_switches.borrow();
     if !probed_endpoint_still_active.has_changed() {
-        publish_probe_outcome(probe_outcome, readiness);
+        publish_probe_outcome(probe_outcome, readiness, outage);
     }
 }
 
 fn publish_probe_outcome(
     probe_outcome: Result<UpstreamHealthSnapshot, SourceError>,
     readiness: &ComposedReadiness,
+    outage: &mut Option<SourceOutage>,
 ) {
     match probe_outcome {
-        Ok(snapshot) => apply_upstream_health_snapshot(snapshot, readiness),
+        Ok(snapshot) => {
+            *outage = None;
+            apply_upstream_health_snapshot(snapshot, readiness);
+        }
         Err(error) => {
             tracing::warn!(
                 target: "zinder::ingest",
                 event = "upstream_health_probe_failed",
                 error = %error,
-                "upstream health probe failed; keeping the last upstream observation"
+                "upstream health probe failed"
             );
+            if matches!(
+                readiness.input_cause(ReadinessInput::NodeSource),
+                Some(ReadinessCause::Starting)
+            ) {
+                // Startup and failover require a first observation of this endpoint.
+                *outage = None;
+                return;
+            }
+            let failure = SourceOutage::record(
+                outage.take(),
+                error.upstream_classification(),
+                sanitize_reason(&error),
+            );
+            readiness.publish_input(
+                ReadinessInput::NodeSource,
+                ReadinessCause::NodeUnavailable(failure.detail.clone()),
+            );
+            *outage = Some(failure);
         }
     }
 }
@@ -188,6 +215,37 @@ mod tests {
         let composed = ComposedReadiness::new(readiness.clone(), &[]);
         composed.publish_admission(admission);
         (readiness, composed)
+    }
+
+    #[test]
+    fn failed_health_observations_require_a_first_response_and_track_the_current_outage()
+    -> Result<(), &'static str> {
+        let readiness = Readiness::default();
+        let composed = ComposedReadiness::new(readiness.clone(), &[ReadinessInput::NodeSource]);
+        composed.publish_admission(ReadinessState::ready(Some(42)));
+        let mut outage = None;
+        let failed_probe = || {
+            Err(SourceError::NodeUnavailable {
+                reason: "connection refused".to_owned(),
+            })
+        };
+        publish_probe_outcome(failed_probe(), &composed, &mut outage);
+        assert_eq!(readiness.report().cause, ReadinessCause::Starting);
+
+        for _ in 0..2 {
+            publish_probe_outcome(Ok(ready_snapshot()), &composed, &mut outage);
+            assert!(readiness.report().is_ready);
+            for failures in 1..=2 {
+                publish_probe_outcome(failed_probe(), &composed, &mut outage);
+                let report = readiness.report();
+                assert!(!report.is_ready);
+                let ReadinessCause::NodeUnavailable(detail) = report.cause else {
+                    return Err("expected a current node outage");
+                };
+                assert_eq!(detail.consecutive_failures, failures);
+            }
+        }
+        Ok(())
     }
 
     #[test]

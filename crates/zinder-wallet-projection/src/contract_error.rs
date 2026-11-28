@@ -47,11 +47,22 @@ pub enum WalletProjectionContractError {
         /// Durable list whose ordering was invalid.
         field: &'static str,
     },
-    /// A durable identity marker does not match the version-1 contract.
-    #[error("{field} identity does not match version 1")]
+    /// A durable record does not begin with the wallet store identity.
+    #[error("{field} does not begin with the wallet store identity \"wallet\"")]
     DurableIdentityMismatch {
         /// Durable contract being decoded.
         field: &'static str,
+    },
+    /// A wallet store was written under a projection schema this release does not read.
+    #[error(
+        "wallet store uses projection schema version {encoded}, and this release reads only \
+         version {supported}; rebuild the wallet store from the canonical store"
+    )]
+    UnsupportedWalletProjectionSchemaVersion {
+        /// Schema version the store records.
+        encoded: u64,
+        /// The only schema version this release reads.
+        supported: u16,
     },
     /// A durable numeric discriminator is unsupported by version 1.
     #[error("{field} has unsupported encoded value {encoded}")]
@@ -164,6 +175,9 @@ pub enum WalletProjectionContractError {
     /// The ready undo family must cover the unsettled canonical suffix exactly.
     #[error("wallet reorg-undo count does not match the unsettled canonical suffix")]
     ReadyReorgUndoCountMismatch,
+    /// The ready block-hash table must cover every retained canonical block exactly.
+    #[error("wallet block-hash row count does not match the retained canonical sequence")]
+    ReadyBlockHashCountMismatch,
     /// The canonical settled tip is not an ancestor of the ready visible tip.
     #[error("wallet settled tip lies outside the ready canonical source range")]
     ReadySettledTipOutsideSourceRange,
@@ -173,8 +187,8 @@ pub enum WalletProjectionContractError {
     /// Version 1 accepts only canonical sequence digest version 1.
     #[error("wallet source sequence digest must use version 1")]
     ReadySourceSequenceVersionMismatch,
-    /// Version 1 requires an `LtHash16` UTXO commitment.
-    #[error("wallet readiness requires the LtHash16 UTXO commitment scheme")]
+    /// Readiness requires the `LtHash16` UTXO commitment with `ChaCha12` expansion.
+    #[error("wallet readiness requires UTXO commitment scheme 1 (LtHash16, ChaCha12 expansion)")]
     ReadyUtxoCommitmentSchemeMismatch,
     /// A persisted build lease uses an unsupported lease encoding version.
     #[error("wallet projection build lease has unsupported version {encoded}")]

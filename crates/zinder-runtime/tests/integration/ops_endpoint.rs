@@ -1,12 +1,13 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use eyre::Result;
+use eyre::{OptionExt as _, Result};
 use http_body_util::BodyExt;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use tokio::net::TcpListener;
 use zinder_runtime::{
-    ComposedReadiness, OpsServer, OpsServerError, Readiness, ReadinessCause, ReadinessInput,
-    ReadinessState, RuntimeService, install_metrics_recorder_for_service, spawn_ops_endpoint,
+    ComposedReadiness, FollowWaitReason, OpsServer, OpsServerError, Readiness, ReadinessCause,
+    ReadinessInput, ReadinessState, RuntimeService, install_metrics_recorder_for_service,
+    spawn_ops_endpoint,
 };
 
 async fn get_json(listen_addr: SocketAddr, path: &str) -> Result<(u16, serde_json::Value)> {
@@ -37,6 +38,18 @@ async fn get_text(listen_addr: SocketAddr, path: &str) -> Result<(u16, String)> 
     let status = response.status().as_u16();
     let body = response.into_body().collect().await?.to_bytes();
     Ok((status, String::from_utf8(body.to_vec())?))
+}
+
+#[cfg(target_os = "linux")]
+fn process_gauge(metrics: &str, name: &str) -> Result<f64> {
+    let kind = format!("# TYPE {name} gauge");
+    assert!(metrics.lines().any(|line| line == kind), "{kind}");
+    let prefix = format!("{name} ");
+    let sample = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .ok_or_else(|| eyre::eyre!("missing {name} sample"))?;
+    Ok(sample.parse()?)
 }
 
 #[tokio::test]
@@ -98,16 +111,51 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
         "node_unreachable"
     );
 
-    // `deploy/wallet-serving-runtime-entrypoint` compares both heights to tell
-    // a caught-up writer from one that trails its node.
     readiness.set(ReadinessState::syncing(None, Some(7), Some(7)));
     let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
     assert_eq!(status, 503);
     assert_eq!(readyz_value["current_height"], 7);
     assert_eq!(readyz_value["target_height"], 7);
+    assert_eq!(
+        readyz_value["cause"]["syncing"],
+        serde_json::json!({ "lag_blocks": null })
+    );
+
+    for (reason, expected) in [
+        (
+            FollowWaitReason::MempoolHydrationAtTip,
+            "mempool_hydration_at_tip",
+        ),
+        (FollowWaitReason::CanonicalProgress, "canonical_progress"),
+    ] {
+        readiness.set(ReadinessState::follow_syncing(
+            reason,
+            None,
+            Some(7),
+            Some(7),
+        ));
+        let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
+        assert_eq!(status, 503);
+        assert_eq!(readyz_value["phase"], "following_tip");
+        assert_eq!(readyz_value["cause"]["syncing"]["wait_reason"], expected);
+    }
 
     let (status, metrics_text) = get_text(listen_addr, "/metrics").await?;
     assert_eq!(status, 200);
+    #[cfg(target_os = "linux")]
+    {
+        let start = process_gauge(&metrics_text, "zinder_process_start_time_seconds")?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+        assert!(start > 0.0 && start <= now.as_secs_f64());
+        let rss = process_gauge(&metrics_text, "zinder_process_rss_bytes")?;
+        let anon = process_gauge(&metrics_text, "zinder_process_rss_anon_bytes")?;
+        assert!(rss > 0.0 && (0.0..=rss).contains(&anon));
+        let (_, next_scrape) = get_text(listen_addr, "/metrics").await?;
+        assert_eq!(
+            start.to_bits(),
+            process_gauge(&next_scrape, "zinder_process_start_time_seconds")?.to_bits()
+        );
+    }
     assert!(
         metrics_text.contains("zinder_build_info{"),
         "{metrics_text}"
@@ -424,4 +472,86 @@ fn installing_the_recorder_starts_its_upkeep_thread() -> Result<()> {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+#[tokio::test]
+async fn status_reports_only_public_fields_and_served_epoch() -> Result<()> {
+    use zinder_core::{BlockHeight, ChainEpochId, Network};
+    use zinder_runtime::{ActiveNodeEndpoint, NodeUnavailableDetail};
+    use zinder_testkit::ChainFixture;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    drop(listener);
+    let readiness = Readiness::default();
+    let server = spawn_ops_endpoint(
+        listen_addr,
+        OpsServer {
+            service_name: "zinder-query",
+            service_version: "0.0.0",
+            network_name: "zcash-regtest",
+            advertised_capabilities: Arc::from(["private-capability"]),
+        },
+        readiness.clone(),
+    )
+    .await?;
+    let (code, starting) = get_json(listen_addr, "/status").await?;
+    let mut expected = serde_json::json!({
+        "status": "not_ready",
+        "service": "zinder-query",
+        "version": "0.0.0",
+        "git_commit": zinder_runtime::BUILD_GIT_COMMIT,
+        "network": "zcash-regtest",
+        "cause": "starting",
+    });
+    assert_eq!(code, 200);
+    assert_eq!(starting, expected);
+
+    let mut epoch = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(7)
+        .chain_epoch(ChainEpochId::new(3))
+        .ok_or_eyre("fixture must include a chain epoch")?;
+    epoch.settled_tip_height = BlockHeight::new(2);
+    readiness.set_served_chain_epoch(&epoch);
+    readiness.set_active_node(Some(ActiveNodeEndpoint { position: 1 }));
+    readiness.set_materialized_view_identities(vec!["/var/lib/private-zinder/view".to_owned()]);
+    readiness.set(ReadinessState::node_unavailable_with_detail(
+        NodeUnavailableDetail::first_iteration(
+            "node_unreachable",
+            "http://test:private-token@192.0.2.5:8232 /var/lib/private-zinder/node.cookie",
+        ),
+        Some(99),
+    ));
+
+    let (code, body) = get_text(listen_addr, "/status").await?;
+    assert_eq!(code, 200);
+    for private in [
+        "private-token",
+        "://",
+        "/var/lib",
+        "192.0.2.5",
+        "private-capability",
+    ] {
+        assert!(!body.contains(private));
+    }
+    let mut status: serde_json::Value = serde_json::from_str(&body)?;
+    let age = status
+        .as_object_mut()
+        .and_then(|fields| fields.remove("served_epoch_age_seconds"))
+        .and_then(|age| age.as_u64())
+        .ok_or_eyre("status must include a numeric age")?;
+    assert!(age > 0);
+    expected["cause"] = serde_json::json!("node_unavailable");
+    expected["served_visible_tip_height"] = serde_json::json!(epoch.visible_tip_height.value());
+    expected["served_settled_tip_height"] = serde_json::json!(2);
+    assert_eq!(status, expected);
+
+    readiness.set(ReadinessState::ready(Some(
+        epoch.visible_tip_height.value(),
+    )));
+    let (_, recovered) = get_json(listen_addr, "/status").await?;
+    assert_eq!(recovered["status"], "ready");
+    assert_eq!(recovered["cause"], "ready");
+    server.shutdown().await?;
+    Ok(())
 }

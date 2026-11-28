@@ -73,6 +73,12 @@ pub enum MempoolSurfaceError {
         /// Stable diagnostic reason.
         reason: String,
     },
+    /// An admitted mempool entry cannot be encoded within the gRPC response budget.
+    #[error("mempool entry cannot be encoded within the gRPC response budget: {reason}")]
+    UnsupportedEncoding {
+        /// Public diagnostic reason.
+        reason: String,
+    },
     /// Cursor is malformed or carries a wrong stream family.
     #[error("mempool cursor is invalid")]
     CursorInvalid,

@@ -1443,20 +1443,13 @@ message TransparentAddressDeltasResponse {
 // `(address_script_hash, ascending_height, in_block_position, kind, index)`.
 // The handler projects this onto `TransparentAddressDeltasEntry`, pulling
 // the height from the key.
-//
-// A row carries its transaction id in exactly one of `transaction_id` and
-// `internal_transaction_id`. Rows written before `internal_transaction_id`
-// existed set `transaction_id`; newer rows set `internal_transaction_id`.
 message TransparentAddressDeltasRecord {
-  // Canonical transaction id in RPC byte order (64 lowercase hex
-  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string transaction_id = 1;
+  // Canonical transaction ID as 32 bytes in internal byte order.
+  bytes transaction_id = 1;
   int64 block_time_unix_seconds = 2;
   // Signed value the event moved for the address; positive for a received
   // output, negative for a spent prevout.
   sint64 value_zat = 3;
-  // Canonical transaction id as 32 bytes in internal byte order.
-  bytes internal_transaction_id = 4;
 }
 
 // `ExplorerQuery.FeeSummary` request.
@@ -2072,7 +2065,8 @@ service ExplorerQuery {
       returns (DisplacedBlockDetailResponse);
 
   // Returns rolling counts of mempool events from the durable per-second
-  // counter column family.
+  // counter column family. A window with no indexed counts fails with
+  // ARTIFACT_UNAVAILABLE.
   // Capability: `explorer.mempool.event_counts_v1`.
   rpc MempoolEventCounts(MempoolEventCountsRequest)
       returns (MempoolEventCountsResponse);
@@ -2471,14 +2465,9 @@ message NetworkUpgradeStatusResponse {
 // carries `(address_script_hash, reverse_height, in_block_position)`.
 // The handler projects this onto the wire `TransparentAddressActivityEntry`
 // shape and pulls the height + timestamp it already knows from the key.
-//
-// A row carries its transaction id in exactly one of `transaction_id` and
-// `internal_transaction_id`. Rows written before `internal_transaction_id`
-// existed set `transaction_id`; newer rows set `internal_transaction_id`.
 message TransparentAddressActivityRecord {
-  // Canonical transaction id in RPC byte order (64 lowercase hex
-  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string transaction_id = 1;
+  // Canonical transaction ID as 32 bytes in internal byte order.
+  bytes transaction_id = 1;
   int64 block_time_unix_seconds = 2;
   // Net transparent value the transaction moved for this address
   // (`sum(outputs to address) - sum(prevouts spent from address)`).
@@ -2494,8 +2483,6 @@ message TransparentAddressActivityRecord {
   // `net_value_zat`. Always present so consumers can render a chip
   // explaining why `net_value_zat` is unset rather than guessing.
   PrevoutResolutionStatus prevout_resolution_status = 6;
-  // Canonical transaction id as 32 bytes in internal byte order.
-  bytes internal_transaction_id = 7;
 }
 
 // Per-transaction record materialized by `TransactionFeesConsumer`.
@@ -2892,24 +2879,12 @@ message DisplacedBlockDetailResponse {
   DisplacedBlockArchiveCoverage coverage = 5;
 }
 
-// Typed error returned when a materialized-view RPC cursor has expired.
-//
-// Per the explorer-plane cursor contract (see
-// `docs/architecture/explorer-plane.md`): cursors are valid for the
-// lifetime of the column-family snapshot at issue time. The server
-// rejects a cursor that references a height range no longer in the store
-// (reorged out, or rolled off retention) with this typed error attached
-// to the gRPC status's `details`. Consumers re-issue from the start of
-// the range or jump to `recommended_resume_height`.
+// Reserved for cursor expiry. ExplorerQuery does not currently emit this detail.
 message CursorExpiredError {
-  // Recommended restart height for a fresh
-  // cursor. Set to the canonical tip when the consumer should restart at
-  // the head of the materialized view; set to the lowest still-indexed height
-  // when the consumer should restart earlier.
+  // Recommended restart height for a fresh cursor.
   uint32 recommended_resume_height = 1;
 
-  // Short reason hint a UI can render verbatim. The canonical sentences
-  // live in `crates/zinder-core/src/explorer_reasons.rs`.
+  // Short reason a UI can display.
   string hint = 2;
 }
 
@@ -2946,7 +2921,7 @@ message OverviewSnapshotRequest {
 //
 // All present sub-fields are read against the snapshot identified by
 // `freshness.chain_view.chain_epoch`; the bundle never spans two tips. Optional
-// fields whose wallet capability is structurally unavailable are identified in
+// fields without an index or a supported wallet capability are identified in
 // `freshness.unavailable`. The handler reads the wallet tip once and every
 // materialized-view field once, in one pass, then assembles the single
 // freshness envelope. Consumers compare the chain epoch's `chain_epoch_id` and
@@ -2969,7 +2944,8 @@ message OverviewSnapshotResponse {
   OverviewMempool mempool = 3;
 
   // Rolling counts of mempool events over a sliding window ending at the
-  // bundle's observation instant.
+  // bundle's observation instant. Absent when the window has no indexed counts. In that
+  // case, `freshness.unavailable` lists `mempool_events`.
   OverviewMempoolEvents mempool_events = 4;
 
   // Fee summary over the last `fee_summary_block_count` blocks ending at

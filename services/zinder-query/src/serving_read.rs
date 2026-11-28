@@ -23,7 +23,7 @@ use crate::{
 #[derive(Clone, Copy)]
 pub(crate) struct SlotPin<'slot> {
     slot: &'slot WalletServingPairSlot,
-    chain_epoch_id: Option<ChainEpochId>,
+    mode: Replacement,
 }
 
 impl<'slot> SlotPin<'slot> {
@@ -33,8 +33,21 @@ impl<'slot> SlotPin<'slot> {
     ) -> Self {
         Self {
             slot,
-            chain_epoch_id,
+            mode: Replacement::Pinned(chain_epoch_id),
         }
+    }
+
+    /// Captures ephemerally when unpinned (`None`), or pins to `Some(id)` when
+    /// a multi-step caller bound the read to a specific epoch.
+    pub(crate) const fn ephemeral_unless_pinned(
+        slot: &'slot WalletServingPairSlot,
+        chain_epoch_id: Option<ChainEpochId>,
+    ) -> Self {
+        let mode = match chain_epoch_id {
+            Some(id) => Replacement::Pinned(Some(id)),
+            None => Replacement::Ephemeral,
+        };
+        Self { slot, mode }
     }
 }
 
@@ -55,8 +68,8 @@ where
 /// Times `request`, including validation and any work after its storage
 /// read, and records its typed outcome under `operation`.
 ///
-/// `requested_blocks` is `Some` only for `compact_blocks_in_range`, which
-/// also samples how many blocks the request asked for.
+/// Compact-block and nullifier range reads also sample the requested block count
+/// by passing it as `requested_blocks`.
 pub(crate) async fn record<Output>(
     operation: &'static str,
     requested_blocks: Option<usize>,
@@ -81,8 +94,37 @@ where
     Read: FnOnce(Arc<WalletServingReadPair>) -> Reading + Clone,
     Reading: Future<Output = Result<Output, QueryError>>,
 {
-    let pair = pin.slot.capture_at(pin.chain_epoch_id);
-    read_pair(pin.slot, pair, pin.chain_epoch_id, read).await
+    let pair = pin.mode.capture(pin.slot);
+    read_replaceable_pair(pin.slot, pair, pin.mode, read).await
+}
+
+/// How a read selects the pair that replaces one whose reader was
+/// invalidated.
+///
+/// It matches how the read selected its own pair, so recovery never changes
+/// whether the slot retains the replacement for pins.
+#[derive(Clone, Copy)]
+enum Replacement {
+    /// The pair that answers the read's pin, observing the current pair.
+    Pinned(Option<ChainEpochId>),
+    /// The current pair, without observing it.
+    Ephemeral,
+}
+
+impl Replacement {
+    const fn chain_epoch_id(self) -> Option<ChainEpochId> {
+        match self {
+            Self::Pinned(chain_epoch_id) => chain_epoch_id,
+            Self::Ephemeral => None,
+        }
+    }
+
+    fn capture(self, slot: &WalletServingPairSlot) -> Arc<WalletServingReadPair> {
+        match self {
+            Self::Pinned(chain_epoch_id) => slot.capture_at(chain_epoch_id),
+            Self::Ephemeral => slot.capture_ephemeral(),
+        }
+    }
 }
 
 /// Runs one read of `pair`, recovering once from an invalidated reader.
@@ -105,13 +147,44 @@ where
     Read: FnOnce(Arc<WalletServingReadPair>) -> Reading + Clone,
     Reading: Future<Output = Result<Output, QueryError>>,
 {
+    read_replaceable_pair(slot, pair, Replacement::Pinned(chain_epoch_id), read).await
+}
+
+/// Runs one read of `pair`, which the caller captured with
+/// [`WalletServingPairSlot::capture_ephemeral`], as [`read_pair`] does.
+///
+/// A replacement after an invalidated reader is captured ephemerally too, and
+/// `read` must answer from whichever pair it receives.
+pub(crate) async fn read_ephemeral_pair<Output, Read, Reading>(
+    slot: &WalletServingPairSlot,
+    pair: Arc<WalletServingReadPair>,
+    read: Read,
+) -> Result<Output, QueryError>
+where
+    Read: FnOnce(Arc<WalletServingReadPair>) -> Reading + Clone,
+    Reading: Future<Output = Result<Output, QueryError>>,
+{
+    read_replaceable_pair(slot, pair, Replacement::Ephemeral, read).await
+}
+
+async fn read_replaceable_pair<Output, Read, Reading>(
+    slot: &WalletServingPairSlot,
+    pair: Arc<WalletServingReadPair>,
+    mode: Replacement,
+    read: Read,
+) -> Result<Output, QueryError>
+where
+    Read: FnOnce(Arc<WalletServingReadPair>) -> Reading + Clone,
+    Reading: Future<Output = Result<Output, QueryError>>,
+{
+    let chain_epoch_id = mode.chain_epoch_id();
     let retry = read.clone();
     let error = match read(Arc::clone(&pair)).await {
         Err(error) if error.invalidates_reader() => error,
         outcome => return outcome,
     };
     let Some(replacement) = slot
-        .replace_missing_table_file_pair(pair, &error, chain_epoch_id)
+        .replace_missing_table_file_pair(pair, &error, || mode.capture(slot))
         .await
     else {
         return Err(error);

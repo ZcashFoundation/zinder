@@ -40,7 +40,12 @@ async fn transparent_address_lookups_agree_on_a_mined_coinbase_output() -> Resul
 
     let balance = source.fetch_transparent_address_balance(&lookup).await?;
     let transaction_ids = source
-        .fetch_transparent_address_transaction_ids(&lookup, mined.block_height, mined.block_height)
+        .fetch_transparent_address_transaction_ids(
+            &lookup,
+            mined.block_height,
+            mined.block_height,
+            source.tip_id().await?,
+        )
         .await?;
     let utxos = source
         .fetch_transparent_address_utxos(&lookup, mined.block_height)
@@ -61,11 +66,13 @@ async fn transparent_address_lookups_agree_on_a_mined_coinbase_output() -> Resul
         mined.block_height.value()
     );
     let first = utxos
+        .outputs
         .first()
         .ok_or_else(|| eyre!("getaddressutxos omits the coinbase output"))?;
     assert_eq!(first.outpoint, mined.outpoint);
     assert_eq!(first.value_zat, mined.value_zat);
-    for output in &utxos {
+    assert!(utxos.tip.height >= mined.block_height);
+    for output in &utxos.outputs {
         assert_eq!(output.address, mined.address);
         assert!(output.block_height >= mined.block_height);
     }
@@ -123,6 +130,7 @@ fn zebra_source(env: &LiveTestEnv) -> Result<ZebraJsonRpcSource> {
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?)
 }

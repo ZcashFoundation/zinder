@@ -3,6 +3,8 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
+mod range_admission;
+
 use std::{
     convert::Infallible,
     marker::PhantomData,
@@ -19,7 +21,7 @@ use tonic::{
     Response, Status,
     body::Body as TonicBody,
     codegen::{Body, BoxFuture, Service, StdError, http},
-    server::{NamedService, ServerStreamingService},
+    server::{NamedService, ServerStreamingService, UnaryService},
     transport::Server,
 };
 use zinder_client::{
@@ -538,32 +540,288 @@ async fn outpoint_spend_status_splits_large_batches_at_one_snapshot_epoch() -> e
     Ok(())
 }
 
+fn reorg_event(
+    event_sequence: u64,
+    previous: u64,
+    current: u64,
+) -> eyre::Result<wallet::ChainEventEnvelope> {
+    reorg_event_at(event_sequence, previous, current, 4)
+}
+
+fn reorg_event_at(
+    event_sequence: u64,
+    previous: u64,
+    current: u64,
+    fork_start: u32,
+) -> eyre::Result<wallet::ChainEventEnvelope> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let mut reverted = chain
+        .chain_epoch(zinder_client::ChainEpochId::new(previous))
+        .ok_or_else(|| eyre!("missing reverted epoch"))?;
+    let settled = chain
+        .block_at(BlockHeight::new(3))
+        .ok_or_else(|| eyre!("missing settled block"))?;
+    reverted.settled_tip_height = settled.height;
+    reverted.settled_tip_hash = settled.hash;
+    let mut committed = reverted;
+    committed.id = zinder_client::ChainEpochId::new(current);
+    committed.visible_tip_hash = zinder_client::BlockHash::from_bytes([0x34; 32]);
+    let mut message = chain_event_message(
+        committed,
+        event_sequence,
+        event_sequence.to_be_bytes().to_vec(),
+    );
+    message.event = Some(wallet::chain_event_envelope::Event::ChainReorged(
+        wallet::ChainReorged {
+            reverted: Some(wallet::ChainRangeReverted {
+                chain_epoch: Some(zinder_proto::wire::chain_epoch_message(reverted)),
+                start_height: fork_start,
+                end_height: 5,
+            }),
+            committed: Some(wallet::ChainEpochCommitted {
+                chain_epoch: Some(zinder_proto::wire::chain_epoch_message(committed)),
+                start_height: fork_start,
+                end_height: 5,
+            }),
+        },
+    ));
+    Ok(message)
+}
+
+async fn chain_events_at_revision(
+    revision: WalletRevision,
+    start: EventStreamStart<zinder_client::ChainEventCursor>,
+    events: Vec<wallet::ChainEventEnvelope>,
+) -> eyre::Result<zinder_client::ChainEventStream> {
+    let endpoint = spawn_malformed_event_service::<wallet::ChainEventsRequest, _>(
+        "/zinder.v1.wallet.WalletQuery/ChainEvents",
+        events,
+        revision,
+    )
+    .await?;
+    let index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+    Ok(index.chain_events(start).await?)
+}
+
+#[tokio::test]
+async fn an_unmarked_stream_rejects_settled_subscriptions_and_enforces_visible_resume_ranges()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let mut epoch = chain
+        .chain_epoch(zinder_client::ChainEpochId::new(2))
+        .ok_or_else(|| eyre!("missing chain epoch"))?;
+    let settled = chain
+        .block_at(BlockHeight::new(2))
+        .ok_or_else(|| eyre!("missing settled block"))?;
+    epoch.settled_tip_height = settled.height;
+    epoch.settled_tip_hash = settled.hash;
+    let message = chain_event_message(epoch, 2, vec![2]);
+    let endpoint = spawn_malformed_chain_event_service(vec![message]).await?;
+    let index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+    assert!(matches!(
+        index
+            .chain_events_for_family(
+                EventStreamStart::LiveTail,
+                zinder_client::ChainEventStreamFamily::Settled
+            )
+            .await,
+        Err(IndexerError::FailedPrecondition { .. })
+    ));
+    let cursor = zinder_client::ChainEventCursor::from_bytes([1]);
+    let mut visible = index
+        .chain_events(EventStreamStart::AfterCursor(cursor))
+        .await?;
+    assert!(matches!(
+        visible.next().await,
+        Some(Err(IndexerError::MalformedResponse {
+            field: "committed.block_range",
+            ..
+        }))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_pruned_reorg_requires_rebuild_before_delivering_its_cursor() -> eyre::Result<()> {
+    for revision in [8, 9] {
+        let cursor = zinder_client::ChainEventCursor::from_bytes([1]);
+        let mut stream = chain_events_at_revision(
+            WalletRevision::Reported(revision),
+            EventStreamStart::AfterCursor(cursor),
+            vec![reorg_event(2, 1, 4)?, reorg_event(3, 2, 3)?],
+        )
+        .await?;
+        assert!(futures_util::poll!(std::pin::pin!(stream.next())).is_pending());
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(IndexerError::ChainEventCursorExpired {
+                recovery: zinder_client::ChainEventCursorRecovery::EarliestRetained,
+            }))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_reorgs_resume_and_a_later_legacy_recovery_ends_the_stream() -> eyre::Result<()> {
+    let mut stream = chain_events_at_revision(
+        WalletRevision::Reported(9),
+        EventStreamStart::AfterCursor(zinder_client::ChainEventCursor::from_bytes([1])),
+        vec![
+            reorg_event(2, 1, 2)?,
+            reorg_event(3, 2, 5)?,
+            reorg_event(4, 3, 4)?,
+        ],
+    )
+    .await?;
+    assert_eq!(
+        stream
+            .next()
+            .await
+            .transpose()?
+            .ok_or_else(|| eyre!("missing retained reorg"))?
+            .event_sequence,
+        2
+    );
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(IndexerError::ChainEventCursorExpired { .. }))
+    ));
+    assert!(stream.next().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn reorg_revision_probe_is_lazy_and_failures_end_the_stream() -> eyre::Result<()> {
+    let mut stream = chain_events_at_revision(
+        WalletRevision::Unavailable,
+        EventStreamStart::LiveTail,
+        vec![
+            reorg_event(2, 1, 2)?,
+            reorg_event(3, 2, 5)?,
+            reorg_event(4, 3, 4)?,
+        ],
+    )
+    .await?;
+    assert!(matches!(stream.next().await, Some(Ok(_))));
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(IndexerError::ServiceUnavailable { .. }))
+    ));
+    assert!(stream.next().await.is_none());
+
+    let mut modern = chain_events_at_revision(
+        WalletRevision::Reported(zinder_proto::CONTRACT_REVISION),
+        EventStreamStart::EarliestRetained,
+        vec![reorg_event(2, 1, 4)?, reorg_event(3, 2, 3)?],
+    )
+    .await?;
+    assert!(matches!(modern.next().await, Some(Ok(_))));
+    assert!(matches!(
+        modern.next().await,
+        Some(Err(IndexerError::MalformedResponse {
+            field: "chain_view.chain_epoch.chain_epoch_id",
+            ..
+        }))
+    ));
+    assert!(modern.next().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_locator_below_settlement_requires_rebuild_and_modern_streams_reject_it()
+-> eyre::Result<()> {
+    for revision in [8, 9, 10] {
+        let mut stream = chain_events_at_revision(
+            WalletRevision::Reported(revision),
+            EventStreamStart::AfterCursor(zinder_client::ChainEventCursor::from_bytes([1])),
+            vec![reorg_event_at(2, 1, 4, 3)?, reorg_event(3, 2, 3)?],
+        )
+        .await?;
+        let error = stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("missing cursor error"))?
+            .err()
+            .ok_or_else(|| eyre!("delivered an unsafe reorg"))?;
+        if revision < 10 {
+            assert!(matches!(
+                error,
+                IndexerError::ChainEventCursorExpired { .. }
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                IndexerError::MalformedResponse {
+                    field: "chain_reorged.reverted.block_range.start",
+                    ..
+                }
+            ));
+        }
+        assert!(stream.next().await.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stalled_revision_probe_ends_before_delivering_the_reorg() -> eyre::Result<()> {
+    let mut stream = chain_events_at_revision(
+        WalletRevision::Stalled,
+        EventStreamStart::LiveTail,
+        vec![reorg_event(2, 1, 4)?, reorg_event(3, 2, 3)?],
+    )
+    .await?;
+    let event = tokio::time::timeout(Duration::from_secs(15), stream.next()).await?;
+    assert!(matches!(
+        event,
+        Some(Err(IndexerError::ServiceUnavailable { .. }))
+    ));
+    assert!(stream.next().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_wrong_network_legacy_reorg_preserves_the_network_error() -> eyre::Result<()> {
+    let mut event = reorg_event(2, 1, 4)?;
+    let epoch = event
+        .chain_view
+        .as_mut()
+        .and_then(|view| view.chain_epoch.as_mut())
+        .ok_or_else(|| eyre!("missing recovery epoch"))?;
+    epoch.network_name =
+        zinder_core::wire::encode_zinder_native_chain_name(Network::ZcashTestnet).to_owned();
+    let mut stream = chain_events_at_revision(
+        WalletRevision::Reported(9),
+        EventStreamStart::LiveTail,
+        vec![event],
+    )
+    .await?;
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(IndexerError::NetworkMismatch { .. }))
+    ));
+    assert!(stream.next().await.is_none());
+    Ok(())
+}
+
 #[tokio::test]
 async fn remote_chain_event_stream_rejects_duplicate_sequence_from_the_wire() -> eyre::Result<()> {
     let chain_epoch = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(2)
         .chain_epoch(zinder_client::ChainEpochId::new(1))
         .ok_or_else(|| eyre!("chain fixture must be non-empty"))?;
-    let event = wallet::ChainEventEnvelope {
-        cursor: vec![1],
-        event_sequence: 1,
-        chain_view: Some(wallet::ChainView {
-            chain_epoch: Some(zinder_proto::wire::chain_epoch_message(chain_epoch)),
-            indexed_tip: None,
-            upstream_tip: None,
-            materialized_views: None,
-        }),
-        event: Some(wallet::chain_event_envelope::Event::ChainCommitted(
-            wallet::ChainCommitted {
-                committed: Some(wallet::ChainEpochCommitted {
-                    chain_epoch: Some(zinder_proto::wire::chain_epoch_message(chain_epoch)),
-                    start_height: 1,
-                    end_height: 2,
-                }),
-            },
-        )),
-    };
-    let endpoint = spawn_malformed_chain_event_service(vec![event.clone(), event]).await?;
+    let first = chain_event_message(chain_epoch, 1, vec![1]);
+    let mut next_epoch = chain_epoch;
+    next_epoch.id = zinder_client::ChainEpochId::new(2);
+    let duplicate = chain_event_message(next_epoch, 1, vec![2]);
+    let endpoint = spawn_malformed_chain_event_service(vec![first, duplicate]).await?;
     let client = RemoteChainIndex::connect(RemoteOpenOptions {
         endpoint,
         network: Network::ZcashRegtest,
@@ -590,13 +848,12 @@ async fn remote_chain_event_stream_rejects_a_nonadjacent_repeated_cursor_from_th
         .extend_blocks(2)
         .chain_epoch(zinder_client::ChainEpochId::new(1))
         .ok_or_else(|| eyre!("chain fixture must be non-empty"))?;
-    let mut first = chain_event_message(chain_epoch, 1, vec![1]);
-    let second = chain_event_message(chain_epoch, 2, vec![2]);
-    let mut repeated = chain_event_message(chain_epoch, 3, vec![1]);
-    // Keep the event payloads independent so the regression specifically
-    // exercises cursor identity across nonadjacent stream items.
-    first.event_sequence = 1;
-    repeated.event_sequence = 3;
+    let first = chain_event_message(chain_epoch, 1, vec![1]);
+    let mut next_epoch = chain_epoch;
+    next_epoch.id = zinder_client::ChainEpochId::new(2);
+    let second = chain_event_message(next_epoch, 2, vec![2]);
+    next_epoch.id = zinder_client::ChainEpochId::new(3);
+    let repeated = chain_event_message(next_epoch, 3, vec![1]);
 
     let endpoint = spawn_malformed_chain_event_service(vec![first, second, repeated]).await?;
     let client = RemoteChainIndex::connect(RemoteOpenOptions {
@@ -736,31 +993,32 @@ fn chain_event_message(
     }
 }
 
-/// Replays a fixed list of events for one server-streaming method and answers
-/// every other method as unimplemented.
-struct MalformedEventService<Request, Event> {
+/// Replays one stream and optionally advertises a wallet contract revision.
+struct ScriptedWalletStream<Request, Event> {
     method_path: &'static str,
-    events: Arc<Vec<Event>>,
+    chunks: Arc<Vec<Result<Event, Status>>>,
+    revision: WalletRevision,
     request: PhantomData<fn() -> Request>,
 }
 
-impl<Request, Event> Clone for MalformedEventService<Request, Event> {
+impl<Request, Event> Clone for ScriptedWalletStream<Request, Event> {
     fn clone(&self) -> Self {
         Self {
             method_path: self.method_path,
-            events: Arc::clone(&self.events),
+            revision: self.revision,
+            chunks: Arc::clone(&self.chunks),
             request: PhantomData,
         }
     }
 }
 
-impl<Request, Event> NamedService for MalformedEventService<Request, Event> {
+impl<Request, Event> NamedService for ScriptedWalletStream<Request, Event> {
     const NAME: &'static str = "zinder.v1.wallet.WalletQuery";
 }
 
-struct ReplayEventsMethod<Event>(Arc<Vec<Event>>);
+struct ReplayWalletChunks<Event>(Arc<Vec<Result<Event, Status>>>);
 
-impl<Req, Event> ServerStreamingService<Req> for ReplayEventsMethod<Event>
+impl<Req, Event> ServerStreamingService<Req> for ReplayWalletChunks<Event>
 where
     Event: Clone + Send + Sync + 'static,
 {
@@ -770,15 +1028,57 @@ where
     type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
 
     fn call(&mut self, _request: tonic::Request<Req>) -> Self::Future {
-        let events = Arc::clone(&self.0);
+        let chunks = Arc::clone(&self.0);
         Box::pin(async move {
-            let stream = tokio_stream::iter(events.as_ref().clone().into_iter().map(Ok));
+            let stream = tokio_stream::iter(chunks.as_ref().clone());
             Ok(Response::new(Box::pin(stream) as Self::ResponseStream))
         })
     }
 }
 
-impl<B, Req, Event> Service<http::Request<B>> for MalformedEventService<Req, Event>
+#[derive(Clone, Copy)]
+enum WalletRevision {
+    Reported(u32),
+    WithCapabilities(u32, &'static [&'static str]),
+    Unavailable,
+    Stalled,
+}
+
+impl UnaryService<wallet::ServerInfoRequest> for WalletRevision {
+    type Response = wallet::ServerInfoResponse;
+    type Future = BoxFuture<Response<Self::Response>, Status>;
+
+    fn call(&mut self, _: tonic::Request<wallet::ServerInfoRequest>) -> Self::Future {
+        let reply = *self;
+        Box::pin(async move {
+            let (revision, capabilities) = match reply {
+                Self::Reported(revision) => (revision, &[][..]),
+                Self::WithCapabilities(revision, capabilities) => (revision, capabilities),
+                Self::Unavailable => return Err(Status::unimplemented("no ServerInfo")),
+                Self::Stalled => return std::future::pending().await,
+            };
+            Ok(Response::new(wallet::ServerInfoResponse {
+                info: Some(wallet::WalletServerInfo {
+                    common: Some(zinder_proto::v1::ops::ServerInfo {
+                        network: zinder_core::wire::encode_zinder_native_chain_name(
+                            Network::ZcashRegtest,
+                        )
+                        .to_owned(),
+                        contract_revision: revision,
+                        capabilities: capabilities
+                            .iter()
+                            .map(|&capability| capability.to_owned())
+                            .collect(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }))
+        })
+    }
+}
+
+impl<B, Req, Event> Service<http::Request<B>> for ScriptedWalletStream<Req, Event>
 where
     B: Body + Send + 'static,
     B::Error: Into<StdError> + Send + 'static,
@@ -794,6 +1094,14 @@ where
     }
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() == "/zinder.v1.wallet.WalletQuery/ServerInfo" {
+            let revision = self.revision;
+            return Box::pin(async move {
+                Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                    .unary(revision, request)
+                    .await)
+            });
+        }
         if request.uri().path() != self.method_path {
             return Box::pin(async move {
                 let mut response = http::Response::new(TonicBody::default());
@@ -809,12 +1117,12 @@ where
             });
         }
 
-        let events = Arc::clone(&self.events);
+        let chunks = Arc::clone(&self.chunks);
         Box::pin(async move {
             let codec = tonic_prost::ProstCodec::<Event, Req>::default();
             let mut grpc = tonic::server::Grpc::new(codec);
             Ok(grpc
-                .server_streaming(ReplayEventsMethod(events), request)
+                .server_streaming(ReplayWalletChunks(chunks), request)
                 .await)
         })
     }
@@ -823,6 +1131,24 @@ where
 async fn spawn_malformed_event_service<Request, Event>(
     method_path: &'static str,
     events: Vec<Event>,
+    revision: WalletRevision,
+) -> eyre::Result<String>
+where
+    Request: tonic_prost::prost::Message + Default + Send + 'static,
+    Event: tonic_prost::prost::Message + Clone + Send + Sync + 'static,
+{
+    spawn_scripted_wallet_stream::<Request, _>(
+        method_path,
+        events.into_iter().map(Ok).collect(),
+        revision,
+    )
+    .await
+}
+
+async fn spawn_scripted_wallet_stream<Request, Event>(
+    method_path: &'static str,
+    chunks: Vec<Result<Event, Status>>,
+    revision: WalletRevision,
 ) -> eyre::Result<String>
 where
     Request: tonic_prost::prost::Message + Default + Send + 'static,
@@ -831,9 +1157,10 @@ where
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let incoming = TcpListenerStream::new(listener);
-    let service = MalformedEventService::<Request, Event> {
+    let service = ScriptedWalletStream::<Request, Event> {
         method_path,
-        events: Arc::new(events),
+        revision,
+        chunks: Arc::new(chunks),
         request: PhantomData,
     };
     tokio::spawn(async move {
@@ -845,12 +1172,36 @@ where
     Ok(format!("http://{addr}"))
 }
 
+pub(super) fn spawn_transport_wallet_query(
+    listener: TcpListener,
+    tls: Option<tonic::transport::ServerTlsConfig>,
+    interceptor: impl tonic::service::Interceptor + Clone + Send + Sync + 'static,
+) -> eyre::Result<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>> {
+    let service = ScriptedWalletStream::<wallet::ChainEventsRequest, wallet::ChainEventEnvelope> {
+        method_path: "/zinder.v1.wallet.WalletQuery/ChainEvents",
+        revision: WalletRevision::Reported(zinder_proto::CONTRACT_REVISION),
+        chunks: Arc::new(Vec::new()),
+        request: PhantomData,
+    };
+    let mut server = Server::builder();
+    if let Some(tls) = tls {
+        server = server.tls_config(tls)?;
+    }
+    let service = tonic::service::interceptor::InterceptedService::new(service, interceptor);
+    Ok(tokio::spawn(
+        server
+            .add_service(service)
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    ))
+}
+
 async fn spawn_malformed_chain_event_service(
     events: Vec<wallet::ChainEventEnvelope>,
 ) -> eyre::Result<String> {
     spawn_malformed_event_service::<wallet::ChainEventsRequest, _>(
         "/zinder.v1.wallet.WalletQuery/ChainEvents",
         events,
+        WalletRevision::Unavailable,
     )
     .await
 }
@@ -861,6 +1212,7 @@ async fn spawn_malformed_mempool_event_service(
     spawn_malformed_event_service::<wallet::MempoolEventsRequest, _>(
         "/zinder.v1.wallet.WalletQuery/MempoolEvents",
         events,
+        WalletRevision::Unavailable,
     )
     .await
 }
@@ -890,7 +1242,8 @@ where
     Ok(format!("http://{addr}"))
 }
 
-async fn spawn_wallet_query<QueryApi>(
+/// Serves the native adapter on an ephemeral loopback port.
+pub(super) async fn spawn_wallet_query<QueryApi>(
     grpc_adapter: WalletQueryGrpcAdapter<QueryApi>,
 ) -> eyre::Result<String>
 where
@@ -908,4 +1261,283 @@ where
     });
 
     Ok(format!("http://{addr}"))
+}
+
+#[tokio::test]
+async fn stalled_capability_probe_bounds_standard_fee_call() -> eyre::Result<()> {
+    let endpoint =
+        spawn_malformed_event_service::<wallet::ChainEventsRequest, wallet::ChainEventEnvelope>(
+            "/zinder.v1.wallet.WalletQuery/ChainEvents",
+            Vec::new(),
+            WalletRevision::Stalled,
+        )
+        .await?;
+    let index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+
+    let fee = tokio::time::timeout(Duration::from_secs(15), index.standard_fee()).await?;
+    assert!(matches!(
+        fee,
+        Err(IndexerError::ServiceUnavailable { reason }) if reason == "wallet capability lookup timed out"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn wallet_scan_extensions_require_exact_capabilities_on_older_endpoints() -> eyre::Result<()>
+{
+    let endpoint =
+        spawn_malformed_event_service::<wallet::ChainEventsRequest, wallet::ChainEventEnvelope>(
+            "/zinder.v1.wallet.WalletQuery/ChainEvents",
+            Vec::new(),
+            WalletRevision::Reported(15),
+        )
+        .await?;
+    let index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+    let descending =
+        zinder_client::CompactRangeQuery::new(BlockHeight::new(2), BlockHeight::new(1));
+    let address = TransparentAddressScriptHash::from_bytes([0x51; 32]);
+    let failures = [
+        (
+            index.scan_compact_blocks(descending.clone()).await.err(),
+            Capability::CompactBlockScan,
+        ),
+        (
+            index.scan_compact_nullifiers(descending).await.err(),
+            Capability::CompactNullifierRange,
+        ),
+        (
+            index
+                .transparent_address_balances(&[address], None)
+                .await
+                .err(),
+            Capability::TransparentAddressBalances,
+        ),
+        (
+            index
+                .transparent_addresses_unspent_outputs(&[address], BlockHeight::new(1), None)
+                .await
+                .err(),
+            Capability::TransparentAddressesUnspentOutputs,
+        ),
+        (index.standard_fee().await.err(), Capability::StandardFee),
+    ];
+    for (failure, capability) in failures {
+        assert!(
+            matches!(failure, Some(IndexerError::FailedPrecondition { reason })
+            if reason.ends_with(capability.as_str()))
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UnspentStreamFailure {
+    MissingHeader,
+    DuplicateHeader,
+    ItemBeforeHeader,
+    ForeignAddress,
+    BeforeFloor,
+    AboveTip,
+    Transport,
+    EpochPin,
+}
+
+impl UnspentStreamFailure {
+    fn script(
+        self,
+        epoch: zinder_client::ChainEpoch,
+        address: TransparentAddressScriptHash,
+    ) -> Vec<Result<wallet::TransparentUnspentOutputsChunk, Status>> {
+        use wallet::transparent_unspent_outputs_chunk::Body;
+
+        let header = wallet::TransparentUnspentOutputsChunk {
+            body: Some(Body::Header(zinder_store::chain_view_message(epoch))),
+        };
+        let output = |address: TransparentAddressScriptHash, height| {
+            wallet::TransparentUnspentOutputsChunk {
+                body: Some(Body::Item(wallet::TransparentUnspentOutput {
+                    address_script_hash: address.as_bytes().to_vec(),
+                    value_zat: 1000,
+                    block_height: height,
+                    block_hash: zinder_core::wire::encode_rpc_block_hash_hex(
+                        epoch.visible_tip_hash,
+                    ),
+                    outpoint: Some(wallet::OutPoint {
+                        transaction_id: zinder_core::wire::encode_rpc_transaction_id_hex(
+                            TransactionId::from_bytes([0x33; 32]),
+                        ),
+                        output_index: 0,
+                    }),
+                    script_pub_key: vec![0x51],
+                })),
+            }
+        };
+        let good_output = || Ok(output(address, 2));
+        match self {
+            Self::MissingHeader => Vec::new(),
+            Self::DuplicateHeader => vec![Ok(header.clone()), Ok(header), good_output()],
+            Self::ItemBeforeHeader => vec![good_output(), Ok(header), good_output()],
+            Self::ForeignAddress => vec![
+                Ok(header),
+                Ok(output(
+                    TransparentAddressScriptHash::from_bytes([0x99; 32]),
+                    2,
+                )),
+                good_output(),
+            ],
+            Self::BeforeFloor => vec![Ok(header), Ok(output(address, 1)), good_output()],
+            Self::AboveTip => vec![Ok(header), Ok(output(address, 3)), good_output()],
+            Self::Transport => vec![
+                Ok(header),
+                good_output(),
+                Err(Status::unavailable("stream interrupted")),
+            ],
+            Self::EpochPin => vec![
+                Ok(header),
+                good_output(),
+                Err(zinder_proto::status_for_reason(
+                    zinder_proto::v1::ops::ErrorReason::ChainEpochPinUnavailable,
+                    "epoch retired",
+                )),
+            ],
+        }
+    }
+
+    fn matches_error(self, error: &IndexerError) -> bool {
+        match self {
+            Self::MissingHeader => matches!(
+                error,
+                IndexerError::MalformedResponse {
+                    field: "transparent_unspent_outputs.header",
+                    ..
+                }
+            ),
+            Self::DuplicateHeader => matches!(
+                error,
+                IndexerError::MalformedResponse {
+                    field: "stream.header",
+                    ..
+                }
+            ),
+            Self::ItemBeforeHeader => matches!(
+                error,
+                IndexerError::MalformedResponse {
+                    field: "stream.item",
+                    ..
+                }
+            ),
+            Self::ForeignAddress | Self::BeforeFloor | Self::AboveTip => matches!(
+                error,
+                IndexerError::MalformedResponse {
+                    field: "transparent_unspent_output",
+                    ..
+                }
+            ),
+            Self::Transport => matches!(error, IndexerError::ServiceUnavailable { .. }),
+            Self::EpochPin => matches!(error, IndexerError::ChainEpochPinUnavailable),
+        }
+    }
+}
+
+#[tokio::test]
+async fn public_unspent_streams_emit_each_failure_once() -> eyre::Result<()> {
+    let epoch = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(2)
+        .chain_epoch(zinder_client::ChainEpochId::new(7))
+        .ok_or_else(|| eyre!("missing fixture epoch"))?;
+    let address = TransparentAddressScriptHash::from_bytes([0x51; 32]);
+    for batch in [false, true] {
+        for failure in [
+            UnspentStreamFailure::MissingHeader,
+            UnspentStreamFailure::DuplicateHeader,
+            UnspentStreamFailure::ItemBeforeHeader,
+            UnspentStreamFailure::ForeignAddress,
+            UnspentStreamFailure::BeforeFloor,
+            UnspentStreamFailure::AboveTip,
+            UnspentStreamFailure::Transport,
+            UnspentStreamFailure::EpochPin,
+        ] {
+            let mut stream = open_scripted_unspent_stream(batch, failure, epoch, address).await?;
+            if matches!(
+                failure,
+                UnspentStreamFailure::Transport | UnspentStreamFailure::EpochPin
+            ) {
+                let output = stream
+                    .next()
+                    .await
+                    .ok_or_else(|| eyre!("missing valid output"))??;
+                assert_eq!(output.chain_epoch, epoch);
+                assert_eq!(output.output.address_script_hash, address);
+                assert_eq!(output.output.block_height, BlockHeight::new(2));
+            }
+            let error = stream
+                .next()
+                .await
+                .ok_or_else(|| eyre!("missing terminal error for {failure:?}, batch={batch}"))?
+                .err()
+                .ok_or_else(|| eyre!("received output for {failure:?}, batch={batch}"))?;
+            assert!(
+                failure.matches_error(&error),
+                "{failure:?}, batch={batch}: {error:?}"
+            );
+            assert!(stream.next().await.is_none());
+            assert!(stream.next().await.is_none());
+        }
+    }
+    Ok(())
+}
+
+async fn open_scripted_unspent_stream(
+    batch: bool,
+    failure: UnspentStreamFailure,
+    epoch: zinder_client::ChainEpoch,
+    address: TransparentAddressScriptHash,
+) -> eyre::Result<zinder_client::TransparentAddressUnspentOutputsStream> {
+    let revision = WalletRevision::WithCapabilities(
+        zinder_proto::CONTRACT_REVISION,
+        &[zinder_proto::capabilities::WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1],
+    );
+    let script = failure.script(epoch, address);
+    let endpoint = if batch {
+        spawn_scripted_wallet_stream::<wallet::TransparentAddressesUnspentOutputsRequest, _>(
+            "/zinder.v1.wallet.WalletQuery/TransparentAddressesUnspentOutputs",
+            script,
+            revision,
+        )
+        .await?
+    } else {
+        spawn_scripted_wallet_stream::<wallet::TransparentAddressUnspentOutputsRequest, _>(
+            "/zinder.v1.wallet.WalletQuery/TransparentAddressUnspentOutputs",
+            script,
+            revision,
+        )
+        .await?
+    };
+    let index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: epoch.network,
+    })?;
+    let start_height = BlockHeight::new(2);
+    let at_epoch_id = Some(epoch.id);
+    Ok(if batch {
+        index
+            .transparent_addresses_unspent_outputs(&[address], start_height, at_epoch_id)
+            .await?
+    } else {
+        index
+            .transparent_address_unspent_outputs(
+                zinder_client::TransparentAddressUnspentOutputsQuery {
+                    address_script_hash: address,
+                    start_height,
+                    at_epoch_id,
+                },
+            )
+            .await?
+    })
 }

@@ -1,1 +1,2 @@
+mod canonical_checkpoint_and_pipeline;
 mod prevout_resolution;

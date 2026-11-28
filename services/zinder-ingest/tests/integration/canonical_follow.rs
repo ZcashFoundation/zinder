@@ -26,20 +26,26 @@ use zinder_core::{
     SubtreeRootIndex, SubtreeRootRange, TransactionId, UnixTimestampMillis,
 };
 use zinder_ingest::{
-    CanonicalConstructionConfig, CanonicalControlCommand, CanonicalFollowConfig, CanonicalFollower,
-    CheckpointComponent, RawBlobPolicy, follow_canonical_tip, follow_canonical_tip_with_control,
-    load_fresh_canonical, prepare_canonical_block,
+    CanonicalConstructionConfig, CanonicalControlCommand, CanonicalControlHandle,
+    CanonicalFollowConfig, CanonicalFollower, CheckpointComponent, CommitmentTreeSizes,
+    PositionedCanonicalBlock, RawBlobPolicy, RetainedRawBlobs, canonical_control_channel,
+    follow_canonical_tip, follow_canonical_tip_with_control, load_fresh_canonical,
+    position_canonical_block, prepare_canonical_block,
 };
-use zinder_proto::v1::ingest::CanonicalWriterStatusResponse;
-use zinder_runtime::{ComposedReadiness, NodeUnavailableDetail, Readiness, ReadinessCause};
+use zinder_proto::v1::ingest::{CanonicalEventPageRequest, CanonicalWriterStatusResponse};
+use zinder_runtime::{
+    ComposedReadiness, FollowWaitReason, NodeUnavailableDetail, Readiness, ReadinessCause,
+    ReadinessReport,
+};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError, SourceSubtreeRoot, SourceSubtreeRoots,
 };
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, MempoolEvent, MempoolEventEnvelope, MempoolEventRetentionConfig,
-    MempoolEventRetentionStepBudget, RocksDbCanonicalBuilder, RocksDbResourceBudget,
+    CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventRetentionStepBudget,
+    CanonicalLiveAppend, CanonicalReorgPolicy, CanonicalStoreBuildPlan, MempoolEvent,
+    MempoolEventEnvelope, MempoolEventRetentionConfig, MempoolEventRetentionStepBudget,
+    RocksDbCanonicalBuilder, RocksDbResourceBudget,
 };
 use zinder_testkit::{frontier_of_size, sample_regtest_upgrade_activations};
 
@@ -55,6 +61,32 @@ const SERIALIZED_HEADER_PARENT_OFFSET: usize = 4;
 const SERIALIZED_HEADER_PARENT_END: usize = SERIALIZED_HEADER_PARENT_OFFSET + 32;
 const SERIALIZED_HEADER_TIME_OFFSET: usize = 100;
 const COINBASE_HEIGHT_OPCODE_OFFSET: usize = 1_534;
+
+fn assert_subtree_verification(metrics: &PrometheusHandle, pool: &str, outcome: &str) {
+    let exposition = metrics.render();
+    for (metric, expected) in [
+        ("zinder_ingest_subtree_root_verifications_total", true),
+        (
+            "zinder_ingest_subtree_root_verification_duration_seconds_count",
+            true,
+        ),
+        (
+            "zinder_ingest_subtree_root_recheck_duration_seconds_count",
+            matches!(outcome, "recheck_match" | "mismatch"),
+        ),
+    ] {
+        let sample = exposition.lines().find(|line| {
+            line.starts_with(metric)
+                && line.contains(&format!("pool=\"{pool}\""))
+                && line.contains(&format!("outcome=\"{outcome}\""))
+        });
+        assert_eq!(
+            sample.and_then(|line| line.split_whitespace().last()),
+            expected.then_some("1"),
+            "{metric} {pool} {outcome}"
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceCall {
@@ -74,8 +106,10 @@ pub(super) struct RecordingParseableSource {
     calls: Arc<Mutex<Vec<SourceCall>>>,
     tip_call_count: Arc<Mutex<u32>>,
     tip_call_gate: Arc<Mutex<Option<SourceTipCallGate>>>,
+    stall_block_read: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     cancel_after_tip_call: Arc<Mutex<Option<(u32, CancellationToken)>>>,
     cancel_after_checkpoint: Arc<Mutex<Option<(BlockHeight, CancellationToken)>>>,
+    cancel_after_subtree_read: Arc<Mutex<Option<CancellationToken>>>,
     switch_before_checkpoint: Arc<Mutex<Option<(BlockHeight, PendingChainSwitch)>>>,
     switch_before_subtree_read: Arc<Mutex<Option<PendingChainSwitch>>>,
     switch_back_after_subtree_read: Arc<Mutex<Option<(BlockHeight, PendingChainSwitch)>>>,
@@ -128,8 +162,10 @@ impl RecordingParseableSource {
             calls: Arc::new(Mutex::new(Vec::new())),
             tip_call_count: Arc::new(Mutex::new(0)),
             tip_call_gate: Arc::new(Mutex::new(None)),
+            stall_block_read: Arc::default(),
             cancel_after_tip_call: Arc::new(Mutex::new(None)),
             cancel_after_checkpoint: Arc::new(Mutex::new(None)),
+            cancel_after_subtree_read: Arc::new(Mutex::new(None)),
             switch_before_checkpoint: Arc::new(Mutex::new(None)),
             switch_before_subtree_read: Arc::new(Mutex::new(None)),
             switch_back_after_subtree_read: Arc::new(Mutex::new(None)),
@@ -195,6 +231,10 @@ impl RecordingParseableSource {
         *self.tip_call_count.lock() = 0;
     }
 
+    fn tip_call_count(&self) -> u32 {
+        *self.tip_call_count.lock()
+    }
+
     fn cancel_after_tip_call(&self, call_count: u32, cancel: CancellationToken) {
         *self.cancel_after_tip_call.lock() = Some((call_count, cancel));
     }
@@ -212,6 +252,10 @@ impl RecordingParseableSource {
 
     fn cancel_after_checkpoint(&self, height: BlockHeight, cancel: CancellationToken) {
         *self.cancel_after_checkpoint.lock() = Some((height, cancel));
+    }
+
+    fn cancel_after_subtree_read(&self, cancel: CancellationToken) {
+        *self.cancel_after_subtree_read.lock() = Some(cancel);
     }
 
     fn calls(&self) -> Vec<SourceCall> {
@@ -249,6 +293,11 @@ impl NodeSource for RecordingParseableSource {
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.calls.lock().push(SourceCall::Block(height));
+        let stall = self.stall_block_read.lock().take();
+        if let Some(entered) = stall {
+            let _ = entered.send(());
+            std::future::pending::<()>().await;
+        }
         self.block_at(height)
     }
 
@@ -353,6 +402,11 @@ impl NodeSource for RecordingParseableSource {
                 start_index: range.start_index,
                 reason: "parseable follower fixture has no root at this index".to_owned(),
             })?;
+        let cancel_after_subtree_read = self.cancel_after_subtree_read.lock().take();
+        if let Some(cancel) = cancel_after_subtree_read {
+            cancel.cancel();
+            std::future::pending::<()>().await;
+        }
         Ok(SourceSubtreeRoots::new(
             range.protocol,
             range.start_index,
@@ -448,12 +502,11 @@ async fn canonical_follower_settles_from_local_header_without_historical_source_
             .block_time_seconds
             .saturating_sub(1),
         build_tip,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(2)?,
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &store_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -585,8 +638,7 @@ async fn canonical_follower_cancellation_after_reorg_preparation_preserves_origi
     let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(3)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -698,8 +750,7 @@ async fn canonical_follower_replaces_shallow_fork_reopens_and_continues_appendin
     let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(3)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -828,8 +879,7 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
     let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1354,8 +1404,7 @@ async fn canonical_follower_follows_a_deeper_fork_after_an_in_place_window_raise
     let store = zinder_store::RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(3)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1417,8 +1466,7 @@ async fn canonical_follower_follows_a_deeper_fork_after_an_in_place_window_raise
     let error = zinder_store::RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -1460,8 +1508,7 @@ async fn halt_during_a_raised_window_ramp_reports_the_covered_depth()
     let store = zinder_store::RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(3)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1605,8 +1652,7 @@ async fn follow_fork_with_replacement_budget(
     let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
         temporary.path().join("canonical"),
         activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(3)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1852,6 +1898,101 @@ async fn canonical_follower_reports_source_outage_and_resumes_after_recovery()
     Ok(())
 }
 
+#[tokio::test]
+async fn stalled_block_preparation_replaces_the_at_tip_mempool_wait()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (at_tip, preparing) = reports_around_stalled_block_read(4).await?;
+    for (report, reason) in [
+        (at_tip, FollowWaitReason::MempoolHydrationAtTip),
+        (preparing, FollowWaitReason::CanonicalProgress),
+    ] {
+        assert_eq!(
+            (report.current_height, report.target_height),
+            (Some(4), Some(4))
+        );
+        assert_eq!(
+            report.cause,
+            ReadinessCause::Syncing {
+                lag_blocks: None,
+                wait_reason: Some(reason),
+            }
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovered_node_tip_ends_a_direct_outage_before_block_preparation()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The fixture has blocks through 5, so the first tip read at 99 fails.
+    let (outage, preparing) = reports_around_stalled_block_read(99).await?;
+    assert!(matches!(outage.cause, ReadinessCause::NodeUnavailable(_)));
+    assert_eq!(
+        preparing.cause,
+        ReadinessCause::Syncing {
+            lag_blocks: Some(1),
+            wait_reason: Some(FollowWaitReason::CanonicalProgress),
+        }
+    );
+    assert_eq!(
+        (preparing.current_height, preparing.target_height),
+        (Some(4), Some(5))
+    );
+    Ok(())
+}
+
+async fn reports_around_stalled_block_read(
+    initial_tip: u32,
+) -> Result<(ReadinessReport, ReadinessReport), Box<dyn std::error::Error>> {
+    let (source, activations, store, _directory) = follower_fixture_at_its_node_tip().await?;
+    let extended = forked_parseable_chain(&parseable_multi_block_chain()?, 5, 5, 1)?;
+    source.replace_chain(
+        extended.clone(),
+        checkpoints_for_parseable_chain(&extended, &activations)?,
+        BlockHeight::new(initial_tip),
+    );
+    source.clear_calls();
+    let (second_tip_read, resume_tip_read) = source.pause_tip_call(2);
+    let (entered, stalled) = oneshot::channel();
+    *source.stall_block_read.lock() = Some(entered);
+    let (_signal, gate) = zinder_ingest::mempool_ready_channel();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let follower = CanonicalFollower::new(
+        &source,
+        activations,
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(30),
+            poll_interval: Duration::ZERO,
+            lag_threshold_blocks: 1,
+            target_height: None,
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(1),
+            mempool_ready_gate: Some(gate),
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
+        },
+        &readiness,
+        &cancel,
+    );
+    let observe = async {
+        second_tip_read.notified().await;
+        let before = readiness.runtime_readiness().report();
+        source.set_tip_height(BlockHeight::new(5));
+        resume_tip_read.notify_one();
+        stalled.await?;
+        let preparing = readiness.runtime_readiness().report();
+        cancel.cancel();
+        Ok::<_, oneshot::error::RecvError>((before, preparing))
+    };
+    let (outcome, reports) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(follow_canonical_tip(store, follower), observe)
+    })
+    .await?;
+    outcome?;
+    Ok(reports?)
+}
+
 /// A reader's deadline for one `WriterStatus` request.
 const READER_WRITER_STATUS_DEADLINE: Duration = Duration::from_secs(15);
 
@@ -1982,7 +2123,7 @@ async fn writer_status_answers_during_the_source_recovery_backoff()
 }
 
 /// A canonical store published through height 4, the tip of its source.
-async fn follower_fixture_at_its_node_tip() -> Result<
+pub(super) async fn follower_fixture_at_its_node_tip() -> Result<
     (
         RecordingParseableSource,
         Arc<NetworkUpgradeActivations>,
@@ -2013,7 +2154,7 @@ async fn follower_fixture_at_its_node_tip() -> Result<
 
 /// A follower that bounds each node request by the default
 /// `node.request_timeout_secs`.
-fn follower_with_default_request_timeout<'a>(
+pub(super) fn follower_with_default_request_timeout<'a>(
     source: &'a RecordingParseableSource,
     activations: &Arc<NetworkUpgradeActivations>,
     readiness: &'a ComposedReadiness,
@@ -2449,8 +2590,7 @@ async fn append_against_tree_states(
     let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
         &store_path,
         activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -2463,6 +2603,8 @@ async fn append_against_tree_states(
 #[tokio::test]
 async fn a_block_that_completes_a_subtree_commits_the_root_derived_from_its_commitments()
 -> Result<(), Box<dyn std::error::Error>> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
     let siblings = subtree_completing_siblings()?;
     let temporary = tempdir()?;
     let (source, store) =
@@ -2499,6 +2641,7 @@ async fn a_block_that_completes_a_subtree_commits_the_root_derived_from_its_comm
             SourceCall::Subtree(orchard_subtree_zero()),
         ]
     );
+    assert_subtree_verification(&recorder.handle(), "orchard", "first_match");
     Ok(())
 }
 
@@ -2603,6 +2746,8 @@ async fn a_subtree_root_that_contradicts_the_derived_root_for_the_same_block_fai
         ),
     ];
     for contradiction in contradictions {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
         let temporary = tempdir()?;
         let store_path = temporary.path().join("canonical");
         let (source, store) = publish_subtree_boundary_store(&siblings, 3, &store_path).await?;
@@ -2650,13 +2795,13 @@ async fn a_subtree_root_that_contradicts_the_derived_root_for_the_same_block_fai
         let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
             &store_path,
             &siblings.activations,
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(2)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         assert_eq!(reopened.event_fence(), original_fence);
         assert!(reopened.subtree_roots(orchard_subtree_zero()).is_err());
+        assert_subtree_verification(&recorder.handle(), "orchard", "mismatch");
     }
     Ok(())
 }
@@ -2670,6 +2815,8 @@ async fn a_subtree_root_that_contradicts_the_derived_root_for_the_same_block_fai
 #[tokio::test]
 async fn a_switch_away_and_back_around_the_subtree_root_read_appends_the_block_with_its_root()
 -> Result<(), Box<dyn std::error::Error>> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
     let siblings = subtree_completing_siblings()?;
     let temporary = tempdir()?;
     let (source, store) =
@@ -2713,6 +2860,44 @@ async fn a_switch_away_and_back_around_the_subtree_root_read_appends_the_block_w
             SourceCall::Subtree(orchard_subtree_zero()),
         ]
     );
+    assert_subtree_verification(&recorder.handle(), "orchard", "recheck_match");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_during_a_subtree_read_records_an_interrupted_verification()
+-> Result<(), Box<dyn std::error::Error>> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
+    let siblings = subtree_completing_siblings()?;
+    let temporary = tempdir()?;
+    let (source, store) =
+        publish_subtree_boundary_store(&siblings, 3, &temporary.path().join("canonical")).await?;
+    siblings.serve_chain_through(&source, &siblings.first, SUBTREE_COMPLETION_HEIGHT)?;
+    let original_fence = store.event_fence();
+    let cancel = CancellationToken::new();
+    source.cancel_after_subtree_read(cancel.clone());
+
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let follower = follower_to_target(
+        &source,
+        &siblings.activations,
+        SUBTREE_COMPLETION_HEIGHT,
+        &readiness,
+        &cancel,
+    );
+    let store = follow_canonical_tip(store, follower).await?;
+
+    assert_eq!(store.event_fence(), original_fence);
+    assert_eq!(
+        source
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, SourceCall::Subtree(_)))
+            .count(),
+        1
+    );
+    assert_subtree_verification(&recorder.handle(), "orchard", "interrupted");
     Ok(())
 }
 
@@ -2764,6 +2949,8 @@ async fn construction_stores_the_subtree_roots_derived_from_the_loaded_blocks()
 #[tokio::test]
 async fn construction_refuses_subtree_roots_read_from_a_sibling_chain()
 -> Result<(), Box<dyn std::error::Error>> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
     let chains = InterleavedSubtreeChains::new()?;
     let first = || chains.chain(&fixture_orchard_source_block()?, 1);
     let second = || chains.chain(&fixture_zakura_orchard_source_block()?, 2);
@@ -2805,6 +2992,7 @@ async fn construction_refuses_subtree_roots_read_from_a_sibling_chain()
         subtree_and_checkpoint_calls(&source),
         construction_reread_calls()
     );
+    assert_subtree_verification(&recorder.handle(), "multiple", "mismatch");
     Ok(())
 }
 
@@ -2816,6 +3004,8 @@ async fn construction_refuses_subtree_roots_read_from_a_sibling_chain()
 #[tokio::test]
 async fn construction_reads_subtree_roots_again_after_a_switch_away_and_back()
 -> Result<(), Box<dyn std::error::Error>> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
     let chains = InterleavedSubtreeChains::new()?;
     let first = chains.chain(&fixture_orchard_source_block()?, 1)?;
     let settled = block_id(&first.blocks, 3)?;
@@ -2836,6 +3026,7 @@ async fn construction_reads_subtree_roots_again_after_a_switch_away_and_back()
         subtree_and_checkpoint_calls(&source),
         construction_reread_calls()
     );
+    assert_subtree_verification(&recorder.handle(), "multiple", "recheck_match");
     assert_eq!(
         InterleavedSubtreeChains::publish_and_read_roots(built, settled)?,
         expected_roots
@@ -3007,12 +3198,11 @@ impl InterleavedSubtreeChains {
                 .fetch_block_at(BlockHeight::new(4))
                 .await
                 .map(|block| BlockId::new(block.height, block.hash))?,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(2)?,
         )?;
         let builder = RocksDbCanonicalBuilder::create_fresh(
             store_path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3231,12 +3421,11 @@ async fn publish_subtree_boundary_store(
         &siblings.activations,
         siblings.predecessor.clone(),
         block_id(&published, build_tip_height)?,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(2)?,
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         store_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -3440,6 +3629,31 @@ pub(super) async fn publish_parseable_store(
     reorg_window_blocks: u32,
     settled_height: BlockHeight,
 ) -> Result<zinder_store::RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    publish_parseable_store_at_time(
+        source,
+        blocks,
+        activations,
+        store_path,
+        reorg_window_blocks,
+        settled_height,
+        UnixTimestampMillis::new(1_783_933_200_000),
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test builder keeps source, fixture identity, activation identity, path, window, settlement, and baseline timestamp explicit"
+)]
+async fn publish_parseable_store_at_time(
+    source: &RecordingParseableSource,
+    blocks: &BTreeMap<BlockHeight, SourceBlock>,
+    activations: Arc<NetworkUpgradeActivations>,
+    store_path: &Path,
+    reorg_window_blocks: u32,
+    settled_height: BlockHeight,
+    baseline_created_at: UnixTimestampMillis,
+) -> Result<zinder_store::RocksDbCanonicalStore, Box<dyn std::error::Error>> {
     let first_height = *blocks
         .keys()
         .next()
@@ -3457,12 +3671,11 @@ pub(super) async fn publish_parseable_store(
             .block_time_seconds
             .saturating_sub(1),
         block_id(blocks, build_tip.value())?,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(reorg_window_blocks)?,
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         store_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -3474,7 +3687,7 @@ pub(super) async fn publish_parseable_store(
     let validated = built.builder.prepare_cold_certified_publication()?;
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
         block_id(blocks, settled_height.value())?,
-        UnixTimestampMillis::new(1_783_933_200_000),
+        baseline_created_at,
     ))?;
     Ok(validated.publish_baseline(publication)?)
 }
@@ -3504,7 +3717,7 @@ pub(super) fn parseable_multi_block_chain()
         prepare_canonical_block(
             &block,
             &sample_regtest_upgrade_activations(),
-            RawBlobPolicy::Transactions,
+            RawBlobPolicy::None,
         )?;
         parent_hash = block.hash;
         blocks.insert(height, block);
@@ -3550,7 +3763,7 @@ pub(super) fn forked_parseable_chain(
         prepare_canonical_block(
             &block,
             &sample_regtest_upgrade_activations(),
-            RawBlobPolicy::Transactions,
+            RawBlobPolicy::None,
         )?;
         parent_hash = block.hash;
         blocks.insert(height, block);
@@ -3591,4 +3804,749 @@ pub(super) fn block_id(
         .get(&height)
         .ok_or_else(|| format!("parseable chain is missing height {}", height.value()))?;
     Ok(BlockId::new(height, block.hash))
+}
+
+async fn read_control_status_and_event_page(
+    canonical: &CanonicalControlHandle,
+) -> Result<(CanonicalWriterStatusResponse, Duration), Box<dyn std::error::Error>> {
+    let started = tokio::time::Instant::now();
+    let status = canonical.writer_status().await?;
+    let page = canonical
+        .event_page(CanonicalEventPageRequest {
+            from_cursor: Vec::new(),
+            max_events: 10,
+        })
+        .await?;
+    assert_ne!(
+        page.events,
+        [] as [zinder_proto::v1::ingest::CanonicalRetainedEvent; 0]
+    );
+    Ok((status, started.elapsed()))
+}
+
+fn fixed_tip_follower<'a>(
+    source: &'a RecordingParseableSource,
+    activations: &Arc<NetworkUpgradeActivations>,
+    poll_interval: Duration,
+    readiness: &'a ComposedReadiness,
+    cancel: &'a CancellationToken,
+) -> CanonicalFollower<'a, RecordingParseableSource> {
+    CanonicalFollower::new(
+        source,
+        Arc::clone(activations),
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(30),
+            poll_interval,
+            lag_threshold_blocks: 0,
+            target_height: None,
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(60),
+            mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
+        },
+        readiness,
+        cancel,
+    )
+}
+
+async fn drive_sustained_control_reads(
+    source: &RecordingParseableSource,
+    canonical: &CanonicalControlHandle,
+    cancel: &CancellationToken,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let start = tokio::time::Instant::now();
+    let mut read_count = 0_usize;
+    for tick in 0..175_u64 {
+        let target_offset = Duration::from_millis(tick * 20);
+        tokio::time::sleep_until(start + target_offset).await;
+        let (status, elapsed) = read_control_status_and_event_page(canonical).await?;
+        assert_eq!(elapsed, Duration::ZERO);
+        assert!(!status.tip_unconfirmed);
+        read_count = read_count.saturating_add(2);
+        if tick == 47 {
+            assert_eq!(
+                source.tip_call_count(),
+                1,
+                "control reads before poll deadline must not trigger extra tip polls"
+            );
+        }
+        if tick == 50 {
+            for _ in 0..10 {
+                let (_status, burst_elapsed) =
+                    read_control_status_and_event_page(canonical).await?;
+                assert_eq!(burst_elapsed, Duration::ZERO);
+                read_count = read_count.saturating_add(2);
+            }
+            tokio::task::yield_now().await;
+            assert_eq!(
+                source.tip_call_count(),
+                2,
+                "control reads at poll deadline must not postpone scheduled tip poll"
+            );
+        }
+    }
+    tokio::time::sleep_until(start + Duration::from_millis(3_500)).await;
+    cancel.cancel();
+    Ok(read_count)
+}
+
+#[tokio::test]
+async fn sustained_control_reads_preserve_at_tip_poll_interval()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (quiet_source, quiet_activations, quiet_store, _quiet_dir) =
+        follower_fixture_at_its_node_tip().await?;
+    let (ctrl_source, ctrl_activations, ctrl_store, _ctrl_dir) =
+        follower_fixture_at_its_node_tip().await?;
+    tokio::time::pause();
+
+    let quiet_readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let quiet_cancel = CancellationToken::new();
+    let quiet_follower = fixed_tip_follower(
+        &quiet_source,
+        &quiet_activations,
+        Duration::from_secs(1),
+        &quiet_readiness,
+        &quiet_cancel,
+    );
+    let ((), quiet_outcome) = tokio::join!(
+        async {
+            tokio::time::sleep(Duration::from_millis(3_500)).await;
+            quiet_cancel.cancel();
+        },
+        follow_canonical_tip(quiet_store, quiet_follower),
+    );
+    quiet_outcome?;
+    let quiet_tip_calls = quiet_source.tip_call_count();
+    assert_eq!(quiet_tip_calls, 4);
+
+    let ctrl_readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let ctrl_cancel = CancellationToken::new();
+    let (canonical, control_commands) = canonical_control_channel();
+    let ctrl_follower = fixed_tip_follower(
+        &ctrl_source,
+        &ctrl_activations,
+        Duration::from_secs(1),
+        &ctrl_readiness,
+        &ctrl_cancel,
+    );
+    let (read_count, ctrl_outcome) = tokio::join!(
+        drive_sustained_control_reads(&ctrl_source, &canonical, &ctrl_cancel),
+        follow_canonical_tip_with_control(ctrl_store, ctrl_follower, control_commands),
+    );
+    assert!(read_count? > 300);
+    ctrl_outcome?;
+    assert_eq!(ctrl_source.tip_call_count(), quiet_tip_calls);
+    Ok(())
+}
+
+async fn yield_until_condition(
+    predicate: impl Fn() -> bool,
+    description: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..10_000 {
+        if predicate() {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+    Err(description.into())
+}
+
+fn mempool_gated_follower<'a>(
+    source: &'a RecordingParseableSource,
+    activations: &Arc<NetworkUpgradeActivations>,
+    gate: zinder_ingest::MempoolReadyGate,
+    readiness: &'a ComposedReadiness,
+    cancel: &'a CancellationToken,
+) -> CanonicalFollower<'a, RecordingParseableSource> {
+    CanonicalFollower::new(
+        source,
+        Arc::clone(activations),
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(10),
+            lag_threshold_blocks: 0,
+            target_height: None,
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(60),
+            mempool_ready_gate: Some(gate),
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
+        },
+        readiness,
+        cancel,
+    )
+}
+
+#[tokio::test]
+async fn at_tip_wait_cancels_promptly() -> Result<(), Box<dyn std::error::Error>> {
+    let (source, activations, store, _directory) = follower_fixture_at_its_node_tip().await?;
+    tokio::time::pause();
+
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let follower = fixed_tip_follower(
+        &source,
+        &activations,
+        Duration::from_secs(60),
+        &readiness,
+        &cancel,
+    );
+    let started = tokio::time::Instant::now();
+    let (cancel_outcome, follow_outcome) = tokio::join!(
+        async {
+            yield_until_condition(
+                || source.tip_call_count() >= 1 && readiness.runtime_readiness().report().is_ready,
+                "follower never entered AtTip wait",
+            )
+            .await?;
+            cancel.cancel();
+            Ok::<_, Box<dyn std::error::Error>>(())
+        },
+        follow_canonical_tip(store, follower),
+    );
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    cancel_outcome?;
+    follow_outcome?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn at_tip_wait_tracks_mempool_hydration_without_polling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (source, activations, store, _directory) = follower_fixture_at_its_node_tip().await?;
+    let tip_four = store.event_fence().visible_tip();
+    tokio::time::pause();
+
+    let (signal, gate) = zinder_ingest::mempool_ready_channel();
+    signal.certify_source_tip(tip_four, signal.observe_node_endpoint());
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let (canonical, control_commands) = canonical_control_channel();
+    let follower = mempool_gated_follower(&source, &activations, gate, &readiness, &cancel);
+    let drive = async {
+        yield_until_condition(
+            || source.tip_call_count() == 1 && readiness.runtime_readiness().report().is_ready,
+            "mempool-gated follower never reached Ready",
+        )
+        .await?;
+        let (_status, elapsed) = read_control_status_and_event_page(&canonical).await?;
+        assert_eq!(elapsed, Duration::ZERO);
+
+        signal.withdraw_certification();
+        yield_until_condition(
+            || {
+                matches!(
+                    readiness.runtime_readiness().report().cause,
+                    ReadinessCause::Syncing {
+                        lag_blocks: None,
+                        wait_reason: Some(FollowWaitReason::MempoolHydrationAtTip),
+                    }
+                )
+            },
+            "withdrawing mempool certification did not update readiness in AtTip wait",
+        )
+        .await?;
+        assert_eq!(source.tip_call_count(), 1);
+
+        signal.certify_source_tip(tip_four, signal.observe_node_endpoint());
+        yield_until_condition(
+            || {
+                matches!(
+                    readiness.runtime_readiness().report().cause,
+                    ReadinessCause::Syncing {
+                        lag_blocks: None,
+                        wait_reason: Some(FollowWaitReason::CanonicalProgress),
+                    }
+                )
+            },
+            "re-certifying mempool did not update wait reason in AtTip wait",
+        )
+        .await?;
+        assert_eq!(source.tip_call_count(), 1);
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        yield_until_condition(
+            || source.tip_call_count() == 2 && readiness.runtime_readiness().report().is_ready,
+            "scheduled poll did not restore Ready after poll_interval",
+        )
+        .await?;
+        cancel.cancel();
+        Ok::<_, Box<dyn std::error::Error>>(())
+    };
+    let (drive_outcome, follow_outcome) = tokio::join!(
+        drive,
+        follow_canonical_tip_with_control(store, follower, control_commands),
+    );
+    drive_outcome?;
+    follow_outcome?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn at_tip_wait_progresses_append_and_replacement_on_scheduled_poll()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (source, activations, store, _directory) = follower_fixture_at_its_node_tip().await?;
+    let base_blocks = parseable_multi_block_chain()?;
+    let appended_chain = forked_parseable_chain(&base_blocks, 5, 5, 0)?;
+    let appended_checkpoints = checkpoints_for_parseable_chain(&appended_chain, &activations)?;
+    let forked_chain = forked_parseable_chain(&base_blocks, 5, 5, 42)?;
+    let forked_checkpoints = checkpoints_for_parseable_chain(&forked_chain, &activations)?;
+    let forked_tip = block_id(&forked_chain, 5)?;
+    tokio::time::pause();
+
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let (canonical, control_commands) = canonical_control_channel();
+    let follower = fixed_tip_follower(
+        &source,
+        &activations,
+        Duration::from_secs(1),
+        &readiness,
+        &cancel,
+    );
+    let drive = async {
+        yield_until_condition(
+            || source.tip_call_count() == 1,
+            "initial AtTip poll did not run",
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        source.replace_chain(appended_chain, appended_checkpoints, BlockHeight::new(5));
+        let (before_poll, _) = read_control_status_and_event_page(&canonical).await?;
+        assert_eq!(
+            before_poll.fence.map(|fence| fence.visible_tip_height),
+            Some(4)
+        );
+        assert_eq!(source.tip_call_count(), 1);
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        yield_until_condition(
+            || source.tip_call_count() == 3,
+            "scheduled append poll did not re-enter AtTip at height 5",
+        )
+        .await?;
+        let (after_append, _) = read_control_status_and_event_page(&canonical).await?;
+        assert_eq!(
+            after_append
+                .fence
+                .map(|fence| (fence.visible_tip_height, fence.event_sequence)),
+            Some((5, 2))
+        );
+
+        source.replace_chain(forked_chain, forked_checkpoints, BlockHeight::new(5));
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        yield_until_condition(
+            || source.tip_call_count() >= 5,
+            "scheduled replacement poll did not run",
+        )
+        .await?;
+        let (after_reorg, _) = read_control_status_and_event_page(&canonical).await?;
+        let reorg_fence = after_reorg
+            .fence
+            .ok_or("writer status after reorg must carry fence")?;
+        assert_eq!(
+            (reorg_fence.visible_tip_height, reorg_fence.event_sequence),
+            (5, 3)
+        );
+        assert_eq!(
+            reorg_fence.visible_tip_hash,
+            forked_tip.hash.as_bytes().to_vec()
+        );
+        cancel.cancel();
+        Ok::<_, Box<dyn std::error::Error>>(())
+    };
+    let (drive_outcome, follow_outcome) = tokio::join!(
+        drive,
+        follow_canonical_tip_with_control(store, follower, control_commands),
+    );
+    drive_outcome?;
+    follow_outcome?;
+    Ok(())
+}
+
+fn append_old_parseable_blocks(
+    mut store: zinder_store::RocksDbCanonicalStore,
+    blocks: &BTreeMap<BlockHeight, SourceBlock>,
+    checkpoints: &BTreeMap<BlockHeight, CommitmentTreeCheckpoint>,
+    activations: &NetworkUpgradeActivations,
+    created_at: UnixTimestampMillis,
+) -> Result<zinder_store::RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    let settled_tip = block_id(blocks, 4)?;
+    for height in 5_u32..=8 {
+        let block_height = BlockHeight::new(height);
+        let source_block = blocks.get(&block_height).ok_or("missing fixture block")?;
+        let checkpoint = checkpoints
+            .get(&block_height)
+            .ok_or("missing fixture checkpoint")?;
+        let anchor = store.append_anchor()?;
+        let mut sizes =
+            CommitmentTreeSizes::from_tip_metadata(anchor.tip_checkpoint().tip_metadata());
+        let prepared = prepare_canonical_block(source_block, activations, RawBlobPolicy::None)?;
+        let PositionedCanonicalBlock {
+            facts,
+            replay_envelope,
+            retained_raw_blobs:
+                RetainedRawBlobs {
+                    block_blob,
+                    transaction_blobs,
+                },
+            compact_block,
+            tip_metadata,
+        } = position_canonical_block(prepared, &mut sizes)?;
+        let build_block = CanonicalBuildBlock {
+            facts,
+            replay_envelope,
+            compact_block,
+            tip_metadata,
+            tree_state_checkpoint: Some(checkpoint.clone()),
+            transaction_blobs,
+            block_blob,
+        };
+        let (next_store, _fence) = store.commit_live_append(
+            CanonicalLiveAppend::new(
+                anchor.event_fence(),
+                build_block,
+                Vec::new(),
+                settled_tip,
+                created_at,
+            ),
+            activations,
+        )?;
+        store = next_store;
+    }
+    Ok(store)
+}
+
+async fn verify_bounded_retention_steps_with_control(
+    source: &RecordingParseableSource,
+    canonical: &CanonicalControlHandle,
+    cancel: &CancellationToken,
+    tip1_entered: Arc<Notify>,
+    tip1_resume: Arc<Notify>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tip1_entered.notified().await;
+    let step_one = canonical.writer_status().await?;
+    assert_eq!(step_one.oldest_retained_event_sequence, 3);
+    assert_eq!(
+        step_one.fence.map(|fence| fence.visible_tip_height),
+        Some(8)
+    );
+
+    let (tip2_entered, tip2_resume) = source.pause_tip_call(2);
+    tip1_resume.notify_one();
+    tip2_entered.notified().await;
+    let step_two = canonical.writer_status().await?;
+    assert_eq!(step_two.oldest_retained_event_sequence, 5);
+    assert_eq!(
+        step_two.fence.map(|fence| fence.visible_tip_height),
+        Some(9)
+    );
+
+    let (tip3_entered, tip3_resume) = source.pause_tip_call(3);
+    tip2_resume.notify_one();
+    tip3_entered.notified().await;
+    let step_three = canonical.writer_status().await?;
+    assert_eq!(step_three.oldest_retained_event_sequence, 6);
+    assert_eq!(
+        step_three.fence.map(|fence| fence.visible_tip_height),
+        Some(10)
+    );
+
+    tip3_resume.notify_one();
+    loop {
+        let final_status = canonical.writer_status().await?;
+        if final_status
+            .fence
+            .is_some_and(|fence| fence.visible_tip_height == 11)
+        {
+            assert_eq!(final_status.oldest_retained_event_sequence, 6);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let cursor_one = zinder_store::CanonicalEventCursor::at(1)?
+        .as_bytes()
+        .to_vec();
+    let expired_error = canonical
+        .event_page(CanonicalEventPageRequest {
+            from_cursor: cursor_one,
+            max_events: 10,
+        })
+        .await
+        .err()
+        .ok_or("pruned cursor 1 must fail with failed_precondition")?;
+    assert_eq!(expired_error.code(), tonic::Code::FailedPrecondition);
+
+    let cursor_five = zinder_store::CanonicalEventCursor::at(5)?
+        .as_bytes()
+        .to_vec();
+    let live_page = canonical
+        .event_page(CanonicalEventPageRequest {
+            from_cursor: cursor_five,
+            max_events: 10,
+        })
+        .await?;
+    let sequences = live_page
+        .events
+        .iter()
+        .filter_map(|event| event.resulting_fence.as_ref().map(|f| f.event_sequence))
+        .collect::<Vec<_>>();
+    assert_eq!(sequences, vec![6, 7, 8]);
+    cancel.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_follower_interleaves_bounded_retention_with_control_reads_and_block_appends()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let base_blocks = parseable_multi_block_chain()?;
+    let full_blocks = forked_parseable_chain(&base_blocks, 5, 11, 0)?;
+    let full_checkpoints = checkpoints_for_parseable_chain(&full_blocks, &activations)?;
+    let old_ts = UnixTimestampMillis::new(
+        UnixTimestampMillis::now()
+            .value()
+            .saturating_sub(10_000_000),
+    );
+    let temporary = tempdir()?;
+    let store_path = temporary.path().join("canonical");
+
+    let initial_source = RecordingParseableSource::new(
+        base_blocks.clone(),
+        checkpoints_for_parseable_chain(&base_blocks, &activations)?,
+        BlockHeight::new(4),
+    );
+    let store = publish_parseable_store_at_time(
+        &initial_source,
+        &base_blocks,
+        Arc::clone(&activations),
+        &store_path,
+        4,
+        BlockHeight::new(4),
+        old_ts,
+    )
+    .await?;
+    let store =
+        append_old_parseable_blocks(store, &full_blocks, &full_checkpoints, &activations, old_ts)?;
+    assert_eq!(store.event_fence().chain_event_sequence(), 5);
+
+    let source = RecordingParseableSource::new(full_blocks, full_checkpoints, BlockHeight::new(11));
+    let (tip1_entered, tip1_resume) = source.pause_tip_call(1);
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let (canonical, control_commands) = canonical_control_channel();
+    let budget = CanonicalEventRetentionStepBudget::new(
+        NonZeroU32::new(2).ok_or("max_inspected must be nonzero")?,
+        NonZeroU32::new(2).ok_or("max_deleted must be nonzero")?,
+    );
+    let follower = CanonicalFollower::new(
+        &source,
+        Arc::clone(&activations),
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(20),
+            lag_threshold_blocks: 0,
+            target_height: None,
+            event_retention_window: Some(Duration::from_hours(1)),
+            event_retention_check_interval: Duration::from_secs(60),
+            mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
+        },
+        &readiness,
+        &cancel,
+    )
+    .with_event_retention_step_budget(budget);
+
+    let (verify_outcome, follow_outcome) = tokio::join!(
+        verify_bounded_retention_steps_with_control(
+            &source,
+            &canonical,
+            &cancel,
+            tip1_entered,
+            tip1_resume,
+        ),
+        follow_canonical_tip_with_control(store, follower, control_commands),
+    );
+    verify_outcome?;
+    let store = follow_outcome?;
+    drop(store);
+
+    let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
+        &store_path,
+        &activations,
+        zinder_store::RawBlobRetention::None,
+        CanonicalReorgPolicy::new(4)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(reopened.canonical_event_retention_floor()?, 6);
+    let _baseline_epoch = reopened.chain_epoch_at(zinder_core::ChainEpochId::new(1))?;
+    Ok(())
+}
+
+async fn wait_for_confirmed_at_tip_status(
+    command_sender: &mpsc::Sender<CanonicalControlCommand>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..10_000 {
+        let (reply, outcome) = oneshot::channel();
+        command_sender
+            .send(CanonicalControlCommand::WriterStatus { reply })
+            .await?;
+        let status = tokio::time::timeout(Duration::from_secs(1), outcome).await???;
+        if !status.tip_unconfirmed {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+    Err("follower did not reach confirmed at-tip wait".into())
+}
+
+#[tokio::test]
+async fn at_tip_wait_yields_to_canonical_between_successive_maintenance_commands()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (source, activations, store, _dir) = follower_fixture_at_its_node_tip().await?;
+    for tag in 1_u8..=3 {
+        let _envelope = store.append_mempool_event(
+            MempoolEvent::Invalidated {
+                transaction_id: TransactionId::from_bytes([tag; 32]),
+                reason: MempoolEvictionReason::Unknown,
+            },
+            UnixTimestampMillis::new(1_000),
+        )?;
+    }
+    let retention = MempoolEventRetentionConfig::new(
+        Some(Duration::from_millis(1)),
+        Some(Duration::from_millis(1)),
+    );
+    let budget = MempoolEventRetentionStepBudget::new(
+        NonZeroU32::new(1).ok_or("retention event budget must be nonzero")?,
+        NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+    );
+    let (command_sender, control_commands) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+    let follower_source = source.clone();
+    let follower_cancel = cancel.clone();
+    let follower_task = tokio::spawn(async move {
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+        let follower = fixed_tip_follower(
+            &follower_source,
+            &activations,
+            Duration::from_secs(60),
+            &readiness,
+            &follower_cancel,
+        );
+        follow_canonical_tip_with_control(store, follower, control_commands).await
+    });
+
+    wait_for_confirmed_at_tip_status(&command_sender).await?;
+    assert_eq!(source.tip_call_count(), 1);
+    let (second_tip_entered, resume_second_tip) = source.pause_tip_call(2);
+    let (first_reply, first_outcome) = oneshot::channel();
+    let (second_reply, mut second_outcome) = oneshot::channel();
+    for reply in [first_reply, second_reply] {
+        command_sender
+            .send(CanonicalControlCommand::PruneMempoolEvents {
+                now: UnixTimestampMillis::new(10_000),
+                retention,
+                budget,
+                reply,
+            })
+            .await?;
+    }
+
+    let first_outcome = tokio::time::timeout(Duration::from_secs(1), first_outcome).await???;
+    assert!(first_outcome.has_immediate_work());
+    tokio::time::timeout(Duration::from_secs(1), second_tip_entered.notified()).await?;
+    assert!(matches!(
+        second_outcome.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    resume_second_tip.notify_one();
+    let second_outcome = tokio::time::timeout(Duration::from_secs(1), second_outcome).await???;
+    assert!(second_outcome.has_immediate_work());
+    cancel.cancel();
+    drop(command_sender);
+    let _store = tokio::time::timeout(Duration::from_secs(1), follower_task).await???;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sustained_concurrent_reads_do_not_starve_at_tip_poll_or_shutdown()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let (source, activations, store, _dir) = follower_fixture_at_its_node_tip().await?;
+    let (command_sender, control_commands) =
+        mpsc::channel(zinder_ingest::CANONICAL_CONTROL_COMMAND_CAPACITY);
+    let cancel = CancellationToken::new();
+    let follower_source = source.clone();
+    let follower_cancel = cancel.clone();
+    let follower_task = tokio::spawn(async move {
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+        let follower = CanonicalFollower::new(
+            &follower_source,
+            Arc::clone(&activations),
+            CanonicalFollowConfig {
+                request_timeout: Duration::from_secs(5),
+                poll_interval: Duration::from_millis(25),
+                lag_threshold_blocks: 0,
+                target_height: None,
+                event_retention_window: None,
+                event_retention_check_interval: Duration::from_secs(60),
+                mempool_ready_gate: None,
+                max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+                node_failover: None,
+            },
+            &readiness,
+            &follower_cancel,
+        );
+        follow_canonical_tip_with_control(store, follower, control_commands).await
+    });
+
+    wait_for_confirmed_at_tip_status(&command_sender).await?;
+    let stop_reads = Arc::new(AtomicBool::new(false));
+    let completed_reads = Arc::new(AtomicUsize::new(0));
+    let reader_sender = command_sender.clone();
+    let reader_stop = Arc::clone(&stop_reads);
+    let reader_completed = Arc::clone(&completed_reads);
+    let reader_task = tokio::spawn(async move {
+        while !reader_stop.load(Ordering::Relaxed) {
+            let (reply, outcome) = oneshot::channel();
+            if reader_sender
+                .send(CanonicalControlCommand::WriterStatus { reply })
+                .await
+                .is_err()
+            {
+                break;
+            }
+            if outcome.await.is_err() {
+                break;
+            }
+            reader_completed.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if source.tip_call_count() >= 3 && completed_reads.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "scheduled at-tip polls starved under sustained concurrent reads (tips={}, reads={})",
+            source.tip_call_count(),
+            completed_reads.load(Ordering::Relaxed),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    cancel.cancel();
+    let _store = tokio::time::timeout(Duration::from_secs(2), follower_task).await???;
+    stop_reads.store(true, Ordering::Relaxed);
+    drop(command_sender);
+    let _ = tokio::time::timeout(Duration::from_secs(2), reader_task).await?;
+    Ok(())
 }

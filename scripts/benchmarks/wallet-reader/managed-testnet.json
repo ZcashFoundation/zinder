@@ -1,0 +1,116 @@
+{
+  "environment": {
+    "network": "zcash-testnet",
+    "tip_height": 4644091,
+    "tip_hash": "000064d028b9ceaa152435294b4184ecefd60dce851a5efb32fa2362783a25df",
+    "listener": "managed",
+    "cache": "warm",
+    "protocol_chain": "test"
+  },
+  "expect_from_environment": {
+    "/chain/tip_before/height": "tip_height",
+    "/chain/tip_before/hash": "tip_hash",
+    "/chain/tip_after/height": "tip_height",
+    "/chain/tip_after/hash": "tip_hash",
+    "/chain/name": "protocol_chain"
+  },
+  "arms": {
+    "baseline": {
+      "endpoint": "http://127.0.0.1:49367",
+      "pid": "BASELINE_PID",
+      "metrics": "http://127.0.0.1:49377/metrics",
+      "executable": "/baseline/zinder-compat-lightwalletd"
+    },
+    "candidate": {
+      "endpoint": "http://127.0.0.1:49368",
+      "pid": "CANDIDATE_PID",
+      "metrics": "http://127.0.0.1:49378/metrics",
+      "executable": "/candidate/zinder-compat-lightwalletd"
+    }
+  },
+  "cases": {
+    "covered": {
+      "command": [
+        "zinder-bench",
+        "raw-range-probe",
+        "--endpoint",
+        "{endpoint}",
+        "--oracle",
+        "scripts/benchmarks/wallet-reader/covered-oracle.json",
+        "--clients",
+        "4",
+        "--repetitions",
+        "1024",
+        "--warmup-repetitions",
+        "1",
+        "--server-pid",
+        "{pid}",
+        "--server-executable",
+        "{executable}",
+        "--server-metrics-url",
+        "{metrics}",
+        "--server-freshness-counter",
+        "zinder_wallet_serving_pair_publisher_refresh_total{status=ok}",
+        "--rocksdb-multiget-counters",
+        "--report",
+        "{report}"
+      ],
+      "expect": {
+        "/verified": true,
+        "/totals/requests": 8192,
+        "/totals/blocks": 16384000,
+        "/totals/bytes": 7413800960,
+        "/chain/tip_unchanged": true,
+        "/counters/available": true
+      },
+      "match": [
+        "/oracle/sha256"
+      ]
+    },
+    "boundary": {
+      "command": [
+        "zinder-bench",
+        "raw-range-probe",
+        "--endpoint",
+        "{endpoint}",
+        "--oracle",
+        "scripts/benchmarks/wallet-reader/boundary-oracle.json",
+        "--clients",
+        "4",
+        "--repetitions",
+        "3072",
+        "--warmup-repetitions",
+        "1",
+        "--server-pid",
+        "{pid}",
+        "--server-executable",
+        "{executable}",
+        "--server-metrics-url",
+        "{metrics}",
+        "--server-freshness-counter",
+        "zinder_wallet_serving_pair_publisher_refresh_total{status=ok}",
+        "--rocksdb-multiget-counters",
+        "--report",
+        "{report}"
+      ],
+      "expect": {
+        "/verified": true,
+        "/totals/requests": 24576,
+        "/totals/blocks": 4915200,
+        "/totals/bytes": 1285275648,
+        "/chain/tip_unchanged": true,
+        "/counters/available": true
+      },
+      "match": [
+        "/oracle/sha256"
+      ]
+    }
+  },
+  "order": "alternating",
+  "repeats": 6,
+  "timeout_seconds": 180,
+  "inputs": [
+    "scripts/benchmarks/wallet-reader/covered-oracle.json",
+    "scripts/benchmarks/wallet-reader/boundary-oracle.json"
+  ]
+}

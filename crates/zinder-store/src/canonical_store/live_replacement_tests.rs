@@ -18,7 +18,7 @@ use super::{
     CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
     CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
+    ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
     RocksDbCanonicalSecondary, RocksDbCanonicalStore,
     displaced_archive::{
         encode_test_archive_state, encode_test_hash_pointer_rows, encode_test_order_key,
@@ -285,8 +285,7 @@ fn all_retention_keeps_block_blobs_across_append_replacement_secondary_and_reope
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::All,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -379,8 +378,7 @@ fn no_blob_retention_preserves_transaction_locations_across_the_complete_store_l
         &store_path,
         &secondary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::None,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -791,8 +789,7 @@ fn retained_events_resume_exactly_and_leases_bound_pruning()
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -824,8 +821,7 @@ fn secondary_wallet_events_reconstruct_historical_branches_across_multiple_reorg
         &store_path,
         &secondary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(32)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -981,9 +977,10 @@ fn secondary_wallet_events_reconstruct_historical_branches_across_multiple_reorg
         max_events: page_limit,
         family: ChainEventStreamFamily::Visible,
     })?;
-    let synthetic = resumed
-        .first()
-        .ok_or("pruned reconnect did not synthesize a reorg")?;
+    let [synthetic] = resumed.as_slice() else {
+        return Err("pruned reconnect must return exactly one reorg".into());
+    };
+    assert_eq!(synthetic.event_sequence, 4);
     let ChainEvent::ChainReorged {
         reverted,
         committed,
@@ -1033,6 +1030,187 @@ fn secondary_wallet_events_reconstruct_historical_branches_across_multiple_reorg
         Err(CanonicalStoreError::CanonicalEventCursorExpired {
             event_sequence: 1,
             oldest_retained_sequence: 4,
+        })
+    ));
+    Ok(())
+}
+
+fn wallet_resume_stores(
+    temporary: &TempDir,
+) -> Result<(RocksDbCanonicalStore, RocksDbCanonicalSecondary), Box<dyn std::error::Error>> {
+    let path = temporary.path().join("canonical");
+    let store = published_store(&path, 5, BlockHeight::new(5), BlockHeight::new(3))?;
+    let secondary = RocksDbCanonicalSecondary::open_ready(
+        &path,
+        temporary.path().join("secondary"),
+        &super::test_network_upgrade_activations(Network::ZcashTestnet)?,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
+        store.reorg_policy(),
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    Ok((store, secondary))
+}
+
+fn replace_wallet_suffix(
+    store: RocksDbCanonicalStore,
+    start: u32,
+    end: u32,
+    parent_tag: u8,
+    offset: u8,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    let replacement = CanonicalLiveReplacement::new(
+        store.event_fence(),
+        replacement_suffix(start, end, [parent_tag; 32], offset)?,
+        UnixTimestampMillis::now(),
+    );
+    Ok(store
+        .commit_live_replacement(
+            replacement,
+            &super::test_network_upgrade_activations(Network::ZcashTestnet)?,
+        )?
+        .0)
+}
+
+fn append_wallet_block(
+    store: RocksDbCanonicalStore,
+    tag: u8,
+    settled_tip: BlockId,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    let fence = store.event_fence();
+    let tip = fence.visible_tip();
+    let block = replacement_block(
+        tip.height.next().ok_or("height overflow")?,
+        [tag; 32],
+        tip.hash.as_bytes(),
+        tag,
+    )?;
+    let append = CanonicalLiveAppend::new(
+        fence,
+        block,
+        Vec::new(),
+        settled_tip,
+        UnixTimestampMillis::now(),
+    );
+    Ok(store
+        .commit_live_append(
+            append,
+            &super::test_network_upgrade_activations(Network::ZcashTestnet)?,
+        )?
+        .0)
+}
+
+fn only_wallet_event(
+    secondary: &RocksDbCanonicalSecondary,
+    cursor: Option<&StreamCursorTokenV1>,
+) -> Result<crate::ChainEventEnvelope, Box<dyn std::error::Error>> {
+    let mut page = secondary
+        .wallet_chain_event_history(ChainEventHistoryRequest::with_default_limit(cursor))?;
+    assert_eq!(page.len(), 1);
+    page.pop().ok_or_else(|| "missing event".into())
+}
+
+#[test]
+fn pruned_double_reorg_heals_once_and_its_cursor_tracks_later_appends_and_reorgs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let (store, mut secondary) = wallet_resume_stores(&temporary)?;
+    let baseline = only_wallet_event(&secondary, None)?;
+    let store = replace_wallet_suffix(store, 5, 5, 4, 100)?;
+    let store = replace_wallet_suffix(store, 5, 5, 4, 200)?;
+    let settled = BlockId::new(BlockHeight::new(5), BlockHash::from_bytes([205; 32]));
+    let store = append_wallet_block(store, 206, settled)?;
+    store.prune_canonical_events_before(3, UnixTimestampMillis::now())?;
+    secondary.try_catch_up()?;
+    let recovery = only_wallet_event(&secondary, Some(&baseline.cursor))?;
+    assert_eq!(recovery.event_sequence, 4);
+    assert_eq!(recovery.chain_epoch.id, ChainEpochId::new(4));
+    assert_eq!(recovery.settled_tip_height, settled.height);
+    assert!(
+        matches!(recovery.event, ChainEvent::ChainReorged { reverted, committed }
+        if reverted.block_range == BlockHeightRange::inclusive(BlockHeight::new(5), BlockHeight::new(5))
+        && committed.block_range == BlockHeightRange::inclusive(BlockHeight::new(5), BlockHeight::new(6)))
+    );
+    let position = recovery
+        .cursor
+        .decode_chain_event(Network::ZcashTestnet, secondary.cursor_auth_key)?;
+    assert_eq!(position.event_sequence, 4);
+    assert_eq!(
+        position.locator.tip().hash,
+        recovery.chain_epoch.visible_tip_hash
+    );
+    assert_eq!(
+        only_wallet_event(&secondary, Some(&baseline.cursor))?,
+        recovery
+    );
+    let after_recovery = ChainEventHistoryRequest::with_default_limit(Some(&recovery.cursor));
+    assert_eq!(secondary.wallet_chain_event_history(after_recovery)?, []);
+
+    let store = append_wallet_block(store, 207, settled)?;
+    secondary.try_catch_up()?;
+    let appended = only_wallet_event(&secondary, Some(&recovery.cursor))?;
+    assert_eq!(appended.event_sequence, 5);
+    assert!(matches!(appended.event, ChainEvent::ChainCommitted { .. }));
+
+    let store = replace_wallet_suffix(store, 6, 7, 205, 210)?;
+    store.prune_canonical_events_before(6, UnixTimestampMillis::now())?;
+    secondary.try_catch_up()?;
+    let reorg = only_wallet_event(&secondary, Some(&recovery.cursor))?;
+    assert_eq!(reorg.event_sequence, 6);
+    assert!(
+        matches!(reorg.event, ChainEvent::ChainReorged { reverted, .. }
+        if reverted.chain_epoch == recovery.chain_epoch && reverted.block_range.start == BlockHeight::new(6))
+    );
+    Ok(())
+}
+
+#[test]
+fn pruned_reorg_checks_settled_identity_when_the_locator_skips_the_fork()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let (store, mut secondary) = wallet_resume_stores(&temporary)?;
+    let baseline = only_wallet_event(&secondary, None)?;
+    let store = replace_wallet_suffix(store, 4, 5, 3, 100)?;
+    let store = append_wallet_block(
+        store,
+        106,
+        BlockId::new(BlockHeight::new(5), BlockHash::from_bytes([105; 32])),
+    )?;
+    store.prune_canonical_events_before(3, UnixTimestampMillis::now())?;
+    secondary.try_catch_up()?;
+    let recovery = only_wallet_event(&secondary, Some(&baseline.cursor))?;
+    assert!(
+        matches!(recovery.event, ChainEvent::ChainReorged { reverted, committed }
+        if reverted.block_range.start == BlockHeight::new(4)
+        && committed.chain_epoch.settled_tip_height == BlockHeight::new(5))
+    );
+
+    let epochs = store
+        .bounded_open
+        .db
+        .cf_handle(super::rocksdb::CHAIN_EPOCH_COLUMN_FAMILY)
+        .ok_or("missing epoch family")?;
+    let old_epoch = baseline.chain_epoch;
+    store.bounded_open.db.put_cf(
+        &epochs,
+        old_epoch.id.value().to_be_bytes(),
+        super::publication::encode_live_chain_epoch(
+            BlockId::new(old_epoch.visible_tip_height, old_epoch.visible_tip_hash),
+            BlockId::new(
+                old_epoch.settled_tip_height,
+                BlockHash::from_bytes([99; 32]),
+            ),
+            ChainTipMetadata::empty(),
+            old_epoch.created_at,
+        ),
+    )?;
+    secondary.try_catch_up()?;
+    assert!(matches!(
+        secondary.wallet_chain_event_history(ChainEventHistoryRequest::with_default_limit(Some(
+            &baseline.cursor
+        ))),
+        Err(CanonicalStoreError::CanonicalEventCursorExpired {
+            event_sequence: 1,
+            oldest_retained_sequence: 3
         })
     ));
     Ok(())
@@ -1238,8 +1416,7 @@ fn writer_raises_the_reorg_window_in_place_across_restart_and_never_lowers_it()
                 &store_path,
                 temporary.path().join("stale-secondary"),
                 &activations,
-                CanonicalStoreWorkload::Wallet,
-                RawBlobRetention::Transactions,
+                crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
                 construction,
                 RocksDbResourceBudget::for_local_tests(),
             )
@@ -1256,8 +1433,7 @@ fn writer_raises_the_reorg_window_in_place_across_restart_and_never_lowers_it()
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         raised,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1326,8 +1502,7 @@ fn secondary_refuses_a_writer_raise_until_it_reopens_with_the_raised_window()
             &store_path,
             temporary.path().join(name),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
             CanonicalReorgPolicy::new(window)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1368,14 +1543,13 @@ fn incremental_replay_tails_match_a_complete_derivation_across_appends_and_repla
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(window)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
-    let complete = |db: &DB, ready: CanonicalStoreReadyEvidence| {
+    let complete = |store_ref: &RocksDbCanonicalStore, ready: CanonicalStoreReadyEvidence| {
         super::replay_tail::AuthenticatedReplayTail::authenticate(
-            db,
+            store_ref.segment_context(),
             ready.sequence_checkpoint,
             ready.visible_tip.height,
             window,
@@ -1421,7 +1595,7 @@ fn incremental_replay_tails_match_a_complete_derivation_across_appends_and_repla
     )?;
     store = next;
 
-    let store_complete = complete(&store.bounded_open.db, store.ready_evidence())?;
+    let store_complete = complete(&store, store.ready_evidence())?;
     assert_eq!(store.replay_tail.checkpoints(), store_complete);
     secondary.try_catch_up()?;
     assert_eq!(secondary.event_fence(), store.event_fence());
@@ -1452,8 +1626,7 @@ fn secondary_lagging_beyond_one_window_matches_a_complete_derivation()
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(window)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1487,7 +1660,7 @@ fn secondary_lagging_beyond_one_window_matches_a_complete_derivation()
     secondary.try_catch_up()?;
     assert_eq!(secondary.event_fence(), store.event_fence());
     let complete = super::replay_tail::AuthenticatedReplayTail::authenticate(
-        &store.bounded_open.db,
+        store.segment_context(),
         store.ready_evidence().sequence_checkpoint,
         store.ready_evidence().visible_tip.height,
         window,
@@ -1525,20 +1698,23 @@ fn writer_detects_an_unannounced_replay_row_change_before_it_settles()
         4,
         128,
     );
-    let forged_replay = encode_canonical_block_replay(
-        &forged.facts,
-        CanonicalBlockReplayFormatVersion::V1,
-        CanonicalBlockFactsDigestVersion::V1,
-    );
+    let (encoded_forged, _) = super::live_tail::LiveTailBlockRecord::encode_from_compact_block_v1(
+        &forged.compact_block,
+        Some(forged.facts.clone()),
+        super::live_tail::LiveTailEncodeOptions {
+            include_supplement: true,
+            retain_canonical_facts: true,
+        },
+    )?;
     let replay_family = store
         .bounded_open
         .db
-        .cf_handle(super::block_replay::BLOCK_REPLAY_COLUMN_FAMILY)
-        .ok_or("replay family absent")?;
+        .cf_handle(super::rocksdb::LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+        .ok_or("live_tail_block family absent")?;
     store.bounded_open.db.put_cf(
         &replay_family,
         zinder_core::wire::encode_height_key_ascending(BlockHeight::new(3)),
-        forged_replay.as_bytes(),
+        encoded_forged,
     )?;
     drop(replay_family);
 
@@ -1750,8 +1926,7 @@ fn secondary_point_reads_agree_with_the_bounded_replay_range_scan()
         &store_path,
         &secondary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1930,7 +2105,7 @@ pub(super) fn published_store(
         reorg_window,
         build_tip_height,
         settled_height,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )
 }
 
@@ -1973,7 +2148,7 @@ pub(super) fn published_fork_store(
         build_tip_height,
         settled_height,
         PublishedChain {
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::All,
             fork_tag,
             note_commitments: false,
             history_floor: None,
@@ -1999,7 +2174,7 @@ pub(super) fn published_note_commitment_store(
         build_tip_height,
         settled_height,
         PublishedChain {
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::All,
             fork_tag: 0,
             note_commitments: true,
             history_floor,
@@ -2057,7 +2232,6 @@ fn published_chain_store(
     };
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -2159,12 +2333,7 @@ pub(super) fn open_store(
     activations: &zinder_core::NetworkUpgradeActivations,
     reorg_window: u32,
 ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
-    open_store_with_retention(
-        path,
-        activations,
-        reorg_window,
-        RawBlobRetention::Transactions,
-    )
+    open_store_with_retention(path, activations, reorg_window, RawBlobRetention::All)
 }
 
 pub(super) fn open_store_with_retention(
@@ -2176,7 +2345,6 @@ pub(super) fn open_store_with_retention(
     Ok(RocksDbCanonicalStore::open_ready(
         path,
         activations,
-        CanonicalStoreWorkload::Wallet,
         raw_blob_retention,
         CanonicalReorgPolicy::new(reorg_window)?,
         RocksDbResourceBudget::for_local_tests(),
@@ -2192,8 +2360,7 @@ fn open_writer(
         RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
             path,
             activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(reorg_window)?,
             RocksDbResourceBudget::for_local_tests(),
         )?,
@@ -2211,7 +2378,7 @@ pub(super) fn replacement_block(
         block_hash,
         parent_hash,
         transaction_tag,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )
 }
 
@@ -2253,7 +2420,7 @@ fn replacement_suffix(
     Ok(blocks)
 }
 
-fn canonical_block(
+pub(super) fn canonical_block(
     height: BlockHeight,
     block_hash: [u8; 32],
     parent_hash: [u8; 32],
@@ -2324,7 +2491,6 @@ fn canonical_block(
         replay_envelope,
         tip_metadata: ChainTipMetadata::new(0, 0, 0),
         tree_state_checkpoint: None,
-        block_final_note_commitment_roots: None,
         transaction_blobs: vec![TransactionBlobArtifact::new(
             transaction_location(height, block_hash, transaction_tag),
             raw_transaction_bytes,
@@ -2341,7 +2507,6 @@ fn apply_raw_blob_retention(
 ) {
     match raw_blob_retention {
         RawBlobRetention::None => block.transaction_blobs.clear(),
-        RawBlobRetention::Transactions => {}
         RawBlobRetention::All => {
             let raw_block_bytes = vec![block_tag];
             block.facts.serialized_bytes_digest =
@@ -2366,12 +2531,17 @@ fn transaction_location(
     block_hash: [u8; 32],
     transaction_tag: u8,
 ) -> TransactionLocation {
-    TransactionLocation::new(
-        TransactionId::from_bytes([transaction_tag; 32]),
-        height,
-        BlockHash::from_bytes(block_hash),
-        0,
-    )
+    TransactionLocation {
+        serialized_bytes_sha256: Some(
+            SerializedBytesDigest::from_serialized_bytes(&[transaction_tag]).as_bytes(),
+        ),
+        ..TransactionLocation::new(
+            TransactionId::from_bytes([transaction_tag; 32]),
+            height,
+            BlockHash::from_bytes(block_hash),
+            0,
+        )
+    }
 }
 
 fn add_checkpoint(block: &mut CanonicalBuildBlock) -> Result<(), Box<dyn std::error::Error>> {

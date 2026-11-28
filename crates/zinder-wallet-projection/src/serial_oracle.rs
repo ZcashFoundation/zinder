@@ -11,7 +11,7 @@ use zinder_core::{
 
 use crate::{
     WalletAddressTransaction, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
-    WalletOutpointKey, WalletProjectionAccumulator, WalletProjectionContractError,
+    WalletBlockHash, WalletOutpointKey, WalletProjectionAccumulator, WalletProjectionContractError,
     WalletProjectionDigest, WalletProjectionDigestBuilder, WalletProjectionFamilyRowCounts,
     WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletTransactionPosition,
     WalletUnspentOutput, WalletUtxoSetSummary,
@@ -33,6 +33,7 @@ pub struct WalletProjectionSerialOracle {
     balance_by_address: BTreeMap<[u8; 32], u64>,
     supported_reorg_depth: u32,
     reorg_undo: BTreeMap<BlockHeight, WalletReorgUndo>,
+    block_hashes: BTreeMap<BlockHeight, BlockHash>,
     utxo_count: u64,
     total_utxo_value_zat: u64,
     utxo_commitment: TransparentUtxoSetCommitment,
@@ -61,6 +62,7 @@ impl WalletProjectionSerialOracle {
             balance_by_address: BTreeMap::new(),
             supported_reorg_depth,
             reorg_undo: BTreeMap::new(),
+            block_hashes: BTreeMap::new(),
             utxo_count: 0,
             total_utxo_value_zat: 0,
             utxo_commitment: TransparentUtxoSetCommitment::empty(),
@@ -114,6 +116,12 @@ impl WalletProjectionSerialOracle {
             .unwrap_or_default()
     }
 
+    /// Returns one projected canonical block hash by height.
+    #[must_use]
+    pub fn find_block_hash(&self, height: BlockHeight) -> Option<BlockHash> {
+        self.block_hashes.get(&height).copied()
+    }
+
     /// Iterates address transactions in exact durable key order.
     pub fn address_transactions(&self) -> impl ExactSizeIterator<Item = &WalletAddressTransaction> {
         self.address_transactions.values()
@@ -134,6 +142,7 @@ impl WalletProjectionSerialOracle {
             transparent_address_transaction_count: count_rows(self.address_transactions.len()),
             transparent_address_balance_count: count_rows(self.balance_by_address.len()),
             reorg_undo_count: count_rows(self.reorg_undo.len()),
+            block_hash_by_height_count: count_rows(self.block_hashes.len()),
         }
     }
 
@@ -217,6 +226,15 @@ impl WalletProjectionSerialOracle {
                 WalletProjectionRowFamily::ReorgUndo,
                 &height.value().to_be_bytes(),
                 &undo.encode_value()?,
+            )?;
+        }
+
+        for (height, hash) in &self.block_hashes {
+            let block_hash_row = WalletBlockHash::new(BlockId::new(*height, *hash));
+            digest.append_row(
+                WalletProjectionRowFamily::BlockHashByHeight,
+                &block_hash_row.encode_key(),
+                &block_hash_row.encode_value(),
             )?;
         }
         Ok(digest)
@@ -322,6 +340,7 @@ impl WalletProjectionSerialOracle {
         }
 
         self.last_projected_block = Some(block);
+        self.block_hashes.insert(block.height, block.hash);
         self.source_sequence_digest = source_sequence_digest_after;
         created_outpoints.sort_unstable();
         spent_outpoints.sort_unstable();
@@ -484,6 +503,14 @@ mod tests {
         assert_eq!(oracle.address_balance(address_two), 4);
         assert_eq!(oracle.address_transactions().len(), 3);
         assert_eq!(
+            oracle.find_block_hash(BlockHeight::new(1)),
+            Some(block_one.block_header.block_hash)
+        );
+        assert_eq!(
+            oracle.find_block_hash(BlockHeight::new(2)),
+            Some(block_two.block_header.block_hash)
+        );
+        assert_eq!(
             oracle.row_counts(),
             WalletProjectionFamilyRowCounts {
                 transparent_unspent_output_count: 1,
@@ -492,6 +519,7 @@ mod tests {
                 transparent_address_transaction_count: 3,
                 transparent_address_balance_count: 1,
                 reorg_undo_count: 0,
+                block_hash_by_height_count: 2,
             }
         );
         assert_eq!(oracle.utxo_summary().utxo_count, 1);
@@ -564,6 +592,7 @@ mod tests {
             ))
         );
         assert_eq!(oracle.row_counts().reorg_undo_count, 1);
+        assert_eq!(oracle.row_counts().block_hash_by_height_count, 2);
         assert!(oracle.projection_digest().is_ok());
     }
 
@@ -730,7 +759,7 @@ mod tests {
                     .unwrap_or_else(|error| unreachable!("valid ordering digest: {error}"))
                     .as_bytes()
             ),
-            "dcdb04fc8570f5988946cfd7ea635dbb8e32dc3f98d98e48bdf15e2efd500b13"
+            "b5600032eb51ad99a3d24a44901a48ae0b2a57255a21a763dc1b9c9f6c7b6be7"
         );
     }
 

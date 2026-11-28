@@ -12,7 +12,7 @@
 //! the write stall bound, and keep their connection slot until the socket
 //! closes.
 
-mod connection_io;
+pub(crate) mod connection_io;
 mod request_body_deadline;
 
 use std::{convert::Infallible, future::Future, io, sync::Arc, time::Duration};
@@ -131,12 +131,9 @@ where
         let stream = match accepted {
             Ok((stream, _peer)) => stream,
             Err(error) => {
-                tracing::warn!(
-                    target: "zinder::runtime",
-                    event = "http_accept_failed",
-                    error = %error,
-                    "failed to accept an HTTP connection"
-                );
+                if !accept_failure_needs_backoff(&error, "http_accept_failed") {
+                    continue;
+                }
                 tokio::select! {
                     () = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => continue,
                     () = &mut shutdown => break,
@@ -155,7 +152,7 @@ where
         };
 
         let service = hyper_service(&router, limits.request_body_read_timeout);
-        let io = ConnectionIo::new(TokioIo::new(stream), limits.write_stall_timeout, slot);
+        let io = ConnectionIo::new(TokioIo::new(stream), limits.write_stall_timeout, Some(slot));
         let connection = builder.serve_connection(io, service).with_upgrades();
         let drain = drain.clone();
         connections.spawn(async move {
@@ -190,6 +187,44 @@ where
     Ok(())
 }
 
+/// Logs a failed `accept` as `event` and returns whether the listener should
+/// back off before it accepts again.
+///
+/// An error that belongs to the one connection being accepted needs no
+/// backoff, as in tonic's server. Other errors, such as running out of file
+/// descriptors, persist.
+pub(crate) fn accept_failure_needs_backoff(error: &io::Error, event: &'static str) -> bool {
+    if is_per_connection_accept_error(error) {
+        tracing::debug!(
+            target: "zinder::runtime",
+            event,
+            error = %error,
+            "a connection failed while it was accepted"
+        );
+        return false;
+    }
+    tracing::warn!(
+        target: "zinder::runtime",
+        event,
+        error = %error,
+        "failed to accept a connection"
+    );
+    true
+}
+
+/// Whether an `accept` error belongs to the one connection being accepted.
+fn is_per_connection_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+    )
+}
+
 /// Adapts the router to hyper, failing any request body that is not fully
 /// received within `body_read_timeout` of its request head.
 fn hyper_service(
@@ -207,4 +242,35 @@ fn hyper_service(
             request.map(|body| Body::new(RequestBodyDeadline::new(body, body_read_timeout)))
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::is_per_connection_accept_error;
+
+    #[test]
+    fn only_errors_of_the_accepted_connection_skip_the_backoff() {
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert!(
+                is_per_connection_accept_error(&io::Error::from(kind)),
+                "{kind:?}"
+            );
+        }
+        // EMFILE and ENOMEM surface as these kinds, and they persist.
+        for kind in [io::ErrorKind::Other, io::ErrorKind::OutOfMemory] {
+            assert!(
+                !is_per_connection_accept_error(&io::Error::from(kind)),
+                "{kind:?}"
+            );
+        }
+    }
 }

@@ -32,7 +32,7 @@ use tonic_health::pb::{
     health_server::{Health, HealthServer},
 };
 
-use crate::{Readiness, readiness::TrafficAdmission};
+use crate::{Readiness, RetryPushback, readiness::TrafficAdmission};
 
 /// Most `Watch` streams the process keeps open at once, across every
 /// listener and connection. A `Watch` past the limit fails with
@@ -123,7 +123,10 @@ impl Health for ReadinessHealth {
             unsent_changes: 0,
             _permit: Arc::clone(&self.watch_permits)
                 .try_acquire_owned()
-                .map_err(|_| Status::resource_exhausted("too many open health watches"))?,
+                .map_err(|_| {
+                    RetryPushback::Backoff
+                        .apply(Status::resource_exhausted("too many open health watches"))
+                })?,
         };
         Ok(Response::new(Box::pin(stream::unfold(
             state,

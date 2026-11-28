@@ -11,6 +11,9 @@
 
 use crate::ChainEpoch;
 
+/// Maximum number of selectors in a batched transparent-address request.
+pub const MAX_TRANSPARENT_ADDRESSES_PER_BATCH: usize = 256;
+
 /// Confirmed transparent-address balance bound to one chain epoch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransparentAddressBalance {

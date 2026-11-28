@@ -38,17 +38,16 @@ use zinder_core::{
     CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts,
     ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontiers, CompactChainMetadata,
     ConsensusBranchId, LockTime, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
-    PrivacyShape, SerializedBytesDigest, TransactionBlobArtifact, TransactionComponentCounts,
-    TransactionId, TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
-    TransactionVersion, TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint,
-    TransparentOutputFact, UnixTimestampMillis, ValidatedCanonicalBlockReplay,
-    encode_canonical_block_replay,
+    PrivacyShape, SerializedBytesDigest, TransactionComponentCounts, TransactionId,
+    TransactionIntrinsicValueBalances, TransactionPublicFacts, TransactionVersion,
+    TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
+    UnixTimestampMillis, ValidatedCanonicalBlockReplay, encode_canonical_block_replay,
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
     CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
-    CanonicalRetainedEvent, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
-    RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbResourceBudget,
+    CanonicalRetainedEvent, CanonicalStoreBuildPlan, CanonicalStoreError, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionFamilyRowCounts, WalletProjectionReadyEvidence,
@@ -68,8 +67,8 @@ const FAN_OUT_OUTPUTS_PER_TRANSACTION: u32 = 16;
 const HISTORY_OUTPUT_COUNT: u32 = 4_096;
 const SUPPORTED_REORG_DEPTH: u32 = 100;
 const OUTPUT_VALUE_ZAT: u64 = 10;
-const FIXTURE_FORMAT_VERSION: u16 = 2;
-const REPORT_FORMAT_VERSION: u16 = 2;
+const FIXTURE_FORMAT_VERSION: u16 = 1;
+const REPORT_FORMAT_VERSION: u16 = 1;
 const REPORT_PATH_ENV: &str = "ZINDER_WALLET_TRANSITION_REPORT";
 const SOFTWARE_REVISION_ENV: &str = "ZINDER_WALLET_TRANSITION_SOFTWARE_REVISION";
 const REPORTED_PERF_METRICS: [PerfMetric; 11] = [
@@ -281,6 +280,7 @@ struct RowCountSummary {
     transparent_address_transaction_count: u64,
     transparent_address_balance_count: u64,
     reorg_undo_count: u64,
+    block_hash_by_height_count: u64,
 }
 
 struct PreparedFixture {
@@ -472,12 +472,11 @@ fn prepare_fixture(stratum: Stratum) -> Result<PreparedFixture> {
         &activations,
         0,
         baseline_tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(SUPPORTED_REORG_DEPTH)?,
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         &canonical_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         CANONICAL_WRITER_BUDGET,
     )?;
@@ -571,8 +570,7 @@ fn prepare_fixture(stratum: Stratum) -> Result<PreparedFixture> {
         &canonical_path,
         temporary.path().join("canonical-secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(SUPPORTED_REORG_DEPTH)?,
         CANONICAL_READER_BUDGET,
     )?;
@@ -746,6 +744,7 @@ fn expected_row_counts(stratum: Stratum, blocks: u64) -> WalletProjectionFamilyR
         transparent_address_transaction_count: history + 1 + baseline + replay_address_transactions,
         transparent_address_balance_count: 1 + stratum_balances,
         reorg_undo_count: u64::from(SUPPORTED_REORG_DEPTH),
+        block_hash_by_height_count: 1 + blocks,
     }
 }
 
@@ -993,22 +992,6 @@ fn canonical_build_block(facts: CanonicalBlockFacts) -> CanonicalBuildBlock {
             ironwood_commitment_tree_size: 0,
         },
     );
-    let transaction_blobs = facts
-        .transactions
-        .iter()
-        .enumerate()
-        .map(|(index, transaction)| {
-            TransactionBlobArtifact::new(
-                TransactionLocation::new(
-                    transaction.public_facts.transaction_id,
-                    height,
-                    block_hash,
-                    u32::try_from(index).unwrap_or(u32::MAX),
-                ),
-                transaction.public_facts.transaction_id.as_bytes(),
-            )
-        })
-        .collect();
     let replay_envelope = encode_canonical_block_replay(
         &facts,
         CanonicalBlockReplayFormatVersion::V1,
@@ -1024,8 +1007,7 @@ fn canonical_build_block(facts: CanonicalBlockFacts) -> CanonicalBuildBlock {
             height.value(),
             CommitmentTreeFrontiers::default(),
         )),
-        block_final_note_commitment_roots: None,
-        transaction_blobs,
+        transaction_blobs: Vec::new(),
         block_blob: None,
     }
 }
@@ -1217,6 +1199,7 @@ const fn row_count_summary(counts: WalletProjectionFamilyRowCounts) -> RowCountS
         transparent_address_transaction_count: counts.transparent_address_transaction_count,
         transparent_address_balance_count: counts.transparent_address_balance_count,
         reorg_undo_count: counts.reorg_undo_count,
+        block_hash_by_height_count: counts.block_hash_by_height_count,
     }
 }
 

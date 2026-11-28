@@ -9,6 +9,7 @@
 //! The harness is a standalone binary and is not linked into production
 //! services.
 
+pub mod active_writer_publication;
 pub mod canonical_fixture_replay;
 pub mod canonical_fixture_transport_server;
 pub mod canonical_replay_storage;
@@ -16,6 +17,7 @@ pub mod capture;
 pub mod error;
 pub mod fixture;
 pub mod metrics_scrape;
+pub mod postgres_segmented;
 pub mod recorder;
 pub mod report;
 pub mod rss;

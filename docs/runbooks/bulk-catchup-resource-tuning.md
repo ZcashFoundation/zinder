@@ -1,93 +1,62 @@
 # Bulk-catchup resource tuning
 
-Use this runbook when canonical or wallet construction runs out of memory,
-stalls, or is slower than the host should allow. It shows how to find the
-resource that limits construction and which setting to change.
+Use this runbook when canonical or wallet construction hits OOM, stalls, or runs slower than host hardware allows.
 
-Ingest sizes its canonical construction budgets from the container's memory
-limit. Wallet construction uses fixed default budgets. Most deployments need
-no tuning. Change a setting only after a metric shows which resource is
-short. To see the values a binary resolved, run it with `--print-config`. In
-a runtime image, run the binary directly in the container, as
-[Inspect a runtime container](deploying-on-a-vm.md#inspect-a-runtime-container)
-shows.
+Both `zinder-ingest` and `zinder-projector` scale default construction budgets from the detected container cgroup memory limit and CPU count, so most deployments need no overrides. Inspect resolved values with `zinder config print` or `--print-config` ([Inspect a runtime container](deploying-on-a-vm.md#inspect-a-runtime-container)) and tune only the bottleneck shown in `/metrics`.
 
 ## Find the limiting resource
 
-Look at the process exit and the metrics just before it. Ingest exports its
-metrics on the ops endpoint at `/metrics`.
-
-| Resource | Signs |
+| Resource | Signals (`/metrics` and exit state) |
 | --- | --- |
-| Memory | Exit code 137 or a cgroup out-of-memory event from the platform. `zinder_ingest_memory_pressure_ratio`, the non-reclaimable memory divided by the container limit, approaches 1 |
-| Node RPC | `zinder_ingest_source_request_duration_seconds` is high, `zinder_ingest_source_retry_total` rises, and `zinder_ingest_bulk_pipeline_head_of_line_wait_seconds` shows construction waiting for the next segment from the node |
-| CPU | The process uses all its CPUs while `zinder_ingest_source_fetch_queue_bytes` stays near its limit, so fetched blocks wait for preparation |
-| Disk IO | Host disk utilization is saturated. `zinder_store_rocksdb_property` reports a rising `rocksdb.estimate-pending-compaction-bytes`, a non-zero `rocksdb.actual-delayed-write-rate`, or `rocksdb.is-write-stopped` equal to 1 |
+| **Memory** | Exit code `137` / cgroup OOM; `zinder_ingest_memory_pressure_ratio` approaches `1`. |
+| **Node RPC** | High `zinder_ingest_source_request_duration_seconds`, rising `zinder_ingest_source_retry_total`, high `zinder_ingest_bulk_pipeline_head_of_line_wait_seconds`. |
+| **CPU** | CPUs saturated while `zinder_ingest_source_fetch_queue_bytes` stays near its limit (blocks waiting for preparation). |
+| **Disk I/O** | Saturated disk; `zinder_store_rocksdb_property{store_role="canonical_primary"}` shows rising `rocksdb.estimate-pending-compaction-bytes`, nonzero `rocksdb.actual-delayed-write-rate`, or `rocksdb.is-write-stopped == 1`. |
 
-Change one setting at a time. Compare throughput and peak memory on the same
-chain range before and after.
+Change one setting at a time and compare throughput and peak memory over the same chain range.
 
-## Settings
+## Construction settings
 
-Construction settings for ingest live under `[ingest.construction]`, and each
-has a `ZINDER_INGEST__CONSTRUCTION__*` environment variable. Wallet
-construction settings live under `[projector.build]`. Every key and its
-environment variable are listed in
-[Configuration](../reference/configuration.md).
+Ingest construction keys live under `[ingest.construction]` (`ZINDER_INGEST__CONSTRUCTION__*`), and projector build keys live under `[projector.build]` (`ZINDER_PROJECTOR__BUILD__*`). See [Configuration](../reference/configuration.md) for all variables.
 
-| Symptom | Setting | Default | Effect of the change |
+| Symptom | Setting | Default | Effect |
 | --- | --- | --- | --- |
-| Ingest runs out of memory | `block_prepare_concurrency` | `min(available CPUs, 16)` | Lower it first. Fewer blocks are prepared at once, so less memory is held |
-| Ingest still runs out of memory | `block_prepare_memory_watermark_bytes` | container memory / 64, clamped to 128 MiB to 512 MiB | Lower it. Less prepared block data waits for its store write |
-| Ingest runs out of memory with a full source queue | `source_fetch_max_in_flight_bytes` | the larger of `node.max_response_bytes` and container memory / 64 clamped to 128 MiB to 384 MiB | Lower it. Fewer node responses are held in memory. It cannot go below `node.max_response_bytes`, the largest across all endpoints when fallbacks are configured |
-| The projector runs out of memory | `projector.build.max_outpoint_sort_memory_bytes` and `projector.build.max_secondary_sort_memory_bytes_per_sorter` | 4 GiB and 1 GiB | Lower them. Sorters spill to disk sooner, so the build needs more free disk |
-| The container limit is too small for any setting | `ZINDER_INGEST_MEMORY_LIMIT`, `ZINDER_PROJECTOR_MEMORY_LIMIT` (Compose) | 14g and 10g on Mainnet | Raise it. The ingest byte budgets above grow with it unless you set them explicitly. The projector's sort budgets stay fixed, so raise them yourself if the projector should use the extra memory |
-| The node answers slowly or times out | `source_fetch_max_in_flight_requests` | 12 | Lower it to reduce load on the node. Raise it only when the node has spare capacity |
-| The node rejects large responses | `source_segment_target_response_bytes` | `min(node.max_response_bytes, 32 MiB)`, using the smallest `max_response_bytes` across all endpoints when fallbacks are configured | Keep it below the node's own limit, which is 50 MiB by default on Zebra 7.1.0 and Zakura 1.8.6. It cannot exceed the largest `max_response_bytes` across all endpoints |
-| CPUs are idle and the node keeps up | `block_prepare_concurrency` | `min(available CPUs, 16)` | Raise it together with `block_prepare_memory_watermark_bytes`. More slots without more bytes only add contention |
-| RocksDB compaction falls behind and the host has spare CPU and disk | `storage.canonical.rocksdb.max_background_jobs` or `wallet.rocksdb.max_background_jobs` | 2 | Raise it. More flush and compaction work runs in parallel |
+| Ingest OOM | `block_prepare_concurrency` | `min(CPUs, 16)` | Lower first to reduce concurrent in-flight block preparation. |
+| Ingest still OOM | `block_prepare_memory_watermark_bytes` | `clamp(container_mem / 64, 128 MiB, 512 MiB)` | Lower to bound prepared blocks waiting for write. |
+| Ingest OOM with full fetch queue | `source_fetch_max_in_flight_bytes` | `max(node.max_response_bytes, clamp(container_mem / 64, 128 MiB, 384 MiB))` | Lower to hold fewer fetched node responses (must be ≥ largest `node.max_response_bytes` across fallbacks). |
+| Projector OOM | `projector.build.max_outpoint_sort_memory_bytes` and `projector.build.max_secondary_sort_memory_bytes_per_sorter` | Cgroup-scaled: `40%` (`64 MiB..=4 GiB`) and `10%` (`32 MiB..=1 GiB`); `4 GiB` / `1 GiB` without a cgroup limit | Lower together so sorters spill sooner. After outpoint drain frees its buffer, address-transaction sort recycles up to half of `max_outpoint_sort_memory_bytes` (10 GiB defaults peak at ~3 GiB). Lowering also clamps concurrent key-prefix drain shards below a 256 MiB per-shard sort floor within `MAX_MERGE_FAN_IN`. |
+| Idle CPUs during wallet build (`canonical_scan`, `*_drain`, or `cold_validation_family_readback` dominate) | `projector.build.accumulator_hashing_workers` | `min(logical CPUs, 4)` (1 if unknown) | Raise toward idle CPUs (up to 64; sharded key-prefix drains cap at 8 shards within the 256 MiB per-shard sort floor), or lower to reserve CPU for ingest/node. |
+| Container ceiling too small for defaults | `DEPLOY_INDEX_MEMORY_LIMIT`, `DEPLOY_SERVE_MEMORY_LIMIT` | `20g` / `8g` (Mainnet Compose; single-volume `8g`+) | Raise ceiling; cgroup-scaled construction budgets scale up automatically (projector defaults cap at `4 GiB` / `1 GiB` / `512 MiB`). |
+| Slow node or timeouts | `source_fetch_max_in_flight_requests` | `12` | Lower to reduce node pressure; raise only with spare node headroom. |
+| Node rejects large batches | `source_segment_target_response_bytes` | `min(node.max_response_bytes, 32 MiB)` (smallest across fallbacks) | Keep below node limit (50 MiB default on Zebra 7.1.0 and Zakura 1.8.6). |
+| Idle CPUs and fast node | `block_prepare_concurrency` | `min(CPUs, 16)` | Raise together with `block_prepare_memory_watermark_bytes`. |
+| Idle CPUs and `tree_hashing_*` dominates `zinder_ingest_canonical_block_load_stage_duration_seconds` | `tree_hashing_workers` | `min(logical CPUs, 8)` for dense construction, else `1` | Raise toward idle CPUs or lower to leave headroom for preparation. |
+| RocksDB compaction lags with spare CPU/IOPS | `storage.canonical.rocksdb.max_background_jobs` or `wallet.rocksdb.max_background_jobs` | `2` | Raise to parallelize flushes and compactions. |
 
-`source_segment_max_blocks` caps the blocks in one node request. It defaults
-to 64, and startup rejects values above 1000, the largest JSON-RPC batch
-Zakura accepts. `node.max_response_bytes` (64 MiB by default) is the largest
-response Zinder accepts, not a request size.
+`source_segment_max_blocks` defaults to `64` and rejects values above `1000` (Zakura's max JSON-RPC batch size).
 
-Startup rejects a configuration in which `source_fetch_max_in_flight_bytes` is
-smaller than one node response, or `source_segment_target_response_bytes` is
-larger than the largest `max_response_bytes` across all endpoints.
+<a id="first-sync-on-fewer-than-8-logical-cpus"></a>
 
-## RocksDB budgets
+### First sync on fewer than 8 logical CPUs
 
-`[storage.canonical.rocksdb]` sets the canonical store's block cache, WAL
-ceiling, open files, write buffers, memtable budget, and background jobs.
-`[wallet.rocksdb]` sets the same for the wallet store. Each role has bounded
-defaults, which [Storage backend](../architecture/storage-backend.md)
-describes.
+Wallet-serving ingest defaults to `every-block` tree-state checkpoint densification during fresh construction (`~40%` more writer CPU than sparse sync, meeting the 3-hour budget on 8 cores). On fewer than 8 logical CPUs, ingest logs `every_block_construction_below_qualified_cpus`.
 
-Raising caches or memtables to hide an undersized container moves the failure
-point instead of removing it. Raise the container limit instead.
+Measured Mainnet fresh canonical construction to `READY` on dedicated writer cores (node on separate cores; a whole small VM sharing node and projector takes longer):
 
-## Allocator
+| Writer cores | `every-block` (default) | `commitment-budget` at `256` | Sparse (estimate) |
+| ---: | --- | --- | --- |
+| `4` | 2 h 34 min | 2 h 9 min | ~2.2–3.1 hours |
+| `2` | 4 h 28 min *(over 3 h budget)* | 3 h 41 min *(over 3 h budget)* | ~3.4–5.3 hours |
 
-Tune the jemalloc allocator with `MALLOC_CONF`, for example
-`background_thread:true`; see
-[Service operations](../architecture/service-operations.md#memory-allocator).
+To speed up initial construction on a smaller host (set before first sync):
 
-## Recover after resource exhaustion
+- **`commitment-budget` cadence:** Set `ingest.tree_state_densification.selection = "commitment-budget"` and `ingest.tree_state_densification.commitment_budget = 256` (default `1024`; setting only `commitment_budget` selects `commitment-budget` automatically). Ingest writes a checkpoint whenever that many note commitments accumulate across pools, keeping `tree_hashing_workers` active while cutting writer CPU to within ~7% of sparse sync. After `READY`, the background pass (`workers = 2`, `max_blocks_per_second = 500`) maintains settled stride coverage.
+- **Sparse construction:** Set `ingest.tree_state_densification.during_construction = false` to write checkpoints every 100 blocks and at the build tip, leaving densification to the background pass after `READY` (~4–5 CPU-hours on Mainnet).
 
-1. Stop the restart loop.
-2. Change the container limit or the setting for the limiting resource.
-3. Start the same runtime against the same storage paths.
+## RocksDB, allocator, and recovery
 
-Unpublished construction work is discarded on restart, so the build starts
-over. A published store reopens and replays its WAL within the configured
-budget. Do not delete WAL or SST files by hand.
+- **RocksDB budgets:** `[storage.canonical.rocksdb]` and `[wallet.rocksdb]` defaults are documented in [Storage backend](../architecture/storage-backend.md). Raise the container memory ceiling rather than shrinking caches to mask an undersized container.
+- **Allocator:** Linux binaries use `jemalloc`, tuned via `MALLOC_CONF` (for example `background_thread:true`; `MALLOC_ARENA_MAX` has no effect). See [Memory allocator](../architecture/service-operations.md#memory-allocator).
+- **Recover after OOM:** Stop the restart loop, raise the container limit or lower the limiting construction setting, and restart against the same paths (unpublished construction staging restarts automatically; published stores replay WAL). Do not delete WAL or SST files by hand. Resource tuning does not fix `SchemaMismatch` or `ArtifactCorrupt`; rebuild into empty paths per [Initial sync](initial-sync.md).
 
-Resource tuning does not fix `SchemaMismatch`, `ArtifactCorrupt`, or a network
-mismatch at startup. For those, build into fresh, empty storage paths as in
-[Initial sync](initial-sync.md), and keep the rejected store until the new one
-is ready.
-
-The design behind these bounds is in
-[ADR-0005](../adrs/0005-bounded-process-memory.md) and
-[ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md).
+See [ADR-0005](../adrs/0005-bounded-process-memory.md) and [ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md) for the bounding design.
