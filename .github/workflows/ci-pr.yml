@@ -640,6 +640,14 @@ jobs:
         run: |
           set -euo pipefail
           upstream_commit="$(cat crates/zinder-proto/proto/external/zebra/COMMIT)"
+          upstream_version="$(cat crates/zinder-proto/proto/external/zebra/VERSION)"
+          tagged_commit="$(git ls-remote https://github.com/ZcashFoundation/zebra \
+            "refs/tags/${upstream_version}" "refs/tags/${upstream_version}^{}" \
+            | sort -k2 | tail -n 1 | cut -f1)"
+          if [ "${tagged_commit}" != "${upstream_commit}" ]; then
+            echo "Zebra ${upstream_version} is ${tagged_commit:-missing}, not ${upstream_commit}" >&2
+            exit 1
+          fi
           upstream_url="https://raw.githubusercontent.com/ZcashFoundation/zebra/${upstream_commit}/zebra-rpc/proto/indexer.proto"
           tempdir="$(mktemp -d)"
           trap 'rm -rf "${tempdir}"' EXIT

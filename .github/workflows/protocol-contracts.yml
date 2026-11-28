@@ -5,17 +5,23 @@ on:
     paths:
       - "Cargo.lock"
       - "Cargo.toml"
+      - "LICENSE"
       - "buf.gen.yaml"
       - "buf.yaml"
       - "scripts/generate-api-artifacts.sh"
+      - "scripts/check-api-artifact.sh"
+      - "scripts/check-native-proto-closure.sh"
+      - "scripts/check-published-proto-compatibility.sh"
       - "scripts/regenerate-zinder-proto.sh"
       - "crates/zinder-client/src/**"
       - "crates/zinder-client/tests/integration/capability_coverage.rs"
       - "crates/zinder-proto/generated/**"
+      - "crates/zinder-proto/buf.release*.yaml"
       - "crates/zinder-proto/proto/**"
       - "crates/zinder-proto/src/capabilities.rs"
       - "tools/zinder-proto-codegen/**"
       - ".github/workflows/protocol-contracts.yml"
+      - ".github/workflows/release.yml"
       - ".github/actions/setup-rust/**"
   push:
     branches:
@@ -23,17 +29,23 @@ on:
     paths:
       - "Cargo.lock"
       - "Cargo.toml"
+      - "LICENSE"
       - "buf.gen.yaml"
       - "buf.yaml"
       - "scripts/generate-api-artifacts.sh"
+      - "scripts/check-api-artifact.sh"
+      - "scripts/check-native-proto-closure.sh"
+      - "scripts/check-published-proto-compatibility.sh"
       - "scripts/regenerate-zinder-proto.sh"
       - "crates/zinder-client/src/**"
       - "crates/zinder-client/tests/integration/capability_coverage.rs"
       - "crates/zinder-proto/generated/**"
+      - "crates/zinder-proto/buf.release*.yaml"
       - "crates/zinder-proto/proto/**"
       - "crates/zinder-proto/src/capabilities.rs"
       - "tools/zinder-proto-codegen/**"
       - ".github/workflows/protocol-contracts.yml"
+      - ".github/workflows/release.yml"
       - ".github/actions/setup-rust/**"
   workflow_dispatch:
 
@@ -89,7 +101,6 @@ jobs:
 
   proto-breaking:
     name: proto breaking
-    if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'allow-proto-breaking')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -104,32 +115,35 @@ jobs:
           version: ${{ env.BUF_VERSION }}
           github_token: ${{ github.token }}
 
-      - name: Check native protobuf compatibility
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate and verify the API release archive
+        id: archive
         run: |
           set -euo pipefail
-          base_ref="${GITHUB_BASE_REF:-main}"
-          against_config="$(cat <<'YAML'
-          version: v2
-          modules:
-            - path: crates/zinder-proto/proto
-              excludes:
-                - crates/zinder-proto/proto/compat
-                - crates/zinder-proto/proto/external
-          breaking:
-            use:
-              - PACKAGE
-          YAML
-          )"
-          # buf's `.git#branch` reads a local branch ref; pull_request checkouts
-          # are detached with the base only under refs/remotes, so materialize it.
-          git rev-parse --verify --quiet "refs/heads/${base_ref}" >/dev/null \
-            || git branch "${base_ref}" "origin/${base_ref}"
-          buf breaking \
-            --against ".git#branch=${base_ref}" \
-            --against-config "${against_config}"
+          scripts/generate-api-artifacts.sh v0.0.0-ci
+          scripts/check-api-artifact.sh dist/zinder-api-docs-v0.0.0-ci.tar.gz
 
-      - name: Generate API release artifacts
-        run: bash scripts/generate-api-artifacts.sh
+      - name: Check native protobuf compatibility against the pull request base
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'allow-proto-breaking')
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: buf breaking --against ".git#ref=${BASE_SHA}"
+
+      - name: Check protobuf compatibility against the published release
+        if: >-
+          ${{
+          !cancelled() && steps.archive.outcome == 'success' &&
+          github.event_name == 'pull_request' &&
+          !contains(github.event.pull_request.labels.*.name, 'allow-proto-breaking')
+          }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/check-published-proto-compatibility.sh "$GITHUB_REPOSITORY" dist/zinder.contract.descriptor.bin
 
   capability-coverage:
     name: capability coverage
