@@ -819,6 +819,13 @@ pub enum CanonicalStoreError {
         reason: String,
     },
 
+    /// The replay height has neither a settled segment nor a live-tail row.
+    #[error("canonical block replay at height {} is absent", .height.value())]
+    MissingLiveTailReplay {
+        /// Height whose live-tail replay row was absent.
+        height: BlockHeight,
+    },
+
     /// A persisted canonical block replay row is malformed or mis-keyed.
     #[error("canonical block replay at height {height} is invalid: {reason}")]
     BlockReplayInvalid {
