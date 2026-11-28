@@ -1919,6 +1919,59 @@ mod tests {
         })
     }
 
+    #[test]
+    fn settled_segment_residency_gauges_preserve_other_caches_on_drop() -> TestResult {
+        let dir = TempDir::new()?;
+        let db = open_bridge_test_db(dir.path())?;
+        let stored_all = CanonicalStoredSet::for_history(
+            RawBlobRetention::All,
+            CanonicalHistoryBounds::complete(),
+        );
+        seed_segment_and_live_tail_db(dir.path(), &db, stored_all, 4)?;
+        let entries = read_all_settled_segment_entries(&db)?;
+        let first = entries.first().ok_or("expected first settled segment")?;
+        let recorder = PrometheusBuilder::new()
+            .set_buckets_for_metric(Matcher::Suffix("_duration_seconds".to_owned()), &[1.0])?
+            .build_recorder();
+        let metrics = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let cache_a = SettledSegmentReaderCache::new(dir.path(), 2, false)?;
+            let cache_b = SettledSegmentReaderCache::new(dir.path(), 2, false)?;
+
+            let readers = cache_a.get_or_open(first)?;
+            let heap = [
+                readers.shielded.index_heap_bytes(),
+                readers
+                    .supplement
+                    .as_ref()
+                    .ok_or("supplement reader")?
+                    .index_heap_bytes(),
+                readers
+                    .raw_block
+                    .as_ref()
+                    .ok_or("raw block reader")?
+                    .index_heap_bytes(),
+            ];
+            let _ = cache_b.get_or_open(first)?;
+
+            let both = metrics.render();
+            for (kind, bytes) in METRIC_KINDS.into_iter().zip(heap) {
+                assert_eq!(segment_metric(&both, "cache_open_readers", kind)?, 2);
+                assert_eq!(
+                    segment_metric(&both, "cache_index_heap_bytes", kind)?,
+                    u64::try_from(bytes)? * 2
+                );
+            }
+
+            drop(cache_a);
+            assert_segment_residency(&metrics.render(), heap, [0; 3])?;
+
+            drop(cache_b);
+            assert_segment_residency(&metrics.render(), [0; 3], [0; 3])?;
+            Ok(())
+        })
+    }
+
     const METRIC_KINDS: [&str; 3] = ["shielded", "supplement", "block_blob"];
 
     fn read_metrics_fixture_block(
