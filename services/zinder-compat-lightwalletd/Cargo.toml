@@ -15,7 +15,6 @@ publish.workspace = true
 async-trait.workspace = true
 arc-swap.workspace = true
 clap = { workspace = true, features = ["derive"] }
-config.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 http.workspace = true

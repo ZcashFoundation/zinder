@@ -16,28 +16,29 @@
 //! tokens, and in the manual `Debug` impls on [`zinder_source::NodeAuth`],
 //! [`zinder_source::IndexerTlsMaterial`], and [`crate::auth::BearerToken`].
 
+mod deserializer;
+mod tree;
+
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use ::config::{
-    Config, ConfigBuilder, ConfigError as InnerConfigError, Environment, File, FileFormat, Value,
-    builder::DefaultState,
-};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use zinder_core::Network;
-use zinder_core::wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name};
+use zinder_core::{
+    Network,
+    wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name},
+};
 use zinder_source::{
     IndexerTlsMaterial, NodeAuth, NodeConfigError, NodeHealthConfig, NodeIndexerTls, NodeTarget,
     redact_endpoint_url,
 };
 
+pub use self::tree::ConfigValue;
+use self::tree::{ConfigTree, PrimitiveValue};
 use crate::auth::{BearerToken, BearerTokenError};
-use crate::env_diagnostics::{RejectedEnvVar, translate_env_error};
 use crate::sections::{
     DEFAULT_ALLOW_PUBLIC_BIND, RuntimeService, defaults::default_ops_listen_addr,
 };
@@ -119,12 +120,46 @@ const fn sibling_sections_for_service(service: RuntimeService) -> &'static [&'st
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConfigError {
-    /// Loading or deserializing layered configuration failed.
-    #[error("failed to load configuration: {source}")]
-    Load {
-        /// Underlying `config-rs` error.
+    /// Reading a TOML configuration file failed.
+    #[error("failed to read configuration file {}: {source}", path.display())]
+    ReadFile {
+        /// File path that could not be read.
+        path: PathBuf,
+        /// Underlying I/O error.
         #[source]
-        source: InnerConfigError,
+        source: std::io::Error,
+    },
+
+    /// Parsing a TOML configuration file failed.
+    #[error("failed to parse TOML configuration file {}: {}", path.display(), source.message())]
+    ParseToml {
+        /// File path whose contents were not valid TOML.
+        path: PathBuf,
+        /// Underlying TOML parse error.
+        #[source]
+        source: Box<toml::de::Error>,
+    },
+
+    /// An environment variable failed typed deserialization or validation.
+    #[error(
+        "invalid value for environment variable `{original_name}` (configuration key `{key}`): {reason}"
+    )]
+    InvalidEnvValue {
+        /// Original `ZINDER_…` variable name set by the operator.
+        original_name: String,
+        /// Target configuration-key path, such as `node.request_timeout_secs`.
+        key: String,
+        /// Parse or validation failure reason without echoing raw env values.
+        reason: String,
+    },
+
+    /// Deserializing merged configuration failed for a non-environment source.
+    #[error("{}", format_deserialize_error(path.as_deref(), reason))]
+    Deserialize {
+        /// Offending configuration path when known.
+        path: Option<String>,
+        /// Deserialization failure reason.
+        reason: String,
     },
 
     /// Rendering effective configuration to TOML failed.
@@ -166,8 +201,9 @@ pub enum ConfigError {
         "rejected environment variable `{original_name}`: produced configuration key \
          `{rejected_key}`, which is not a valid field. Zinder env vars use `__` (double \
          underscore) between TOML section names and single `_` inside field names. \
-         {}See `docs/reference/configuration.md` for the canonical env-var table.",
-        suggestion_sentence(suggested_name.as_deref())
+         {}See `docs/reference/configuration.md` for the canonical env-var table.{}",
+        suggestion_sentence(suggested_name.as_deref()),
+        detail_suffix(detail.as_deref())
     )]
     RejectedEnvVar {
         /// Original `ZINDER_…` name as set by the operator.
@@ -177,20 +213,30 @@ pub enum ConfigError {
         /// Suggested corrected env var name. `None` when the heuristic
         /// cannot confidently propose an alternative.
         suggested_name: Option<String>,
+        /// Underlying serde unknown-field detail when rejected during schema decoding.
+        detail: Option<Box<str>>,
     },
+}
+
+fn format_deserialize_error(path: Option<&str>, reason: &str) -> String {
+    if reason.starts_with("unknown field ") {
+        return reason.to_owned();
+    }
+    match path {
+        Some(path) if !reason.contains(path) => format!("{path}: {reason}"),
+        _ => reason.to_owned(),
+    }
 }
 
 fn suggestion_sentence(suggested_name: Option<&str>) -> String {
     suggested_name.map_or_else(String::new, |name| format!("Try `{name}` instead. "))
 }
 
-impl ConfigError {
-    /// Builds a [`ConfigError::Load`] from a `config-rs` error.
-    #[must_use]
-    pub fn load(source: InnerConfigError) -> Self {
-        Self::Load { source }
-    }
+fn detail_suffix(detail: Option<&str>) -> String {
+    detail.map_or_else(String::new, |text| format!("\n{text}"))
+}
 
+impl ConfigError {
     /// Builds a [`ConfigError::Invalid`] from a free-form reason.
     #[must_use]
     pub fn invalid(reason: impl Into<String>) -> Self {
@@ -203,29 +249,6 @@ impl ConfigError {
     #[must_use]
     pub const fn missing_field(field: &'static str) -> Self {
         Self::MissingField { field }
-    }
-
-    fn from_rejected_env_var(rejection: RejectedEnvVar) -> Self {
-        Self::RejectedEnvVar {
-            original_name: rejection.original_name,
-            rejected_key: rejection.rejected_key,
-            suggested_name: rejection.suggested_name,
-        }
-    }
-
-    /// Translates an `InnerConfigError` to a [`ConfigError::RejectedEnvVar`]
-    /// when the failure can be attributed to an env var, falling back to
-    /// [`ConfigError::Load`] otherwise.
-    fn from_inner_with_env_diagnostics(
-        inner: InnerConfigError,
-        reverse_index: Option<&HashMap<String, String>>,
-    ) -> Self {
-        if let Some(reverse_index) = reverse_index
-            && let Some(rejection) = translate_env_error(&inner, reverse_index)
-        {
-            return Self::from_rejected_env_var(rejection);
-        }
-        Self::Load { source: inner }
     }
 }
 
@@ -255,53 +278,13 @@ impl From<NodeConfigError> for ConfigError {
     }
 }
 
-/// Standard Zinder environment source for `config-rs`.
-///
-/// Paired with the reverse mapping from produced config-key paths back to
-/// the original `ZINDER_…` names so the loader can attribute
-/// deserialization failures to specific env vars.
-#[derive(Debug)]
-pub struct ZinderEnvironmentSource {
-    /// `config-rs` source ready to be added to a [`ConfigBuilder`].
-    pub source: Environment,
-    /// Map from `config-rs`-style config-key path (e.g. `ops_listen_addr`,
-    /// `ops.listen_addr`) to the `ZINDER_…` name that produced it. Used by
-    /// the diagnostic loader to turn serde unknown-field errors back into
-    /// operator-actionable messages.
-    pub reverse_index: HashMap<String, String>,
-}
-
-/// Builds the standard Zinder environment source from the process
-/// environment.
-///
-/// Reads `std::env::vars()`. Strips `ZINDER_TEST_*` prefixes so test-only
-/// acknowledgements cannot leak into production config. Secret values
-/// pass through unchanged; redaction happens at emit boundaries.
-pub fn zinder_environment_source() -> Result<ZinderEnvironmentSource, ConfigError> {
-    zinder_environment_source_from_map(std::env::vars())
-}
-
-/// Builds a Zinder environment source from an explicit iterator of
-/// `(name, value)` pairs.
-///
-/// Use this in tests that want deterministic env input without mutating
-/// the global process environment.
-pub fn zinder_environment_source_from_map<I>(
-    env_iter: I,
-) -> Result<ZinderEnvironmentSource, ConfigError>
-where
-    I: IntoIterator<Item = (String, String)>,
-{
-    filtered_zinder_environment_source(collect_zinder_env_entries(env_iter), None)
-}
-
-fn collect_zinder_env_entries<I>(env_iter: I) -> Vec<(String, String)>
+pub(crate) fn collect_zinder_env_entries<I>(env_iter: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,
 {
     env_iter
         .into_iter()
-        .filter_map(|(variable, env_value)| {
+        .filter_map(|(variable, env_raw)| {
             if TEST_ENV_PREFIXES
                 .iter()
                 .any(|test_prefix| variable.starts_with(test_prefix))
@@ -309,12 +292,12 @@ where
                 return None;
             }
             let env_key = variable.strip_prefix(ENV_PREFIX)?;
-            Some((env_key.to_owned(), env_value))
+            Some((env_key.to_owned(), env_raw))
         })
         .collect()
 }
 
-fn top_level_segment(config_path: &str) -> &str {
+pub(crate) fn top_level_segment(config_path: &str) -> &str {
     config_path
         .split_once('.')
         .map_or(config_path, |(section, _)| section)
@@ -394,7 +377,10 @@ fn is_unconsumed_shared_path(service: RuntimeService, config_path: &str) -> bool
     }
 }
 
-fn is_unconsumed_known_path_for_service(service: RuntimeService, config_path: &str) -> bool {
+pub(crate) fn is_unconsumed_known_path_for_service(
+    service: RuntimeService,
+    config_path: &str,
+) -> bool {
     if !is_known_zinder_leaf_path(config_path) {
         return false;
     }
@@ -419,63 +405,65 @@ fn edit_distance(left: &str, right: &str) -> usize {
     previous_row[right_chars.len()]
 }
 
+fn suggest_double_underscore_form(original_name: &str) -> Option<String> {
+    let suffix = original_name.strip_prefix(ENV_PREFIX)?;
+    let first_underscore = suffix.find('_')?;
+    let (head, tail) = suffix.split_at(first_underscore);
+    let rest = tail.strip_prefix('_')?;
+    if head.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some(format!("{ENV_PREFIX}{head}__{rest}"))
+}
+
+fn normalize_position_pattern(rejected_key: &str) -> (String, Option<String>) {
+    let mut captured_position = None;
+    let normalized = rejected_key
+        .split('.')
+        .map(|segment| {
+            if is_positive_position_segment(segment) && captured_position.is_none() {
+                captured_position = Some(segment.to_owned());
+                "<N>"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    (normalized, captured_position)
+}
+
 fn suggest_known_env_var(rejected_key: &str) -> Option<String> {
-    let section = top_level_segment(rejected_key);
+    let (normalized_key, position) = normalize_position_pattern(rejected_key);
+    let section = top_level_segment(&normalized_key);
+    let same_section = find_closest_doc_name(&normalized_key, Some(section));
+    let matched = same_section.or_else(|| find_closest_doc_name(&normalized_key, None))?;
+    Some(position.map_or_else(|| matched.to_owned(), |pos| matched.replace("<N>", &pos)))
+}
+
+fn find_closest_doc_name(
+    normalized_key: &str,
+    section_filter: Option<&str>,
+) -> Option<&'static str> {
     crate::env_var_docs::ENVIRONMENT_VARIABLES
         .iter()
-        .filter(|doc| top_level_segment(doc.toml_path) == section)
+        .filter(|doc| {
+            section_filter.is_none_or(|section| top_level_segment(doc.toml_path) == section)
+        })
         .filter_map(|doc| {
-            let distance = edit_distance(rejected_key, doc.toml_path);
+            let distance = edit_distance(normalized_key, doc.toml_path);
             (distance <= 3).then_some((distance, doc.name))
         })
         .min_by_key(|(distance, _)| *distance)
-        .map(|(_, name)| name.to_owned())
+        .map(|(_, name)| name)
 }
 
-fn filtered_zinder_environment_source(
-    entries: Vec<(String, String)>,
-    service: Option<RuntimeService>,
-) -> Result<ZinderEnvironmentSource, ConfigError> {
-    let mut filtered_env = HashMap::new();
-    let mut reverse_index = HashMap::new();
-
-    for (env_key, env_value) in entries {
-        let config_key = env_key_to_config_key(&env_key);
-        let original_name = format!("{ENV_PREFIX}{env_key}");
-        if let Some(runtime_service) = service {
-            if is_unconsumed_known_path_for_service(runtime_service, &config_key) {
-                continue;
-            }
-            if sibling_sections_for_service(runtime_service)
-                .contains(&top_level_segment(&config_key))
-            {
-                return Err(ConfigError::RejectedEnvVar {
-                    original_name,
-                    suggested_name: suggest_known_env_var(&config_key),
-                    rejected_key: config_key,
-                });
-            }
-        }
-        reverse_index.insert(config_key, original_name);
-        filtered_env.insert(env_key, env_value);
+pub(crate) fn suggest_env_var(original_name: &str, rejected_key: &str) -> Option<String> {
+    if !rejected_key.contains('.') {
+        return suggest_double_underscore_form(original_name)
+            .or_else(|| suggest_known_env_var(rejected_key));
     }
-
-    let source = Environment::default()
-        .separator("__")
-        .try_parsing(true)
-        .source(Some(filtered_env));
-
-    Ok(ZinderEnvironmentSource {
-        source,
-        reverse_index,
-    })
-}
-
-/// Mirrors how `config-rs` transforms an env-var key (post-`ZINDER_`
-/// strip) into a config-key path: lowercase everything and treat `__` as
-/// a nesting separator. Single `_` stays inside the key segment.
-fn env_key_to_config_key(env_key: &str) -> String {
-    env_key.to_lowercase().replace("__", ".")
+    suggest_known_env_var(rejected_key)
 }
 
 /// Returns `field_value` or a [`ConfigError::MissingField`] error pointing at
@@ -484,9 +472,6 @@ pub fn require_field<T>(field_value: Option<T>, field: &'static str) -> Result<T
     field_value.ok_or(ConfigError::MissingField { field })
 }
 
-/// Converts `path` to a UTF-8 string suitable for the TOML-shaped config
-/// layer, returning [`ConfigError::NonUnicodePath`] if the path is not valid
-/// UTF-8.
 fn path_to_config_string(path: PathBuf, field: &'static str) -> Result<String, ConfigError> {
     path.into_os_string()
         .into_string()
@@ -581,8 +566,9 @@ enum LoaderSource {
 /// before calling [`ConfigLoader::load`] to deserialize.
 #[must_use]
 pub struct ConfigLoader {
-    builder: ConfigBuilder<DefaultState>,
+    defaults: Vec<(String, PrimitiveValue)>,
     sources: Vec<LoaderSource>,
+    overrides: Vec<(String, PrimitiveValue)>,
     service: Option<RuntimeService>,
 }
 
@@ -590,8 +576,9 @@ impl ConfigLoader {
     /// Starts a new loader with no sources or defaults.
     pub fn new() -> Self {
         Self {
-            builder: Config::builder(),
+            defaults: Vec::new(),
             sources: Vec::new(),
+            overrides: Vec::new(),
             service: None,
         }
     }
@@ -607,12 +594,10 @@ impl ConfigLoader {
     /// regardless of when they are recorded.
     pub fn with_default<V>(mut self, key: &str, default_for_key: V) -> Result<Self, ConfigError>
     where
-        V: Into<Value>,
+        V: Into<ConfigValue>,
     {
-        self.builder = self
-            .builder
-            .set_default(key, default_for_key)
-            .map_err(ConfigError::load)?;
+        self.defaults
+            .push((key.to_owned(), default_for_key.into().inner));
         Ok(self)
     }
 
@@ -629,9 +614,8 @@ impl ConfigLoader {
     /// environment.
     ///
     /// Strips `ZINDER_TEST_*` prefixes and filters known sibling-component
-    /// sections when scoped to a [`RuntimeService`], while preserving the
-    /// env-key reverse index used by [`Self::load`] to translate serde
-    /// "unknown field" errors back to the env var that caused them.
+    /// sections when scoped to a [`RuntimeService`], while preserving exact
+    /// env-var provenance for diagnostics.
     pub fn with_zinder_env(self) -> Result<Self, ConfigError> {
         self.with_zinder_env_from_map(std::env::vars())
     }
@@ -647,7 +631,7 @@ impl ConfigLoader {
         I: IntoIterator<Item = (String, String)>,
     {
         self.sources
-            .push(LoaderSource::Env(collect_zinder_env_entries(env_iter)));
+            .push(LoaderSource::Env(env_iter.into_iter().collect()));
         Ok(self)
     }
 
@@ -687,13 +671,11 @@ impl ConfigLoader {
         override_for_key: Option<V>,
     ) -> Result<Self, ConfigError>
     where
-        V: Into<Value>,
+        V: Into<ConfigValue>,
     {
         if let Some(override_for_key) = override_for_key {
-            self.builder = self
-                .builder
-                .set_override(key, override_for_key)
-                .map_err(ConfigError::load)?;
+            self.overrides
+                .push((key.to_owned(), override_for_key.into().inner));
         }
         Ok(self)
     }
@@ -707,10 +689,8 @@ impl ConfigLoader {
     ) -> Result<Self, ConfigError> {
         if let Some(path) = override_path {
             let path_string = path_to_config_string(path, key)?;
-            self.builder = self
-                .builder
-                .set_override(key, path_string)
-                .map_err(ConfigError::load)?;
+            self.overrides
+                .push((key.to_owned(), PrimitiveValue::String(path_string)));
         }
         Ok(self)
     }
@@ -718,62 +698,35 @@ impl ConfigLoader {
     /// Builds the merged configuration and deserializes it as `T`.
     ///
     /// When deserialization fails and the failure can be attributed to an
-    /// env var the operator set, returns [`ConfigError::RejectedEnvVar`]
-    /// with the original `ZINDER_…` name and a suggested correction.
-    /// Otherwise returns [`ConfigError::Load`] wrapping the underlying
-    /// `config-rs` error.
+    /// env var the operator set, returns [`ConfigError::RejectedEnvVar`] or
+    /// [`ConfigError::InvalidEnvValue`] with the original `ZINDER_…` name.
     pub fn load<T>(self) -> Result<T, ConfigError>
     where
         T: DeserializeOwned,
     {
-        let (merged, reverse_index) = self.merge_sources()?;
-        merged.try_deserialize::<T>().map_err(|inner| {
-            ConfigError::from_inner_with_env_diagnostics(inner, reverse_index.as_ref())
-        })
+        let tree = self.merge_sources()?;
+        tree.deserialize()
     }
 
-    pub(crate) fn merge_sources(
-        mut self,
-    ) -> Result<(Config, Option<HashMap<String, String>>), ConfigError> {
-        let mut reverse_index: Option<HashMap<String, String>> = None;
+    pub(crate) fn merge_sources(self) -> Result<ConfigTree, ConfigError> {
+        let mut tree = ConfigTree::new();
+        for (key, default_primitive) in self.defaults {
+            tree.insert_primitive_path(&key, default_primitive, false)?;
+        }
         for source in self.sources {
             match source {
-                LoaderSource::File(path) => {
-                    self.builder = add_filtered_toml_file(self.builder, path, self.service)?;
-                }
-                LoaderSource::Env(entries) => {
-                    let env_source = filtered_zinder_environment_source(entries, self.service)?;
-                    self.builder = self.builder.add_source(env_source.source);
-                    reverse_index =
-                        Some(merge_reverse_index(reverse_index, env_source.reverse_index));
-                }
+                LoaderSource::File(path) => tree.merge_toml_file(&path, self.service)?,
+                LoaderSource::Env(entries) => tree.merge_env_entries(entries, self.service)?,
             }
         }
-        let built = self.builder.build().map_err(|inner| {
-            ConfigError::from_inner_with_env_diagnostics(inner, reverse_index.as_ref())
-        })?;
-        Ok((built, reverse_index))
+        for (key, override_primitive) in self.overrides {
+            tree.insert_primitive_path(&key, override_primitive, true)?;
+        }
+        Ok(tree)
     }
 }
 
-fn add_filtered_toml_file(
-    builder: ConfigBuilder<DefaultState>,
-    path: PathBuf,
-    service: Option<RuntimeService>,
-) -> Result<ConfigBuilder<DefaultState>, ConfigError> {
-    if let Some(runtime_service) = service
-        && let Ok(raw_toml) = std::fs::read_to_string(&path)
-        && let Ok(mut table) = toml::from_str::<toml::Table>(&raw_toml)
-    {
-        prune_toml_table(&mut table, "", runtime_service)?;
-        let filtered_toml = toml::to_string(&table)
-            .map_err(|source| ConfigError::load(InnerConfigError::Foreign(Box::new(source))))?;
-        return Ok(builder.add_source(File::from_str(&filtered_toml, FileFormat::Toml)));
-    }
-    Ok(builder.add_source(File::from(path).format(FileFormat::Toml).required(true)))
-}
-
-fn prune_toml_table(
+pub(crate) fn prune_toml_table(
     table: &mut toml::Table,
     prefix: &str,
     service: RuntimeService,
@@ -786,8 +739,7 @@ fn prune_toml_table(
         } else {
             format!("{prefix}.{key}")
         };
-        let is_table = matches!(table.get(&key), Some(toml::Value::Table(_)));
-        if is_table {
+        if matches!(table.get(&key), Some(toml::Value::Table(_))) {
             let should_remove_empty =
                 if let Some(toml::Value::Table(subtable)) = table.get_mut(&key) {
                     let child_removed = prune_toml_table(subtable, &field_path, service)?;
@@ -812,25 +764,13 @@ fn prune_toml_table(
             } else {
                 format!(" for key `{prefix}`")
             };
-            return Err(ConfigError::load(InnerConfigError::Message(format!(
-                "unknown field `{key}`{suffix}"
-            ))));
+            return Err(ConfigError::Deserialize {
+                path: Some(field_path),
+                reason: format!("unknown field `{key}`{suffix}"),
+            });
         }
     }
     Ok(removed_any)
-}
-
-fn merge_reverse_index(
-    existing: Option<HashMap<String, String>>,
-    incoming: HashMap<String, String>,
-) -> HashMap<String, String> {
-    match existing {
-        Some(mut existing) => {
-            existing.extend(incoming);
-            existing
-        }
-        None => incoming,
-    }
 }
 
 impl Default for ConfigLoader {
@@ -1091,6 +1031,29 @@ impl Serialize for NodeFallbacksToml {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zinder_source::{NodeFallbackSections, NodeSection};
+
+    #[test]
+    fn suggests_double_underscore_and_normalized_known_vars() {
+        assert_eq!(
+            suggest_double_underscore_form("ZINDER_OPS_LISTEN_ADDR"),
+            Some("ZINDER_OPS__LISTEN_ADDR".to_owned()),
+        );
+        assert_eq!(suggest_double_underscore_form("ZINDER_NETWORK"), None);
+        assert_eq!(suggest_double_underscore_form("FOO_BAR"), None);
+        assert_eq!(
+            suggest_env_var("ZINDER_INJEST__SOURCE", "injest.source"),
+            Some("ZINDER_INGEST__SOURCE".to_owned()),
+        );
+        assert_eq!(
+            suggest_env_var(
+                "ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADRR",
+                "node_fallbacks.1.json_rpc_adrr",
+            ),
+            Some("ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR".to_owned()),
+        );
+    }
+
     #[test]
     fn require_field_returns_missing_field_for_none() {
         let outcome: Result<u32, _> =
@@ -1202,15 +1165,32 @@ mod tests {
     #[test]
     fn indexer_tls_inline_pems_reach_loader_and_print_config_redacts_them()
     -> Result<(), ConfigError> {
-        for material in ["CA_CERT", "CLIENT_CERT", "CLIENT_KEY"] {
-            let variable = format!("ZINDER_NODE__INDEXER_TLS__{material}_PEM");
-            let expected_key = format!("node.indexer_tls.{}_pem", material.to_ascii_lowercase());
-            let env_source = zinder_environment_source_from_map([(
-                variable.clone(),
-                "-----BEGIN PRIVATE KEY-----\nsecret-material\n".to_owned(),
-            )])?;
-            assert_eq!(env_source.reverse_index.get(&expected_key), Some(&variable));
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct Probe {
+            node: NodeSection,
         }
+
+        let loaded: Probe = ConfigLoader::new()
+            .with_zinder_env_from_map([
+                (
+                    "ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM".to_owned(),
+                    "ca-secret-material\nline-two".to_owned(),
+                ),
+                (
+                    "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM".to_owned(),
+                    "client-cert-secret".to_owned(),
+                ),
+                (
+                    "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM".to_owned(),
+                    "-----BEGIN PRIVATE KEY-----\nclient-key-secret\n".to_owned(),
+                ),
+            ])?
+            .load()?;
+        assert_eq!(
+            loaded.node.indexer_tls.ca_cert_pem.as_deref(),
+            Some("ca-secret-material\nline-two")
+        );
         let target = NodeTarget::new(
             Network::ZcashRegtest,
             "http://127.0.0.1:18232".to_owned(),
@@ -1238,31 +1218,56 @@ mod tests {
             rendered.contains("ca_cert_pem = \"[REDACTED]\""),
             "{rendered}"
         );
-        assert!(
-            rendered.contains("client_cert_pem = \"[REDACTED]\""),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("client_key_pem = \"[REDACTED]\""),
-            "{rendered}"
-        );
         Ok(())
     }
 
     #[test]
     fn fallback_indexer_tls_pem_variables_reach_the_loader() -> Result<(), ConfigError> {
-        let env_source = zinder_environment_source_from_map([(
-            "ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CLIENT_KEY_PEM".to_owned(),
-            "-----BEGIN PRIVATE KEY-----\nsecret-material\n".to_owned(),
-        )])?;
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct Probe {
+            node: NodeSection,
+            node_fallbacks: NodeFallbackSections,
+        }
 
-        assert_eq!(
-            env_source
-                .reverse_index
-                .get("node_fallbacks.2.indexer_tls.client_key_pem")
-                .map(String::as_str),
-            Some("ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CLIENT_KEY_PEM")
-        );
+        let loaded: Probe = ConfigLoader::new()
+            .with_zinder_env_from_map([
+                (
+                    "ZINDER_NODE__JSON_RPC_ADDR".to_owned(),
+                    "http://127.0.0.1:18232".to_owned(),
+                ),
+                (
+                    "ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR".to_owned(),
+                    "https://fallback-1:8232".to_owned(),
+                ),
+                (
+                    "ZINDER_NODE_FALLBACKS__2__JSON_RPC_ADDR".to_owned(),
+                    "https://fallback-2:8232".to_owned(),
+                ),
+                (
+                    "ZINDER_NODE_FALLBACKS__2__INDEXER_GRPC_ADDR".to_owned(),
+                    "https://fallback-2:8230".to_owned(),
+                ),
+                (
+                    "ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CLIENT_CERT_PEM".to_owned(),
+                    "-----BEGIN CERTIFICATE-----\ncert-material\n".to_owned(),
+                ),
+                (
+                    "ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CLIENT_KEY_PEM".to_owned(),
+                    "-----BEGIN PRIVATE KEY-----\nsecret-material\n".to_owned(),
+                ),
+            ])?
+            .load()?;
+        let targets = NodeTarget::resolve_fallbacks(Network::ZcashRegtest, loaded.node_fallbacks)?;
+        assert_eq!(targets.len(), 2);
+        let tls = targets[1]
+            .indexer_tls
+            .as_ref()
+            .ok_or_else(|| ConfigError::invalid("expected fallback 2 indexer_tls"))?;
+        assert!(matches!(
+            tls.client_identity.as_ref().map(|identity| &identity.key),
+            Some(IndexerTlsMaterial::Inline(_))
+        ));
         Ok(())
     }
 
@@ -1306,15 +1311,15 @@ mod tests {
             .with_file(Some(toml_path))
             .with_zinder_env_from_map([("ZINDER_INJEST__SOURCE".to_owned(), "x".to_owned())])?
             .load::<ProbeConfig>();
-        assert!(typo.is_err());
-
-        let token_conflict = resolve_optional_bearer_token(
-            Some(Path::new("/tmp/token")),
-            Some("inline-token"),
-            "test.bearer_token_path",
-            "test.bearer_token",
-        );
-        assert!(token_conflict.is_err());
+        assert!(matches!(
+            typo,
+            Err(ConfigError::RejectedEnvVar {
+                ref original_name,
+                ref suggested_name,
+                ..
+            }) if original_name == "ZINDER_INJEST__SOURCE"
+                && suggested_name.as_deref() == Some("ZINDER_INGEST__SOURCE")
+        ));
         Ok(())
     }
 
@@ -1486,7 +1491,15 @@ mod tests {
                 "/typo".to_owned(),
             )])?
             .load::<SharedProbeConfig>();
-        assert!(shared_typo.is_err());
+        assert!(matches!(
+            shared_typo,
+            Err(ConfigError::RejectedEnvVar {
+                ref original_name,
+                ref suggested_name,
+                ..
+            }) if original_name == "ZINDER_STORAGE__CANONICL_PATH"
+                && suggested_name.as_deref() == Some("ZINDER_STORAGE__CANONICAL_PATH")
+        ));
 
         let wallet_typo = ConfigLoader::new()
             .with_ops_section(RuntimeService::Ingest)?
@@ -1529,9 +1542,8 @@ mod tests {
             second.is_some() && tenth.is_some() && second < tenth,
             "{rendered}"
         );
-        assert!(rendered.contains("[node_fallbacks.1.auth]"));
-        assert!(!rendered.contains("secret-password"));
-        assert!(rendered.contains("password = \"[REDACTED]\""));
+        assert!(rendered.contains("password = \"[REDACTED]\""), "{rendered}");
+        assert!(!rendered.contains("secret-password"), "{rendered}");
         Ok(())
     }
 
@@ -1574,12 +1586,6 @@ mod tests {
                 "{rendered}"
             );
             assert!(
-                fields.contains(
-                    "indexer_grpc_addr = \"http://[REDACTED]@127.0.0.1:18230/?[REDACTED]\""
-                ),
-                "{rendered}"
-            );
-            assert!(
                 fields.contains("addr = \"http://127.0.0.1:18233/ready?[REDACTED]\""),
                 "{rendered}"
             );
@@ -1588,34 +1594,45 @@ mod tests {
     }
 
     #[test]
-    fn unrecognized_indexer_tls_pem_name_is_left_to_the_unknown_key_check()
-    -> Result<(), ConfigError> {
-        let env_source = zinder_environment_source_from_map([(
-            "ZINDER_NODE__INDEXER_TLS__CLIENT_PEM".to_owned(),
-            "-----BEGIN CERTIFICATE-----\n".to_owned(),
-        )])?;
+    fn unrecognized_indexer_tls_pem_name_is_rejected_with_env_name() {
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct Probe {
+            node: NodeSection,
+        }
 
-        assert!(
-            env_source
-                .reverse_index
-                .contains_key("node.indexer_tls.client_pem")
-        );
-        Ok(())
+        let outcome = ConfigLoader::new()
+            .with_zinder_env_from_map([(
+                "ZINDER_NODE__INDEXER_TLS__CLIENT_PEM".to_owned(),
+                "-----BEGIN CERTIFICATE-----\n".to_owned(),
+            )])
+            .and_then(ConfigLoader::load::<Probe>);
+        assert!(matches!(
+            outcome,
+            Err(ConfigError::RejectedEnvVar {
+                ref original_name,
+                ..
+            }) if original_name == "ZINDER_NODE__INDEXER_TLS__CLIENT_PEM"
+        ));
     }
 
     #[test]
     fn indexer_tls_path_variables_reach_the_loader() -> Result<(), ConfigError> {
-        let env_source = zinder_environment_source_from_map([(
-            "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH".to_owned(),
-            "/run/secrets/indexer-client.key".to_owned(),
-        )])?;
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct Probe {
+            node: NodeSection,
+        }
 
+        let loaded: Probe = ConfigLoader::new()
+            .with_zinder_env_from_map([(
+                "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH".to_owned(),
+                "/run/secrets/indexer-client.key".to_owned(),
+            )])?
+            .load()?;
         assert_eq!(
-            env_source
-                .reverse_index
-                .get("node.indexer_tls.client_key_path")
-                .map(String::as_str),
-            Some("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH")
+            loaded.node.indexer_tls.client_key_path.as_deref(),
+            Some(Path::new("/run/secrets/indexer-client.key"))
         );
         Ok(())
     }
@@ -1645,6 +1662,19 @@ mod tests {
                 "method = \"none\"\n",
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_mutually_exclusive_bearer_tokens() -> Result<(), ConfigError> {
+        let token_conflict = resolve_optional_bearer_token(
+            Some(Path::new("/tmp/token")),
+            Some("inline-token"),
+            "test.bearer_token_path",
+            "test.bearer_token",
+        );
+        assert!(token_conflict.is_err());
+        assert!(load_bearer_token(None)?.is_none());
         Ok(())
     }
 }

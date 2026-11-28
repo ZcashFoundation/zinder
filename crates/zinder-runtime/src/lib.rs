@@ -14,10 +14,10 @@
 //!   are applied in one place.
 //! - The shared configuration error type, fluent layered loader, and shared
 //!   schema/redacted-render mirrors ([`ConfigError`], [`ConfigLoader`],
-//!   [`NetworkSection`], [`NetworkToml`], [`NodeAuthToml`], [`NodeHealthToml`],
-//!   [`NodeIndexerTlsToml`], [`NodeToml`], [`NodeFallbacksToml`], [`zinder_environment_source`],
-//!   [`require_field`], [`duration_as_millis_u64`]) that every service binary
-//!   uses to honor the
+//!   [`ConfigValue`], [`NetworkSection`], [`NetworkToml`], [`NodeAuthToml`],
+//!   [`NodeHealthToml`], [`NodeIndexerTlsToml`], [`NodeToml`],
+//!   [`NodeFallbacksToml`], [`require_field`], [`duration_as_millis_u64`]) that
+//!   every service binary uses to honor the
 //!   `defaults -> file -> ZINDER_* env -> CLI overrides` precedence.
 //! - Two thin lifecycle helpers used by every binary entry point:
 //!   [`cancel_on_terminating_signal`] and [`install_tracing_subscriber`],
@@ -54,7 +54,6 @@ mod browser_transport;
 mod canonical_fence_attestation;
 mod composed_readiness;
 mod config;
-mod env_diagnostics;
 mod env_var_docs;
 mod http_listener;
 mod logging;
@@ -93,10 +92,9 @@ pub use canonical_fence_attestation::{
 };
 pub use composed_readiness::{ComposedReadiness, ReadinessInput};
 pub use config::{
-    ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeFallbacksToml,
-    NodeHealthToml, NodeIndexerTlsToml, NodeToml, ZinderEnvironmentSource, duration_as_millis_u64,
+    ConfigError, ConfigLoader, ConfigValue, NetworkSection, NetworkToml, NodeAuthToml,
+    NodeFallbacksToml, NodeHealthToml, NodeIndexerTlsToml, NodeToml, duration_as_millis_u64,
     load_bearer_token, parse_socket_addr, require_field, resolve_optional_bearer_token,
-    zinder_environment_source, zinder_environment_source_from_map,
 };
 pub use env_var_docs::{
     ENVIRONMENT_VARIABLES, EnvVarDoc, Requirement as EnvVarRequirement,
