@@ -18,11 +18,12 @@ use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_proto::v1::explorer::explorer_query_server::SERVICE_NAME;
 use zinder_runtime::{
-    ComposedReadiness, OpsEndpointHandle, OpsHealthcheckArgs, Readiness, ReadinessCause,
-    ReadinessInput, ReadinessState, RuntimeService, RuntimeSupervisionError, StartupPhase,
-    SupervisedRuntime, SupervisedTasks, TracingSubscriberError, guard_serving_bind,
+    ComposedReadiness, OpsEndpointHandle, OpsHealthcheckArgs, OpsServerError, Readiness,
+    ReadinessCause, ReadinessInput, ReadinessState, RuntimeService, RuntimeSupervisionError,
+    StartupPhase, SupervisedRuntime, SupervisedTasks, TracingSubscriberError, guard_serving_bind,
     host_cpu_meets_compiled_baseline, host_cpu_meets_pasta_backend_baseline,
-    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
+    install_metrics_recorder_for_service, install_tracing_subscriber,
+    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
@@ -37,7 +38,7 @@ use crate::{
 
 pub use config::{
     ExplorerConfig, ExplorerConfigError, ExplorerConfigOverrides, explorer_config_toml,
-    load_explorer_config, load_explorer_config_with_env,
+    load_explorer_config, load_explorer_config_with_env, resolve_explorer_config_from_raw,
 };
 
 type SharedCanonicalSecondary = Arc<RwLock<RocksDbCanonicalSecondary>>;
@@ -301,6 +302,18 @@ async fn serve_explorer(
     listener: Option<TcpListener>,
 ) -> Result<(), ExplorerConfigError> {
     let start_api_phase = StartupPhase::StartApi.start();
+
+    if explorer_config.ops_listen_addr.is_some()
+        && let Err(error) = install_metrics_recorder_for_service(
+            RuntimeService::Explorer,
+            env!("CARGO_PKG_VERSION"),
+            encode_zinder_native_chain_name(explorer_config.network),
+        )
+        .map_err(OpsServerError::from)
+    {
+        start_api_phase.fail(&error);
+        return Err(error.into());
+    }
 
     let (canonical_secondary, materialized_view_store) =
         match open_explorer_stores(&explorer_config) {

@@ -25,8 +25,12 @@ buf build "$repository_root" --output "$extracted/source-native.bin"
 cmp "$extracted/source-native.bin" "$extracted/zinder.v1.descriptor.bin"
 
 cd "$extracted"
-for vendor in proto/compat/lightwalletd proto/external/zebra; do
-  for notice in LICENSE UPSTREAM.md COMMIT VERSION; do
+for vendor in proto/compat/lightwalletd proto/compat/darkside proto/external/zebra; do
+  notices=(LICENSE UPSTREAM.md COMMIT)
+  if [[ "$vendor" != proto/compat/darkside ]]; then
+    notices+=(VERSION)
+  fi
+  for notice in "${notices[@]}"; do
     test -s "$vendor/$notice" || {
       echo >&2 "vendored proto notice is missing or empty: $vendor/$notice"
       exit 1
@@ -42,11 +46,12 @@ buf generate
 
 mapfile -d '' -t proto_files < <(find proto -name '*.proto' -type f -print0)
 mkdir from-protoc
-protoc -I proto/compat/lightwalletd -I proto/external/zebra -I proto \
+protoc -I proto/compat/lightwalletd -I proto/compat/darkside -I proto/external/zebra -I proto \
   --python_out=from-protoc "${proto_files[@]}"
 for schema in "${proto_files[@]}"; do
   case "$schema" in
     proto/compat/lightwalletd/*) relative="${schema#proto/compat/lightwalletd/}" ;;
+    proto/compat/darkside/*) relative="${schema#proto/compat/darkside/}" ;;
     proto/external/zebra/*) relative="${schema#proto/external/zebra/}" ;;
     *) relative="${schema#proto/}" ;;
   esac

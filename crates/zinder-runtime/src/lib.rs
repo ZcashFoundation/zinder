@@ -12,12 +12,13 @@
 //! - The bounded HTTP/1 listener ([`serve_http`], [`HttpListenerLimits`]) that
 //!   serves every axum router, so header, body, idle, and connection limits
 //!   are applied in one place.
-//! - The shared configuration error type, fluent layered loader, and shared
-//!   schema/redacted-render mirrors ([`ConfigError`], [`ConfigLoader`],
-//!   [`NetworkSection`], [`NetworkToml`], [`NodeAuthToml`], [`NodeHealthToml`],
-//!   [`NodeIndexerTlsToml`], [`NodeToml`], [`NodeFallbacksToml`], [`zinder_environment_source`],
-//!   [`require_field`], [`duration_as_millis_u64`]) that every service binary
-//!   uses to honor the
+//! - The shared configuration error type, fluent layered loader, and unified
+//!   strict configuration schema ([`ZinderConfig`], [`ConfigError`],
+//!   [`ConfigLoader`], [`ConfigValue`], [`Toggle`], [`SecretInput`],
+//!   [`RedactedUrl`], [`NetworkSection`], [`zinder_source::NodeSection`],
+//!   [`zinder_source::NodeFallbackSections`], [`require_field`],
+//!   [`duration_as_millis_u64`]) that every service binary and the `zinder`
+//!   supervisor use to honor the
 //!   `defaults -> file -> ZINDER_* env -> CLI overrides` precedence.
 //! - Two thin lifecycle helpers used by every binary entry point:
 //!   [`cancel_on_terminating_signal`] and [`install_tracing_subscriber`],
@@ -54,7 +55,6 @@ mod browser_transport;
 mod canonical_fence_attestation;
 mod composed_readiness;
 mod config;
-mod env_diagnostics;
 mod env_var_docs;
 mod http_listener;
 mod logging;
@@ -93,10 +93,10 @@ pub use canonical_fence_attestation::{
 };
 pub use composed_readiness::{ComposedReadiness, ReadinessInput};
 pub use config::{
-    ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeFallbacksToml,
-    NodeHealthToml, NodeIndexerTlsToml, NodeToml, ZinderEnvironmentSource, duration_as_millis_u64,
-    load_bearer_token, parse_socket_addr, require_field, resolve_optional_bearer_token,
-    zinder_environment_source, zinder_environment_source_from_map,
+    ConfigError, ConfigLoader, ConfigValue, DISABLED_SENTINEL, NetworkSection,
+    REDACTED_PLACEHOLDER, RedactedCidrs, RedactedUrl, SecretInput, Toggle, ZinderConfig,
+    discover_schema_leaf_paths, duration_as_millis_u64, load_bearer_token, parse_socket_addr,
+    require_field, resolve_optional_bearer_token, validate_optional_path,
 };
 pub use env_var_docs::{
     ENVIRONMENT_VARIABLES, EnvVarDoc, Requirement as EnvVarRequirement,
@@ -156,21 +156,23 @@ pub use runtime_supervision::{
     RuntimeTaskFailure, ShutdownRequest, SupervisedGrpcRouter, SupervisedRuntime, SupervisedTasks,
 };
 pub use sections::{
-    CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, DEFAULT_ALLOW_PUBLIC_BIND,
-    DeploymentProfile, DeploymentSection, DeploymentToml, IngestControlReaderToml,
-    IngestControlSection, IngestControlWriterToml, ObservabilityConfig, OpsSection, OpsToml,
-    ProjectorControlSection, ProjectorControlToml, ResolvedCanonicalSecondaryStorage,
-    ResolvedIngestControlReader, ResolvedIngestControlWriter, ResolvedProjectorControl,
-    ResolvedRetention, ResolvedSecondaryStorage, RetentionSection, RetentionToml,
-    RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, RuntimeService,
-    SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
-    StorageRoleSection, StorageRoleToml, defaults as section_defaults, derive_canonical_path,
-    derive_canonical_secondary_path, derive_checkpoints_path, derive_explorer_secondary_path,
-    derive_wallet_path, derive_wallet_secondary_path, resolve_allow_public_bind,
-    resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
-    resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_reader,
-    resolve_ingest_control_writer, resolve_ingest_control_writer_with_data_dir,
-    resolve_manual_raw_blob_retention, resolve_materialized_view_reader_rocksdb_budget,
+    CipherscanSection, CompatSection, CompatServing, DEFAULT_ALLOW_PUBLIC_BIND, DeploymentProfile,
+    DeploymentSection, ExplorerSection, IngestConstructionSection, IngestControlSection,
+    IngestCoverage, IngestFollowSection, IngestMempoolSection, IngestPhaseClassificationSection,
+    IngestRunOverridesSection, IngestSection, IngestTreeStateDensificationSection,
+    IngestTreeStateVerificationSection, ObservabilityConfig, OpsSection, ProjectorBuildSection,
+    ProjectorControlSection, ProjectorFollowSection, ProjectorSection, QuerySection,
+    ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, ResolvedIngestControlWriter,
+    ResolvedProjectorControl, ResolvedRetention, ResolvedSecondaryStorage, RetentionSection,
+    RocksDbResourceBudgetSection, RuntimeService, SecuritySection, StorageRoleSection,
+    StorageSection, TreeStateSelectionName, WalletSection, defaults as section_defaults,
+    derive_canonical_path, derive_canonical_secondary_path, derive_checkpoints_path,
+    derive_explorer_secondary_path, derive_wallet_path, derive_wallet_secondary_path,
+    resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
+    resolve_canonical_secondary_storage, resolve_canonical_writer_rocksdb_budget,
+    resolve_ingest_control_reader, resolve_ingest_control_writer,
+    resolve_ingest_control_writer_with_data_dir, resolve_manual_raw_blob_retention,
+    resolve_materialized_view_reader_rocksdb_budget,
     resolve_materialized_view_writer_rocksdb_budget, resolve_ops_listen_addr,
     resolve_projector_control, resolve_projector_control_with_data_dir, resolve_retention,
     resolve_secondary_storage, resolve_wallet_projection_reader_rocksdb_budget,

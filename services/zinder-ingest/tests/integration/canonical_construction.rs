@@ -2509,7 +2509,8 @@ fn assert_compose_legacy_transactions_fails_closed(
     assert!(!printed.status.success(), "{printed:?}");
     let stderr = String::from_utf8(printed.stderr)?;
     assert!(
-        stderr.contains("does not have variant constructor transactions"),
+        stderr.contains("ZINDER_STORAGE__RAW_BLOB_POLICY")
+            && stderr.contains("expected `none` or `all`"),
         "{stderr}"
     );
     Ok(())

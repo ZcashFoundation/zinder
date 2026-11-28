@@ -159,9 +159,7 @@ impl RocksDbTreeStateVerifier {
             canonical_verification_column_family_descriptors,
         )
         .map(|secondary| {
-            secondary
-                .segment_cache
-                .record_corpus_admission(StoreRole::TreeStateVerificationSecondary);
+            secondary.record_settled_corpus_admission(StoreRole::TreeStateVerificationSecondary);
             Self { secondary }
         })
     }

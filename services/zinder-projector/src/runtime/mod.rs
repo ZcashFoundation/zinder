@@ -68,7 +68,7 @@ use projector_control::{
 pub use config::{
     ProjectorBuildConfig, ProjectorConfig, ProjectorConfigOverrides, ProjectorError,
     ProjectorFollowConfig, load_projector_config, load_projector_config_with_env,
-    projector_config_toml,
+    projector_config_toml, resolve_projector_config_from_raw,
 };
 
 const CANONICAL_FENCE_CONVERGENCE_INITIAL_DELAY: Duration = Duration::from_millis(50);

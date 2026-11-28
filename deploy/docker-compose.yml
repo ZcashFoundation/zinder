@@ -5,33 +5,34 @@
 # authenticated control stays loopback-only while sharing the node and
 # observability networks.
 #
-# Select a deployment preset (`wallet`, `light-wallet`, or `explorer`) with
-# `ZINDER_PRESET` or `ZINDER_DEPLOYMENT__PROFILE` (default: `wallet`).
+# Select a deployment preset (`wallet`, `light-wallet`, or `explorer`) in your
+# `zinder.env` via `ZINDER_DEPLOYMENT__PROFILE` (default: `wallet`).
 #
-# ZINDER_VERSION=vX.Y.Z pulls the signed release image of that tag; use the
+# DEPLOY_VERSION=vX.Y.Z pulls the signed release image of that tag; use the
 # Compose file from the same tag. Without it, `up -d --build` builds from
 # this checkout and tags `:local`.
 #
-# The Zcash node is external to this project. Select one of the `deploy/.env.*`
-# files for its Docker network, cookie volume, and JSON-RPC/indexer endpoints.
-name: zinder-${ZINDER_DEPLOY_NETWORK:?set ZINDER_DEPLOY_NETWORK to mainnet, testnet, or regtest}
+# The Zcash node is external to this project. Select one of the
+# `deploy/profiles/<name>/deploy.env` files for its Docker network, cookie
+# volume, host ports, and paired `zinder.env` (`DEPLOY_ZINDER_ENV`).
+name: zinder-${DEPLOY_NETWORK:?set DEPLOY_NETWORK to mainnet, testnet, or regtest}
 
 networks:
   node:
     external: true
-    name: ${ZINDER_SOURCE_NETWORK_NAME:?set the node's external Docker network name}
+    name: ${DEPLOY_NODE_NETWORK:?set the node's external Docker network name}
   observability:
-    name: ${ZINDER_OBSERVABILITY_NETWORK_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-observability}
+    name: ${DEPLOY_OBSERVABILITY_NETWORK:-zinder-${DEPLOY_NETWORK}-observability}
 
 x-zinder-image: &zinder-image
-  image: ${ZINDER_IMAGE:-ghcr.io/zcashfoundation/zinder:${ZINDER_VERSION:-local}}
+  image: ${DEPLOY_IMAGE:-ghcr.io/zcashfoundation/zinder:${DEPLOY_VERSION:-local}}
   stop_grace_period: 30s
   build:
     context: ..
     dockerfile: deploy/Dockerfile
     target: zinder
     args:
-      ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-1}
+      ZINDER_PASTA_ASM: ${DEPLOY_PASTA_ASM:-1}
 
 services:
   state-init:
@@ -59,11 +60,11 @@ services:
 
   zinder-index:
     <<: *zinder-image
-    mem_limit: ${ZINDER_INDEX_MEMORY_LIMIT:-20g}
+    mem_limit: ${DEPLOY_INDEX_MEMORY_LIMIT:-20g}
     ulimits:
       nofile:
-        soft: ${ZINDER_NOFILE_SOFT_LIMIT:-65536}
-        hard: ${ZINDER_NOFILE_HARD_LIMIT:-65536}
+        soft: ${DEPLOY_NOFILE_SOFT_LIMIT:-65536}
+        hard: ${DEPLOY_NOFILE_HARD_LIMIT:-65536}
     restart: on-failure
     depends_on:
       state-init:
@@ -71,31 +72,23 @@ services:
     networks:
       node:
         aliases:
-          - zinder-${ZINDER_DEPLOY_NETWORK}-index
-          - zinder-${ZINDER_DEPLOY_NETWORK}-ingest
+          - zinder-${DEPLOY_NETWORK}-index
+          - zinder-${DEPLOY_NETWORK}-ingest
       observability:
     volumes:
       - data:/var/lib/zinder
       - checkpoint-staging:/var/lib/zinder/checkpoints
       - node-cookie:/var/run/auth:ro
-      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
-      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/checkpoint.token:/var/run/zinder-checkpoint/checkpoint.token:ro
-    command: ["index", "--preset", "${ZINDER_PRESET:-${ZINDER_DEPLOYMENT__PROFILE:-wallet}}"]
+      - ${DEPLOY_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
+      - ${DEPLOY_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/checkpoint.token:/var/run/zinder-checkpoint/checkpoint.token:ro
+    command: ["index"]
+    env_file:
+      - path: ${DEPLOY_ZINDER_ENV:?set DEPLOY_ZINDER_ENV to your Zinder runtime env file}
+        required: true
+      - path: ${DEPLOY_INDEX_ENV-./profiles/empty-index.env}
+        required: true
     environment:
-      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_PRESET:-${ZINDER_DEPLOYMENT__PROFILE:-wallet}}
-      ZINDER_INGEST__SOURCE: ${ZINDER_INGEST__SOURCE:-zebra-json-rpc}
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
-      # Empty selects JSON-RPC mempool polling.
-      ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR-}
-      ZINDER_NODE__INDEXER_TLS__SERVER_NAME: ${ZINDER_NODE__INDEXER_TLS__SERVER_NAME-}
-      ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM: ${ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM-}
-      ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM: ${ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM-}
-      ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM: ${ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM-}
-      ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
-      ZINDER_NODE__AUTH__PATH: /var/run/auth/.cookie
       ZINDER_STORAGE__DATA_DIR: /var/lib/zinder
-      ZINDER_STORAGE__FULL_BLOCKS: ${ZINDER_STORAGE__FULL_BLOCKS:-false}
       ZINDER_INGEST_CONTROL__LISTEN_ADDR: "127.0.0.1:9100"
       ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH: /var/run/zinder-control/ingest.token
       ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH: /var/run/zinder-checkpoint/checkpoint.token
@@ -106,12 +99,12 @@ services:
       ZINDER_OPS__LISTEN_ADDR: "[::]:9105"
       ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
     ports:
-      - "127.0.0.1:${ZINDER_INDEX_OPS_HOST_PORT:-${ZINDER_INGEST_OPS_HOST_PORT:-9105}}:9105"
-      - "127.0.0.1:${ZINDER_COMPAT_HOST_PORT:-9067}:9067"
-      - "127.0.0.1:${ZINDER_QUERY_HOST_PORT:-9102}:9102"
-      - "127.0.0.1:${ZINDER_EXPLORER_HOST_PORT:-9068}:9068"
-      - "127.0.0.1:${ZINDER_CIPHERSCAN_HOST_PORT:-9070}:9070"
-      - "127.0.0.1:${ZINDER_SERVE_OPS_HOST_PORT:-${ZINDER_COMPAT_OPS_HOST_PORT:-9108}}:9108"
+      - "127.0.0.1:${DEPLOY_INDEX_OPS_HOST_PORT:-9105}:9105"
+      - "127.0.0.1:${DEPLOY_COMPAT_HOST_PORT:-9067}:9067"
+      - "127.0.0.1:${DEPLOY_QUERY_HOST_PORT:-9102}:9102"
+      - "127.0.0.1:${DEPLOY_EXPLORER_HOST_PORT:-9068}:9068"
+      - "127.0.0.1:${DEPLOY_CIPHERSCAN_HOST_PORT:-9070}:9070"
+      - "127.0.0.1:${DEPLOY_SERVE_OPS_HOST_PORT:-9108}:9108"
     healthcheck:
       test: ["CMD", "/usr/local/bin/zinder", "healthcheck", "--addr", "127.0.0.1:9105"]
       interval: 30s
@@ -122,11 +115,11 @@ services:
   zinder-serve:
     <<: *zinder-image
     # Include headroom for buffered settled-segment reads. See docs/runbooks/deploying.md.
-    mem_limit: ${ZINDER_SERVE_MEMORY_LIMIT:-8g}
+    mem_limit: ${DEPLOY_SERVE_MEMORY_LIMIT:-8g}
     ulimits:
       nofile:
-        soft: ${ZINDER_NOFILE_SOFT_LIMIT:-65536}
-        hard: ${ZINDER_NOFILE_HARD_LIMIT:-65536}
+        soft: ${DEPLOY_NOFILE_SOFT_LIMIT:-65536}
+        hard: ${DEPLOY_NOFILE_HARD_LIMIT:-65536}
     restart: on-failure
     network_mode: "service:zinder-index"
     depends_on:
@@ -135,16 +128,13 @@ services:
     volumes:
       - data:/var/lib/zinder
       - node-cookie:/var/run/auth:ro
-      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
-    command: ["serve", "--readers-only", "--preset", "${ZINDER_PRESET:-${ZINDER_DEPLOYMENT__PROFILE:-wallet}}"]
+      - ${DEPLOY_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
+    command: ["serve", "--readers-only"]
+    env_file:
+      - path: ${DEPLOY_ZINDER_ENV:?set DEPLOY_ZINDER_ENV to your Zinder runtime env file}
+        required: true
     environment:
-      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_PRESET:-${ZINDER_DEPLOYMENT__PROFILE:-wallet}}
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
-      ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
-      ZINDER_NODE__AUTH__PATH: /var/run/auth/.cookie
       ZINDER_STORAGE__DATA_DIR: /var/lib/zinder
-      ZINDER_STORAGE__FULL_BLOCKS: ${ZINDER_STORAGE__FULL_BLOCKS:-false}
       ZINDER_INGEST_CONTROL__ADDR: http://127.0.0.1:9100
       ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH: /var/run/zinder-control/ingest.token
       ZINDER_OPS__LISTEN_ADDR: "[::]:9108"
@@ -153,10 +143,6 @@ services:
       ZINDER_EXPLORER__LISTEN_ADDR: "[::]:9068"
       ZINDER_CIPHERSCAN__LISTEN_ADDR: "[::]:9070"
       ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
-      # Proxy trust is an explicit opt-in after verifying the reverse proxy and network isolation.
-      ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS:-false}
-      ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS:-false}
-      ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS:-false}
     healthcheck:
       test: ["CMD", "/usr/local/bin/zinder", "healthcheck", "--addr", "127.0.0.1:9108"]
       interval: 30s
@@ -166,7 +152,7 @@ services:
 
   zinder-prometheus:
     image: prom/prometheus:v3.16.0
-    mem_limit: ${ZINDER_PROMETHEUS_MEMORY_LIMIT:-1g}
+    mem_limit: ${DEPLOY_PROMETHEUS_MEMORY_LIMIT:-1g}
     restart: unless-stopped
     profiles: [observability]
     networks:
@@ -180,10 +166,10 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
-      - "--storage.tsdb.retention.time=${ZINDER_PROMETHEUS_RETENTION:-30d}"
+      - "--storage.tsdb.retention.time=${DEPLOY_PROMETHEUS_RETENTION:-30d}"
       - "--web.enable-lifecycle"
     ports:
-      - "127.0.0.1:${ZINDER_PROMETHEUS_HOST_PORT:-9095}:9090"
+      - "127.0.0.1:${DEPLOY_PROMETHEUS_HOST_PORT:-9095}:9090"
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
       interval: 30s
@@ -192,7 +178,7 @@ services:
 
   zinder-grafana:
     image: grafana/grafana:13.3.1
-    mem_limit: ${ZINDER_GRAFANA_MEMORY_LIMIT:-512m}
+    mem_limit: ${DEPLOY_GRAFANA_MEMORY_LIMIT:-512m}
     restart: unless-stopped
     profiles: [observability]
     networks: [observability]
@@ -204,11 +190,11 @@ services:
       - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${ZINDER_GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${DEPLOY_GRAFANA_ADMIN_PASSWORD:-admin}
       GF_USERS_DEFAULT_THEME: light
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/zinder-overview.json
     ports:
-      - "127.0.0.1:${ZINDER_GRAFANA_HOST_PORT:-3002}:3000"
+      - "127.0.0.1:${DEPLOY_GRAFANA_HOST_PORT:-3002}:3000"
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
       interval: 30s
@@ -217,13 +203,13 @@ services:
 
 volumes:
   data:
-    name: ${ZINDER_SINGLE_HOST_DATA_VOLUME_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-data}
+    name: ${DEPLOY_DATA_VOLUME:-zinder-${DEPLOY_NETWORK}-data}
   checkpoint-staging:
-    name: ${ZINDER_CHECKPOINT_STAGING_VOLUME_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-checkpoints}
+    name: ${DEPLOY_CHECKPOINT_STAGING_VOLUME:-zinder-${DEPLOY_NETWORK}-checkpoints}
   prometheus:
-    name: ${ZINDER_PROMETHEUS_VOLUME_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-prometheus}
+    name: ${DEPLOY_PROMETHEUS_VOLUME:-zinder-${DEPLOY_NETWORK}-prometheus}
   grafana:
-    name: ${ZINDER_GRAFANA_VOLUME_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-grafana}
+    name: ${DEPLOY_GRAFANA_VOLUME:-zinder-${DEPLOY_NETWORK}-grafana}
   node-cookie:
     external: true
-    name: ${ZINDER_SOURCE_COOKIE_VOLUME_NAME:?set the node's external cookie volume name}
+    name: ${DEPLOY_NODE_COOKIE_VOLUME:?set the node's external cookie volume name}

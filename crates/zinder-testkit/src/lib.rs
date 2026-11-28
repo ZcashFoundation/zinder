@@ -46,7 +46,6 @@ pub mod binary_path;
 pub mod canonical_writer_fixture;
 pub mod chain_fixture;
 pub mod commitment_tree_fixtures;
-pub mod env_var_contract;
 pub mod grpc_web;
 pub mod ingest_control_fixture;
 pub mod json_rpc_test_server;
@@ -77,7 +76,6 @@ pub use commitment_tree_fixtures::{
     FIXTURE_NOTE_COMMITMENT, completed_sapling_subtree_frontier, completed_subtree_frontier,
     frontier_from_note_commitments, frontier_of_size, one_leaf_frontier, one_leaf_sapling_frontier,
 };
-pub use env_var_contract::EnvVarContractProbe;
 pub use ingest_control_fixture::{IngestControlFixture, IngestControlFixtureService};
 pub use json_rpc_test_server::{
     BatchResponseShape, JsonRpcRequest, JsonRpcStub, JsonRpcStubBuilder, JsonRpcTestServer,

@@ -54,10 +54,7 @@ pub use reader::{
     ShieldedRangePlan, ShieldedReadScratch, ShieldedReadStep, ShieldedSlabDecodeRequest,
     VerifiedShieldedIndexSlice,
 };
-pub(crate) use wire_projection::{
-    ExpectedShieldedBlock, synthesize_empty_nullifier_payload,
-    validate_live_tail_shielded_block_wire,
-};
+pub(crate) use wire_projection::synthesize_empty_nullifier_payload;
 pub use wire_projection::{
     is_passthrough_shielded_block_wire, project_shielded_block_wire,
     project_shielded_block_wire_with_scratch,

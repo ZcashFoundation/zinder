@@ -6,7 +6,9 @@
 //! buffers (`Bytes`), asynchronous database slices (`PostgreSQL` `substring`),
 //! and HTTP `Range` fetches.
 
-use std::{collections::VecDeque, fs::File, io, num::NonZeroU64, ops::Range, sync::Arc};
+use std::{
+    collections::VecDeque, fs::File, io, num::NonZeroU64, ops::Range, sync::Arc, time::Instant,
+};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -242,6 +244,69 @@ impl PositionalByteSource for File {
 
     fn read_vec_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         read_vec_file_at(self, offset, len)
+    }
+}
+
+/// Binds read metric handles once for a settled segment file.
+pub(crate) struct SegmentSource<S> {
+    source: S,
+    scan_pages: Option<Box<TrackedScanPages<S>>>,
+    metrics: Option<(metrics::Counter, metrics::Histogram)>,
+}
+
+impl SegmentSource<File> {
+    pub(crate) fn file(source: File, kind: &'static str, constrained: bool) -> Self {
+        Self {
+            scan_pages: TrackedScanPages::for_file(&source, constrained),
+            source,
+            metrics: Some((
+                metrics::counter!("zinder_store_settled_segment_pread_bytes_total", "kind" => kind),
+                metrics::histogram!("zinder_store_settled_segment_pread_duration_seconds", "kind" => kind),
+            )),
+        }
+    }
+}
+
+impl<S> SegmentSource<S> {
+    pub(crate) const fn unmeasured(source: S) -> Self {
+        Self {
+            source,
+            scan_pages: None,
+            metrics: None,
+        }
+    }
+
+    pub(crate) fn scan_drop_behind(&self) -> Option<ScanDropBehind<'_, S>> {
+        self.scan_pages
+            .as_deref()
+            .map(|pages| ScanDropBehind::tracked(&self.source, pages))
+    }
+
+    fn read<T>(&self, len: usize, read: impl FnOnce(&S) -> io::Result<T>) -> io::Result<T> {
+        let Some((bytes, duration)) = self.metrics.as_ref().filter(|_| len != 0) else {
+            return read(&self.source);
+        };
+        let start = Instant::now();
+        let outcome = read(&self.source);
+        duration.record(start.elapsed().as_secs_f64());
+        if outcome.is_ok() {
+            bytes.increment(len as u64);
+        }
+        outcome
+    }
+}
+
+impl<S: PositionalByteSource> PositionalByteSource for SegmentSource<S> {
+    fn total_len(&self) -> io::Result<u64> {
+        self.source.total_len()
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.read(buf.len(), |source| source.read_exact_at(offset, buf))
+    }
+
+    fn read_vec_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.read(len, |source| source.read_vec_at(offset, len))
     }
 }
 

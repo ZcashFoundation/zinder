@@ -62,8 +62,8 @@ cat > "$cfg/projector.toml" <<T
 [network]
 name = "zcash-mainnet"
 [storage]
-canonical_path = "$canonical"
-canonical_secondary_path = "$root/projector/canonical-secondary"
+path = "$canonical"
+secondary_path = "$root/projector/canonical-secondary"
 raw_blob_policy = "none"
 [wallet]
 path = "$wallet"

@@ -8,7 +8,7 @@ use zinder_core::{
 };
 
 use crate::{
-    positional_source::{ByteRange, PositionalByteSource, ScanDropBehind, TrackedScanPages},
+    positional_source::{ByteRange, PositionalByteSource, ScanDropBehind, SegmentSource},
     segment_verity,
 };
 
@@ -965,8 +965,7 @@ impl SettledRawBlockSegmentIndex {
 /// Authenticated reader over one settled `ZSBLKB01` raw block segment backed
 /// by a [`PositionalByteSource`] (default [`File`]).
 pub struct SettledRawBlockSegmentReader<S = File> {
-    source: S,
-    scan_pages: Option<Box<TrackedScanPages<S>>>,
+    source: SegmentSource<S>,
     index: SettledRawBlockSegmentIndex,
 }
 
@@ -1023,8 +1022,12 @@ impl SettledRawBlockSegmentReader<File> {
         if options.require_fs_verity && !kernel_verified {
             return Err(SettledRawBlockSegmentError::FsVerityRequired);
         }
-        let scan_pages = TrackedScanPages::for_file(&file, constrained);
-        Self::admit_with_verity(file, expected, options, kernel_verified, scan_pages)
+        Self::admit_with_verity(
+            SegmentSource::file(file, "block_blob", constrained),
+            expected,
+            options,
+            kernel_verified,
+        )
     }
 }
 
@@ -1045,15 +1048,28 @@ impl<S: PositionalByteSource> SettledRawBlockSegmentReader<S> {
         if options.require_fs_verity {
             return Err(SettledRawBlockSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(source, expected, options, false, None)
+        Self::admit_with_verity(SegmentSource::unmeasured(source), expected, options, false)
+    }
+
+    pub(crate) fn index_heap_bytes(&self) -> usize {
+        std::mem::size_of_val(self.index.rows.as_ref())
+            + self
+                .index
+                .row_index_page_digests
+                .as_deref()
+                .map_or(0, std::mem::size_of_val)
+            + self
+                .index
+                .tx_table_page_digests
+                .as_deref()
+                .map_or(0, std::mem::size_of_val)
     }
 
     fn admit_with_verity(
-        source: S,
+        source: SegmentSource<S>,
         expected: &RawBlockSegmentIdentity,
         options: SettledRawBlockSegmentOpenOptions,
         kernel_verified: bool,
-        scan_pages: Option<Box<TrackedScanPages<S>>>,
     ) -> Result<Self, SettledRawBlockSegmentError> {
         let total_len = source.total_len()?;
         let mut header_bytes = [0_u8; HEADER_LEN];
@@ -1076,11 +1092,7 @@ impl<S: PositionalByteSource> SettledRawBlockSegmentReader<S> {
             total_len,
             kernel_verified,
         )?;
-        let reader = Self {
-            source,
-            scan_pages,
-            index,
-        };
+        let reader = Self { source, index };
         if options.verify_full_payload {
             reader.verify_full_payload_with_raw(&header_bytes, &index_and_trailer)?;
         }
@@ -1247,9 +1259,7 @@ impl<S: PositionalByteSource> SettledRawBlockSegmentReader<S> {
     }
 
     pub(crate) fn scan_drop_behind(&self) -> Option<ScanDropBehind<'_, S>> {
-        self.scan_pages
-            .as_deref()
-            .map(|pages| ScanDropBehind::tracked(&self.source, pages))
+        self.source.scan_drop_behind()
     }
 
     pub(crate) fn read_raw_block_for_scan(
@@ -1716,7 +1726,7 @@ fn validate_entry_tx_slices(
 }
 
 fn verify_all_slab_frames<S: PositionalByteSource>(
-    source: &S,
+    source: &SegmentSource<S>,
     index: &SettledRawBlockSegmentIndex,
     raw_row_index: &[u8],
     whole_digest: &mut Sha256,

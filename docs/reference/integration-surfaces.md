@@ -24,7 +24,7 @@ Zinder serves two wallet protocols on separate endpoints. A client speaks one of
 | A Cipherscan frontend | Cipherscan-compatible REST and WebSocket | `zinder-compat-cipherscan` (`--preset explorer`) | 9070 |
 | A server-side wallet | `zinder-client` plus a wallet library such as librustzcash | `zinder-query` | 9102 |
 
-All four client ports (`9067`, `9068`, `9070`, `9102`) are published on host loopback by `deploy/docker-compose.yml` (`zinder-serve` listens on `[::]:9070` with `ZINDER_CIPHERSCAN__LISTEN_ADDR` and `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`; select `--preset explorer` / `ZINDER_PRESET=explorer` to start Explorer and Cipherscan compat alongside wallet serving). Your operator may publish different ports.
+All four client ports (`9067`, `9068`, `9070`, `9102`) are published on host loopback by `deploy/docker-compose.yml` (`zinder-serve` listens on `[::]:9070` with `ZINDER_CIPHERSCAN__LISTEN_ADDR` and `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`; set `ZINDER_DEPLOYMENT__PROFILE=explorer` in `zinder.env`, or pass `--preset explorer` on standalone CLI runs, to start Explorer and Cipherscan compat alongside wallet serving). Your operator may publish different ports.
 
 #### Generate bindings from a pinned release
 
@@ -75,12 +75,18 @@ python -m grpc_tools.protoc -I proto \
 For other languages, pin the Protobuf and gRPC plugins in your own template
 and pass it to `buf generate --template`. Use `--path proto/zinder` to limit
 generation to native Zinder. With `protoc`, use `-I proto` for native Zinder,
-`-I proto/compat/lightwalletd` for lightwalletd, and
-`-I proto/external/zebra` for Zebra. Keep the vendored notices alongside any
-schemas you redistribute.
+`-I proto/compat/lightwalletd` for lightwalletd, `-I proto/compat/darkside` for
+Darkside, and `-I proto/external/zebra` for Zebra. When compiling multiple
+schema families together, list the vendored include paths before `-I proto`.
 
-The archive includes `zinder.contract.descriptor.bin` for all three schema
-families and `zinder.v1.descriptor.bin` for native-only tooling. For an upgrade,
+`darkside.proto` is a commit-pinned schema for wallet test drivers. It shares
+lightwalletd's `cash.z.wallet.sdk.rpc` package and imports its `service.proto`,
+so pass both compatibility include paths when generating Darkside bindings.
+Keep `LICENSE`, `UPSTREAM.md`, and `COMMIT` alongside any vendored schemas you
+redistribute, plus `VERSION` for lightwalletd and Zebra.
+
+The archive includes `zinder.contract.descriptor.bin` for native and vendored
+schemas and `zinder.v1.descriptor.bin` for native-only tooling. For an upgrade,
 verify and extract the new tag into a separate directory. From the new
 directory, compare the full descriptors.
 

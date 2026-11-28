@@ -9,20 +9,19 @@ use std::{
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
-    BearerToken, ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection, DeploymentToml,
-    IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml, OpsSection,
-    OpsServerError, OpsToml, ProjectorControlSection, ProjectorControlToml,
-    ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
-    RuntimeService, SecuritySection, SecurityToml, StorageRoleSection, derive_canonical_path,
+    BearerToken, ConfigError, ConfigLoader, DEFAULT_ALLOW_PUBLIC_BIND, DeploymentProfile,
+    DeploymentSection, IngestControlSection, NetworkSection, OpsSection, OpsServerError,
+    ProjectorBuildSection, ProjectorControlSection, ProjectorFollowSection, ProjectorSection,
+    ResolvedIngestControlReader, RuntimeService, SecuritySection, StorageRoleSection,
+    StorageSection, WalletSection, ZinderConfig, derive_canonical_path,
     derive_canonical_secondary_path, derive_wallet_path, guard_optional_serving_bind,
     require_field, resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
     resolve_ingest_control_reader, resolve_manual_raw_blob_retention, resolve_ops_listen_addr,
     resolve_projector_control_with_data_dir, resolve_wallet_projection_writer_rocksdb_budget,
-    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir,
+    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir, validate_optional_path,
 };
 use zinder_store::{RawBlobRetention, RocksDbResourceBudget};
 use zinder_wallet_rocksdb::{MAX_ACCUMULATOR_HASHING_WORKERS, RocksDbWalletBuildOptions};
@@ -142,9 +141,9 @@ pub struct ProjectorFollowConfig {
 pub struct ProjectorConfigOverrides {
     /// Override for `network.name`.
     pub network: Option<String>,
-    /// Override for `storage.canonical_path`.
+    /// Override for `storage.path`.
     pub canonical_path: Option<PathBuf>,
-    /// Override for `storage.canonical_secondary_path`.
+    /// Override for `storage.secondary_path`.
     pub canonical_secondary_path: Option<PathBuf>,
     /// Override for `wallet.path`.
     pub wallet_path: Option<PathBuf>,
@@ -196,7 +195,7 @@ pub enum ProjectorError {
     /// Creating the canonical secondary directory failed.
     #[error("could not create canonical secondary directory {path:?}: {source}")]
     CanonicalSecondaryDirectoryCreate {
-        /// Configured `storage.canonical_secondary_path` directory.
+        /// Configured `storage.secondary_path` directory.
         path: PathBuf,
         /// Underlying filesystem creation failure.
         #[source]
@@ -209,9 +208,9 @@ pub enum ProjectorError {
         format_error_chain(source)
     )]
     CanonicalSecondaryOpen {
-        /// Configured `storage.canonical_path` directory.
+        /// Configured `storage.path` directory.
         primary_path: PathBuf,
-        /// Configured `storage.canonical_secondary_path` directory.
+        /// Configured `storage.secondary_path` directory.
         secondary_path: PathBuf,
         /// Underlying canonical-store admission or open failure.
         #[source]
@@ -405,7 +404,7 @@ pub fn load_projector_config(
     config_path: Option<PathBuf>,
     overrides: ProjectorConfigOverrides,
 ) -> Result<ProjectorConfig, ProjectorError> {
-    resolve_projector_config(load_raw_projector_config(
+    resolve_projector_config_from_raw(load_raw_projector_config(
         config_path,
         overrides,
         std::env::vars(),
@@ -419,7 +418,7 @@ pub fn load_projector_config_with_env(
     overrides: ProjectorConfigOverrides,
     environment: impl IntoIterator<Item = (String, String)>,
 ) -> Result<ProjectorConfig, ProjectorError> {
-    resolve_projector_config(load_raw_projector_config(
+    resolve_projector_config_from_raw(load_raw_projector_config(
         config_path,
         overrides,
         environment,
@@ -452,16 +451,13 @@ fn load_raw_projector_config(
     config_path: Option<PathBuf>,
     overrides: ProjectorConfigOverrides,
     environment: impl IntoIterator<Item = (String, String)>,
-) -> Result<ProjectorRawConfig, ConfigError> {
+) -> Result<ZinderConfig, ConfigError> {
     projector_config_loader()?
         .with_file(config_path)
         .with_zinder_env_from_map(environment)?
         .with_override_if("network.name", overrides.network)?
-        .with_override_path_if("storage.canonical_path", overrides.canonical_path)?
-        .with_override_path_if(
-            "storage.canonical_secondary_path",
-            overrides.canonical_secondary_path,
-        )?
+        .with_override_path_if("storage.path", overrides.canonical_path)?
+        .with_override_path_if("storage.secondary_path", overrides.canonical_secondary_path)?
         .with_override_path_if("wallet.path", overrides.wallet_path)?
         .with_override_if(
             "projector.reorg_window_blocks",
@@ -500,155 +496,97 @@ fn load_raw_projector_config(
 
 fn projector_config_loader() -> Result<ConfigLoader, ConfigError> {
     ConfigLoader::new()
-        .with_default("projector.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
-        .with_default(
-            "projector.fence_convergence_timeout_seconds",
-            DEFAULT_FENCE_CONVERGENCE_TIMEOUT_SECONDS,
-        )?
-        .with_default(
-            "projector.build.max_outpoint_sort_memory_bytes",
-            zinder_runtime::wallet_build_outpoint_sort_memory_bytes(),
-        )?
-        .with_default(
-            "projector.build.max_secondary_sort_memory_bytes_per_sorter",
-            zinder_runtime::wallet_build_secondary_sort_memory_bytes_per_sorter(),
-        )?
-        .with_default(
-            "projector.build.max_temporary_file_bytes_per_sorter",
-            DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER,
-        )?
-        .with_default(
-            "projector.build.sst_target_logical_bytes",
-            DEFAULT_SST_TARGET_LOGICAL_BYTES,
-        )?
-        .with_default(
-            "projector.build.max_accounted_reorg_undo_bytes",
-            zinder_runtime::wallet_build_reorg_undo_memory_bytes(),
-        )?
-        .with_default(
-            "projector.follow.max_transition_logical_bytes",
-            DEFAULT_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES,
-        )?
         .with_ops_section(RuntimeService::Projector)?
-        .with_default("ingest_control.addr", "http://127.0.0.1:9100")?
         .with_security_section()
 }
 
 /// Renders the complete accepted config shape without exposing auth material.
 pub fn projector_config_toml(config: &ProjectorConfig) -> Result<String, ProjectorError> {
-    toml::to_string(&ProjectorConfigToml::from_config(config))
+    let toml_config = ZinderConfig {
+        deployment: DeploymentSection::from_resolved(config.profile),
+        network: NetworkSection::from_network(config.network),
+        storage: StorageSection {
+            data_dir: config.storage_data_dir.clone(),
+            path: Some(config.canonical_path.clone()),
+            secondary_path: Some(config.canonical_secondary_path.clone()),
+            full_blocks: config.storage_full_blocks,
+            raw_blob_policy: config
+                .profile
+                .is_none()
+                .then_some(config.expected_canonical_raw_blob_retention),
+            canonical: StorageRoleSection::from_resolved(config.canonical_rocksdb_budget),
+            ..StorageSection::default()
+        },
+        wallet: WalletSection::from_resolved_writer(
+            config.wallet_path.clone(),
+            config.wallet_rocksdb_budget,
+        ),
+        projector: ProjectorSection {
+            reorg_window_blocks: Some(config.reorg_window_blocks),
+            build_owner_hex: config.build_owner.map(encode_hex),
+            lease_duration_seconds: Some(config.lease_duration.as_secs()),
+            fence_convergence_timeout_seconds: Some(config.fence_convergence_timeout.as_secs()),
+            build: ProjectorBuildSection {
+                max_outpoint_sort_memory_bytes: Some(config.build.max_outpoint_sort_memory_bytes),
+                max_secondary_sort_memory_bytes_per_sorter: Some(
+                    config.build.max_secondary_sort_memory_bytes_per_sorter,
+                ),
+                max_temporary_file_bytes_per_sorter: Some(
+                    config.build.max_temporary_file_bytes_per_sorter,
+                ),
+                sst_target_logical_bytes: Some(config.build.sst_target_logical_bytes),
+                max_accounted_reorg_undo_bytes: Some(config.build.max_accounted_reorg_undo_bytes),
+                accumulator_hashing_workers: Some(config.build.accumulator_hashing_workers.get()),
+            },
+            follow: ProjectorFollowSection {
+                max_transition_logical_bytes: Some(
+                    config.follow.max_transition_logical_bytes.get(),
+                ),
+            },
+        },
+        ingest_control: IngestControlSection::from_reader(&ResolvedIngestControlReader {
+            addr: config.ingest_control_addr.clone(),
+            bearer_token_path: config.ingest_control_bearer_token_path.clone(),
+            bearer_token: config.ingest_control_bearer_token.clone(),
+        }),
+        projector_control: ProjectorControlSection::from_control(&config.projector_control),
+        ops: OpsSection::from_resolved(config.ops_listen_addr),
+        observability: config.observability.clone(),
+        security: SecuritySection::from_resolved(config.allow_public_bind),
+        ..ZinderConfig::default()
+    };
+    toml::to_string(&toml_config)
         .map_err(|source| ConfigError::Render { source })
         .map_err(ProjectorError::from)
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ProjectorRawConfig {
-    deployment: DeploymentSection,
-    network: NetworkSection,
-    storage: ProjectorStorageSection,
-    wallet: ProjectorWalletSection,
-    projector: ProjectorSection,
-    ingest_control: IngestControlSection,
-    projector_control: ProjectorControlSection,
-    ops: OpsSection,
-    observability: zinder_runtime::ObservabilityConfig,
-    security: SecuritySection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ProjectorStorageSection {
-    data_dir: Option<PathBuf>,
-    canonical_path: Option<PathBuf>,
-    canonical_secondary_path: Option<PathBuf>,
-    raw_blob_policy: Option<RawBlobRetention>,
-    full_blocks: Option<bool>,
-    canonical: StorageRoleSection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ProjectorWalletSection {
-    path: Option<PathBuf>,
-    rocksdb: RocksDbResourceBudgetSection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ProjectorSection {
-    reorg_window_blocks: Option<u32>,
-    build_owner_hex: Option<String>,
-    lease_duration_seconds: Option<u64>,
-    fence_convergence_timeout_seconds: Option<u64>,
-    build: ProjectorBuildSection,
-    follow: ProjectorFollowSection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ProjectorBuildSection {
-    max_outpoint_sort_memory_bytes: Option<u64>,
-    max_secondary_sort_memory_bytes_per_sorter: Option<u64>,
-    max_temporary_file_bytes_per_sorter: Option<u64>,
-    sst_target_logical_bytes: Option<u64>,
-    max_accounted_reorg_undo_bytes: Option<u64>,
-    accumulator_hashing_workers: Option<u32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ProjectorFollowSection {
-    max_transition_logical_bytes: Option<u64>,
-}
-
-fn non_blank_path_or(
-    explicit: Option<PathBuf>,
-    field: &'static str,
-    fallback: impl FnOnce() -> PathBuf,
-) -> Result<PathBuf, ConfigError> {
-    match explicit {
-        Some(path) => {
-            if path.to_string_lossy().trim().is_empty() {
-                return Err(ConfigError::invalid(format!("{field} must not be blank")));
-            }
-            Ok(path)
-        }
-        None => Ok(fallback()),
-    }
-}
-
 fn resolve_projector_paths(
-    storage: &mut ProjectorStorageSection,
+    storage: &mut StorageSection,
     wallet_path: Option<PathBuf>,
 ) -> Result<(PathBuf, PathBuf, PathBuf), ConfigError> {
     storage.data_dir = validate_optional_data_dir(storage.data_dir.take())?;
     let data_dir = storage.data_dir.as_deref();
     let effective_root = data_dir.unwrap_or_else(|| Path::new(DEFAULT_DATA_DIR));
-    let canonical_path = non_blank_path_or(
-        storage.canonical_path.take(),
-        "storage.canonical_path",
-        || derive_canonical_path(effective_root),
-    )?;
-    let canonical_secondary_path = non_blank_path_or(
-        storage.canonical_secondary_path.take(),
-        "storage.canonical_secondary_path",
-        || {
-            data_dir.map_or_else(
-                || PathBuf::from(DEFAULT_CANONICAL_SECONDARY_PATH),
-                |dir| derive_canonical_secondary_path(dir, "projector"),
-            )
-        },
-    )?;
-    let wallet_path = non_blank_path_or(wallet_path, "wallet.path", || {
-        derive_wallet_path(effective_root)
-    })?;
+    let canonical_path = validate_optional_path(storage.path.take(), "storage.path")?
+        .unwrap_or_else(|| derive_canonical_path(effective_root));
+    let canonical_secondary_path =
+        validate_optional_path(storage.secondary_path.take(), "storage.secondary_path")?
+            .unwrap_or_else(|| {
+                data_dir.map_or_else(
+                    || PathBuf::from(DEFAULT_CANONICAL_SECONDARY_PATH),
+                    |dir| derive_canonical_secondary_path(dir, "projector"),
+                )
+            });
+    let wallet_path = validate_optional_path(wallet_path, "wallet.path")?
+        .unwrap_or_else(|| derive_wallet_path(effective_root));
     require_distinct_paths(&canonical_path, &canonical_secondary_path, &wallet_path)?;
     Ok((canonical_path, canonical_secondary_path, wallet_path))
 }
 
-fn resolve_projector_config(
-    mut raw: ProjectorRawConfig,
+/// Validates and resolves an already-deserialized unified [`ZinderConfig`] for
+/// `zinder-projector`.
+pub fn resolve_projector_config_from_raw(
+    mut raw: ZinderConfig,
 ) -> Result<ProjectorConfig, ProjectorError> {
     let profile = raw.deployment.profile;
     let network = raw.network.resolve()?;
@@ -666,7 +604,9 @@ fn resolve_projector_config(
     let wallet_rocksdb_budget =
         resolve_wallet_projection_writer_rocksdb_budget(raw.wallet.rocksdb)?;
     let reorg_window_blocks = require_nonzero_u32(
-        raw.projector.reorg_window_blocks,
+        raw.projector
+            .reorg_window_blocks
+            .or(Some(DEFAULT_REORG_WINDOW_BLOCKS)),
         "projector.reorg_window_blocks",
     )?;
     let owner_path = persisted_build_owner_path(&wallet_path)?;
@@ -680,7 +620,9 @@ fn resolve_projector_config(
         MINIMUM_LEASE_DURATION_SECONDS,
     )?;
     let fence_convergence_timeout_seconds = require_nonzero_u64(
-        raw.projector.fence_convergence_timeout_seconds,
+        raw.projector
+            .fence_convergence_timeout_seconds
+            .or(Some(DEFAULT_FENCE_CONVERGENCE_TIMEOUT_SECONDS)),
         "projector.fence_convergence_timeout_seconds",
     )?;
     let build = resolve_build_config(&raw.projector.build)?;
@@ -691,7 +633,13 @@ fn resolve_projector_config(
         storage_data_dir.as_deref(),
     )?;
     let ops_listen_addr = resolve_ops_listen_addr(raw.ops)?;
-    let allow_public_bind = resolve_allow_public_bind(raw.security)?;
+    let allow_public_bind = resolve_allow_public_bind(SecuritySection {
+        allow_public_bind: Some(
+            raw.security
+                .allow_public_bind
+                .unwrap_or(DEFAULT_ALLOW_PUBLIC_BIND),
+        ),
+    })?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
 
     Ok(ProjectorConfig {
@@ -741,23 +689,29 @@ fn resolve_expected_raw_blob_retention(
 fn resolve_build_config(raw: &ProjectorBuildSection) -> Result<ProjectorBuildConfig, ConfigError> {
     Ok(ProjectorBuildConfig {
         max_outpoint_sort_memory_bytes: require_nonzero_u64(
-            raw.max_outpoint_sort_memory_bytes,
+            raw.max_outpoint_sort_memory_bytes
+                .or_else(|| Some(zinder_runtime::wallet_build_outpoint_sort_memory_bytes())),
             "projector.build.max_outpoint_sort_memory_bytes",
         )?,
         max_secondary_sort_memory_bytes_per_sorter: require_nonzero_u64(
-            raw.max_secondary_sort_memory_bytes_per_sorter,
+            raw.max_secondary_sort_memory_bytes_per_sorter.or_else(|| {
+                Some(zinder_runtime::wallet_build_secondary_sort_memory_bytes_per_sorter())
+            }),
             "projector.build.max_secondary_sort_memory_bytes_per_sorter",
         )?,
         max_temporary_file_bytes_per_sorter: require_nonzero_u64(
-            raw.max_temporary_file_bytes_per_sorter,
+            raw.max_temporary_file_bytes_per_sorter
+                .or(Some(DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER)),
             "projector.build.max_temporary_file_bytes_per_sorter",
         )?,
         sst_target_logical_bytes: require_nonzero_u64(
-            raw.sst_target_logical_bytes,
+            raw.sst_target_logical_bytes
+                .or(Some(DEFAULT_SST_TARGET_LOGICAL_BYTES)),
             "projector.build.sst_target_logical_bytes",
         )?,
         max_accounted_reorg_undo_bytes: require_nonzero_u64(
-            raw.max_accounted_reorg_undo_bytes,
+            raw.max_accounted_reorg_undo_bytes
+                .or_else(|| Some(zinder_runtime::wallet_build_reorg_undo_memory_bytes())),
             "projector.build.max_accounted_reorg_undo_bytes",
         )?,
         accumulator_hashing_workers: match raw.accumulator_hashing_workers {
@@ -778,7 +732,8 @@ fn resolve_follow_config(
     raw: &ProjectorFollowSection,
 ) -> Result<ProjectorFollowConfig, ConfigError> {
     let max_transition_logical_bytes = require_nonzero_u64(
-        raw.max_transition_logical_bytes,
+        raw.max_transition_logical_bytes
+            .or(Some(DEFAULT_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES)),
         "projector.follow.max_transition_logical_bytes",
     )?;
     if max_transition_logical_bytes > MAX_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES {
@@ -812,7 +767,7 @@ fn require_distinct_paths(
             .any(|other| other == path || other.starts_with(path) || path.starts_with(other))
         {
             return Err(ConfigError::invalid(
-                "storage.canonical_path, storage.canonical_secondary_path, and wallet.path must be disjoint roots",
+                "storage.path, storage.secondary_path, and wallet.path must be disjoint roots",
             ));
         }
     }
@@ -1072,144 +1027,6 @@ fn require_minimum_u64(
         )));
     }
     Ok(configured)
-}
-
-#[derive(Serialize)]
-struct ProjectorConfigToml {
-    #[serde(skip_serializing_if = "DeploymentToml::is_empty")]
-    deployment: DeploymentToml,
-    network: NetworkToml,
-    storage: ProjectorStorageToml,
-    wallet: ProjectorWalletToml,
-    projector: ProjectorToml,
-    ingest_control: IngestControlReaderToml,
-    projector_control: ProjectorControlToml,
-    ops: OpsToml,
-    #[serde(skip_serializing_if = "zinder_runtime::ObservabilityConfig::is_empty")]
-    observability: zinder_runtime::ObservabilityConfig,
-    security: SecurityToml,
-}
-
-impl ProjectorConfigToml {
-    fn from_config(config: &ProjectorConfig) -> Self {
-        let storage = ProjectorStorageToml {
-            data_dir: config.storage_data_dir.clone(),
-            canonical_path: config.canonical_path.clone(),
-            canonical_secondary_path: config.canonical_secondary_path.clone(),
-            full_blocks: config.storage_full_blocks,
-            raw_blob_policy: config
-                .profile
-                .is_none()
-                .then_some(config.expected_canonical_raw_blob_retention),
-            canonical: ProjectorStorageRoleToml::from_budget(config.canonical_rocksdb_budget),
-        };
-        Self {
-            deployment: DeploymentToml::from_resolved(config.profile),
-            network: NetworkToml::from_network(config.network),
-            storage,
-            wallet: ProjectorWalletToml {
-                path: config.wallet_path.clone(),
-                rocksdb: RocksDbResourceBudgetToml::from_resolved(config.wallet_rocksdb_budget),
-            },
-            projector: ProjectorToml {
-                reorg_window_blocks: config.reorg_window_blocks,
-                build_owner_hex: config.build_owner.map(encode_hex),
-                lease_duration_seconds: config.lease_duration.as_secs(),
-                fence_convergence_timeout_seconds: config.fence_convergence_timeout.as_secs(),
-                build: ProjectorBuildToml::from(config.build),
-                follow: ProjectorFollowToml::from(config.follow),
-            },
-            ingest_control: IngestControlReaderToml::from_reader(&ResolvedIngestControlReader {
-                addr: config.ingest_control_addr.clone(),
-                bearer_token_path: config.ingest_control_bearer_token_path.clone(),
-                bearer_token: config.ingest_control_bearer_token.clone(),
-            }),
-            projector_control: ProjectorControlToml::from_control(&config.projector_control),
-            ops: OpsToml::from_resolved(config.ops_listen_addr),
-            observability: config.observability.clone(),
-            security: SecurityToml::from_resolved(config.allow_public_bind),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ProjectorStorageToml {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data_dir: Option<PathBuf>,
-    canonical_path: PathBuf,
-    canonical_secondary_path: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    full_blocks: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    raw_blob_policy: Option<RawBlobRetention>,
-    canonical: ProjectorStorageRoleToml,
-}
-
-#[derive(Serialize)]
-struct ProjectorWalletToml {
-    path: PathBuf,
-    rocksdb: RocksDbResourceBudgetToml,
-}
-
-#[derive(Serialize)]
-struct ProjectorStorageRoleToml {
-    rocksdb: RocksDbResourceBudgetToml,
-}
-
-impl ProjectorStorageRoleToml {
-    const fn from_budget(budget: RocksDbResourceBudget) -> Self {
-        Self {
-            rocksdb: RocksDbResourceBudgetToml::from_resolved(budget),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ProjectorToml {
-    reorg_window_blocks: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    build_owner_hex: Option<String>,
-    lease_duration_seconds: u64,
-    fence_convergence_timeout_seconds: u64,
-    build: ProjectorBuildToml,
-    follow: ProjectorFollowToml,
-}
-
-#[derive(Serialize)]
-struct ProjectorBuildToml {
-    max_outpoint_sort_memory_bytes: u64,
-    max_secondary_sort_memory_bytes_per_sorter: u64,
-    max_temporary_file_bytes_per_sorter: u64,
-    sst_target_logical_bytes: u64,
-    max_accounted_reorg_undo_bytes: u64,
-    accumulator_hashing_workers: u32,
-}
-
-impl From<ProjectorBuildConfig> for ProjectorBuildToml {
-    fn from(config: ProjectorBuildConfig) -> Self {
-        Self {
-            max_outpoint_sort_memory_bytes: config.max_outpoint_sort_memory_bytes,
-            max_secondary_sort_memory_bytes_per_sorter: config
-                .max_secondary_sort_memory_bytes_per_sorter,
-            max_temporary_file_bytes_per_sorter: config.max_temporary_file_bytes_per_sorter,
-            sst_target_logical_bytes: config.sst_target_logical_bytes,
-            max_accounted_reorg_undo_bytes: config.max_accounted_reorg_undo_bytes,
-            accumulator_hashing_workers: config.accumulator_hashing_workers.get(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ProjectorFollowToml {
-    max_transition_logical_bytes: u64,
-}
-
-impl From<ProjectorFollowConfig> for ProjectorFollowToml {
-    fn from(config: ProjectorFollowConfig) -> Self {
-        Self {
-            max_transition_logical_bytes: config.max_transition_logical_bytes.get(),
-        }
-    }
 }
 
 fn encode_hex(bytes: [u8; 16]) -> String {
