@@ -15,9 +15,7 @@ use zstd::bulk::Decompressor;
 
 use crate::{
     HeightOrder,
-    positional_source::{
-        ByteRange, DiscardScanPages, PositionalByteSource, ScanDropBehind, bounded_file_scan,
-    },
+    positional_source::{ByteRange, PositionalByteSource, ScanDropBehind, TrackedScanPages},
     segment_verity,
 };
 
@@ -900,7 +898,7 @@ impl SettledSupplementSegmentIndex {
 /// Authenticated positional reader for one settled `ZSTSUP01` supplement segment.
 pub struct SettledSupplementSegmentReader<S = File> {
     source: S,
-    discard_scan_pages: Option<DiscardScanPages<S>>,
+    scan_pages: Option<Box<TrackedScanPages<S>>>,
     index: SettledSupplementSegmentIndex,
 }
 
@@ -956,10 +954,8 @@ impl SettledSupplementSegmentReader<File> {
         if options.require_fs_verity && !verity_verified {
             return Err(SettledSupplementSegmentError::FsVerityRequired);
         }
-        let discard_scan_pages = bounded_file_scan(&file, constrained);
-        let mut reader = Self::admit_with_verity(file, expected, options, verity_verified)?;
-        reader.discard_scan_pages = discard_scan_pages;
-        Ok(reader)
+        let scan_pages = TrackedScanPages::for_file(&file, constrained);
+        Self::admit_with_verity(file, expected, options, verity_verified, scan_pages)
     }
 }
 
@@ -979,7 +975,7 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         if options.require_fs_verity {
             return Err(SettledSupplementSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(source, expected, options, false)
+        Self::admit_with_verity(source, expected, options, false, None)
     }
 
     fn admit_with_verity(
@@ -987,6 +983,7 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         expected: &SupplementSegmentIdentity,
         options: SettledSupplementSegmentOpenOptions,
         kernel_verified: bool,
+        scan_pages: Option<Box<TrackedScanPages<S>>>,
     ) -> Result<Self, SettledSupplementSegmentError> {
         let total_len = source.total_len()?;
         let min_len = u64::try_from(HEADER_LEN + TRAILER_LEN).map_err(|_| {
@@ -1011,7 +1008,7 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         )?;
         let reader = Self {
             source,
-            discard_scan_pages: None,
+            scan_pages,
             index,
         };
         if options.verify_full_payload {
@@ -1037,6 +1034,12 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         let idx_range = header.indexes_and_trailer_range()?;
         let indexes_and_trailer = self.source.read_vec_at(idx_range.offset, idx_range.len)?;
         self.verify_full_payload_with_raw(&header_bytes, &indexes_and_trailer)
+    }
+
+    fn scan_drop_behind(&self) -> Option<ScanDropBehind<'_, S>> {
+        self.scan_pages
+            .as_deref()
+            .map(|pages| ScanDropBehind::tracked(&self.source, pages))
     }
 
     fn verify_full_payload_with_raw(
@@ -1068,13 +1071,24 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
 
         let mut body_hasher = Sha256::new();
         body_hasher.update(*header_bytes);
-        verify_all_compressed_chunks(&self.source, &self.index, &mut body_hasher)?;
+        verify_all_compressed_chunks(
+            &self.source,
+            &self.index,
+            &mut body_hasher,
+            self.scan_drop_behind(),
+        )?;
         body_hasher.update(raw_chunks);
         body_hasher.update(raw_rows);
         let computed: [u8; 32] = body_hasher.finalize().into();
         if computed != trailer || computed != self.index.identity.sha256 {
             return Err(SettledSupplementSegmentError::PayloadIntegrity(
                 "supplement segment SHA-256 trailer or pinned digest mismatch".to_owned(),
+            ));
+        }
+        if let Some(mut scan) = self.scan_drop_behind() {
+            scan.consumed(ByteRange::new(
+                self.index.header.chunk_index_offset,
+                indexes_and_trailer.len(),
             ));
         }
         Ok(())
@@ -1192,6 +1206,9 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
             })?;
             hashes.push(hash);
         }
+        if let Some(mut scan) = self.scan_drop_behind() {
+            scan.consumed(ByteRange::new(self.index.header.row_index_offset, byte_len));
+        }
         Ok(hashes)
     }
 
@@ -1291,7 +1308,7 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
             SupplementCompressionCodec::Zstd => Some(Decompressor::new()?),
         };
         let mut drop_behind = (start_height != end_height)
-            .then(|| ScanDropBehind::new(&self.source, self.discard_scan_pages))
+            .then(|| self.scan_drop_behind())
             .flatten();
         for step in plan.chunks() {
             let chunk_range = step.compressed_range();
@@ -1376,6 +1393,10 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
                 Some(Decompressor::new().map_err(SettledSupplementSegmentError::Io)?)
             }
         };
+        let mut drop_behind = self.scan_drop_behind();
+        if let Some(scan) = &mut drop_behind {
+            scan.consumed(row_range);
+        }
         for step in plan.chunks() {
             let chunk_range = step.compressed_range();
             let compressed = self
@@ -1389,6 +1410,9 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
                 verified_rows,
                 decompressor.as_mut(),
             )?;
+            if let Some(scan) = &mut drop_behind {
+                scan.consumed(chunk_range);
+            }
             for (row_idx, record) in step.row_range().zip(records.iter()) {
                 let offset = u32::try_from(row_idx - plan.first_row()).map_err(|_| {
                     SettledSupplementSegmentError::InvalidFormat(
@@ -1562,7 +1586,7 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
             scratch: &mut scratch,
             emit,
         };
-        let mut drop_behind = ScanDropBehind::new(&self.source, self.discard_scan_pages);
+        let mut drop_behind = self.scan_drop_behind();
         match request.order {
             HeightOrder::Ascending => {
                 for splice_step in plan.chunks() {
@@ -1902,6 +1926,7 @@ fn verify_all_compressed_chunks<S: PositionalByteSource>(
     source: &S,
     index: &SettledSupplementSegmentIndex,
     body_hasher: &mut Sha256,
+    mut drop_behind: Option<ScanDropBehind<'_, S>>,
 ) -> Result<(), SettledSupplementSegmentError> {
     let mut scratch = vec![0_u8; STAGING_CHUNK];
     for (idx, chunk) in index.chunks.iter().enumerate() {
@@ -1932,6 +1957,9 @@ fn verify_all_compressed_chunks<S: PositionalByteSource>(
             )));
         }
         chunk.mark_valid();
+        if let Some(scan) = &mut drop_behind {
+            scan.consumed(ByteRange::new(abs_offset, chunk.compressed_len as usize));
+        }
     }
     Ok(())
 }

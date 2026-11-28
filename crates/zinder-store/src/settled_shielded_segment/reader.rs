@@ -1195,9 +1195,7 @@ impl SettledShieldedSegmentReader<File> {
             return Err(SettledShieldedSegmentError::FsVerityRequired);
         }
         let scan_pages = TrackedScanPages::for_file(&file, constrained);
-        let mut reader = Self::admit_with_verity(file, expected, options, kernel_verified)?;
-        reader.scan_pages = scan_pages;
-        Ok(reader)
+        Self::admit_with_verity(file, expected, options, kernel_verified, scan_pages)
     }
 }
 
@@ -1217,7 +1215,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
         if options.require_fs_verity {
             return Err(SettledShieldedSegmentError::FsVerityRequired);
         }
-        Self::admit_with_verity(source, expected, options, false)
+        Self::admit_with_verity(source, expected, options, false, None)
     }
 
     fn admit_with_verity(
@@ -1225,6 +1223,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
         expected: &ShieldedSegmentIdentity,
         options: SettledShieldedSegmentOpenOptions,
         kernel_verified: bool,
+        scan_pages: Option<Box<TrackedScanPages<S>>>,
     ) -> Result<Self, SettledShieldedSegmentError> {
         let total_len = source.total_len()?;
         let mut header_bytes = [0_u8; HEADER_LEN];
@@ -1241,7 +1240,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
         )?;
         let reader = Self {
             source,
-            scan_pages: None,
+            scan_pages,
             index,
         };
         if options.verify_full_payload {
@@ -1270,6 +1269,12 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
         self.verify_full_payload_with_raw(&header_bytes, &index_and_trailer)
     }
 
+    fn scan_drop_behind(&self) -> Option<ScanDropBehind<'_, S>> {
+        self.scan_pages
+            .as_deref()
+            .map(|pages| ScanDropBehind::tracked(&self.source, pages))
+    }
+
     fn verify_full_payload_with_raw(
         &self,
         header_bytes: &[u8; HEADER_LEN],
@@ -1296,12 +1301,24 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
 
         let mut whole_digest = Sha256::new();
         whole_digest.update(*header_bytes);
-        verify_all_slab_frames(&self.source, &self.index, raw_index, &mut whole_digest)?;
+        verify_all_slab_frames(
+            &self.source,
+            &self.index,
+            raw_index,
+            &mut whole_digest,
+            self.scan_drop_behind(),
+        )?;
         whole_digest.update(raw_index);
         let computed: [u8; 32] = whole_digest.finalize().into();
         if computed != trailer || computed != self.index.identity.sha256 {
             return Err(SettledShieldedSegmentError::PayloadIntegrity(
                 "portable shielded segment length or SHA-256 mismatch".to_owned(),
+            ));
+        }
+        if let Some(mut scan) = self.scan_drop_behind() {
+            scan.consumed(ByteRange::new(
+                self.index.index_offset,
+                index_and_trailer.len(),
             ));
         }
         Ok(())
@@ -1423,6 +1440,9 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
                 self.index.rows[row_idx].mark_invalid();
             })?;
             hashes.push(hash);
+        }
+        if let Some(mut scan) = self.scan_drop_behind() {
+            scan.consumed(ByteRange::new(self.index.index_offset, byte_len));
         }
         Ok(hashes)
     }
@@ -1692,11 +1712,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
             ),
             _ => None,
         };
-        let mut drop_behind = self
-            .scan_pages
-            .as_deref()
-            .filter(|_| scan)
-            .map(|pages| ScanDropBehind::tracked(&self.source, pages));
+        let mut drop_behind = scan.then(|| self.scan_drop_behind()).flatten();
         let mut emit_step = |step: &ShieldedReadStep,
                              step_scratch: &mut ShieldedReadScratch,
                              step_sink: &mut StepOutputSink<'_>|
@@ -1888,6 +1904,7 @@ fn verify_all_slab_frames<S: PositionalByteSource>(
     index: &SettledShieldedSegmentIndex,
     raw_index: &[u8],
     whole_digest: &mut Sha256,
+    mut drop_behind: Option<ScanDropBehind<'_, S>>,
 ) -> Result<(), SettledShieldedSegmentError> {
     let mut reader = BufferedSourceSpan::new(source, index.slab_offset, u64::from(index.slab_len));
     let mut payload_buf = Vec::new();
@@ -1899,8 +1916,9 @@ fn verify_all_slab_frames<S: PositionalByteSource>(
         reader.read_exact(&mut prefix)?;
         whole_digest.update(prefix);
         let payload_len = decode_frame_prefix(&prefix)?;
-        let (_, expected_frame_len) = frame_span(&index.rows, index.slab_len, idx)?;
-        if u32::try_from(FRAME_PREFIX_LEN + payload_len).ok() != Some(expected_frame_len) {
+        let (rel_offset, expected_frame_len) = frame_span(&index.rows, index.slab_len, idx)?;
+        let frame_len = FRAME_PREFIX_LEN + payload_len;
+        if u32::try_from(frame_len).ok() != Some(expected_frame_len) {
             compact_row.mark_invalid();
             return Err(SettledShieldedSegmentError::InvalidFormat(
                 "streamed slab frame length disagrees with row index".to_owned(),
@@ -1934,6 +1952,12 @@ fn verify_all_slab_frames<S: PositionalByteSource>(
             return Err(err);
         }
         compact_row.mark_valid();
+        if let Some(scan) = &mut drop_behind {
+            scan.consumed(ByteRange::new(
+                index.slab_offset + u64::from(rel_offset),
+                frame_len,
+            ));
+        }
         prev_hash_wire = block_hash_wire;
     }
     if reader.remaining != 0 {

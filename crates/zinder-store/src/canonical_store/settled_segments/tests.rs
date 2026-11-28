@@ -2640,6 +2640,159 @@ fn assert_raw_file_cap_presplit(modules: SettledSegmentModules) -> TestResult {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn portable_cold_admission_discards_verified_payload_and_indexes_only_when_constrained()
+-> TestResult {
+    const BLOCKS: u32 = 2_048;
+    let dir = TempDir::new()?;
+    let config = SettledSegmentSealerConfig::new(
+        Network::ZcashRegtest,
+        TEST_SCHEMA_VERSION,
+        SettledSegmentModules {
+            supplement: true,
+            raw_bodies: true,
+        },
+    )
+    .with_segment_blocks(BLOCKS)
+    .with_supplement_options(SettledSupplementSegmentWriteOptions {
+        codec: crate::SupplementCompressionCodec::None,
+        ..SettledSupplementSegmentWriteOptions::default()
+    })
+    .with_raw_block_codec(RawBlockCodec::None);
+    let mut sealer = SettledSegmentSealer::new(dir.path(), config, None)?;
+    let entry =
+        push_synthetic_range(&mut sealer, 1..=BLOCKS, true)?.ok_or("expected sealed stride")?;
+    let paths = SettledSegmentFilePaths::for_entry(dir.path(), &entry)?;
+    let files = [
+        (paths.shielded.as_path(), SHIELDED_HEADER_LEN),
+        (
+            paths.supplement.as_deref().ok_or("missing supplement")?,
+            SUPPLEMENT_HEADER_LEN,
+        ),
+        (
+            paths.raw_block.as_deref().ok_or("missing raw blocks")?,
+            RAW_HEADER_LEN,
+        ),
+    ];
+    for (path, _) in files {
+        strip_verity_by_replace(path, false)?;
+    }
+
+    let entries = std::slice::from_ref(&entry);
+    for budget in [NonZeroU64::new(1), None] {
+        let cache = SettledSegmentReaderCache::with_corpus_budget(dir.path(), entries, budget)?;
+        let admission = zinder_testkit::LogCapture::install_for_target("zinder::store");
+        super::snapshot::verify_pinned_segments_into_cache(dir.path(), entries, false, &cache)?;
+        let readers = cache.get_or_open(&entry)?;
+        let supplement = readers.supplement.ok_or("missing cached supplement")?;
+        let raw = readers.raw_block.ok_or("missing cached raw blocks")?;
+        assert!(!readers.shielded.kernel_verified());
+        assert!(!supplement.kernel_verified());
+        assert!(!raw.kernel_verified());
+        let supplement_plan = supplement
+            .index()
+            .plan_block_range(entry.start_height, entry.end_block.height)?;
+        let supplement_end = supplement_plan
+            .chunks()
+            .last()
+            .and_then(|step| step.compressed_range().end())
+            .ok_or("missing supplement payload end")?;
+        let full_payload = zinder_testkit::LogCapture::install_for_target("zinder::store");
+        readers.shielded.verify_full_payload()?;
+        supplement.verify_full_payload()?;
+        raw.verify_full_payload()?;
+        for ((path, header), payload_end) in files.into_iter().zip([
+            readers.shielded.index().index_offset(),
+            supplement_end,
+            raw.index().tx_table_offset(),
+        ]) {
+            for capture in [&admission, &full_payload] {
+                assert_cold_discard_ranges(capture, path, header, payload_end, budget.is_some())?;
+            }
+        }
+    }
+    assert_corrupt_cold_payloads_are_rejected(dir.path(), entries, files)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_cold_discard_ranges(
+    capture: &zinder_testkit::LogCapture,
+    path: &Path,
+    header: usize,
+    payload_end: u64,
+    constrained: bool,
+) -> TestResult {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let meta = fs::metadata(path)?;
+    let inode = meta.ino().to_string();
+    let page_size = u64::try_from(rustix::param::page_size())?;
+    let mut advised_payload = false;
+    let mut advised_index = false;
+    for event in capture.events().iter().filter(|event| {
+        event.field("event") == Some("settled_scan_discard_pages")
+            && event.field("inode") == Some(inode.as_str())
+    }) {
+        let offset = event
+            .field("offset")
+            .ok_or("missing advice offset")?
+            .parse::<u64>()?;
+        let len = event
+            .field("len")
+            .ok_or("missing advice length")?
+            .parse::<u64>()?;
+        assert!(constrained, "unexpected advice for {}", path.display());
+        assert_eq!((offset % page_size, len % page_size), (0, 0));
+        assert!(offset >= u64::try_from(header)? && len > 0 && offset + len <= meta.len());
+        advised_payload |= offset + page_size <= payload_end;
+        advised_index |= offset + len >= payload_end.next_multiple_of(page_size) + page_size;
+    }
+    assert_eq!(
+        (advised_payload, advised_index),
+        (constrained, constrained),
+        "{}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn assert_corrupt_cold_payloads_are_rejected(
+    root: &Path,
+    entries: &[SettledSegmentIndexEntry],
+    files: [(&Path, usize); 3],
+) -> TestResult {
+    for (path, header) in files {
+        let mut bytes = fs::read(path)?;
+        bytes[header + 8] ^= 0xff;
+        fs::write(path, &bytes)?;
+        let cache =
+            SettledSegmentReaderCache::with_corpus_budget(root, entries, NonZeroU64::new(1))?;
+        let err = super::snapshot::verify_pinned_segments_into_cache(root, entries, false, &cache)
+            .err()
+            .ok_or("cold verification accepted a corrupt payload")?;
+        assert!(
+            matches!(
+                err,
+                SettledSegmentsError::Shielded(SettledShieldedSegmentError::PayloadIntegrity(_))
+                    | SettledSegmentsError::Supplement(
+                        crate::SettledSupplementSegmentError::PayloadIntegrity(_)
+                    )
+                    | SettledSegmentsError::RawBlock(
+                        crate::SettledRawBlockSegmentError::PayloadIntegrity(_)
+                    )
+            ),
+            "{}: {err}",
+            path.display()
+        );
+        assert!(cache.is_empty());
+        bytes[header + 8] ^= 0xff;
+        fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
 fn seal_multi_test_strides(
     store_root: &Path,
     stride_count: u32,

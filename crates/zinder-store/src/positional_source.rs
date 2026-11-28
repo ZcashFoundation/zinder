@@ -42,9 +42,9 @@ impl ByteRange {
     }
 }
 
-pub(crate) type DiscardScanPages<S> = fn(&S, u64, NonZeroU64);
+type DiscardScanPages<S> = fn(&S, u64, NonZeroU64);
 
-pub(crate) fn bounded_file_scan(file: &File, constrained: bool) -> Option<DiscardScanPages<File>> {
+fn bounded_file_scan(file: &File, constrained: bool) -> Option<DiscardScanPages<File>> {
     if !constrained {
         return None;
     }
@@ -56,12 +56,16 @@ pub(crate) fn bounded_file_scan(file: &File, constrained: bool) -> Option<Discar
         }
         Some(|source, offset, len| {
             #[cfg(test)]
-            tracing::trace!(
-                target: "zinder::store",
-                event = "settled_scan_discard_pages",
-                offset,
-                len = len.get()
-            );
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                tracing::trace!(
+                    target: "zinder::store",
+                    event = "settled_scan_discard_pages",
+                    inode = source.metadata().map_or(0, |meta| meta.ino()),
+                    offset,
+                    len = len.get()
+                );
+            }
             if let Err(error) = fadvise(source, offset, Some(len), Advice::DontNeed) {
                 tracing::debug!(target: "zinder::store", %error, "could not discard settled segment scan pages");
             }
@@ -140,31 +144,18 @@ impl<S> TrackedScanPages<S> {
     }
 }
 
-enum ScanDiscard<'a, S> {
-    Direct(DiscardScanPages<S>),
-    Tracked(&'a TrackedScanPages<S>),
-}
-
 /// Collects consumed payload ranges before advising the kernel.
 pub(crate) struct ScanDropBehind<'a, S> {
     source: &'a S,
-    discard: ScanDiscard<'a, S>,
+    pages: &'a TrackedScanPages<S>,
     pending: Option<(u64, u64)>,
 }
 
 impl<'a, S> ScanDropBehind<'a, S> {
-    pub(crate) fn new(source: &'a S, discard: Option<DiscardScanPages<S>>) -> Option<Self> {
-        Some(Self {
-            source,
-            discard: ScanDiscard::Direct(discard?),
-            pending: None,
-        })
-    }
-
     pub(crate) const fn tracked(source: &'a S, pages: &'a TrackedScanPages<S>) -> Self {
         Self {
             source,
-            discard: ScanDiscard::Tracked(pages),
+            pages,
             pending: None,
         }
     }
@@ -195,17 +186,10 @@ impl<'a, S> ScanDropBehind<'a, S> {
         let Some((start, end)) = self.pending.take() else {
             return;
         };
-        let (discard, extent) = match self.discard {
-            ScanDiscard::Direct(discard) => (discard, start..end),
-            ScanDiscard::Tracked(pages) => {
-                let Some(extent) = pages.completed_pages(start..end) else {
-                    return;
-                };
-                (pages.discard, extent)
-            }
-        };
-        if let Some(len) = NonZeroU64::new(extent.end - extent.start) {
-            discard(self.source, extent.start, len);
+        if let Some(extent) = self.pages.completed_pages(start..end)
+            && let Some(len) = NonZeroU64::new(extent.end - extent.start)
+        {
+            (self.pages.discard)(self.source, extent.start, len);
         }
     }
 }
@@ -390,11 +374,14 @@ mod tests {
     #[test]
     fn scan_discards_only_consumed_extents_in_bounded_batches() -> TestOutcome {
         let discarded = RefCell::new(Vec::new());
-        let mut scan = ScanDropBehind::new(
-            &discarded,
-            Some(|out, offset, len| out.borrow_mut().push((offset, len.get()))),
-        )
-        .ok_or("expected enabled scan")?;
+        let pages = TrackedScanPages {
+            discard: |out: &RefCell<Vec<(u64, u64)>>, offset, len| {
+                out.borrow_mut().push((offset, len.get()));
+            },
+            page_size: std::num::NonZeroU64::new(4_096).ok_or("expected nonzero page size")?,
+            partial: parking_lot::Mutex::default(),
+        };
+        let mut scan = ScanDropBehind::tracked(&discarded, &pages);
         for offset in [524_288, 0, 3_145_728, 3_670_016, 5_242_880] {
             scan.consumed(ByteRange::new(offset, 524_288));
         }
@@ -407,7 +394,6 @@ mod tests {
             *discarded.borrow(),
             [(0, 1_048_576), (3_145_728, 1_048_576), (5_242_880, 524_288)]
         );
-        assert!(ScanDropBehind::new(&discarded, None).is_none());
         Ok(())
     }
 
