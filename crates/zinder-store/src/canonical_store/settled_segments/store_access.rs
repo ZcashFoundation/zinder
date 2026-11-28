@@ -1010,33 +1010,25 @@ pub(in crate::canonical_store) fn read_raw_blocks_in_range_split(
     }
     let mut out = vec![None; count];
     let mut live_tail_heights = Vec::new();
-    let mut active_segment: Option<(SettledSegmentIndexEntry, Arc<SettledRawBlockSegmentReader>)> =
-        None;
-    for (idx, height) in range.into_iter().enumerate() {
-        let in_active = active_segment.as_ref().is_some_and(|(entry, _)| {
-            height >= entry.start_height && height <= entry.end_block.height
-        });
-        if in_active {
-            if let Some((_, raw_reader)) = active_segment.as_ref() {
-                out[idx] = Some(raw_reader.read_raw_block(height).map_err(|err| {
-                    CanonicalStoreError::from(SettledSegmentsError::RawBlock(err))
-                })?);
-            }
-            continue;
-        }
-        if let Some(entry) =
-            resolve_settled_segment_for_height(ctx.db, ctx.sealed_segments, height)?
-        {
-            if let Some(raw_reader) = open_raw_block_reader(ctx.db, ctx.segment_cache, &entry)? {
-                out[idx] = Some(raw_reader.read_raw_block(height).map_err(|err| {
-                    CanonicalStoreError::from(SettledSegmentsError::RawBlock(err))
-                })?);
-                active_segment = Some((entry, raw_reader));
-            } else {
-                active_segment = None;
-            }
-        } else {
+    let mut heights = range.into_iter().enumerate().peekable();
+    while let Some((idx, height)) = heights.next() {
+        let Some(entry) = resolve_settled_segment_for_height(ctx.db, ctx.sealed_segments, height)?
+        else {
             live_tail_heights.push((idx, height));
+            continue;
+        };
+        let Some(reader) = open_raw_block_reader(ctx.db, ctx.segment_cache, &entry)? else {
+            continue;
+        };
+        let end = entry.end_block.height;
+        let following = std::iter::from_fn(|| heights.next_if(|(_, next)| *next <= end));
+        let mut drop_behind = reader.scan_drop_behind();
+        for (idx, height) in std::iter::once((idx, height)).chain(following) {
+            out[idx] = Some(
+                reader
+                    .read_raw_block_for_scan(height, &mut drop_behind)
+                    .map_err(SettledSegmentsError::RawBlock)?,
+            );
         }
     }
     populate_live_tail_raw_blocks(ctx.db, &live_tail_heights, &mut out)?;
@@ -1349,7 +1341,7 @@ pub(in crate::canonical_store) fn verify_cold_segments_and_manifest(
             ),
         });
     }
-    let segment_cache = SettledSegmentReaderCache::with_default_capacity(store_root, false)?;
+    let segment_cache = SettledSegmentReaderCache::with_admitted_corpus(store_root, &entries)?;
     verify_pinned_segments_into_cache(store_root, &entries, false, &segment_cache)?;
     Ok((entries, segment_cache))
 }

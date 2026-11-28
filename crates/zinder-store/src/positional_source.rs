@@ -6,9 +6,12 @@
 //! buffers (`Bytes`), asynchronous database slices (`PostgreSQL` `substring`),
 //! and HTTP `Range` fetches.
 
-use std::{fs::File, io, sync::Arc, time::Instant};
+use std::{
+    collections::VecDeque, fs::File, io, num::NonZeroU64, ops::Range, sync::Arc, time::Instant,
+};
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 
 /// Half-open byte interval `[offset, offset + len)` within a segment artifact.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +41,164 @@ impl ByteRange {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+type DiscardScanPages<S> = fn(&S, u64, NonZeroU64);
+
+fn bounded_file_scan(file: &File, constrained: bool) -> Option<DiscardScanPages<File>> {
+    if !constrained {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{Advice, fadvise};
+        if let Err(error) = fadvise(file, 0, None, Advice::Random) {
+            tracing::debug!(target: "zinder::store", %error, "could not advise settled segment readahead");
+        }
+        Some(|source, offset, len| {
+            #[cfg(test)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                tracing::trace!(
+                    target: "zinder::store",
+                    event = "settled_scan_discard_pages",
+                    inode = source.metadata().map_or(0, |meta| meta.ino()),
+                    offset,
+                    len = len.get()
+                );
+            }
+            if let Err(error) = fadvise(source, offset, Some(len), Advice::DontNeed) {
+                tracing::debug!(target: "zinder::store", %error, "could not discard settled segment scan pages");
+            }
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        None
+    }
+}
+
+/// Carries incomplete consumed pages across scans of one immutable file.
+pub(crate) struct TrackedScanPages<S> {
+    discard: DiscardScanPages<S>,
+    page_size: NonZeroU64,
+    partial: Mutex<VecDeque<Range<u64>>>,
+}
+
+impl TrackedScanPages<File> {
+    pub(crate) fn for_file(file: &File, constrained: bool) -> Option<Box<Self>> {
+        let discard = bounded_file_scan(file, constrained)?;
+        #[cfg(target_os = "linux")]
+        {
+            let page_size = NonZeroU64::new(u64::try_from(rustix::param::page_size()).ok()?)?;
+            Some(Box::new(Self {
+                discard,
+                page_size,
+                partial: Mutex::new(VecDeque::new()),
+            }))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = discard;
+            None
+        }
+    }
+}
+
+impl<S> TrackedScanPages<S> {
+    fn completed_pages(&self, mut consumed: Range<u64>) -> Option<Range<u64>> {
+        let mut partial = self.partial.lock();
+        while let Some(index) = partial
+            .iter()
+            .position(|old| old.start <= consumed.end && consumed.start <= old.end)
+        {
+            let old = partial.remove(index)?;
+            consumed.start = consumed.start.min(old.start);
+            consumed.end = consumed.end.max(old.end);
+        }
+        let page_size = self.page_size.get();
+        let end = consumed.end - consumed.end % page_size;
+        let start = consumed
+            .start
+            .checked_next_multiple_of(page_size)
+            .filter(|start| *start < end);
+        let Some(start) = start else {
+            Self::remember(&mut partial, consumed);
+            return None;
+        };
+        Self::remember(&mut partial, consumed.start..start);
+        Self::remember(&mut partial, end..consumed.end);
+        drop(partial);
+        Some(start..end)
+    }
+
+    fn remember(partial: &mut VecDeque<Range<u64>>, extent: Range<u64>) {
+        const MAX_PARTIAL_EXTENTS: usize = 16;
+        if !extent.is_empty() {
+            if partial.len() == MAX_PARTIAL_EXTENTS {
+                // Forgetting a fragment leaves its page cached until reclaim or another scan.
+                partial.pop_front();
+            }
+            partial.push_back(extent);
+        }
+    }
+}
+
+/// Collects consumed payload ranges before advising the kernel.
+pub(crate) struct ScanDropBehind<'a, S> {
+    source: &'a S,
+    pages: &'a TrackedScanPages<S>,
+    pending: Option<(u64, u64)>,
+}
+
+impl<'a, S> ScanDropBehind<'a, S> {
+    pub(crate) const fn tracked(source: &'a S, pages: &'a TrackedScanPages<S>) -> Self {
+        Self {
+            source,
+            pages,
+            pending: None,
+        }
+    }
+
+    pub(crate) fn consumed(&mut self, range: ByteRange) {
+        const BATCH_BYTES: u64 = 1024 * 1024;
+        let Some(end) = range.end() else {
+            return;
+        };
+        if let Some((start, previous_end)) = self.pending
+            && range.offset <= previous_end
+            && end >= start
+        {
+            self.pending = Some((start.min(range.offset), previous_end.max(end)));
+        } else {
+            self.flush();
+            self.pending = Some((range.offset, end));
+        }
+        if self
+            .pending
+            .is_some_and(|(start, end)| end - start >= BATCH_BYTES)
+        {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        let Some((start, end)) = self.pending.take() else {
+            return;
+        };
+        if let Some(extent) = self.pages.completed_pages(start..end)
+            && let Some(len) = NonZeroU64::new(extent.end - extent.start)
+        {
+            (self.pages.discard)(self.source, extent.start, len);
+        }
+    }
+}
+
+impl<S> Drop for ScanDropBehind<'_, S> {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -89,12 +250,14 @@ impl PositionalByteSource for File {
 /// Binds read metric handles once for a settled segment file.
 pub(crate) struct SegmentSource<S> {
     source: S,
+    scan_pages: Option<Box<TrackedScanPages<S>>>,
     metrics: Option<(metrics::Counter, metrics::Histogram)>,
 }
 
 impl SegmentSource<File> {
-    pub(crate) fn file(source: File, kind: &'static str) -> Self {
+    pub(crate) fn file(source: File, kind: &'static str, constrained: bool) -> Self {
         Self {
+            scan_pages: TrackedScanPages::for_file(&source, constrained),
             source,
             metrics: Some((
                 metrics::counter!("zinder_store_settled_segment_pread_bytes_total", "kind" => kind),
@@ -108,8 +271,15 @@ impl<S> SegmentSource<S> {
     pub(crate) const fn unmeasured(source: S) -> Self {
         Self {
             source,
+            scan_pages: None,
             metrics: None,
         }
+    }
+
+    pub(crate) fn scan_drop_behind(&self) -> Option<ScanDropBehind<'_, S>> {
+        self.scan_pages
+            .as_deref()
+            .map(|pages| ScanDropBehind::tracked(&self.source, pages))
     }
 
     fn read<T>(&self, len: usize, read: impl FnOnce(&S) -> io::Result<T>) -> io::Result<T> {
@@ -236,14 +406,61 @@ fn read_vec_file_at(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>>
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc};
+    use std::{cell::RefCell, fs, sync::Arc};
 
     use bytes::Bytes;
     use tempfile::TempDir;
 
-    use super::{ByteRange, PositionalByteSource};
+    use super::{ByteRange, PositionalByteSource, ScanDropBehind, TrackedScanPages};
 
     type TestOutcome<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    #[test]
+    fn interleaved_scan_fragments_only_discard_fully_consumed_pages() -> TestOutcome {
+        let discarded = RefCell::new(Vec::new());
+        let pages = TrackedScanPages {
+            discard: |out: &RefCell<Vec<(u64, u64)>>, offset, len| {
+                out.borrow_mut().push((offset, len.get()));
+            },
+            page_size: std::num::NonZeroU64::new(4_096).ok_or("expected nonzero page size")?,
+            partial: parking_lot::Mutex::default(),
+        };
+        for (offset, len) in [(0, 1024), (8192, 2048), (2048, 2048)] {
+            ScanDropBehind::tracked(&discarded, &pages).consumed(ByteRange::new(offset, len));
+        }
+        assert!(discarded.borrow().is_empty());
+        ScanDropBehind::tracked(&discarded, &pages).consumed(ByteRange::new(1024, 1024));
+        assert_eq!(*discarded.borrow(), [(0, 4096)]);
+        ScanDropBehind::tracked(&discarded, &pages).consumed(ByteRange::new(10240, 2048));
+        assert_eq!(*discarded.borrow(), [(0, 4096), (8192, 4096)]);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_discards_only_consumed_extents_in_bounded_batches() -> TestOutcome {
+        let discarded = RefCell::new(Vec::new());
+        let pages = TrackedScanPages {
+            discard: |out: &RefCell<Vec<(u64, u64)>>, offset, len| {
+                out.borrow_mut().push((offset, len.get()));
+            },
+            page_size: std::num::NonZeroU64::new(4_096).ok_or("expected nonzero page size")?,
+            partial: parking_lot::Mutex::default(),
+        };
+        let mut scan = ScanDropBehind::tracked(&discarded, &pages);
+        for offset in [524_288, 0, 3_145_728, 3_670_016, 5_242_880] {
+            scan.consumed(ByteRange::new(offset, 524_288));
+        }
+        assert_eq!(
+            *discarded.borrow(),
+            [(0, 1_048_576), (3_145_728, 1_048_576)]
+        );
+        drop(scan);
+        assert_eq!(
+            *discarded.borrow(),
+            [(0, 1_048_576), (3_145_728, 1_048_576), (5_242_880, 524_288)]
+        );
+        Ok(())
+    }
 
     #[test]
     fn byte_range_arithmetic_and_empty_checks() {

@@ -21,7 +21,7 @@ use zstd::bulk::Decompressor;
 
 use crate::{
     HeightOrder,
-    positional_source::{ByteRange, PositionalByteSource, SegmentSource},
+    positional_source::{ByteRange, PositionalByteSource, ScanDropBehind, SegmentSource},
     segment_verity,
 };
 
@@ -974,6 +974,15 @@ impl SettledSupplementSegmentReader<File> {
         expected: &SupplementSegmentIdentity,
         options: SettledSupplementSegmentOpenOptions,
     ) -> Result<Self, SettledSupplementSegmentError> {
+        Self::open_file_with_scan_policy(file, expected, options, false)
+    }
+
+    pub(crate) fn open_file_with_scan_policy(
+        file: File,
+        expected: &SupplementSegmentIdentity,
+        options: SettledSupplementSegmentOpenOptions,
+        constrained: bool,
+    ) -> Result<Self, SettledSupplementSegmentError> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(io::Error::new(
@@ -991,7 +1000,7 @@ impl SettledSupplementSegmentReader<File> {
             return Err(SettledSupplementSegmentError::FsVerityRequired);
         }
         Self::admit_with_verity(
-            SegmentSource::file(file, "supplement"),
+            SegmentSource::file(file, "supplement", constrained),
             expected,
             options,
             verity_verified,
@@ -1085,6 +1094,10 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         self.verify_full_payload_with_raw(&header_bytes, &indexes_and_trailer)
     }
 
+    fn scan_drop_behind(&self) -> Option<ScanDropBehind<'_, S>> {
+        self.source.scan_drop_behind()
+    }
+
     fn verify_full_payload_with_raw(
         &self,
         header_bytes: &[u8; HEADER_LEN],
@@ -1114,13 +1127,24 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
 
         let mut body_hasher = Sha256::new();
         body_hasher.update(*header_bytes);
-        verify_all_compressed_chunks(&self.source, &self.index, &mut body_hasher)?;
+        verify_all_compressed_chunks(
+            &self.source,
+            &self.index,
+            &mut body_hasher,
+            self.scan_drop_behind(),
+        )?;
         body_hasher.update(raw_chunks);
         body_hasher.update(raw_rows);
         let computed: [u8; 32] = body_hasher.finalize().into();
         if computed != trailer || computed != self.index.identity.sha256 {
             return Err(SettledSupplementSegmentError::PayloadIntegrity(
                 "supplement segment SHA-256 trailer or pinned digest mismatch".to_owned(),
+            ));
+        }
+        if let Some(mut scan) = self.scan_drop_behind() {
+            scan.consumed(ByteRange::new(
+                self.index.header.chunk_index_offset,
+                indexes_and_trailer.len(),
             ));
         }
         Ok(())
@@ -1237,6 +1261,9 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
                 self.index.rows[row_idx].mark_invalid();
             })?;
             hashes.push(hash);
+        }
+        if let Some(mut scan) = self.scan_drop_behind() {
+            scan.consumed(ByteRange::new(self.index.header.row_index_offset, byte_len));
         }
         Ok(hashes)
     }
@@ -1366,8 +1393,11 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
             }
         }
         let mut records = Vec::with_capacity(plan.last_row() - plan.first_row() + 1);
+        let mut drop_behind = (start_height != end_height)
+            .then(|| self.scan_drop_behind())
+            .flatten();
         for step in plan.chunks() {
-            records.extend(self.read_chunk_rows(step, verified_rows)?);
+            records.extend(self.read_chunk_rows(step, verified_rows, drop_behind.as_mut())?);
         }
         Ok(records)
     }
@@ -1376,6 +1406,7 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         &self,
         step: &SupplementChunkReadStep,
         verified_rows: VerifiedSupplementRowIndexSlice<'_>,
+        drop_behind: Option<&mut ScanDropBehind<'_, S>>,
     ) -> Result<Vec<BlockSupplementRecord>, SettledSupplementSegmentError> {
         let chunk_idx = step.chunk_idx();
         let cached = CHUNK_CACHE.lock().get(&self.cache_id, chunk_idx);
@@ -1396,6 +1427,9 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
             chunk_idx,
             bytes: Arc::new(bytes),
         });
+        if let Some(scan) = drop_behind {
+            scan.consumed(range);
+        }
         Ok(records)
     }
 
@@ -1456,8 +1490,12 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
                     row_range.offset,
                     &raw_row_index,
                 ))?;
+        let mut drop_behind = self.scan_drop_behind();
+        if let Some(scan) = &mut drop_behind {
+            scan.consumed(row_range);
+        }
         for step in plan.chunks() {
-            let records = self.read_chunk_rows(step, verified_rows)?;
+            let records = self.read_chunk_rows(step, verified_rows, drop_behind.as_mut())?;
             for (row_idx, record) in step.row_range().zip(records.iter()) {
                 let offset = u32::try_from(row_idx - plan.first_row()).map_err(|_| {
                     SettledSupplementSegmentError::InvalidFormat(
@@ -1626,17 +1664,18 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
             scratch: &mut scratch,
             emit,
         };
+        let mut drop_behind = self.scan_drop_behind();
         match request.order {
             HeightOrder::Ascending => {
                 for splice_step in plan.chunks() {
-                    if !self.process_splice_step(splice_step, &mut ctx)? {
+                    if !self.process_splice_step(splice_step, &mut ctx, &mut drop_behind)? {
                         return Ok(false);
                     }
                 }
             }
             HeightOrder::Descending => {
                 for splice_step in plan.chunks().iter().rev() {
-                    if !self.process_splice_step(splice_step, &mut ctx)? {
+                    if !self.process_splice_step(splice_step, &mut ctx, &mut drop_behind)? {
                         return Ok(false);
                     }
                 }
@@ -1649,13 +1688,14 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         &self,
         splice_step: &SupplementSpliceChunkStep,
         ctx: &mut OrderedSpliceContext<'_, P>,
+        drop_behind: &mut Option<ScanDropBehind<'_, S>>,
     ) -> Result<bool, SettledSupplementSegmentError> {
         if ctx.cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Ok(false);
         }
         let decode_step = splice_step.decode_step();
         let decoded_chunk = if splice_step.compressed_range().is_some() {
-            Some(self.read_chunk_rows(decode_step, ctx.verified_rows)?)
+            Some(self.read_chunk_rows(decode_step, ctx.verified_rows, drop_behind.as_mut())?)
         } else {
             None
         };
@@ -1727,8 +1767,9 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
                     &raw_row_index,
                 ))?;
         let mut records = Vec::with_capacity(shielded_payloads.len());
+        let mut drop_behind = self.scan_drop_behind();
         for step in plan.chunks() {
-            records.extend(self.read_chunk_rows(step, verified_rows)?);
+            records.extend(self.read_chunk_rows(step, verified_rows, drop_behind.as_mut())?);
         }
         let mut artifacts = Vec::with_capacity(shielded_payloads.len());
         let base_row = plan.first_row();
@@ -1930,9 +1971,10 @@ fn decode_and_validate_tables(
 }
 
 fn verify_all_compressed_chunks<S: PositionalByteSource>(
-    source: &S,
+    source: &SegmentSource<S>,
     index: &SettledSupplementSegmentIndex,
     body_hasher: &mut Sha256,
+    mut drop_behind: Option<ScanDropBehind<'_, S>>,
 ) -> Result<(), SettledSupplementSegmentError> {
     let mut scratch = vec![0_u8; STAGING_CHUNK];
     for (idx, chunk) in index.chunks.iter().enumerate() {
@@ -1963,6 +2005,9 @@ fn verify_all_compressed_chunks<S: PositionalByteSource>(
             )));
         }
         chunk.mark_valid();
+        if let Some(scan) = &mut drop_behind {
+            scan.consumed(ByteRange::new(abs_offset, chunk.compressed_len as usize));
+        }
     }
     Ok(())
 }

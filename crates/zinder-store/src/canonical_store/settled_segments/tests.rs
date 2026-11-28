@@ -1,8 +1,16 @@
 //! T0 unit tests for canonical settled segments layout, manifests, live-tail
 //! records, aligned sealing, `.staging/` recovery, pinned snapshots, and LRU cache.
 
-use std::{fs, io, path::Path, sync::Arc};
+use std::{
+    fs, io,
+    num::NonZeroU64,
+    path::Path,
+    sync::Arc,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
 
+use parking_lot::{Condvar, Mutex};
 use sha2::{Digest as _, Sha256};
 use tempfile::{NamedTempFile, TempDir};
 use zinder_core::{
@@ -2640,6 +2648,224 @@ fn assert_raw_file_cap_presplit(modules: SettledSegmentModules) -> TestResult {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn canonical_reconstruction_discards_cold_supplement_chunks_only_when_constrained() -> TestResult {
+    use std::os::unix::fs::MetadataExt as _;
+
+    use super::store_access::{SegmentReplayReaders, reconstruct_segment_compact_range};
+
+    const BLOCKS: u32 = 512;
+    let dir = TempDir::new()?;
+    let config = SettledSegmentSealerConfig::new(
+        Network::ZcashRegtest,
+        TEST_SCHEMA_VERSION,
+        SettledSegmentModules {
+            supplement: true,
+            raw_bodies: false,
+        },
+    )
+    .with_segment_blocks(BLOCKS)
+    .with_supplement_options(SettledSupplementSegmentWriteOptions {
+        codec: crate::SupplementCompressionCodec::None,
+        chunk_blocks: 16,
+    });
+    let mut sealer = SettledSegmentSealer::new(dir.path(), config, None)?;
+    let entry =
+        push_synthetic_range(&mut sealer, 1..=BLOCKS, false)?.ok_or("expected sealed stride")?;
+    let paths = SettledSegmentFilePaths::for_entry(dir.path(), &entry)?;
+    let supplement_path = paths.supplement.ok_or("missing supplement path")?;
+    let inode = fs::metadata(supplement_path)?.ino().to_string();
+    let is_supplement_discard = |event: &zinder_testkit::CapturedEvent| {
+        event.field("event") == Some("settled_scan_discard_pages")
+            && event.field("inode") == Some(inode.as_str())
+    };
+    let range = BlockHeightRange::inclusive(entry.start_height, entry.end_block.height);
+    let expected: Vec<_> = (1..=BLOCKS)
+        .map(|height| build_block_input(height, false).compact_block)
+        .collect();
+    for budget in [NonZeroU64::new(1), None] {
+        let cache = SettledSegmentReaderCache::with_corpus_budget(
+            dir.path(),
+            std::slice::from_ref(&entry),
+            budget,
+        )?;
+        let readers = SegmentReplayReaders {
+            shielded: cache.get_or_open_shielded(&entry)?,
+            supplement: cache.get_or_open_supplement(&entry)?,
+        };
+        let cold = zinder_testkit::LogCapture::install_for_target("zinder::store");
+        assert_eq!(
+            reconstruct_segment_compact_range(&readers, range)?,
+            expected
+        );
+        assert_eq!(cold.any(is_supplement_discard), budget.is_some());
+        drop(cold);
+
+        let hit = zinder_testkit::LogCapture::install_for_target("zinder::store");
+        let single = BlockHeightRange::inclusive(range.start, range.start);
+        assert_eq!(
+            reconstruct_segment_compact_range(&readers, single)?,
+            expected[..1]
+        );
+        assert!(!hit.any(is_supplement_discard));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn portable_cold_admission_discards_verified_payload_and_indexes_only_when_constrained()
+-> TestResult {
+    const BLOCKS: u32 = 2_048;
+    let dir = TempDir::new()?;
+    let config = SettledSegmentSealerConfig::new(
+        Network::ZcashRegtest,
+        TEST_SCHEMA_VERSION,
+        SettledSegmentModules {
+            supplement: true,
+            raw_bodies: true,
+        },
+    )
+    .with_segment_blocks(BLOCKS)
+    .with_supplement_options(SettledSupplementSegmentWriteOptions {
+        codec: crate::SupplementCompressionCodec::None,
+        ..SettledSupplementSegmentWriteOptions::default()
+    })
+    .with_raw_block_codec(RawBlockCodec::None);
+    let mut sealer = SettledSegmentSealer::new(dir.path(), config, None)?;
+    let entry =
+        push_synthetic_range(&mut sealer, 1..=BLOCKS, true)?.ok_or("expected sealed stride")?;
+    let paths = SettledSegmentFilePaths::for_entry(dir.path(), &entry)?;
+    let files = [
+        (paths.shielded.as_path(), SHIELDED_HEADER_LEN),
+        (
+            paths.supplement.as_deref().ok_or("missing supplement")?,
+            SUPPLEMENT_HEADER_LEN,
+        ),
+        (
+            paths.raw_block.as_deref().ok_or("missing raw blocks")?,
+            RAW_HEADER_LEN,
+        ),
+    ];
+    for (path, _) in files {
+        strip_verity_by_replace(path, false)?;
+    }
+
+    let entries = std::slice::from_ref(&entry);
+    for budget in [NonZeroU64::new(1), None] {
+        let cache = SettledSegmentReaderCache::with_corpus_budget(dir.path(), entries, budget)?;
+        let admission = zinder_testkit::LogCapture::install_for_target("zinder::store");
+        super::snapshot::verify_pinned_segments_into_cache(dir.path(), entries, false, &cache)?;
+        let readers = cache.get_or_open(&entry)?;
+        let supplement = readers.supplement.ok_or("missing cached supplement")?;
+        let raw = readers.raw_block.ok_or("missing cached raw blocks")?;
+        assert!(!readers.shielded.kernel_verified());
+        assert!(!supplement.kernel_verified());
+        assert!(!raw.kernel_verified());
+        let supplement_plan = supplement
+            .index()
+            .plan_block_range(entry.start_height, entry.end_block.height)?;
+        let supplement_end = supplement_plan
+            .chunks()
+            .last()
+            .and_then(|step| step.compressed_range().end())
+            .ok_or("missing supplement payload end")?;
+        let full_payload = zinder_testkit::LogCapture::install_for_target("zinder::store");
+        readers.shielded.verify_full_payload()?;
+        supplement.verify_full_payload()?;
+        raw.verify_full_payload()?;
+        for ((path, header), payload_end) in files.into_iter().zip([
+            readers.shielded.index().index_offset(),
+            supplement_end,
+            raw.index().tx_table_offset(),
+        ]) {
+            for capture in [&admission, &full_payload] {
+                assert_cold_discard_ranges(capture, path, header, payload_end, budget.is_some())?;
+            }
+        }
+    }
+    assert_corrupt_cold_payloads_are_rejected(dir.path(), entries, files)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_cold_discard_ranges(
+    capture: &zinder_testkit::LogCapture,
+    path: &Path,
+    header: usize,
+    payload_end: u64,
+    constrained: bool,
+) -> TestResult {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let meta = fs::metadata(path)?;
+    let inode = meta.ino().to_string();
+    let page_size = u64::try_from(rustix::param::page_size())?;
+    let mut advised_payload = false;
+    let mut advised_index = false;
+    for event in capture.events().iter().filter(|event| {
+        event.field("event") == Some("settled_scan_discard_pages")
+            && event.field("inode") == Some(inode.as_str())
+    }) {
+        let offset = event
+            .field("offset")
+            .ok_or("missing advice offset")?
+            .parse::<u64>()?;
+        let len = event
+            .field("len")
+            .ok_or("missing advice length")?
+            .parse::<u64>()?;
+        assert!(constrained, "unexpected advice for {}", path.display());
+        assert_eq!((offset % page_size, len % page_size), (0, 0));
+        assert!(offset >= u64::try_from(header)? && len > 0 && offset + len <= meta.len());
+        advised_payload |= offset + page_size <= payload_end;
+        advised_index |= offset + len >= payload_end.next_multiple_of(page_size) + page_size;
+    }
+    assert_eq!(
+        (advised_payload, advised_index),
+        (constrained, constrained),
+        "{}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn assert_corrupt_cold_payloads_are_rejected(
+    root: &Path,
+    entries: &[SettledSegmentIndexEntry],
+    files: [(&Path, usize); 3],
+) -> TestResult {
+    for (path, header) in files {
+        let mut bytes = fs::read(path)?;
+        bytes[header + 8] ^= 0xff;
+        fs::write(path, &bytes)?;
+        let cache =
+            SettledSegmentReaderCache::with_corpus_budget(root, entries, NonZeroU64::new(1))?;
+        let err = super::snapshot::verify_pinned_segments_into_cache(root, entries, false, &cache)
+            .err()
+            .ok_or("cold verification accepted a corrupt payload")?;
+        assert!(
+            matches!(
+                err,
+                SettledSegmentsError::Shielded(SettledShieldedSegmentError::PayloadIntegrity(_))
+                    | SettledSegmentsError::Supplement(
+                        crate::SettledSupplementSegmentError::PayloadIntegrity(_)
+                    )
+                    | SettledSegmentsError::RawBlock(
+                        crate::SettledRawBlockSegmentError::PayloadIntegrity(_)
+                    )
+            ),
+            "{}: {err}",
+            path.display()
+        );
+        assert!(cache.is_empty());
+        bytes[header + 8] ^= 0xff;
+        fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
 fn seal_multi_test_strides(
     store_root: &Path,
     stride_count: u32,
@@ -2655,6 +2881,492 @@ fn seal_multi_test_strides(
         entries.extend(sealer.push_block(build_block_input(height, modules.raw_bodies))?);
     }
     Ok(entries)
+}
+
+#[test]
+fn settled_corpus_admission_reports_exact_bytes_and_warns_only_below_budget() -> TestResult {
+    let dir = TempDir::new()?;
+    let entries = seal_multi_test_strides(
+        dir.path(),
+        2,
+        4,
+        SettledSegmentModules {
+            supplement: true,
+            raw_bodies: true,
+        },
+    )?;
+    let mut corpus_bytes = 0;
+    for entry in &entries {
+        let paths = SettledSegmentFilePaths::for_entry(dir.path(), entry)?;
+        for path in [Some(paths.shielded), paths.supplement, paths.raw_block]
+            .into_iter()
+            .flatten()
+        {
+            corpus_bytes += fs::metadata(path)?.len();
+        }
+    }
+    let orphan = SettledSegmentFilePaths::for_entry(dir.path(), &entries[0])?
+        .shielded
+        .with_file_name("unpublished-segment");
+    fs::write(orphan, b"excluded from corpus")?;
+    for (budget, exposed_budget, ratio, constrained) in [
+        (NonZeroU64::new(1), "1".to_owned(), corpus_bytes, true),
+        (
+            NonZeroU64::new(corpus_bytes),
+            corpus_bytes.to_string(),
+            1,
+            false,
+        ),
+        (None, "inf".to_owned(), 0, false),
+    ] {
+        let capture = zinder_testkit::LogCapture::install_for_target("zinder::store");
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let cache = SettledSegmentReaderCache::with_corpus_budget(dir.path(), &entries, budget)?;
+        cache.record_corpus_admission(crate::StoreRole::CanonicalSecondary);
+        let corpus = corpus_bytes.to_string();
+        assert_eq!(
+            capture.any(|event| {
+                event.level == tracing::Level::WARN
+                    && event.field("event") == Some("settled_segment_corpus_exceeds_memory_budget")
+                    && event.field("store_role") == Some("canonical_secondary")
+                    && event.field("corpus_bytes") == Some(corpus.as_str())
+                    && event.field("memory_budget_bytes") == Some("1")
+            }),
+            constrained
+        );
+        assert_eq!(capture.events().len(), usize::from(constrained));
+        let metrics = recorder.handle().render();
+        for (metric, sample) in [
+            ("corpus_bytes", corpus),
+            ("memory_budget_bytes", exposed_budget),
+            ("corpus_to_budget_ratio", ratio.to_string()),
+        ] {
+            let expected = format!(
+                "zinder_store_settled_segment_{metric}{{store_role=\"canonical_secondary\"}} {sample}"
+            );
+            assert!(
+                metrics
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case(&expected)),
+                "missing {expected} in {metrics}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[path = "../../../tests/common/payload_page_probe.rs"]
+mod payload_page_probe;
+
+const SCAN_STREAMS: usize = 4;
+const SCAN_ROUNDS: usize = 3;
+const SCAN_ROUND_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct ScanRound {
+    elapsed: std::time::Duration,
+    matches_baseline: bool,
+    #[cfg(target_os = "linux")]
+    discard_hints: Vec<std::ops::Range<usize>>,
+}
+
+type ScanRoundResult = Result<ScanRound, Box<dyn std::error::Error + Send + Sync>>;
+type ScanWorkerResult = Result<Vec<ScanRound>, Box<dyn std::error::Error + Send + Sync>>;
+
+#[test]
+fn constrained_and_unbounded_readers_serve_concurrent_settled_ranges() -> TestResult {
+    let dir = TempDir::new()?;
+    let entry = seal_dense_scan_segment(dir.path())?;
+    let path = SettledSegmentFilePaths::for_entry(dir.path(), &entry)?.shielded;
+    let meta = fs::metadata(&path)?;
+    assert!(meta.len() > 4 * 1024 * 1024);
+    let range = BlockHeightRange::inclusive(entry.start_height, entry.end_block.height);
+    let entries = std::slice::from_ref(&entry);
+    let baseline_reader = SettledSegmentReaderCache::with_corpus_budget(dir.path(), entries, None)?
+        .get_or_open_shielded(&entry)?;
+    let baseline = Arc::new(baseline_reader.read_default_range(range, HeightOrder::Ascending)?);
+    #[cfg(target_os = "linux")]
+    let (probe, inode) = {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let probe = payload_page_probe::PayloadPageProbe::open(
+            &path,
+            SHIELDED_HEADER_LEN,
+            baseline_reader.index().index_offset(),
+        )?;
+        (probe, meta.ino().to_string())
+    };
+
+    for budget in [NonZeroU64::new(1024 * 1024), None] {
+        #[cfg(target_os = "linux")]
+        let calibration = {
+            probe.evict()?;
+            probe.sample()?
+        };
+        #[cfg(target_os = "linux")]
+        let mut residency = Vec::with_capacity(SCAN_ROUNDS);
+
+        let cache = SettledSegmentReaderCache::with_corpus_budget(dir.path(), entries, budget)?;
+        let scan_cache = Arc::clone(&cache);
+        let entry = entry.clone();
+        let baseline = Arc::clone(&baseline);
+        #[cfg(target_os = "linux")]
+        let inode = inode.clone();
+        let streams = run_concurrent_scan_rounds(
+            SCAN_ROUND_TIMEOUT,
+            move || {
+                #[cfg(target_os = "linux")]
+                let capture = zinder_testkit::LogCapture::install_for_target("zinder::store");
+                let start = Instant::now();
+                let reader = scan_cache.get_or_open_shielded(&entry)?;
+                let blocks = reader.read_default_range(range, HeightOrder::Ascending)?;
+                Ok(ScanRound {
+                    elapsed: start.elapsed(),
+                    matches_baseline: blocks.len() == baseline.len()
+                        && blocks
+                            .iter()
+                            .zip(baseline.iter())
+                            .all(|(block, expected)| block.payload() == expected.payload()),
+                    #[cfg(target_os = "linux")]
+                    discard_hints: shielded_scan_hints(&capture, &inode)?,
+                })
+            },
+            || {
+                #[cfg(target_os = "linux")]
+                residency.push(probe.sample());
+            },
+        )?;
+        assert_eq!(cache.open_count(SettledSegmentKind::Shielded), 1);
+        for (tid, rounds) in streams.iter().enumerate() {
+            assert_eq!(rounds.len(), SCAN_ROUNDS, "stream {tid} did not finish");
+            for (round, stats) in rounds.iter().enumerate() {
+                assert!(
+                    stats.matches_baseline,
+                    "stream {tid} round {round} payloads differ"
+                );
+                assert!(
+                    stats.elapsed < SCAN_ROUND_TIMEOUT,
+                    "stream {tid} round {round} exceeded the progress budget: {:?}",
+                    stats.elapsed
+                );
+            }
+        }
+        #[cfg(target_os = "linux")]
+        assert_concurrent_scan_residency(&probe, calibration, &streams, residency, budget)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ScanAbort {
+    Worker(usize),
+    Timeout(usize),
+    Coordinator,
+}
+
+#[derive(Default)]
+struct ScanRoundState {
+    round: usize,
+    finished: usize,
+    aborted: Option<ScanAbort>,
+}
+
+#[derive(Default)]
+struct ScanRendezvous {
+    state: Mutex<ScanRoundState>,
+    changed: Condvar,
+}
+
+impl ScanRendezvous {
+    fn start_and_wait(&self, round: usize, timeout: Duration) -> Result<(), ScanAbort> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock();
+        state.round = round;
+        state.finished = 0;
+        self.changed.notify_all();
+        loop {
+            if let Some(reason) = state.aborted {
+                return Err(reason);
+            }
+            if state.finished == SCAN_STREAMS {
+                return Ok(());
+            }
+            if self.changed.wait_until(&mut state, deadline).timed_out()
+                && state.finished < SCAN_STREAMS
+                && state.aborted.is_none()
+            {
+                let reason = ScanAbort::Timeout(round);
+                state.aborted = Some(reason);
+                drop(state);
+                self.changed.notify_all();
+                return Err(reason);
+            }
+        }
+    }
+
+    fn wait_for_start(&self, round: usize) -> bool {
+        let mut state = self.state.lock();
+        while state.round < round && state.aborted.is_none() {
+            self.changed.wait(&mut state);
+        }
+        state.aborted.is_none()
+    }
+
+    fn finish(&self) {
+        self.state.lock().finished += 1;
+        self.changed.notify_all();
+    }
+}
+
+struct AbortOnDrop<'a> {
+    rendezvous: &'a ScanRendezvous,
+    reason: Option<ScanAbort>,
+}
+
+impl Drop for AbortOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(reason) = self.reason {
+            self.rendezvous.state.lock().aborted.get_or_insert(reason);
+            self.rendezvous.changed.notify_all();
+        }
+    }
+}
+
+fn run_concurrent_scan_rounds(
+    round_timeout: Duration,
+    scan: impl Fn() -> ScanRoundResult + Send + Sync + 'static,
+    mut after_round: impl FnMut(),
+) -> Result<Vec<Vec<ScanRound>>, Box<dyn std::error::Error>> {
+    let rendezvous = Arc::new(ScanRendezvous::default());
+    let scan = Arc::new(scan);
+    let mut coordinator = AbortOnDrop {
+        rendezvous: &rendezvous,
+        reason: Some(ScanAbort::Coordinator),
+    };
+    let mut workers: Vec<_> = (0..SCAN_STREAMS)
+        .map(|id| {
+            let rendezvous = Arc::clone(&rendezvous);
+            let scan = Arc::clone(&scan);
+            thread::spawn(move || {
+                let mut abort = AbortOnDrop {
+                    rendezvous: &rendezvous,
+                    reason: Some(ScanAbort::Worker(id)),
+                };
+                let mut rounds = Vec::with_capacity(SCAN_ROUNDS);
+                for round in 1..=SCAN_ROUNDS {
+                    if !rendezvous.wait_for_start(round) {
+                        break;
+                    }
+                    rounds.push(scan()?);
+                    rendezvous.finish();
+                }
+                abort.reason = None;
+                Ok(rounds)
+            })
+        })
+        .collect();
+
+    for round in 1..=SCAN_ROUNDS {
+        match rendezvous.start_and_wait(round, round_timeout) {
+            Ok(()) => after_round(),
+            Err(ScanAbort::Worker(id)) => {
+                join_scan_worker(workers.swap_remove(id))?;
+                return Err("scan worker exited before finishing its round".into());
+            }
+            // Dropping the join handles lets the coordinator return even if a
+            // worker is still blocked in a synchronous read.
+            Err(ScanAbort::Timeout(round)) => {
+                return Err(format!("scan round {round} timed out after {round_timeout:?}").into());
+            }
+            Err(ScanAbort::Coordinator) => return Err("scan coordinator aborted".into()),
+        }
+    }
+    coordinator.reason = None;
+    workers.into_iter().map(join_scan_worker).collect()
+}
+
+fn join_scan_worker(
+    worker: JoinHandle<ScanWorkerResult>,
+) -> Result<Vec<ScanRound>, Box<dyn std::error::Error>> {
+    worker
+        .join()
+        .map_err(|_| "scan worker panicked")?
+        .map_err(|error| error as Box<dyn std::error::Error>)
+}
+
+#[test]
+fn concurrent_scan_rounds_abort_cleanly_when_a_worker_panics() -> TestResult {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let first_scan = AtomicBool::new(true);
+    let started = Instant::now();
+    let outcome = run_concurrent_scan_rounds(
+        SCAN_ROUND_TIMEOUT,
+        move || {
+            if first_scan.swap(false, Ordering::Relaxed) {
+                std::panic::resume_unwind(Box::new("injected scan panic"));
+            }
+            Ok(ScanRound {
+                elapsed: Duration::ZERO,
+                matches_baseline: true,
+                #[cfg(target_os = "linux")]
+                discard_hints: Vec::new(),
+            })
+        },
+        || {},
+    );
+    let error = outcome.err().ok_or("scan worker panic was lost")?;
+    assert_eq!(error.to_string(), "scan worker panicked");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    Ok(())
+}
+
+#[test]
+fn concurrent_scan_rounds_report_timeout_while_workers_are_blocked() -> TestResult {
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    let started = Instant::now();
+    let outcome = run_concurrent_scan_rounds(
+        Duration::from_millis(100),
+        move || {
+            released.lock().recv_timeout(Duration::from_secs(3))?;
+            Err("blocked scan unexpectedly released".into())
+        },
+        || {},
+    );
+    drop(release);
+    let error = outcome.err().ok_or("blocked scan did not time out")?;
+    assert_eq!(error.to_string(), "scan round 1 timed out after 100ms");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn shielded_scan_hints(
+    capture: &zinder_testkit::LogCapture,
+    inode: &str,
+) -> Result<Vec<std::ops::Range<usize>>, Box<dyn std::error::Error + Send + Sync>> {
+    capture
+        .events()
+        .iter()
+        .filter(|event| {
+            event.field("event") == Some("settled_scan_discard_pages")
+                && event.field("inode") == Some(inode)
+        })
+        .map(|event| {
+            let offset = event
+                .field("offset")
+                .ok_or("missing discard offset")?
+                .parse::<usize>()?;
+            let len = event
+                .field("len")
+                .ok_or("missing discard length")?
+                .parse::<usize>()?;
+            Ok(offset..offset + len)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn assert_concurrent_scan_residency(
+    probe: &payload_page_probe::PayloadPageProbe,
+    calibration: Option<payload_page_probe::PageResidency>,
+    streams: &[Vec<ScanRound>],
+    residency: Vec<io::Result<Option<payload_page_probe::PageResidency>>>,
+    budget: Option<NonZeroU64>,
+) -> TestResult {
+    let calibrated = calibration.is_some_and(payload_page_probe::PageResidency::confirms_eviction);
+    for (round, sample) in residency.into_iter().enumerate() {
+        let sample = sample?;
+        let elapsed_us: Vec<_> = streams
+            .iter()
+            .map(|s| s[round].elapsed.as_micros())
+            .collect();
+        let mut hints: Vec<_> = streams
+            .iter()
+            .flat_map(|s| s[round].discard_hints.iter())
+            .collect();
+        #[allow(
+            clippy::print_stderr,
+            reason = "reports measured scan progress and page residency"
+        )]
+        {
+            eprintln!(
+                "settled_concurrent_scan budget={budget:?} round={round} calibration={calibration:?} calibrated={calibrated} residency={sample:?} elapsed_us={elapsed_us:?} discard_hints={}",
+                hints.len()
+            );
+        }
+        if budget.is_some() {
+            hints.sort_unstable_by_key(|hint| hint.start);
+            let mut covered = probe.interior.start;
+            for hint in hints {
+                assert!(hint.start >= probe.interior.start && hint.end <= probe.interior.end);
+                assert!(hint.start <= covered, "discard gap before {hint:?}");
+                assert_eq!(hint.start % probe.page_size, 0);
+                assert_eq!(hint.end % probe.page_size, 0);
+                covered = covered.max(hint.end);
+            }
+            assert_eq!(covered, probe.interior.end);
+        } else {
+            assert_eq!(hints, [] as [&std::ops::Range<usize>; 0]);
+        }
+        if calibrated {
+            let measured = sample.ok_or("residency probe stopped working after calibration")?;
+            if let Some(limit) = budget {
+                assert!(
+                    measured.confirms_eviction(),
+                    "constrained scan retained {measured:?}"
+                );
+                assert!(u64::try_from(measured.resident * probe.page_size)? < limit.get());
+            } else {
+                assert!(
+                    measured.mostly_resident(),
+                    "unbounded scan retained {measured:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn seal_dense_scan_segment(
+    root: &Path,
+) -> Result<SettledSegmentIndexEntry, Box<dyn std::error::Error>> {
+    const BLOCKS: u32 = 256;
+    let config = SettledSegmentSealerConfig::new(
+        Network::ZcashRegtest,
+        TEST_SCHEMA_VERSION,
+        SettledSegmentModules {
+            supplement: false,
+            raw_bodies: false,
+        },
+    )
+    .with_segment_blocks(BLOCKS);
+    let mut sealer = SettledSegmentSealer::new(root, config, None)?;
+    let mut entries = Vec::new();
+    for height in 1..=BLOCKS {
+        let mut block = build_block_input(height, false);
+        let parts = block.compact_block.into_parts();
+        let mut transactions = parts.transactions;
+        let first_tx = &mut transactions[0].data;
+        let action = first_tx.orchard_actions[0].clone();
+        first_tx.orchard_actions.resize(128, action);
+        block.canonical_facts.transactions[0]
+            .public_facts
+            .counts
+            .orchard_action_count = 128;
+        block.compact_block = CompactBlockArtifact::new(
+            parts.block_id,
+            parts.previous_block_hash,
+            parts.time,
+            transactions,
+            parts.chain_metadata,
+        )?;
+        entries.extend(sealer.push_block(block)?);
+    }
+    let [entry] = <[_; 1]>::try_from(entries).map_err(|_| "expected one dense scan segment")?;
+    Ok(entry)
 }
 
 #[test]

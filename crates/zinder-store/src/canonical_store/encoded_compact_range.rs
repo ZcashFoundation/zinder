@@ -1587,6 +1587,130 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_block_range_calls_drop_full_consumed_pages_across_requests() -> TestOutcome {
+        const BLOCKS: u32 = 1_024;
+        let directory = TempDir::new()?;
+        let (db, entries, _, _) = seed_multi_segment_store(directory.path(), BLOCKS, BLOCKS, &[])?;
+        let page_size = u64::try_from(rustix::param::page_size())?;
+
+        for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+            let cache = SettledSegmentReaderCache::with_corpus_budget(
+                directory.path(),
+                &entries,
+                std::num::NonZeroU64::new(1),
+            )?;
+            let ctx = SegmentStoreContext {
+                db: &db,
+                segment_cache: Some(&cache),
+                sealed_segments: Some(&entries),
+            };
+            let reader = cache.get_or_open_shielded(&entries[0])?;
+            let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(BLOCKS));
+            let selection = ShieldedProjectionSelection::DEFAULT_SHIELDED;
+            let expected = full_payload_pages(
+                &reader.index().plan_block_range(range, selection)?,
+                page_size,
+            )?;
+            assert_ne!(expected, []);
+
+            let capture = zinder_testkit::LogCapture::install_for_target("zinder::store");
+            let request = EncodedCompactBlockRangeRequest {
+                range,
+                order,
+                selection,
+                include_transparent: false,
+                output: EncodedCompactBlockOutput::Blocks,
+                max_bytes: 0,
+                enforce_wire_fee_limit: true,
+            };
+            for offset in 1..=BLOCKS {
+                let height = match order {
+                    HeightOrder::Ascending => BlockHeight::new(offset),
+                    HeightOrder::Descending => BlockHeight::new(BLOCKS + 1 - offset),
+                };
+                let single = BlockHeightRange::inclusive(height, height);
+                let payload_plan = reader.index().plan_block_range(single, selection)?;
+                assert!(
+                    payload_plan
+                        .steps()
+                        .iter()
+                        .filter_map(crate::ShieldedReadStep::slab_byte_range)
+                        .all(|extent| (extent.len as u64) < page_size)
+                );
+                let range = match order {
+                    HeightOrder::Ascending => BlockHeightRange::inclusive(height, range.end),
+                    HeightOrder::Descending => BlockHeightRange::inclusive(range.start, height),
+                };
+                let chunk = encoded_compact_block_range_for_context(
+                    ctx,
+                    EncodedCompactBlockRangeRequest { range, ..request },
+                    None,
+                )?
+                .ok_or("expected single-block progress")?;
+                assert_eq!((chunk.block_count, chunk.covered), (1, single));
+                if offset == 1 {
+                    assert!(capture.events().iter().all(|event| {
+                        event.field("event") != Some("settled_scan_discard_pages")
+                    }));
+                }
+            }
+            let mut advised = advised_scan_pages(&capture)?;
+            advised.sort_unstable();
+            assert_eq!(advised, expected, "{order:?}");
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn full_payload_pages(
+        plan: &crate::ShieldedRangePlan,
+        page_size: u64,
+    ) -> TestOutcome<Vec<(u64, u64)>> {
+        let mut spans = plan
+            .steps()
+            .iter()
+            .filter_map(crate::ShieldedReadStep::slab_byte_range);
+        let start = spans
+            .clone()
+            .next()
+            .ok_or("missing first payload span")?
+            .offset;
+        let end = spans
+            .next_back()
+            .and_then(|span| span.end())
+            .ok_or("missing payload end")?;
+        let start = start
+            .checked_next_multiple_of(page_size)
+            .ok_or("overflow aligning span")?;
+        Ok((start..end - end % page_size)
+            .step_by(usize::try_from(page_size)?)
+            .map(|offset| (offset, page_size))
+            .collect())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn advised_scan_pages(capture: &zinder_testkit::LogCapture) -> TestOutcome<Vec<(u64, u64)>> {
+        capture
+            .events()
+            .into_iter()
+            .filter(|event| event.field("event") == Some("settled_scan_discard_pages"))
+            .map(|event| {
+                Ok((
+                    event
+                        .field("offset")
+                        .ok_or("missing advice offset")?
+                        .parse::<u64>()?,
+                    event
+                        .field("len")
+                        .ok_or("missing advice length")?
+                        .parse::<u64>()?,
+                ))
+            })
+            .collect()
+    }
+
     #[test]
     fn wide_fee_and_tamper_surface_as_artifact_corrupt_across_settled_and_live() -> TestOutcome {
         let settled_wide_dir = TempDir::new()?;

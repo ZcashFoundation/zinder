@@ -12,7 +12,7 @@ use zinder_core::{
 
 use crate::{
     BoundedRocksDbOpen, RawBlobRetention, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
-    build_block_based_table_factory, build_point_lookup_block_based_table_factory,
+    StoreRole, build_block_based_table_factory, build_point_lookup_block_based_table_factory,
     keep_blocks_of_dropped_table_files, kv::build_uncached_block_based_table_factory,
     open_bounded_rocksdb, open_bounded_rocksdb_read_only_probe,
 };
@@ -315,6 +315,7 @@ impl RocksDbCanonicalStore {
         segment_cache: Arc<SettledSegmentReaderCache>,
     ) -> Self {
         let stored_set = build_plan.admitted_stored_set(manifest_details.subtree_root_coverage);
+        segment_cache.record_corpus_admission(StoreRole::CanonicalPrimary);
         Self {
             bounded_open,
             build_plan,
@@ -592,12 +593,16 @@ impl RocksDbCanonicalStore {
         expectation: &CanonicalStoreAdmissionExpectation,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, CanonicalStoreError> {
-        Self::open_ready_with_mode(
+        let store = Self::open_ready_with_mode(
             path,
             expectation,
             resource_budget,
             PrimarySegmentOpenMode::HealPrimary,
-        )
+        )?;
+        store
+            .segment_cache
+            .record_corpus_admission(StoreRole::CanonicalPrimary);
+        Ok(store)
     }
 
     fn open_ready_with_mode(
@@ -1069,10 +1074,8 @@ impl RocksDbCanonicalStore {
 
     /// Publishes throttled resource gauges for the canonical writer.
     pub fn record_resource_gauges(&self) {
-        self.bounded_open.record_resource_gauges(
-            crate::StoreRole::CanonicalPrimary,
-            &CANONICAL_DATA_COLUMN_FAMILIES,
-        );
+        self.bounded_open
+            .record_resource_gauges(StoreRole::CanonicalPrimary, &CANONICAL_DATA_COLUMN_FAMILIES);
     }
 
     /// Returns the filesystem I/O mode selected by the bounded `RocksDB` open.
@@ -1255,7 +1258,7 @@ fn cleanup_primary_segments_and_build_cache(
         }
     }
     cleanup_unreferenced_segment_files(store_path, &entries)?;
-    let cache = SettledSegmentReaderCache::with_default_capacity(store_path, false)?;
+    let cache = SettledSegmentReaderCache::with_admitted_corpus(store_path, &entries)?;
     verify_pinned_segments_into_cache(store_path, &entries, false, &cache)?;
     let _ = sync_segments_manifest_from_db(db, network)?;
     Ok((entries, cache))
@@ -1532,7 +1535,7 @@ fn store_control_iteration_error(path: &Path, source: rust_rocksdb::Error) -> Ca
     CanonicalStoreError::admission(path, format!("store-control iteration failed: {source}"))
 }
 
-fn read_admitted_schedule(
+pub(super) fn read_admitted_schedule(
     db: &DB,
     path: &Path,
     control: &DecodedStoreControl,

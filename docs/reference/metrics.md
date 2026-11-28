@@ -545,6 +545,9 @@ within each process.
 | --- | --- | --- | --- |
 | `zinder_store_block_cache_capacity_bytes` | gauge | `store_role` | Block cache capacity. Excludes canonical settled-segment (`ZSHRNG02` / `ZSTSUP01` / `ZSBLKB01`) file reads, which use OS buffered I/O and rely on the Linux OS page cache. |
 | `zinder_store_block_cache_usage_bytes` | gauge | `store_role` | Block cache use. It can exceed capacity by pinned index and filter blocks. Settled-segment file pages are accounted for by the OS. |
+| `zinder_store_settled_segment_corpus_bytes` | gauge | `store_role` | Sum of the logical file lengths of admitted shielded, supplement, and raw-block segments. |
+| `zinder_store_settled_segment_memory_budget_bytes` | gauge | `store_role` | Tightest finite cgroup v2 memory budget detected at canonical open. `+Inf` means no finite limit was detected. |
+| `zinder_store_settled_segment_corpus_to_budget_ratio` | gauge | `store_role` | Corpus bytes divided by the budget, or zero when no finite limit was detected. |
 | `zinder_store_block_cache_pinned_usage_bytes` | gauge | `store_role` | Pinned block cache use. |
 | `zinder_store_block_cache_entries` | gauge | `store_role`, `entry_role` | Serving readers only. Number of cached entries by RocksDB role, such as `DataBlock`, `IndexBlock`, or `FilterBlock`. |
 | `zinder_store_block_cache_entry_bytes` | gauge | `store_role`, `entry_role` | Serving readers only. Approximate cache charge by entry role. RocksDB rounds each role's charge before export. |
@@ -557,6 +560,22 @@ within each process.
 | `zinder_store_rocksdb_io_mode` | gauge | `store_role`, `mode` | 1 for the I/O mode: `direct` or `buffered`. |
 | `zinder_store_rocksdb_property` | gauge | `store_role`, `cf`, `property` | RocksDB properties, such as pending compaction bytes and per-family live SST size (`rocksdb.live-sst-files-size`). |
 | `zinder_store_rocksdb_ticker` | gauge | `store_role`, `ticker` | RocksDB statistics tickers, when statistics are on. |
+
+Each successful canonical open, including a cold replacement generation, sets
+the gauges for its `store_role`. An open above a ratio of 1 emits
+`settled_segment_corpus_exceeds_memory_budget` at WARN with `store_role`,
+`corpus_bytes`, and `memory_budget_bytes`. In-place catch-up adds the lengths
+of newly admitted files and refreshes the gauges when the corpus grows. It
+warns when growth first pushes the corpus above the budget sampled at open.
+Live-tail recovery reopens refresh the gauges after validating the new handle's
+fence and warn only when recovery switches to a constrained reader.
+
+On Linux, constrained handles disable speculative readahead and request
+release of consumed pages during sequential range reads and cold verification.
+The ratio compares file lengths with the full budget. Use cgroup memory and
+disk I/O metrics to observe actual residency and reclaim. See
+[ADR-0005](../adrs/0005-bounded-process-memory.md) for the policy and
+[Size your host](../runbooks/deploying.md#step-3-size-your-host) for serving limits.
 
 Ingest samples the canonical primary after bulk loads, while following the
 tip, and after checkpoint densification commits. The projector samples the

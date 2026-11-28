@@ -3504,19 +3504,199 @@ fn boundary_build_block(
 fn published_4096_boundary_store(
     store_path: &std::path::Path,
 ) -> Result<(RocksDbCanonicalStore, NetworkUpgradeActivations), Box<dyn std::error::Error>> {
+    published_boundary_store(store_path, 4_104)
+}
+
+fn settled_fixture_bytes(
+    root: &Path,
+    entry: &super::settled_segments::layout::SettledSegmentIndexEntry,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let paths = super::settled_segments::layout::SettledSegmentFilePaths::for_entry(root, entry)?;
+    Ok([Some(paths.shielded), paths.supplement, paths.raw_block]
+        .into_iter()
+        .flatten()
+        .try_fold(0, |total, path| {
+            Ok::<_, std::io::Error>(total + std::fs::metadata(path)?.len())
+        })?)
+}
+
+#[test]
+fn live_tail_reopen_records_settled_corpus_only_after_fence_validation()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::num::NonZeroU64;
+
+    use super::settled_segments::cache::SettledSegmentReaderCache;
+
+    let directory = TempDir::new()?;
+    let primary = directory.path().join("canonical");
+    let (store, _) = published_4096_boundary_store(&primary)?;
+    let mut secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &primary,
+        directory.path().join("secondary"),
+        Network::ZcashTestnet,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
+        CanonicalReorgPolicy::new(8)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let [entry] = secondary.sealed_segments.as_slice() else {
+        return Err("expected one sealed segment".into());
+    };
+    let corpus_bytes = settled_fixture_bytes(&primary, entry)?;
+    let cache = SettledSegmentReaderCache::with_corpus_budget(
+        &primary,
+        &secondary.sealed_segments,
+        NonZeroU64::new(1),
+    )?;
+    assert!(cache.constrained());
+    secondary.replace_settled_cache(cache);
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let capture = zinder_testkit::LogCapture::install_for_target("zinder::store");
+    let ready = secondary.ready_evidence;
+    let height = ready.visible_tip.height;
+    secondary.ready_evidence.visible_event_sequence += 1;
+    let error = secondary
+        .reopen_after_missing_live_tail(height)
+        .err()
+        .ok_or("reopen accepted a regressed fence")?;
+    assert!(
+        error
+            .to_string()
+            .contains("canonical fence regressed or diverged")
+    );
+    assert!(secondary.live_tail_cache().is_none());
+    let before = recorder.handle().render();
+    for name in [
+        "corpus_bytes",
+        "memory_budget_bytes",
+        "corpus_to_budget_ratio",
+    ] {
+        assert!(!before.contains(&format!("zinder_store_settled_segment_{name}")));
+    }
+
+    secondary.ready_evidence = ready;
+    secondary.reopen_after_missing_live_tail(height)?;
+    assert_eq!(secondary.event_fence(), store.event_fence());
+    assert!(secondary.live_tail_cache().is_some());
+    let cache = secondary
+        .segment_context()
+        .segment_cache
+        .ok_or("missing settled cache")?;
+    assert_eq!(
+        cache.constrained(),
+        crate::container_memory_budget_bytes().is_some_and(|budget| budget < corpus_bytes)
+    );
+    let after = recorder.handle().render();
+    assert!(after.contains(&format!("zinder_store_settled_segment_corpus_bytes{{store_role=\"canonical_secondary\"}} {corpus_bytes}\n")));
+    assert!(after.contains(
+        "zinder_store_settled_segment_memory_budget_bytes{store_role=\"canonical_secondary\"}"
+    ));
+    assert!(after.contains(
+        "zinder_store_settled_segment_corpus_to_budget_ratio{store_role=\"canonical_secondary\"}"
+    ));
+    assert!(
+        !capture
+            .any(|event| event.field("event")
+                == Some("settled_segment_corpus_exceeds_memory_budget"))
+    );
+    Ok(())
+}
+
+#[test]
+fn secondary_catch_up_activates_scan_policy_when_newly_sealed_files_exceed_budget()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::num::NonZeroU64;
+
+    use super::settled_segments::cache::SettledSegmentReaderCache;
+
+    let directory = TempDir::new()?;
+    let primary = directory.path().join("canonical");
+    let next = 2 * crate::DEFAULT_SETTLED_SEGMENT_BLOCKS + 8;
+    let (store, activations) = published_boundary_store(&primary, next - 1)?;
+    let mut secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &primary,
+        directory.path().join("secondary"),
+        Network::ZcashTestnet,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
+        CanonicalReorgPolicy::new(8)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(secondary.sealed_segments.len(), 1);
+    let first = secondary.sealed_segments[0].clone();
+    let budget = settled_fixture_bytes(&primary, &first)?;
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let cache = SettledSegmentReaderCache::with_corpus_budget(
+        &primary,
+        &secondary.sealed_segments,
+        NonZeroU64::new(budget),
+    )?;
+    secondary.replace_settled_cache(std::sync::Arc::clone(&cache));
+    let old = cache.get_or_open_shielded(&first)?;
+    assert!(!cache.constrained());
+
+    let fence = store.event_fence();
+    let (store, _) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            fence,
+            boundary_build_block(next, boundary_det_hash(next - 1), &activations, true)?,
+            Vec::new(),
+            BlockId::new(
+                BlockHeight::new(next - 8),
+                BlockHash::from_bytes(boundary_det_hash(next - 8)),
+            ),
+            UnixTimestampMillis::new(1_750_000_000_001),
+        ),
+        &activations,
+    )?;
+    let capture = zinder_testkit::LogCapture::install_for_target("zinder::store");
+    assert!(secondary.try_catch_up()?.advanced());
+    assert_eq!(secondary.event_fence(), store.event_fence());
+    assert_eq!(secondary.sealed_segments.len(), 2);
+    assert!(cache.constrained());
+    let gauges = recorder.handle().render();
+    assert!(
+        gauges.contains("zinder_store_settled_segment_cache_open_readers{kind=\"shielded\"} 0\n")
+    );
+    assert!(
+        gauges
+            .contains("zinder_store_settled_segment_cache_index_heap_bytes{kind=\"shielded\"} 0\n")
+    );
+    let refreshed = cache.get_or_open_shielded(&first)?;
+    assert!(!std::sync::Arc::ptr_eq(&old, &refreshed));
+    assert!(!secondary.try_catch_up()?.advanced());
+    let same = cache.get_or_open_shielded(&first)?;
+    assert!(std::sync::Arc::ptr_eq(&same, &refreshed));
+    assert_eq!(
+        capture
+            .events()
+            .iter()
+            .filter(|event| {
+                event.field("event") == Some("settled_segment_corpus_exceeds_memory_budget")
+            })
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+fn published_boundary_store(
+    store_path: &std::path::Path,
+    tip_height: u32,
+) -> Result<(RocksDbCanonicalStore, NetworkUpgradeActivations), Box<dyn std::error::Error>> {
     use crate::{
         CanonicalBaselinePublication, CanonicalStoreBuildPlan, RocksDbCanonicalBuilder,
         TREE_STATE_CHECKPOINT_STRIDE,
     };
 
-    const BOUNDARY_TIP: u32 = 4_104;
-    const BOUNDARY_SETTLED: u32 = crate::DEFAULT_SETTLED_SEGMENT_BLOCKS;
-    const BOUNDARY_REORG: u32 = BOUNDARY_TIP - BOUNDARY_SETTLED;
+    const BOUNDARY_REORG: u32 = 8;
+    let settled_height = tip_height - BOUNDARY_REORG;
 
     let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
     let tip = BlockId::new(
-        BlockHeight::new(BOUNDARY_TIP),
-        BlockHash::from_bytes(boundary_det_hash(BOUNDARY_TIP)),
+        BlockHeight::new(tip_height),
+        BlockHash::from_bytes(boundary_det_hash(tip_height)),
     );
     let plan = CanonicalStoreBuildPlan::complete(
         &activations,
@@ -3531,10 +3711,10 @@ fn published_4096_boundary_store(
         RocksDbResourceBudget::for_local_tests(),
     )?;
     let mut blocks: Vec<Result<crate::CanonicalBuildBlock, std::io::Error>> =
-        Vec::with_capacity(usize::try_from(BOUNDARY_TIP)?);
+        Vec::with_capacity(usize::try_from(tip_height)?);
     let mut parent = Network::ZcashTestnet.genesis_hash().as_bytes();
-    for h in 1_u32..=BOUNDARY_TIP {
-        let with_ckpt = h == BOUNDARY_TIP || h.is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
+    for h in 1_u32..=tip_height {
+        let with_ckpt = h == tip_height || h.is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
         let blk = boundary_build_block(h, parent, &activations, with_ckpt)?;
         parent = blk.facts.block_header.block_hash.as_bytes();
         blocks.push(Ok(blk));
@@ -3543,13 +3723,13 @@ fn published_4096_boundary_store(
     builder.load_subtree_roots(std::iter::empty())?;
     builder.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
         tip,
-        1_750_000_000 + BOUNDARY_TIP,
-        super::test_checkpoint_frontiers(&activations, BlockHeight::new(BOUNDARY_TIP))?,
+        1_750_000_000 + tip_height,
+        super::test_checkpoint_frontiers(&activations, BlockHeight::new(tip_height))?,
     ))?;
     let validated = builder.prepare_cold_certified_publication()?;
     let settled = BlockId::new(
-        BlockHeight::new(BOUNDARY_SETTLED),
-        BlockHash::from_bytes(boundary_det_hash(BOUNDARY_SETTLED)),
+        BlockHeight::new(settled_height),
+        BlockHash::from_bytes(boundary_det_hash(settled_height)),
     );
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
         settled,

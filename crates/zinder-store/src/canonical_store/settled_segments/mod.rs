@@ -3,6 +3,7 @@
 
 pub(crate) mod cache;
 pub(crate) mod layout;
+pub(super) mod page_cache;
 pub(crate) mod sealer;
 pub(crate) mod snapshot;
 pub(crate) mod store_access;
@@ -616,6 +617,15 @@ impl VerifiedDir {
         &self,
         name: &str,
     ) -> Result<Option<EntryKind>, SettledSegmentsError> {
+        Ok(self
+            .stat_entry_and_len_nofollow(name)?
+            .map(|(kind, _)| kind))
+    }
+
+    fn stat_entry_and_len_nofollow(
+        &self,
+        name: &str,
+    ) -> Result<Option<(EntryKind, u64)>, SettledSegmentsError> {
         reject_unsafe_component(name)?;
         #[cfg(unix)]
         {
@@ -636,7 +646,10 @@ impl VerifiedDir {
                         | FileType::BlockDevice
                         | FileType::Unknown => EntryKind::SymlinkOrOther,
                     };
-                    Ok(Some(kind))
+                    let len = u64::try_from(stat.st_size).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "negative segment file length")
+                    })?;
+                    Ok(Some((kind, len)))
                 }
                 Err(Errno::NOENT) => Ok(None),
                 Err(err) => Err(SettledSegmentsError::Io(io::Error::from(err))),
@@ -655,7 +668,7 @@ impl VerifiedDir {
                     } else {
                         EntryKind::SymlinkOrOther
                     };
-                    Ok(Some(kind))
+                    Ok(Some((kind, meta.len())))
                 }
                 Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
                 Err(err) => Err(SettledSegmentsError::Io(err)),

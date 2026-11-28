@@ -38,7 +38,8 @@ use super::{
     replay_tail::AuthenticatedReplayTail,
     rocksdb::{
         CanonicalStoreAdmissionExpectation, StoredDataAdmission,
-        canonical_column_family_descriptors, canonical_store_path, validate_open_store_control,
+        canonical_column_family_descriptors, canonical_store_path, read_admitted_schedule,
+        validate_open_store_control,
     },
     settled_segments::{
         cache::SettledSegmentReaderCache,
@@ -150,7 +151,7 @@ impl RocksDbCanonicalSecondary {
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resources: impl Into<RocksDbOpenResources>,
     ) -> Result<Self, CanonicalStoreError> {
-        Self::open_ready_with_expectation(
+        let secondary = Self::open_ready_with_expectation(
             primary_path.as_ref(),
             secondary_path.as_ref(),
             &CanonicalStoreAdmissionExpectation::from_activations(
@@ -160,7 +161,9 @@ impl RocksDbCanonicalSecondary {
             ),
             resources.into(),
             canonical_column_family_descriptors,
-        )
+        )?;
+        secondary.record_settled_corpus_admission(StoreRole::CanonicalSecondary);
+        Ok(secondary)
     }
 
     /// Opens a secondary with explicit minimum retained data and history.
@@ -179,7 +182,7 @@ impl RocksDbCanonicalSecondary {
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resources: impl Into<RocksDbOpenResources>,
     ) -> Result<Self, CanonicalStoreError> {
-        Self::open_ready_with_expectation(
+        let secondary = Self::open_ready_with_expectation(
             primary_path.as_ref(),
             secondary_path.as_ref(),
             &CanonicalStoreAdmissionExpectation::adopting_writer_schedule(
@@ -189,7 +192,9 @@ impl RocksDbCanonicalSecondary {
             ),
             resources.into(),
             canonical_column_family_descriptors,
-        )
+        )?;
+        secondary.record_settled_corpus_admission(StoreRole::CanonicalSecondary);
+        Ok(secondary)
     }
 
     #[allow(
@@ -269,7 +274,8 @@ impl RocksDbCanonicalSecondary {
                 });
             }
         }
-        let segment_cache = SettledSegmentReaderCache::with_default_capacity(&primary_path, false)?;
+        let segment_cache =
+            SettledSegmentReaderCache::with_admitted_corpus(&primary_path, &sealed_segments)?;
         let ctx = SegmentStoreContext {
             db: &bounded_open.db,
             segment_cache: Some(&segment_cache),
@@ -281,20 +287,8 @@ impl RocksDbCanonicalSecondary {
             reorg_policy,
             &ready_evidence,
         )?;
-        let activation_schedule = opened_control
-            .activation_schedule_binding
-            .map(|binding| {
-                CanonicalActivationSchedule::read_bound(
-                    &bounded_open.db,
-                    &primary_path,
-                    binding,
-                    opened_control
-                        .build_plan
-                        .network_upgrade_activations_fingerprint()
-                        .as_bytes(),
-                )
-            })
-            .transpose()?;
+        let activation_schedule =
+            read_admitted_schedule(&bounded_open.db, &primary_path, &opened_control)?;
         Ok(Self {
             bounded_open,
             open_settings: Box::new(SecondaryOpenSettings {
@@ -342,7 +336,8 @@ impl RocksDbCanonicalSecondary {
         height: BlockHeight,
     ) -> Result<(), CanonicalStoreError> {
         let observed_ready = self.ready_evidence;
-        *self = self.open_live_tail_recovery(height, &observed_ready)?;
+        *self =
+            self.open_live_tail_recovery(height, &observed_ready, StoreRole::CanonicalSecondary)?;
         Ok(())
     }
 
@@ -350,6 +345,7 @@ impl RocksDbCanonicalSecondary {
         &mut self,
         height: BlockHeight,
         observed_ready: &CanonicalStoreReadyEvidence,
+        role: StoreRole,
     ) -> Result<Self, CanonicalStoreError> {
         self.read_caches.live_tail = None;
         let before = self.event_fence();
@@ -397,6 +393,10 @@ impl RocksDbCanonicalSecondary {
             .secondary_path
             .clone_from(&self.open_settings.secondary_path);
         fresh.open_settings.recovery_directory = Some(directory);
+        fresh
+            .read_caches
+            .settled
+            .record_corpus_admission_transition(role, !self.read_caches.settled.constrained());
         Ok(fresh)
     }
 
@@ -539,7 +539,14 @@ impl RocksDbCanonicalSecondary {
     pub fn try_catch_up(
         &mut self,
     ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
-        self.catch_up(false)
+        self.catch_up(StoreRole::CanonicalSecondary, false)
+    }
+
+    pub(super) fn try_catch_up_for_role(
+        &mut self,
+        role: StoreRole,
+    ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
+        self.catch_up(role, false)
     }
 
     /// Catches up an active writer follower, reopening once if a live replay
@@ -550,18 +557,19 @@ impl RocksDbCanonicalSecondary {
     pub fn try_catch_up_following(
         &mut self,
     ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
-        self.catch_up(true)
+        self.catch_up(StoreRole::CanonicalSecondary, true)
     }
 
     fn catch_up(
         &mut self,
+        role: StoreRole,
         recover_missing_live_tail: bool,
     ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
         // RocksDB can advance before admission fails. Restore cached rows
         // only when this handle successfully admits the same READY evidence.
         let previous_cache = self.read_caches.live_tail.take();
         let previous_ready = self.ready_evidence;
-        let outcome = self.catch_up_inner(recover_missing_live_tail);
+        let outcome = self.catch_up_inner(role, recover_missing_live_tail);
         // A successful reopen already installed its own empty cache.
         if outcome.is_ok() && self.read_caches.live_tail.is_none() {
             let cache = match previous_cache {
@@ -575,6 +583,7 @@ impl RocksDbCanonicalSecondary {
 
     fn catch_up_inner(
         &mut self,
+        role: StoreRole,
         recover_missing_live_tail: bool,
     ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
         let before = self.event_fence();
@@ -618,6 +627,16 @@ impl RocksDbCanonicalSecondary {
             ));
         }
         let updated_sealed_segments = self.sync_settled_segments_on_catch_up(&ready_evidence)?;
+        let corpus_growth = updated_sealed_segments
+            .as_ref()
+            .map(|entries| {
+                self.read_caches
+                    .settled
+                    .prepare_corpus_growth(&entries[self.sealed_segments.len()..])
+            })
+            .transpose()?;
+        let activation_schedule =
+            read_admitted_schedule(&self.bounded_open.db, self.primary_path(), &opened_control)?;
         // Unchanged READY evidence is still explained by the tail this reader
         // already authenticated; otherwise re-derive only what changed.
         if ready_changed
@@ -627,7 +646,7 @@ impl RocksDbCanonicalSecondary {
             if recover_missing_live_tail
                 && let CanonicalStoreError::MissingLiveTailReplay { height } = error
             {
-                self.reopen_during_catch_up(height, &ready_evidence)?;
+                self.reopen_during_catch_up(height, &ready_evidence, role)?;
                 return Ok(CanonicalSecondaryCatchupOutcome {
                     before,
                     after: self.event_fence(),
@@ -636,22 +655,11 @@ impl RocksDbCanonicalSecondary {
             return Err(error);
         }
         self.ready_evidence = ready_evidence;
-        if let Some(entries) = updated_sealed_segments {
+        if let Some((entries, growth)) = updated_sealed_segments.zip(corpus_growth) {
+            self.read_caches.settled.admit_corpus_growth(growth, role);
             self.sealed_segments = entries;
         }
-        self.activation_schedule = opened_control
-            .activation_schedule_binding
-            .map(|binding| {
-                CanonicalActivationSchedule::read_bound(
-                    &self.bounded_open.db,
-                    self.primary_path(),
-                    binding,
-                    self.build_plan
-                        .network_upgrade_activations_fingerprint()
-                        .as_bytes(),
-                )
-            })
-            .transpose()?;
+        self.activation_schedule = activation_schedule;
         Ok(CanonicalSecondaryCatchupOutcome {
             before,
             after: self.event_fence(),
@@ -681,9 +689,10 @@ impl RocksDbCanonicalSecondary {
         &mut self,
         height: BlockHeight,
         ready_evidence: &CanonicalStoreReadyEvidence,
+        role: StoreRole,
     ) -> Result<(), CanonicalStoreError> {
         *self = self
-            .open_live_tail_recovery(height, ready_evidence)
+            .open_live_tail_recovery(height, ready_evidence, role)
             .map_err(|error| {
                 // Followers retry missing SSTs on ordinary catch-up. A failed
                 // recovery open must end this attempt.
@@ -815,6 +824,15 @@ impl RocksDbCanonicalSecondary {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn record_settled_corpus_admission(&self, role: StoreRole) {
+        self.read_caches.settled.record_corpus_admission(role);
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_settled_cache(&mut self, cache: Arc<SettledSegmentReaderCache>) {
+        self.read_caches.settled = cache;
     }
 
     pub(super) fn live_tail_cache(&self) -> Option<&LiveTailShieldedCache> {

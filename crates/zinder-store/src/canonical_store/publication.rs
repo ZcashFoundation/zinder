@@ -261,7 +261,7 @@ impl PublicationContext {
             }
         }
         let segment_cache =
-            SettledSegmentReaderCache::with_default_capacity(&self.store_path, false)?;
+            SettledSegmentReaderCache::with_admitted_corpus(&self.store_path, &sealed_segments)?;
         let ctx = SegmentStoreContext {
             db: &bounded_open.db,
             segment_cache: Some(&segment_cache),

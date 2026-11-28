@@ -55,9 +55,16 @@ You need an archive Zebra or Zakura node on the same network. Ingest reads every
 ### Public high-concurrency Mainnet endpoint
 
 - **CPU:** 8–16+ vCPUs (Broadwell+/Zen+ `x86-64` with `BMI2 + ADX`, or `AArch64`). Release images and optimized binary archives enable `pasta_curves/asm` (pass `--features pasta_curves/asm` when compiling directly with Cargo; `DEPLOY_PASTA_ASM=0` disables it in source Compose builds), saving ~6.7–8.2% on Orchard Merkle hashing and canonical construction benchmarks while failing closed at startup if `ADX` is missing.
-- **RAM:** **64+ GiB RAM** and size `zinder-serve`'s cgroup memory limit above **32 GiB** (`DEPLOY_SERVE_MEMORY_LIMIT`). Under cgroup v2, the OS page cache for canonical `ZSHRNG02` settled segments counts against the container reading those segments; keeping headroom above the active settled-segment working set prevents page-cache thrashing and `wait_timeout` refusals under concurrent range syncs.
+- **RAM:** **64+ GiB RAM** and size `zinder-serve`'s cgroup memory limit above **32 GiB** (`DEPLOY_SERVE_MEMORY_LIMIT`). Allow room for the active settled-segment working set and the rest of the process. If range-stream `wait_timeout` refusals rise alongside disk read saturation, check the [settled-segment memory gauges](../reference/metrics.md#storage) and raise the limit to accommodate the serving workload.
 - **Node feed:** Set `ZINDER_NODE__INDEXER_GRPC_ADDR` in `zinder.env` (and `ZINDER_INGEST__SOURCE=zebra-indexer-grpc`, plus any `ZINDER_NODE__INDEXER_TLS__*` PEMs, in writer-only `index.env` pointed to by `DEPLOY_INDEX_ENV`) to stream mempool events and fetch blocks as binary protobufs instead of polling the full mempool over JSON-RPC on every block.
 - **Edge proxy:** Put a TLS proxy with per-client connection, request, and stream limits in front of the listeners ([Exposing over TLS](exposing-over-tls.md)).
+
+The two-container Compose manifest defaults `DEPLOY_SERVE_MEMORY_LIMIT` to
+`8g`. For a native systemd deployment, set the equivalent ceiling with
+`MemoryMax`. Buffered reads of settled segments can charge the Linux page
+cache to that limit even when RocksDB uses direct I/O. If the admitted corpus
+exceeds the budget sampled at open, Zinder logs a warning and requests
+disabled speculative readahead and drop-behind of consumed payload pages.
 
 ### Testnet and Regtest baselines
 

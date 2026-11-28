@@ -4,6 +4,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt, io,
+    num::NonZeroU64,
     path::Path,
     sync::Arc,
 };
@@ -12,6 +13,7 @@ use parking_lot::{Condvar, Mutex};
 use zinder_core::{BlockHeight, BlockId};
 
 use crate::{
+    StoreRole, container_memory_budget_bytes,
     settled_raw_block_segment::{
         RawBlockSegmentIdentity, SettledRawBlockSegmentError, SettledRawBlockSegmentOpenOptions,
         SettledRawBlockSegmentReader,
@@ -33,6 +35,7 @@ use super::{
         SEGMENTS_DIR_NAME, SettledSegmentIndexEntry, SettledSegmentKind, SettledSegmentModules,
         format_segment_filename,
     },
+    page_cache::SettledSegmentPageCache,
 };
 
 /// Default shared bounded-LRU segment reader capacity (`1,024` segments).
@@ -356,6 +359,7 @@ struct LruReaderState {
     lru_order: VecDeque<BlockHeight>,
     inflight: HashMap<InflightKey, Arc<InflightLoad>>,
     generation: u64,
+    page_cache: SettledSegmentPageCache,
 }
 
 impl LruReaderState {
@@ -365,6 +369,7 @@ impl LruReaderState {
             lru_order: VecDeque::with_capacity(capacity),
             inflight: HashMap::new(),
             generation: 0,
+            page_cache: SettledSegmentPageCache::default(),
         }
     }
 
@@ -373,6 +378,13 @@ impl LruReaderState {
             self.lru_order.remove(pos);
         }
         self.lru_order.push_back(height);
+    }
+
+    fn clear_resident_readers(&mut self, metrics: &CacheMetrics) {
+        for (_, slot) in self.slots.drain() {
+            metrics.remove_slot(&slot, false);
+        }
+        self.lru_order.clear();
     }
 }
 
@@ -487,6 +499,7 @@ impl SettledSegmentReaderCache {
     }
 
     /// Creates a shared reader cache with [`DEFAULT_SETTLED_SEGMENT_READER_CACHE_CAPACITY`] (`1,024`).
+    #[cfg(test)]
     pub(crate) fn with_default_capacity(
         store_root: impl AsRef<Path>,
         require_fs_verity: bool,
@@ -496,6 +509,74 @@ impl SettledSegmentReaderCache {
             DEFAULT_SETTLED_SEGMENT_READER_CACHE_CAPACITY,
             require_fs_verity,
         )?))
+    }
+
+    pub(in crate::canonical_store) fn with_admitted_corpus(
+        store_root: &Path,
+        entries: &[SettledSegmentIndexEntry],
+    ) -> Result<Arc<Self>, SettledSegmentsError> {
+        Self::with_corpus_budget(
+            store_root,
+            entries,
+            container_memory_budget_bytes().and_then(NonZeroU64::new),
+        )
+    }
+
+    pub(in crate::canonical_store) fn with_corpus_budget(
+        store_root: &Path,
+        entries: &[SettledSegmentIndexEntry],
+        memory_budget: Option<NonZeroU64>,
+    ) -> Result<Arc<Self>, SettledSegmentsError> {
+        let mut cache = Self::new(
+            store_root,
+            DEFAULT_SETTLED_SEGMENT_READER_CACHE_CAPACITY,
+            false,
+        )?;
+        cache.inner.get_mut().page_cache =
+            SettledSegmentPageCache::measure(&cache.root_dir, entries, memory_budget)?;
+        Ok(Arc::new(cache))
+    }
+
+    pub(in crate::canonical_store) fn record_corpus_admission(&self, role: StoreRole) {
+        self.record_corpus_admission_transition(role, true);
+    }
+
+    pub(in crate::canonical_store) fn record_corpus_admission_transition(
+        &self,
+        role: StoreRole,
+        warn_if_constrained: bool,
+    ) {
+        let page_cache = self.inner.lock().page_cache;
+        page_cache.record_admission(role, warn_if_constrained);
+    }
+
+    pub(in crate::canonical_store) fn prepare_corpus_growth(
+        &self,
+        entries: &[SettledSegmentIndexEntry],
+    ) -> Result<SettledSegmentPageCache, SettledSegmentsError> {
+        let page_cache = self.inner.lock().page_cache;
+        page_cache.with_new_entries(&self.root_dir, entries)
+    }
+
+    pub(in crate::canonical_store) fn admit_corpus_growth(
+        &self,
+        page_cache: SettledSegmentPageCache,
+        role: StoreRole,
+    ) {
+        let mut inner = self.inner.lock();
+        let changed = inner.page_cache.constrained() != page_cache.constrained();
+        inner.page_cache = page_cache;
+        if changed {
+            inner.generation = inner.generation.wrapping_add(1);
+            inner.clear_resident_readers(&self.metrics);
+            inner.inflight.clear();
+        }
+        drop(inner);
+        page_cache.record_admission(role, changed);
+    }
+
+    pub(in crate::canonical_store) fn constrained(&self) -> bool {
+        self.inner.lock().page_cache.constrained()
     }
 
     /// Returns the configured maximum number of open segments held in the cache.
@@ -586,10 +667,7 @@ impl SettledSegmentReaderCache {
     pub(crate) fn clear(&self) {
         let mut guard = self.inner.lock();
         guard.generation = guard.generation.wrapping_add(1);
-        for (_, slot) in guard.slots.drain() {
-            self.metrics.remove_slot(&slot, false);
-        }
-        guard.lru_order.clear();
+        guard.clear_resident_readers(&self.metrics);
     }
 
     /// Lazily opens (or returns cached) ONLY the `ZSHRNG02` shielded segment reader.
@@ -827,7 +905,7 @@ impl SettledSegmentReaderCache {
                 hook(kind);
             }
         }
-        let loaded = open_single_module(&self.root_dir, entry, kind, self.require_fs_verity)
+        let loaded = open_single_module(self, entry, kind)
             .map_err(|err| CachedOpenFailure::from_error(&err));
         let final_result = self.commit_leader_outcome(key, expected_pin, inflight, loaded);
 
@@ -925,27 +1003,29 @@ impl SettledSegmentReaderCache {
 }
 
 fn open_single_module(
-    root_dir: &VerifiedDir,
+    cache: &SettledSegmentReaderCache,
     entry: &SettledSegmentIndexEntry,
     kind: SettledSegmentKind,
-    require_fs_verity: bool,
 ) -> Result<LoadedModuleReader, SettledSegmentsError> {
-    let segments_dir = root_dir.open_child_dir_existing(SEGMENTS_DIR_NAME)?;
+    let segments_dir = cache.root_dir.open_child_dir_existing(SEGMENTS_DIR_NAME)?;
+    let require_fs_verity = cache.require_fs_verity;
     let start = entry.start_height;
     let end = entry.end_block.height;
     let file = segments_dir
         .open_child_dir_existing(kind.subdir_name())?
         .open_regular_file_nofollow(&format_segment_filename(kind, start, end)?)?;
+    let constrained = cache.constrained();
 
     match kind {
         SettledSegmentKind::Shielded => Ok(LoadedModuleReader::Shielded(Arc::new(
-            SettledShieldedSegmentReader::open_file(
+            SettledShieldedSegmentReader::open_file_with_scan_policy(
                 file,
                 &entry.shielded_identity,
                 SettledShieldedSegmentOpenOptions {
                     require_fs_verity,
                     verify_full_payload: false,
                 },
+                constrained,
             )?,
         ))),
         SettledSegmentKind::Supplement => {
@@ -955,13 +1035,14 @@ fn open_single_module(
                 )
             })?;
             Ok(LoadedModuleReader::Supplement(Arc::new(
-                SettledSupplementSegmentReader::open_file(
+                SettledSupplementSegmentReader::open_file_with_scan_policy(
                     file,
                     sup_id,
                     SettledSupplementSegmentOpenOptions {
                         require_fs_verity,
                         verify_full_payload: false,
                     },
+                    constrained,
                 )?,
             )))
         }
@@ -972,13 +1053,14 @@ fn open_single_module(
                 )
             })?;
             Ok(LoadedModuleReader::RawBlock(Arc::new(
-                SettledRawBlockSegmentReader::open_file(
+                SettledRawBlockSegmentReader::open_file_with_scan_policy(
                     file,
                     raw_id,
                     SettledRawBlockSegmentOpenOptions {
                         require_fs_verity,
                         verify_full_payload: false,
                     },
+                    constrained,
                 )?,
             )))
         }

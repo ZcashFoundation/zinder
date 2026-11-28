@@ -8,7 +8,7 @@ use zinder_core::{
 };
 
 use crate::{
-    positional_source::{ByteRange, PositionalByteSource, SegmentSource},
+    positional_source::{ByteRange, PositionalByteSource, ScanDropBehind, SegmentSource},
     segment_verity,
 };
 
@@ -996,6 +996,15 @@ impl SettledRawBlockSegmentReader<File> {
         expected: &RawBlockSegmentIdentity,
         options: SettledRawBlockSegmentOpenOptions,
     ) -> Result<Self, SettledRawBlockSegmentError> {
+        Self::open_file_with_scan_policy(file, expected, options, false)
+    }
+
+    pub(crate) fn open_file_with_scan_policy(
+        file: File,
+        expected: &RawBlockSegmentIdentity,
+        options: SettledRawBlockSegmentOpenOptions,
+        constrained: bool,
+    ) -> Result<Self, SettledRawBlockSegmentError> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(io::Error::new(
@@ -1014,7 +1023,7 @@ impl SettledRawBlockSegmentReader<File> {
             return Err(SettledRawBlockSegmentError::FsVerityRequired);
         }
         Self::admit_with_verity(
-            SegmentSource::file(file, "block_blob"),
+            SegmentSource::file(file, "block_blob", constrained),
             expected,
             options,
             kernel_verified,
@@ -1137,13 +1146,25 @@ impl<S: PositionalByteSource> SettledRawBlockSegmentReader<S> {
         )?;
         let mut whole_digest = Sha256::new();
         whole_digest.update(header_bytes);
-        verify_all_slab_frames(&self.source, &self.index, raw_row_index, &mut whole_digest)?;
+        verify_all_slab_frames(
+            &self.source,
+            &self.index,
+            raw_row_index,
+            &mut whole_digest,
+            self.scan_drop_behind(),
+        )?;
         whole_digest.update(raw_tx_table);
         whole_digest.update(raw_row_index);
         let computed: [u8; 32] = whole_digest.finalize().into();
         if computed != trailer || computed != self.index.identity.sha256 {
             return Err(SettledRawBlockSegmentError::PayloadIntegrity(
                 "portable raw block segment length or SHA-256 mismatch".to_owned(),
+            ));
+        }
+        if let Some(mut scan) = self.scan_drop_behind() {
+            scan.consumed(ByteRange::new(
+                self.index.tx_table_offset,
+                index_and_trailer.len(),
             ));
         }
         Ok(())
@@ -1234,6 +1255,18 @@ impl<S: PositionalByteSource> SettledRawBlockSegmentReader<S> {
         &self,
         height: BlockHeight,
     ) -> Result<Vec<u8>, SettledRawBlockSegmentError> {
+        self.read_raw_block_for_scan(height, &mut None)
+    }
+
+    pub(crate) fn scan_drop_behind(&self) -> Option<ScanDropBehind<'_, S>> {
+        self.source.scan_drop_behind()
+    }
+
+    pub(crate) fn read_raw_block_for_scan(
+        &self,
+        height: BlockHeight,
+        drop_behind: &mut Option<ScanDropBehind<'_, S>>,
+    ) -> Result<Vec<u8>, SettledRawBlockSegmentError> {
         let plan = self.index.plan_block_read(height)?;
         let row = &self.index.rows[plan.row_idx];
         let raw_rows = self
@@ -1254,6 +1287,9 @@ impl<S: PositionalByteSource> SettledRawBlockSegmentReader<S> {
             .source
             .read_vec_at(plan.slab_byte_range.offset, plan.slab_byte_range.len)
             .inspect_err(|_| row.mark_invalid())?;
+        if let Some(scan) = drop_behind {
+            scan.consumed(plan.slab_byte_range);
+        }
         self.index
             .verify_and_decode_block(&plan, verified_rows, &frame)
     }
@@ -1399,6 +1435,9 @@ impl<S: PositionalByteSource> SettledRawBlockSegmentReader<S> {
                 .inspect_err(|_| row.mark_invalid())?;
             visit(tx_idx, SerializedBytesDigest::from_bytes(tx_entry.sha256))?;
         }
+        if let Some(mut scan) = self.scan_drop_behind() {
+            scan.consumed(tx_range);
+        }
         Ok(plan.tx_count)
     }
 
@@ -1433,6 +1472,9 @@ impl<S: PositionalByteSource> SettledRawBlockSegmentReader<S> {
                 .inspect_err(|_| self.index.rows[row_idx].mark_invalid())?;
             let digest = SerializedBytesDigest::from_bytes(entry.uncompressed_sha256);
             rows_meta.push((block_hash, digest));
+        }
+        if let Some(mut scan) = self.scan_drop_behind() {
+            scan.consumed(byte_range);
         }
         Ok(rows_meta)
     }
@@ -1683,11 +1725,12 @@ fn validate_entry_tx_slices(
     Ok(tx_end)
 }
 
-fn verify_all_slab_frames(
-    source: &impl PositionalByteSource,
+fn verify_all_slab_frames<S: PositionalByteSource>(
+    source: &SegmentSource<S>,
     index: &SettledRawBlockSegmentIndex,
     raw_row_index: &[u8],
     whole_digest: &mut Sha256,
+    mut drop_behind: Option<ScanDropBehind<'_, S>>,
 ) -> Result<(), SettledRawBlockSegmentError> {
     let total_slab = u64::from(index.slab_len);
     let mut cursor = 0_u64;
@@ -1703,11 +1746,15 @@ fn verify_all_slab_frames(
         let batch_len = usize::try_from(batch_end_rel - batch_start_rel).map_err(|_| {
             SettledRawBlockSegmentError::InvalidFormat("slab batch exceeds usize".to_owned())
         })?;
+        let batch_offset = index.slab_offset + batch_start_rel;
         let batch_bytes = source
-            .read_vec_at(index.slab_offset + batch_start_rel, batch_len)
+            .read_vec_at(batch_offset, batch_len)
             .inspect_err(|_| mark_row_slice_invalid(&index.rows[idx..batch_end]))?;
         whole_digest.update(&batch_bytes);
         verify_slab_batch_frames(index, raw_row_index, idx, batch_end, &batch_bytes)?;
+        if let Some(scan) = &mut drop_behind {
+            scan.consumed(ByteRange::new(batch_offset, batch_len));
+        }
         cursor += u64::try_from(batch_bytes.len()).unwrap_or(0);
         idx = batch_end;
     }

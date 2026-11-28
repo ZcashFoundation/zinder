@@ -222,7 +222,7 @@ Key takeaways from the Zebra 7.1.0 runs:
 
 - **Rust indexers eliminate the restore bottleneck.** In the 16-wallet TLS restore test (2,000 blocks + 20 tree states), Zinder (`light-wallet` and `wallet`), `ztreamer`, and `Zingod` all cluster near `24.1 wallets/s`, over `13x` faster than Go `lightwalletd` (`1.83 wallets/s`), which blocks on per-request Zebra RPCs.
 - **Zinder's `v0.26.0` builds and spot latencies.** On 8 writer cores, `light-wallet` builds in `60.4 min` (`71.76 GB` disk; `48.6 min` / `70.97 GB` with `commitment-budget = 1024`; `zebra-indexer-grpc` cuts indexer CPU by `5.5%` and Zebra CPU by `9.1%`), and `wallet` builds in `75.8 min` (`122.64 GB` final / `131.80 GB` peak). In `v0.26.0` spot checks, `GetTreeState` `c1` warm p50 measured `98.9–102.6 µs` and `cbb-tree 100` reached `65.7k–70.6k req/s`.
-- **Zinder's operational tradeoffs.** Zinder runs on a single-host `rocksdb` multi-process topology today (`postgres` horizontal serving in [ADR-0004](../adrs/0004-storage-and-deployment-topologies.md) is decided, not implemented). Public high-concurrency `zinder-compat-lightwalletd` endpoints should size `DEPLOY_SERVE_MEMORY_LIMIT` to accommodate OS page cache for canonical `ZSHRNG02` settled segments (`32g+` on `64+ GiB` hosts) and prevent cgroup v2 page-cache thrashing. Initial construction is non-resumable if stopped before publication, listeners speak plaintext h2c behind your own TLS proxy, and as an alpha project, storage layout bumps require a fresh rebuild or restoring a same-schema snapshot.
+- **Zinder's operational tradeoffs.** Zinder runs on a single-host `rocksdb` multi-process topology today (`postgres` horizontal serving in [ADR-0004](../adrs/0004-storage-and-deployment-topologies.md) is decided, not implemented). Public high-concurrency endpoints need [memory headroom for settled-segment scans](../runbooks/deploying.md#step-3-size-your-host). Initial construction is non-resumable if stopped before publication, listeners speak plaintext h2c behind your own TLS proxy, and as an alpha project, storage layout bumps require a fresh rebuild or restoring a same-schema snapshot.
 
 ## Strengths and limits
 
@@ -307,7 +307,7 @@ Strengths:
 Limits:
 
 - Alpha stability: APIs, storage layouts, and topology will evolve, and layout bumps require a fresh rebuild or same-schema snapshot restore.
-- Single-host `rocksdb` multi-process topology today (`postgres` horizontal serving is decided in [ADR-0004](../adrs/0004-storage-and-deployment-topologies.md), not implemented); high-concurrency public range endpoints should size `DEPLOY_SERVE_MEMORY_LIMIT` to cover OS page cache for canonical `ZSHRNG02` settled segments.
+- Single-host `rocksdb` multi-process topology today (`postgres` horizontal serving is decided in [ADR-0004](../adrs/0004-storage-and-deployment-topologies.md), not implemented); public range endpoints need [memory headroom for settled-segment scans](../runbooks/deploying.md#step-3-size-your-host).
 - Initial builds restart from scratch if interrupted before publication; `zinder-ingest` requires an archive validator and readers stop 5 minutes after ingest stops.
 - No built-in TLS or wallet-listener client auth (front with a reverse proxy); full blocks require `storage.raw_blob_policy = "all"` and Explorer views require `zinder-explorer` and `ingest.explorer_views = true`.
 
