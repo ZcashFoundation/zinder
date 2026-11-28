@@ -185,7 +185,7 @@ fn the_caddy_template_replaces_the_header_the_listener_reads() -> Result<()> {
 fn the_caddy_readiness_gate_reuses_a_bounded_pool_for_status_only_probes() -> Result<()> {
     let gate = caddy_block(
         CADDYFILE.lines(),
-        "forward_auth 127.0.0.1:{$ZINDER_COMPAT_OPS_HOST_PORT}",
+        "forward_auth 127.0.0.1:{$DEPLOY_SERVE_OPS_HOST_PORT}",
     )?;
     for directive in ["uri /readyz", "method HEAD", "header_down -Content-Length"] {
         assert!(
@@ -211,7 +211,7 @@ https://example.org:443 {
 \t\t\theader_up X-Zinder-Client-Address {http.request.remote}
 \t\t}
 
-\t\treverse_proxy h2c://127.0.0.1:{$ZINDER_COMPAT_HOST_PORT} {
+\t\treverse_proxy h2c://127.0.0.1:{$DEPLOY_COMPAT_HOST_PORT} {
 \t\t\tflush_interval -1
 \t\t}
 \t}

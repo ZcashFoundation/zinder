@@ -24,7 +24,7 @@ Zinder serves two wallet protocols on separate endpoints. A client speaks one of
 | A Cipherscan frontend | Cipherscan-compatible REST and WebSocket | `zinder-compat-cipherscan` (`--preset explorer`) | 9070 |
 | A server-side wallet | `zinder-client` plus a wallet library such as librustzcash | `zinder-query` | 9102 |
 
-All four client ports (`9067`, `9068`, `9070`, `9102`) are published on host loopback by `deploy/docker-compose.yml` (`zinder-serve` listens on `[::]:9070` with `ZINDER_CIPHERSCAN__LISTEN_ADDR` and `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`; select `--preset explorer` / `ZINDER_PRESET=explorer` to start Explorer and Cipherscan compat alongside wallet serving). Your operator may publish different ports.
+All four client ports (`9067`, `9068`, `9070`, `9102`) are published on host loopback by `deploy/docker-compose.yml` (`zinder-serve` listens on `[::]:9070` with `ZINDER_CIPHERSCAN__LISTEN_ADDR` and `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`; set `ZINDER_DEPLOYMENT__PROFILE=explorer` in `zinder.env`, or pass `--preset explorer` on standalone CLI runs, to start Explorer and Cipherscan compat alongside wallet serving). Your operator may publish different ports.
 
 #### Generate bindings from a pinned release
 

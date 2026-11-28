@@ -490,20 +490,20 @@ jobs:
 
       - name: Test deployment Compose contract
         env:
-          ZINDER_IMAGE: zinder:ci-proof
-          ZINDER_SINGLE_HOST_DATA_VOLUME_NAME: zinder-ci-proof-data
-          ZINDER_PROMETHEUS_VOLUME_NAME: zinder-ci-proof-prometheus
-          ZINDER_GRAFANA_VOLUME_NAME: zinder-ci-proof-grafana
-          ZINDER_OBSERVABILITY_NETWORK_NAME: zinder-ci-proof-observability
+          DEPLOY_IMAGE: zinder:ci-proof
+          DEPLOY_DATA_VOLUME: zinder-ci-proof-data
+          DEPLOY_PROMETHEUS_VOLUME: zinder-ci-proof-prometheus
+          DEPLOY_GRAFANA_VOLUME: zinder-ci-proof-grafana
+          DEPLOY_OBSERVABILITY_NETWORK: zinder-ci-proof-observability
         run: |
           docker compose \
-            --env-file deploy/.env.testnet \
+            --env-file deploy/profiles/testnet/deploy.env \
             -f deploy/docker-compose.yml \
             --profile observability \
             config --format json \
           | jq -e '
-              .services["zinder-index"].command[0] == "index"
-              and .services["zinder-serve"].command[0] == "serve"
+              .services["zinder-index"].command == ["index"]
+              and .services["zinder-serve"].command == ["serve", "--readers-only"]
               and .services["zinder-index"].image == "zinder:ci-proof"
               and .services["zinder-serve"].image == "zinder:ci-proof"
               and .services["zinder-serve"].network_mode == "service:zinder-index"
