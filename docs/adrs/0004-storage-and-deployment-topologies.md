@@ -47,10 +47,21 @@ The longest outages observed so far came from the Zcash node, not from storage. 
    - Persistent canonical indexes and events while keeping canonical, wallet projection, and Explorer writers decoupled. Writers keep engine-specific code. Slice 1 adds a PostgreSQL canonical and mempool writer behind stateless `light-wallet` and canonical `ExplorerQuery` (`zinder-explorer`) readers, and Slice 2 adds wallet projection, native `WalletQuery` serving, and `zinder-compat-cipherscan` (which requires both `ExplorerQuery` and `WalletQuery` per [Cipherscan adapter](../architecture/cipherscan-adapter.md)). `postgres` becomes certified and advertised at the end of Slice 2. Writer standby failover and isolated analytical Explorer materialized-view consumers follow.
 9. **Every release declares an upgrade class.** The classes are compatible, additive schema change, projection layout change, and canonical layout change. During a compatible or additive upgrade, the old and new releases must each read and write correctly against the same schema and each other's rows. A layout change raises the affected store's schema version, and each release refuses a store at any other version. A layout change requires a fresh store, built from scratch in a fresh path. Zinder has no in-place migration. Team-operated deployments schedule the rebuild and keep no mandatory rollback lane. A release serves only from a store at its own version, so a self-hoster who wants a fallback keeps the previous binaries and store until the new store passes admission. Starting at v0.28.0, the release workflow records and validates the release's upgrade class from its changelog fragments (`scripts/prepare-changelog-release.sh` and `scripts/validate-changelog.sh`), while Zinder has no upgrade command or migration job.
 
-Regional RocksDB instances can initialize independent single-host writers from verified snapshots. Each instance owns its copy and follows its configured validator. [ADR-0024](0024-verified-edge-snapshot-bootstrap.md).
+10. **Regional RocksDB writers share immutable bootstrap objects.** Independent
+    single-writer hosts use the static HTTPS settled-segment pool in
+    [ADR-0024](0024-verified-edge-snapshot-bootstrap.md) for bootstrap and regional
+    seeding ([#478](https://github.com/ZcashFoundation/zinder/issues/478),
+    [#714](https://github.com/ZcashFoundation/zinder/issues/714)). Each host
+    admits its own writer, keeps its own RocksDB checkpoint and indexes, and
+    follows an admitted validator. This distribution design and wallet HTTP
+    range downloads ([#697](https://github.com/ZcashFoundation/zinder/issues/697))
+    have no dependency on the PostgreSQL topology or its M3 read-through cache
+    ([#678](https://github.com/ZcashFoundation/zinder/issues/678)). The shipped
+    edge snapshot remains a verified physical checkpoint.
 
 ## Evidence
 
+- Decision 10: Judgment. Sharing settled objects saves repeated transfers of chain history while keeping writer ownership and recovery per host. Regional recovery measurements that miss the operator's recovery objective with a shared pool would reopen the design.
 - Decision 6: judgment. It serves operators who run a managed database and does not relieve a measured limit, so no RocksDB measurement reopens it. Its cost is a second storage engine to build and certify. Decision 7's gate is the observation that reopens it: a threshold the design cannot be reworked to meet. The Context gives the current RocksDB rebuild and restore figures, which this purpose does not depend on.
 - Decision 7, the build threshold: judgment on a measured baseline. The RocksDB side measured about 1 h 51 min for canonical construction and about 1 h 19 min for the wallet projection on Mainnet ([#488](https://github.com/ZcashFoundation/zinder/issues/488), [#474](https://github.com/ZcashFoundation/zinder/issues/474)), so the former 48-hour limit was more than ten times the RocksDB build and could not detect a regression. The factor of four, like the factors of one half and two in the other thresholds, is a chosen tolerance, not a measurement. The commit-latency, streaming-rate, and size thresholds are unchanged.
 - Decision 2, exact identity for writers and minimum data for readers: judgment. A reader still compares the schema, network, reorg window, upgrade schedule, READY state, and manifest agreement, so admitting a store that holds more data changes neither the chain nor the history it serves. It lets one store serve readers that need less. A different answer reopens it when both stores cover the request, both readers offer the same capability, and the dependencies each needs for that request are available. Availability can differ when one reader has a retained body and the other needs an unreachable node.
@@ -60,6 +71,7 @@ Regional RocksDB instances can initialize independent single-host writers from v
 
 ## Consequences
 
+- Each region still needs local capacity and qualification for checkpoint restore, indexes, and validator following.
 - Canonical throughput does not depend on wallet index lookups, and wallet or Explorer schemas can be rebuilt without redefining chain truth.
 - Operators keep the supported primaries on one host filesystem and give each reader its own secondary metadata path.
 - Until `postgres` is certified, hosted deployments keep release downtime and the full rebuild cost.
@@ -75,6 +87,7 @@ Regional RocksDB instances can initialize independent single-host writers from v
 
 ## Alternatives rejected
 
+- **A dedicated regional gRPC replication listener.** Static HTTPS can distribute the same immutable objects to each region without adding a replication protocol or writer dependency.
 - **One schema for canonical, wallet, and Explorer data.** It couples canonical progress to every consumer workload and makes projection schema changes part of the chain-truth contract.
 - **A generic database adapter.** The engines differ in transactions, replication, bulk load, and recovery. A generic adapter exposes keys, rows, and scans for callers to compose. The engine-neutral read interfaces instead answer domain questions, such as a block range, and a shared conformance suite defines them.
 - **Mixed engines in one deployment.** Mixing multiplies backup, readiness, failover, and support combinations. An Explorer that stays on RocksDB runs as a separate deployment.
@@ -90,6 +103,7 @@ Regional RocksDB instances can initialize independent single-host writers from v
 
 ## Revision history
 
+- 2026-11-28. Decision 10 binds independent regional RocksDB bootstrap to the shared settled-segment pool.
 - 2026-11-27. Updated Decisions 4, 6, and 8 for unified `zinder` runtimes, PostgreSQL mempool/epoch/cursor state (`mempool_active_entry` alongside `mempool_event`) with qualified node-backed method boundaries, transaction-pooler compatibility (`PgBouncer` / uncached `Cloudflare Hyperdrive` SQL for mutable reads), `<= 256 MiB` byte-identical settled segments (`ZSTSUP01` 16-block chunks and `ZSBLKB01` per-block framing in `canonical_settled_segment` with `STORAGE EXTERNAL`), Cloudflare Containers + Hyperdrive edge hosting (explicitly rejecting a 3rd SQLite/D1/Turso engine), optional R2/CDN settled-segment read-through caching, and Slice 1 canonical Explorer support.
 
 - 2026-11-24. Simplified the topology identifiers to `rocksdb` and `postgres`, and updated Decision 8 to bind both engines to one logical canonical model (settled split plus a live tail bounded by the effective reorg window and parent boundary anchor) while keeping canonical, wallet projection, and Explorer writers separate.

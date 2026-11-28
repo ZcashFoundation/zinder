@@ -4,7 +4,7 @@ Status: Accepted
 
 ## Context
 
-A wallet reader serves from a serving pair: a canonical secondary and a wallet secondary opened at the same canonical fence ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md)). A new pair is published after each block, and a request reads exactly one pair.
+A wallet reader serves from a serving pair: a canonical secondary and a wallet secondary opened at the same canonical fence ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md)). New pairs publish as ingest advances. Ordinary indexed reads bind to one pair, and long-lived streams have explicit continuity rules.
 
 Capability discovery used to come from an implementation profile and from configured booleans for retention and providers. The advertised set could disagree with the persisted store, the installed handlers, or the wired dependencies. It advertised operations that could not work and omitted some that could.
 
@@ -24,16 +24,55 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 6. **Broadcast fails over in order and stays put.** A broadcast moves to the next verified endpoint only when one is unreachable or rejects the consensus branch, and the endpoint that answers becomes preferred, with no timed failback.
 7. **Replaced pairs are retained by time, not by count, and only when a request observed them.** A replaced pair that a request observed stays readable for a fixed time however fast blocks arrive, so a pinned workflow's deadline does not depend on block rate. A pair is observed once a read that can expose its chain epoch captures it, or a read pins the epoch it answers. A pair republished at the same epoch keeps the observation of the pair it replaces. A read that exposes no epoch and continues by none, such as `GetLatestBlock`, `GetLightdInfo`, and the publisher's own checks, captures the current pair without observing it. The publisher releases a replaced pair that no request observed at once, because no pin can name it, so a burst of blocks that no workflow observes never waits on the retention window. The slot orders the one-time observation of a pair against its replacement, so a request that received a pair's epoch always finds that pair retained. [Wallet data plane](../architecture/wallet-data-plane.md#how-reads-stay-consistent) gives the durations.
 8. **Generations are bounded and recycled.** The publisher uses a fixed number of secondary generations. It catches a drained generation up in place instead of opening a new one, and reuses drained generations in turn. A published pair is never modified. When a read reports its reader invalidated, as the `RocksDB` reader does when it finds a table file deleted by compaction, it marks its pair, the publisher replaces the pair at the writer's fence, and the read runs once more only on a pair that answers the same epoch.
-9. **Compatibility block ranges bind each chunk, not the stream.** A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, and the first at most 256 KiB, so a stream opens after a small read. A single block larger than its chunk's limit forms a chunk alone. The adapter holds at most two chunks of a stream: the one it hands to the gRPC server and the next, read meanwhile; blocks the gRPC server has taken can still wait in its send buffers. Each chunk is read at the current view and holds no pair while waiting for the client. A chunk continues the stream only if it links by hash to the last block sent. Otherwise the stream ends with `ABORTED`, or with `OUT_OF_RANGE` when the tip fell below a height still to send. These are the codes lightwalletd returns for the same cases.
+9. **Compatibility block ranges bind each chunk, not the stream.** A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, and the first at most 256 KiB, so a stream opens after a small read. A single block larger than its chunk's limit forms a chunk alone. The adapter holds at most two chunks of a stream: the one it hands to the gRPC server and the next, read meanwhile; blocks the gRPC server has taken can still wait in its send buffers. Each chunk is read at the current view and holds no pair while waiting for the client. A chunk continues the stream only if it links by hash to the last block sent. Otherwise the stream ends with `ABORTED`, or with `OUT_OF_RANGE` when the tip fell below a height still to send.
 10. **Consumers own their requirements.** A native consumer reads `ServerInfo` and reports every missing capability before it touches wallet storage. Zinder's contract tests prove its own invariants. Real consumer binaries, not fixture parity tests, certify consumers.
 11. **Canonical `ZSHRNG02` settled segments and `live_tail_block` carry lightwalletd's pre-encoded settled and tail shielded history directly.** `zinder-compat-lightwalletd` derives both default projections and wire-projected non-transparent shielded pool subsets directly from `zinder-store`'s canonical `ZSHRNG02` segments and `live_tail_block` rows without a separate `history-publisher` process or sidecar catalog. The [serving contract](../reference/lightwalletd-compatibility.md#canonical-settled-segments-and-live-tail-wire-streaming) defines canonical wire streaming and chunk admission.
 12. **The unified `zinder` supervisor coordinates roles without collapsing boundaries.** `zinder serve` and `zinder index` launch their preset's split role subprocesses with per-role filtered configs and private loopback control tokens, keeping each runtime's capability isolation and fail-fast exit behavior intact while exposing aggregated health and readiness. The wallet RPC and its advertised capabilities stay split by role, and readers verify canonical `READY` store admission directly before binding.
 13. **The wallet listener and its consumer size HTTP/2 windows for WAN round trips.** `PublicGrpcServer` raises each stream's send buffer from hyper's ~400 KiB default to 1 MiB, h2's per-stream backpressure threshold, so a block-range stream can fill a 100-200 ms bandwidth-delay product; the send-stall timeout still bounds how long a stalled stream keeps that buffer. `zinder-client`'s `RemoteChainIndex` raises its receive windows from hyper's 2 MiB stream, 5 MiB connection, and 16 KiB frame defaults to 4 MiB stream, 16 MiB connection, and a 64 KiB max frame; it omits h2's adaptive window, because in tonic 0.14.9 and hyper 1.12.0 that setting resets both initial windows back to 65,535 bytes and would discard the fixed sizes. How the listener keys each client for the receive limit, including a bare IP a load balancer names, is in [ADR-0007](0007-node-failure-recovery-and-transport-policy.md) Decision 10.
 
+14. **Wide ranges have orthogonal discovery and stateless SDK resumption.**
+    Revision 16 already advertises `wallet.read.compact_block_range_v3` for
+    descending ranges and pool selection ([#734](https://github.com/ZcashFoundation/zinder/pull/734)).
+    The ratified wide-range semantics in [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md)
+    decision 8 ship at `CONTRACT_REVISION = 17` and advertise
+    `wallet.read.wide_compact_block_range_v1`. Protocol range caps are
+    revision-bound constants exported by `zinder-proto` and shared by
+    `zinder-query` and `zinder-client`. `WalletServerInfo` has no
+    `max_compact_block_range_blocks` field.
+
+    The ratified `zinder-client` `sync_compact_blocks` stream owns request
+    chunking, retries, and `RefreshChainEpoch` recovery across settled
+    prefixes. It uses the wide capability when available and falls back to
+    requests of at most 1,000 blocks. The wallet caller persists durable
+    scan progress, such as the last scanned height or its own cursor. On
+    an unsettled suffix reorg or hash fence mismatch, the stream returns
+    control to the wallet. The wallet keeps its settled progress and
+    reconciles the affected suffix against a fresh view before resuming.
+    The SDK resumes from caller-supplied progress with no durable SDK
+    state or server-side resume session. Document that remote `snapshot()`
+    uses `VisibleTipBlock` to establish its epoch. Keep
+    `ChainIndex::block_header_by_selector`, whose capability is already
+    `AlwaysOn` ([#668](https://github.com/ZcashFoundation/zinder/pull/668)).
+    [#636](https://github.com/ZcashFoundation/zinder/issues/636) and
+    [#571](https://github.com/ZcashFoundation/zinder/issues/571) track
+    implementation.
+
+15. **Pruned following keeps transaction-byte discovery honest.** The
+    ratified [#713](https://github.com/ZcashFoundation/zinder/issues/713)
+    policy advertises `wallet.read.transaction_bytes_v1` only when the
+    admitted store records `raw_blob_policy = "all"` (`--full-blocks`)
+    or the installed verified byte source has at least one admitted
+    upstream validator in `Archive` mode. A lean reader backed solely by
+    pruned validators withholds the capability. Historical body failures
+    follow [ADR-0018](0018-transaction-facts-status-and-broadcast.md) decision 9.
+
 [Wallet data plane](../architecture/wallet-data-plane.md) describes pinning and pair publication. [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md) lists the block-range outcomes.
 
 ## Evidence
 
+- Decision 14, revision and capability: External constraint. Revision 16 already assigns `wallet.read.compact_block_range_v3` to range direction and pool selection. [ADR-0013](0013-chain-event-streams.md) decision 6 requires a revision bump for changed semantics.
+- Decision 14, shared constants and SDK resumption: Judgment. One revision-bound cap lets the SDK select a request path from advertised support. The SDK can retry immutable settled blocks across epochs. The wallet alone knows which suffix changes it durably applied. Reopen if independent deployment limits become necessary or a settled retry cannot resume from caller-owned progress without gaps.
+- Decision 15: Judgment. An admitted archive source or local full retention is evidence of historical coverage, while a pruned-only source can drop bodies after admission. Reopen if a source can prove equivalent full byte coverage without either condition.
 - Decision 1, deployment profiles and serving settings are not capability evidence: judgment. The rejected alternative on capability profiles records the reason.
 - Decision 4, ingest-control admission: judgment. Checking the service before storage admission refuses an endpoint with the wrong identity, network, or contract before it can supply writer evidence.
 - Decision 7, observation-gated retention: judgment backed by unit tests. A burst with no observed pair, and a burst with only tip polling between blocks, publish every block with no `retention_window` generation wait. A burst whose pairs a request observed still waits for the full window. Deterministic tests cover a capture before and after a publication, an explicit pin, and a same-epoch republication, and a concurrent test checks that a pair a capture returns still answers its epoch after a racing publication. A tip read that recovers from a deleted table file keeps its replacement unobserved.
@@ -41,6 +80,7 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 
 ## Consequences
 
+- A wallet can resume a wide scan without a server session. Revision 16 consumers and servers continue to use their existing bounded range contract.
 - Operators choose a deployment profile, retention, and endpoints, and none of them is a capability claim. Invalid capability claims cannot be constructed.
 - A misconfigured node endpoint is still advertised. Every broadcast through it fails with the retryable `NODE_UNAVAILABLE`, and the operator sees a degraded dependency instead of a missing capability.
 - A client that read `ServerInfo` early never loses a capability later.
@@ -52,6 +92,8 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 
 ## Alternatives rejected
 
+- **A range-limit field in `WalletServerInfo`.** A per-host limit makes interoperability depend on configuration where the contract only needs a revision-bound limit and a capability.
+- **Advertise transaction bytes from any configured validator.** A lean reader backed only by pruned nodes cannot promise historical bodies.
 - **Capability profiles, or per-capability booleans.** A name or flag that declares capabilities keeps a shadow model that can disagree with the composed service. A deployment profile avoids this because capabilities still derive from the composition it selects.
 - **Derive support from the registry alone.** The registry cannot prove that storage retained an artifact or that a provider was wired.
 - **A generic capability-provider framework.** There is one composition root, so it adds indirection without removing any evidence binding.
@@ -69,6 +111,7 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 
 ## Revision history
 
+- 2026-11-28. Decisions 14 and 15 specify wide-range discovery, SDK recovery, and wallet-owned progress, and gate historical transaction-byte discovery on coverage.
 - 2026-11-24. Decision 1 adds the verified mined-transaction byte source as capability evidence.
 
 - 2026-11-21. Added the trust and ownership boundary for pre-encoded settled lightwalletd history.

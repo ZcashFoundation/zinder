@@ -23,6 +23,25 @@ Zinder also runs as separate processes. `zinder-ingest` writes the canonical sto
    - A request that needs a node that does not answer fails with `UNAVAILABLE`, never with an empty or zero answer. The node can also refuse a request for its own reasons, such as a missing address index or an oversized answer, and the request fails with a matching status. Reads of stored data keep serving.
    - The node's capabilities and upgrade schedule are verified once per basis and reused for up to one minute. A failed tip check, an HTTP 429 refusal, or an unreachable node fails the requests that waited on it but never discards that verification. A separate check that the node's best chain holds the served tip runs only where the node's reply does not bind itself to the served view: before a canonical miss consults the mempool, before `SendTransaction` and `GetStandardFee`, and at the end of an address-history stream. A mined transaction body needs none, because the node names the mining block and the bytes must match the recorded digest. Unspent outputs need none, because every page reports the tip it answered at. Address-history rows need none, because each binds to the served view through its local location and digest. Concurrent requests checking the same tip share one node call, and no answer is reused after that call returns, so every request still observes the node at or after its own arrival.
 
+8. **Wide native compact ranges bind to the opening chain view.** This is the
+   ratified contract for [#636](https://github.com/ZcashFoundation/zinder/issues/636).
+   Revision 16 still reads a bounded range against one admitted serving pair.
+   For a wide stream, `header_epoch` fixes the settled boundary and the requested
+   chain. Heights at or below `header_epoch.settled_tip` remain immutable across
+   later serving epochs. The stream reads them from current admitted pairs
+   without holding a retired serving-pair pin. This remains true through an
+   in-place reorg-window raise. A reader must restart with the new window before
+   it can admit a post-raise pair, as required by [ADR-0010](0010-reorg-window-and-displaced-blocks.md)
+   decisions 2 and 4.
+
+   At stream open, capture a compact `(height, hash)` fence from the opening
+   pair for each requested height above `header_epoch.settled_tip`. The fence
+   contains at most `reorg_window_blocks` entries. Release the opening pair
+   before a slow settled scan can retain it. Each tail read must match its
+   captured hash before delivery. A mismatch or a height that can no longer
+   be verified ends the stream with `CHAIN_EPOCH_PIN_UNAVAILABLE`. Settled
+   items already delivered remain valid.
+
 Lightwalletd compatibility block ranges, including `GetBlockRangeNullifiers`, read each chunk at the epoch current at that moment and join chunks by hash linkage, which proves that every block sent belongs to one chain ([ADR-0015](0015-wallet-runtime-composition.md)). Light-wallet subtree-root streams bound their roots to the starting tip and check that it is still canonical before reading each page from the current generation. Event subscriptions follow [ADR-0013](0013-chain-event-streams.md).
 
 [Storage backend](../architecture/storage-backend.md) describes the store roles and secondary catch-up, and [Wallet data plane](../architecture/wallet-data-plane.md) describes read consistency for clients. [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#runtime-serving-selection) lists which serving mode forwards which method.
@@ -31,6 +50,7 @@ A separate canonical writer can initialize from a publisher checkpoint after pri
 
 ## Evidence
 
+- Decision 8: Judgment. Settlement is monotonic under [ADR-0010](0010-reorg-window-and-displaced-blocks.md), so an opening hash per requested unsettled height is enough to preserve the opening view without tying reader generation lifetime to client speed. A changed settled identity or a delivered tail item that differs from its opening fence reopens the design.
 - Decision 1 and the paragraph after the decisions: judgment. Pinning an indexed lookup keeps one response on one chain. A block range or an event subscription is paced by its client, so no retained epoch covers it, and it proves continuity by hash linkage or by cursor instead ([ADR-0015](0015-wallet-runtime-composition.md) decision 9, [ADR-0013](0013-chain-event-streams.md)). The tip check lets light-wallet subtree streams keep their starting bounds without holding a reader generation for the whole stream. A delivered response that joins two chains reopens it.
 - Decisions 2 and 4: judgment. They defer store admission to [ADR-0004](0004-storage-and-deployment-topologies.md) decision 2, whose evidence applies.
 - Decision 7, binding forwarded transactions, unspent outputs, and balances to the served tip: measured. On Regtest with Zebra 7.1.0, a node one block ahead of the reader returned a transaction, 141 unspent outputs, and a balance that included a block the reader had not served ([#480](https://github.com/ZcashFoundation/zinder/issues/480)). With the binding, the same skew returned `NOT_FOUND` for that transaction and refused the balance and output calls, and each check's regression test fails with its guard disabled ([#481](https://github.com/ZcashFoundation/zinder/pull/481)).
@@ -40,6 +60,7 @@ A separate canonical writer can initialize from a publisher checkpoint after pri
 
 ## Consequences
 
+- A stalled wide stream retains a bounded tail fence and relies on ordinary admission for subsequent pages. A reader restart may end an active RPC, and the client can resume from its own committed progress ([ADR-0015](0015-wallet-runtime-composition.md)).
 - Every multi-artifact response carries one explicit chain identity.
 - One process owns every write path of a store, so reorg authority and visibility have one owner.
 - Reader freshness is observable and feeds readiness ([Readiness](../reference/readiness.md)).
@@ -51,6 +72,7 @@ A separate canonical writer can initialize from a publisher checkpoint after pri
 
 ## Alternatives rejected
 
+- **Retain the opening pair for the entire wide range.** A slow settled scan can outlast bounded pair retention and hold open files while newer generations need to publish.
 - **Several canonical writers.** They would compete over visibility and reorg decisions. Zinder keeps one writer and distributes authenticated events instead.
 - **Unpinned reads.** They are simpler, but a reorg between two reads produces a response that matches no chain.
 - **Fetching missing artifacts from the node.** It hides storage gaps behind node latency and node availability, and the node's answer is not bound to the reader's epoch. A node-backed read differs in both respects: the light-wallet composition declares it per method, so no stored artifact is missing, and decision 7 binds its answer to the served tip.
@@ -60,6 +82,7 @@ A separate canonical writer can initialize from a publisher checkpoint after pri
 
 ## Revision history
 
+- 2026-11-28. Decision 8 records settled reads and the opening tail hash fence for wide native compact ranges.
 - 2026-11-24. Decision 7 shares the node schedule verification and served-tip checks across requests, and skips the tip check where the node reply binds itself to the served view.
 - 2026-11-24. Decision 7 binds lean wallet byte retrieval to indexed transaction evidence.
 - 2026-11-24. Linked ADR-0024 for initializing an independent writer from a verified snapshot.

@@ -74,9 +74,36 @@ the release claiming precision it does not have for native libraries.
    matches the Zebra and Zakura images, Zinder reads the node's mode-0600 RPC
    cookie directly without root privilege dropping.
 
+10. **Version the client contract before distributing language wrappers.**
+    The release workflow packages an independently pinnable protobuf module
+    and `FileDescriptorSet` in `zinder-api-docs-<tag>.tar.gz`. The archive
+    includes root `buf.yaml`, `buf.gen.yaml`, and
+    `zinder.contract.descriptor.bin`. Protobuf CI checks for breaking
+    changes. Packaging is implemented on `main` in
+    [#749](https://github.com/ZcashFoundation/zinder/pull/749), which closed
+    [#9](https://github.com/ZcashFoundation/zinder/issues/9). The Apple and
+    Android SDKs will distribute Mozilla UniFFI bindings as an XCFramework via
+    SwiftPM and an AAR via Maven Central. The TypeScript SDK will distribute
+    `@zcashfoundation/zinder-client` on npm using that protobuf module
+    over gRPC-Web. The pending UniFFI and TypeScript wrapper rollout
+    ([#704](https://github.com/ZcashFoundation/zinder/issues/704)) waits for
+    [#571](https://github.com/ZcashFoundation/zinder/issues/571) to stabilize
+    `sync_compact_blocks`.
+
+11. **Rust SDK crates share the workspace MSRV.** `zinder-core`,
+    `zinder-proto`, and `zinder-client` keep Rust 1.100 as their minimum
+    supported version. The FFI artifacts and npm SDK need no consumer
+    `rustc`. Reconsider a lower SDK MSRV only when a concrete Rust-source
+    consumer needs it and CI covers the split dependency graph.
+
 The release procedure and how operators verify a download are in
 [Releasing](../runbooks/releasing.md) and
 [Deploying on a VM](../runbooks/deploying-on-a-vm.md).
+
+## Evidence
+
+- Decision 10: Judgment. The versioned wire contract gives wrappers a shared compatibility baseline. Waiting for `sync_compact_blocks` gives them a common recovery contract. Reopen if a committed consumer demonstrates a distribution requirement the pinned contract cannot meet.
+- Decision 11: Judgment. One MSRV keeps one supported Rust dependency graph. A concrete Rust-source consumer that needs a lower version and CI coverage of the split graph would reopen it.
 
 ## Consequences
 
@@ -111,6 +138,8 @@ The release procedure and how operators verify a download are in
 
 ## Alternatives rejected
 
+- **Ship platform wrappers before the wire contract and sync API stabilize.** Each wrapper would establish a separate integration contract to maintain.
+- **Lower the SDK MSRV for binary consumers.** SwiftPM, Maven Central, and npm consumers install packaged artifacts without compiling Rust.
 - **Container images only.** Operators who supervise native processes would
   have to extract binaries from images themselves.
 - **One build per platform.** Nothing would detect a build that depends on
@@ -128,6 +157,7 @@ The release procedure and how operators verify a download are in
 
 ## Revision history
 
+- 2026-11-28. Decisions 10 and 11 record the implemented contract packaging, remaining SDK rollout gate, and workspace MSRV policy.
 - 2026-11-27. Added Apple Silicon and baseline x86-64 archives to the reproducible release workflow and included the personal-node Compose manifest in the signed asset catalog.
 - 2026-11-27. Removed the retired shielded history publisher role from decision 2 after Canonical Schema v2 cutover.
 - 2026-11-27. Consolidated the five runtime executables and separate runtime/single-volume images into the single `bin/zinder` archive binary and single distroless `ghcr.io/zcashfoundation/zinder` OCI image (`deploy/release-images.json`).

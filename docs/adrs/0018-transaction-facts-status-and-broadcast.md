@@ -77,10 +77,34 @@ matched substrings of node messages broke whenever the wording changed.
    [Storage backend](../architecture/storage-backend.md#canonical-store)
    defines the 72-byte row value.
 
+9. **Pruned history is a body availability failure.** Under the ratified
+   pruned-follow policy, a lean `READY` store backed solely by pruned
+   validators can locate a mined transaction after the validator prunes
+   its body. If forwarded history is pruned out,
+   `CompactTxStreamer.GetTransaction` returns `UNAVAILABLE`. An unavailable
+   native byte lookup returns a typed historical-body unavailability
+   error. Neither case can produce `TRANSACTION_NOT_FOUND`. The indexed
+   location and digest remain authoritative, and any bytes a validator
+   supplies must still pass decision 8. Discovery follows
+   [ADR-0015](0015-wallet-runtime-composition.md) decision 15.
+   [#713](https://github.com/ZcashFoundation/zinder/issues/713).
+
+10. **Broadcast and forwarded raw bytes stay validator-backed.** Transactions
+    go to admitted validator endpoints, with the broadcast failover in
+    [ADR-0015](0015-wallet-runtime-composition.md). A mined body also comes
+    from an admitted validator when it is not retained locally, subject to
+    the location and digest checks in decision 8. The validator-only
+    boundary in [ADR-0006](0006-node-source-boundary.md) applies to both.
+
 Method behavior is in
 [Wallet data plane](../architecture/wallet-data-plane.md), and error reasons
 with their retry rules are in
 [Error vocabulary](../reference/error-vocabulary.md).
+
+## Evidence
+
+- Decision 9: Judgment. The store can prove a transaction is mined even when the source lacks its body. Reopen if a consumer cannot distinguish a pruned body from proven absence using the typed status.
+- Decision 10: Judgment. Validator endpoints preserve the admitted authority for chain and broadcast decisions. [ADR-0006](0006-node-source-boundary.md#evidence) decision 10 gives the reopening condition.
 
 ## Consequences
 
@@ -101,6 +125,7 @@ with their retry rules are in
 
 ## Alternatives rejected
 
+- **Treat pruned history as absence or fetch it from P2P peers.** A missing body proves nothing about chain membership, and peer responses cannot replace admitted validator evidence. See [#709](https://github.com/ZcashFoundation/zinder/issues/709).
 - **Parse raw bytes at read time.** Each reader would own its own parser and
   its own bugs.
 - **Fill missing facts from the node at read time.** The answer would mix
@@ -115,6 +140,7 @@ with their retry rules are in
 
 ## Revision history
 
+- 2026-11-28. Decisions 9 and 10 define pruned-history errors and reaffirm validator authority for byte forwarding and broadcast.
 - 2026-11-27. Updated decision 8 to reflect Canonical Schema v2 (`none` or `all` raw-blob retention on `transaction_location`).
 
 - 2026-11-24. Mined byte reads can use the verified primary node and a bounded cache.

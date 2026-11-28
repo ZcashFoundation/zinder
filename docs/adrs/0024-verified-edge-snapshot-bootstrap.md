@@ -12,6 +12,8 @@ recipient independent cursor authentication and process state.
 
 ## Decision
 
+### Verified physical checkpoint
+
 Export a quiesced READY canonical store whose visible and settled tips name the
 same block at a height divisible by 4,096. A physical checkpoint captures the
 entire visible store. Prepare a publisher store at the desired boundary before
@@ -88,6 +90,50 @@ provenance and full bundle byte integrity. Validator attestation checks the
 consensus anchors and samples history. A trusted publisher remains responsible
 for the accuracy of historical rows outside those checks.
 
+### Shared HTTPS settled-segment pool
+
+The shipped `zinder-edge-snapshot.v1` path above retrieves whole files. The
+ratified distribution contract uses one public, versioned catalog and
+content-addressed object layout on static HTTPS. Published objects are
+immutable Schema v2 settled segments (`ZSHRNG02`, `ZSTSUP01`, `ZSBLKB01`).
+Within the versioned layout, the catalog and objects have immutable
+addresses derived from their SHA-256 digests. Each segment entry binds
+its format, height interval, byte length, and digest. The catalog is a
+public distribution contract separate from the store's internal
+`segments-manifest.json`.
+Track the RocksDB checkpoint and indexes separately per
+`(network, schema_version, stored_set)`. Regional seed hosts reuse the same
+pool and run their own single writer under [ADR-0004](0004-storage-and-deployment-topologies.md).
+[#478](https://github.com/ZcashFoundation/zinder/issues/478)
+and [#714](https://github.com/ZcashFoundation/zinder/issues/714).
+
+An expiring, domain-separated Ed25519-signed availability record binds the
+current catalog digest and revision for each track. Verify it against an
+explicit `--public-key` allowlist. For routine rotation, overlap the old and
+new public keys, then remove the retired key. Revalidate availability
+against the HTTPS origin before selecting a catalog and again before
+publication. Reject expired,
+withdrawn, or superseded records and revisions older than one already
+accepted for the track. Withdrawing the current record blocks new admission
+at once. Expiration bounds the lifetime of a previously signed record.
+
+Stream directly into private staging. Resume a partial object with
+`Range` and `If-Range` using its strong `ETag`. Append only a matching
+`206 Partial Content` response whose `Content-Range` starts at the staged
+offset and agrees with the expected length. If the origin does not support
+`206` or the representation changes, retain verified complete files and
+restart the partial file from byte zero. Verify signed length and digest
+before admitting each completed object.
+[RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#section-14).
+
+Physical checkpoint admission, readback, and validator RPC attestation still
+precede writer `READY` and publication. Each host generates a fresh
+`cursor_auth_key`. Attestation excludes P2P-only `NODE_TREE_ROOTS` under
+[ADR-0006](0006-node-source-boundary.md). Wallet HTTP range downloads share
+the object layout and use the TLS-authenticated Zinder digest trust path in
+[ADR-0014](0014-consumer-neutral-wallet-data-plane.md).
+[#697](https://github.com/ZcashFoundation/zinder/issues/697).
+
 ## Publication and recovery
 
 Bootstrap prepares the store beneath `<target>.bootstrap.staging`, with the
@@ -133,7 +179,50 @@ its validator. Run `zinder-ingest bootstrap-from-snapshot --source BUNDLE
 `BUNDLE`. Repeat `--public-key` during a publisher key transition.
 `--spot-check-blocks` sets a positive sample count.
 
+## Evidence
+
+- Shared catalog and independent checkpoint tracks: Judgment. Immutable
+  content can be shared across consumers, while each regional host needs
+  its own admitted writer. Regional recovery that cannot meet its objective
+  using the shared objects would reopen the split.
+- Transfer semantics: External constraint. RFC 9110 defines conditional
+  range requests, and an origin can ignore a range and return the entire
+  representation. A complete-file fallback preserves compatibility.
+- Direct-to-stage transfer: Judgment. Staging once avoids an extra disk
+  copy. Reopen if measured recovery shows the staging layout cannot verify
+  and resume safely after interrupted transfers.
+- Availability and rotation: Judgment. Current-origin revalidation,
+  expiration, and an explicit trust allowlist keep the catalog revocable
+  without a separate certificate revocation service. An expired, withdrawn,
+  or superseded catalog accepted by a receiver would reopen the design.
+- Writer attestation: Judgment. Publisher signatures authenticate bytes,
+  and an admitted validator attests to consensus anchors before publication.
+  A signed bundle that passes these checks with an incorrect attested anchor
+  would reopen admission.
+
+## Consequences
+
+- Regional hosts can share settled objects, with per-host checkpoints,
+  indexes, credentials, and validator following.
+- Range-aware origins save retransmission after an interruption. Simple
+  HTTPS origins can still resume at verified file boundaries.
+- Operators must keep the active availability record and trust keys current.
+  A withdrawn or expired publication cannot seed a new writer.
+
+## Alternatives rejected
+
+- **Publish the internal RocksDB segment manifest.** It would couple
+  consumers to an internal store inventory and lifecycle.
+- **Add a regional gRPC replication listener.** Regional seeding can
+  reuse the same static objects as snapshot bootstrap.
+- **Use an indefinite signature or add CRL/OCSP infrastructure.** An
+  indefinite signature can outlive withdrawal. An expiring record and
+  explicit trust rotation provide withdrawal and rollback protection
+  without a separate revocation system.
+
 ## Revision history
+
+- 2026-11-28. Added the ratified shared HTTPS segment pool, resumable transfers, and signed availability for regional bootstrap and wallet downloads.
 
 - 2026-11-27. Removed `canonical workload` from `ManifestAnchors` and documented `segments-manifest.json` / `segments/` within `canonical-rocksdb/` for Canonical Schema v2.
 - 2026-11-27. Retired the optional `sealed-history/` snapshot sidecar (`--include-sealed-history` / `--sealed-history-output`) after cutting lightwalletd streaming over directly to canonical `ZSHRNG02` segments inside the canonical store.
