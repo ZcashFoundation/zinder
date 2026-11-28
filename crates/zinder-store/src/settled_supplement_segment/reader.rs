@@ -1767,8 +1767,9 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
                     &raw_row_index,
                 ))?;
         let mut records = Vec::with_capacity(shielded_payloads.len());
+        let mut drop_behind = self.scan_drop_behind();
         for step in plan.chunks() {
-            records.extend(self.read_chunk_rows(step, verified_rows, None)?);
+            records.extend(self.read_chunk_rows(step, verified_rows, drop_behind.as_mut())?);
         }
         let mut artifacts = Vec::with_capacity(shielded_payloads.len());
         let base_row = plan.first_row();

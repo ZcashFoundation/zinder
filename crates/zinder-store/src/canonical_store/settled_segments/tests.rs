@@ -2642,6 +2642,71 @@ fn assert_raw_file_cap_presplit(modules: SettledSegmentModules) -> TestResult {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn canonical_reconstruction_discards_cold_supplement_chunks_only_when_constrained() -> TestResult {
+    use std::os::unix::fs::MetadataExt as _;
+
+    use super::store_access::{SegmentReplayReaders, reconstruct_segment_compact_range};
+
+    const BLOCKS: u32 = 512;
+    let dir = TempDir::new()?;
+    let config = SettledSegmentSealerConfig::new(
+        Network::ZcashRegtest,
+        TEST_SCHEMA_VERSION,
+        SettledSegmentModules {
+            supplement: true,
+            raw_bodies: false,
+        },
+    )
+    .with_segment_blocks(BLOCKS)
+    .with_supplement_options(SettledSupplementSegmentWriteOptions {
+        codec: crate::SupplementCompressionCodec::None,
+        chunk_blocks: 16,
+    });
+    let mut sealer = SettledSegmentSealer::new(dir.path(), config, None)?;
+    let entry =
+        push_synthetic_range(&mut sealer, 1..=BLOCKS, false)?.ok_or("expected sealed stride")?;
+    let paths = SettledSegmentFilePaths::for_entry(dir.path(), &entry)?;
+    let supplement_path = paths.supplement.ok_or("missing supplement path")?;
+    let inode = fs::metadata(supplement_path)?.ino().to_string();
+    let is_supplement_discard = |event: &zinder_testkit::CapturedEvent| {
+        event.field("event") == Some("settled_scan_discard_pages")
+            && event.field("inode") == Some(inode.as_str())
+    };
+    let range = BlockHeightRange::inclusive(entry.start_height, entry.end_block.height);
+    let expected: Vec<_> = (1..=BLOCKS)
+        .map(|height| build_block_input(height, false).compact_block)
+        .collect();
+    for budget in [NonZeroU64::new(1), None] {
+        let cache = SettledSegmentReaderCache::with_corpus_budget(
+            dir.path(),
+            std::slice::from_ref(&entry),
+            budget,
+        )?;
+        let readers = SegmentReplayReaders {
+            shielded: cache.get_or_open_shielded(&entry)?,
+            supplement: cache.get_or_open_supplement(&entry)?,
+        };
+        let cold = zinder_testkit::LogCapture::install_for_target("zinder::store");
+        assert_eq!(
+            reconstruct_segment_compact_range(&readers, range)?,
+            expected
+        );
+        assert_eq!(cold.any(is_supplement_discard), budget.is_some());
+        drop(cold);
+
+        let hit = zinder_testkit::LogCapture::install_for_target("zinder::store");
+        let single = BlockHeightRange::inclusive(range.start, range.start);
+        assert_eq!(
+            reconstruct_segment_compact_range(&readers, single)?,
+            expected[..1]
+        );
+        assert!(!hit.any(is_supplement_discard));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn portable_cold_admission_discards_verified_payload_and_indexes_only_when_constrained()
 -> TestResult {
     const BLOCKS: u32 = 2_048;
