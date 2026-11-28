@@ -1,0 +1,61 @@
+[package]
+name = "wallet-scan-experiment"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+description = "Reproducible compact-block scan experiments"
+categories = ["development-tools::profiling"]
+keywords = ["zcash", "benchmark"]
+
+[features]
+default = ["archive", "runner"]
+runner = ["dep:clap", "dep:rustix", "dep:sha2", "dep:hex"]
+archive = ["dep:clap", "dep:prost", "dep:tempfile", "dep:zinder-core", "dep:zinder-store", "dep:zinder-proto"]
+
+[[bin]]
+name = "export-wallet-scan-corpus"
+path = "src/export.rs"
+required-features = ["archive"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "compare-wallet-scans"
+path = "src/compare.rs"
+required-features = ["runner"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.130"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["time"], optional = true }
+
+[dependencies]
+blake2b_simd.workspace = true
+chacha20 = "0.10.2"
+num-bigint = "0.4.8"
+orchard.workspace = true
+zcash_note_encryption = "0.5.1"
+clap = { workspace = true, features = ["derive"], optional = true }
+eyre.workspace = true
+pasta_curves = { version = "0.6.3", features = ["glv"] }
+prost = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+zinder-core = { workspace = true, optional = true }
+zinder-proto = { workspace = true, optional = true }
+zinder-store = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rust-rocksdb.workspace = true
+zinder-testkit.workspace = true
+
+[lints]
+workspace = true
