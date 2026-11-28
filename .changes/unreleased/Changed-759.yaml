@@ -1,0 +1,7 @@
+kind: changed
+body: Separate `DEPLOY_*` Compose, systemd, and Caddy orchestration variables in `--env-file deploy/profiles/<network>/deploy.env` from `ZINDER_*` runtime settings passed via `env_file:` in `deploy/profiles/<network>/zinder.env`, and remove the legacy combined `deploy/.env.*` files.
+time: 2026-11-28T10:39:21Z
+custom:
+  Bump: major
+  PR: "759"
+  Upgrade: compatible
