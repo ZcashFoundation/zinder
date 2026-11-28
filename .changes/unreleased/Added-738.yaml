@@ -1,0 +1,7 @@
+kind: added
+body: Paginate GetAddressUtxos and GetAddressUtxosStream at complete block heights within maxEntries. If the first height exceeds maxEntries, retry with the count from MAX_ENTRIES_EXCEEDED_AT_HEIGHT. In light-wallet serving, 100,000 outputs at the first height followed by more matching outputs can fail with RESOURCE_EXHAUSTED because the node lookup cannot end at that height.
+time: 2026-11-27T23:30:44.883973847Z
+custom:
+    Bump: minor
+    PR: "738"
+    Upgrade: compatible

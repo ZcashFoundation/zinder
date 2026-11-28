@@ -49,9 +49,9 @@ use zinder_source::{
 use zinder_store::{ArtifactFamily, BlockHashLookup};
 
 use super::{
-    CanonicalTransactionMiss, GrpcStream, LightwalletdGrpcAdapter,
+    AddressUtxoResponseBudget, CanonicalTransactionMiss, GrpcStream, LightwalletdGrpcAdapter,
     SUBTREE_ROOT_STREAM_CHANNEL_CAPACITY, SubtreeRootReads, SubtreeRootsStream,
-    address_utxo_limit_exceeded, lightwalletd_tree_state, lightwalletd_tree_state_from_hex,
+    address_utxo_height_limit_exceeded, lightwalletd_tree_state, lightwalletd_tree_state_from_hex,
     reject_future_tree_state_height, reject_genesis_tree_state, require_sapling_tree_state,
     send_response_from_broadcast_outcome, shielded_protocol_from_request, spawn_response_stream,
     standard_fee_response, transparent_address_tx_history_request, tree_state_block_lookup_status,
@@ -338,8 +338,13 @@ impl NodeBackedLightWallet {
         response_limit: NonZeroU32,
         method: &'static str,
         tip_wait: &TipWait,
-    ) -> Result<Option<(Vec<SourceTransparentUnspentOutput>, ForwardedResponsePermit)>, Status>
-    {
+    ) -> Result<
+        Option<(
+            Vec<lightwalletd::GetAddressUtxosReply>,
+            ForwardedResponsePermit,
+        )>,
+        Status,
+    > {
         if request.addresses.is_empty() {
             return Ok(None);
         }
@@ -362,7 +367,7 @@ impl NodeBackedLightWallet {
         // request never holds a node-call slot while it waits, and it is
         // dropped before TipWait waits on a mismatch.
         let deadline = self.reads.deadline();
-        let (mut rows, response_permit) = self
+        let (rows, response_permit) = self
             .run_with_tip_wait(method, tip_wait, deadline, || async {
                 let response_permit = self
                     .reads
@@ -380,26 +385,21 @@ impl NodeBackedLightWallet {
                     kind: ForwardedReadKind::Utxo,
                     deadline,
                 };
+                let max_entries = request.max_entries.min(response_limit.get());
                 let rows =
-                    wallet_ordered_utxos(&reads, &lookup, height, request.max_entries, view.tip)
-                        .await?;
+                    height_complete_utxos(&reads, &lookup, height, max_entries, view.tip).await?;
                 Ok((rows, response_permit))
             })
             .await?;
-        let count = wallet_utxo_response_len(rows.len(), request.max_entries, response_limit)?;
-        if count == 0 {
+        let replies = utxo_page_replies(
+            rows,
+            request.max_entries,
+            u32_to_usize(response_limit.get()),
+        )?;
+        if replies.is_empty() {
             return Ok(None);
         }
-        rows.sort_unstable_by_key(|row| {
-            (
-                row.block_height,
-                row.outpoint.transaction_id,
-                row.outpoint.output_index,
-            )
-        });
-        rows.truncate(count);
-        rows.shrink_to_fit();
-        Ok(Some((rows, response_permit)))
+        Ok(Some((replies, response_permit)))
     }
 
     async fn run_with_tip_wait<T, Attempt, Fut>(
@@ -550,20 +550,6 @@ fn forwarded_transaction_status(error: ForwardedTransactionError) -> Status {
     forwarded_query_status(QueryError::from(error))
 }
 
-fn wallet_utxo_response_len(
-    available: usize,
-    requested: u32,
-    limit: NonZeroU32,
-) -> Result<usize, Status> {
-    let count =
-        NonZeroU32::new(requested).map_or(available, |max| available.min(u32_to_usize(max.get())));
-    let limit = u32_to_usize(limit.get());
-    if count > limit {
-        return Err(address_utxo_limit_exceeded(limit));
-    }
-    Ok(count)
-}
-
 fn indexed_address(text: &str, network: Network) -> Result<Address, Status> {
     let address =
         parse_transparent_address(text).map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -610,17 +596,18 @@ async fn served_utxo_page(
     }
 }
 
-/// The node orders same-height outputs by block position, the wallet by txid.
+/// Reads a height-complete prefix in the node's transaction order.
 ///
-/// Complete the last height before sorting a bounded prefix. A second lookup
-/// starts at that height so earlier outputs cannot exhaust its row budget.
-async fn wallet_ordered_utxos(
+/// A second lookup starts at the cutoff height so earlier outputs cannot
+/// exhaust its row budget.
+async fn height_complete_utxos(
     node: &NodeReads<'_>,
     lookup: &TransparentAddressLookup,
     height: BlockHeight,
     max_entries: u32,
     served: BlockId,
 ) -> Result<Vec<SourceTransparentUnspentOutput>, UtxoAttemptError> {
+    let max_entries = max_entries.min(TransparentAddressRowLimit::MAX.get());
     let Some(requested) = TransparentAddressRowLimit::new(max_entries) else {
         return Ok(served_utxo_page(node, lookup, height, None, served)
             .await?
@@ -630,16 +617,21 @@ async fn wallet_ordered_utxos(
         .unwrap_or(TransparentAddressRowLimit::MAX);
     let page = served_utxo_page(node, lookup, height, Some(limit), served).await?;
     let mut rows = page.outputs;
-    if rows.len() < u32_to_usize(requested.get()) {
+    let max_entries = u32_to_usize(requested.get());
+    if rows.len() < max_entries {
         return Ok(rows);
     }
-    let cutoff = rows[u32_to_usize(requested.get() - 1)].block_height;
+    let cutoff = rows[max_entries - 1].block_height;
     let through_cutoff = rows.partition_point(|row| row.block_height <= cutoff);
+    let before_cutoff = rows.partition_point(|row| row.block_height < cutoff);
+    if before_cutoff > 0 && through_cutoff > max_entries {
+        rows.truncate(before_cutoff);
+        return Ok(rows);
+    }
     if page.complete || through_cutoff < rows.len() {
         rows.truncate(through_cutoff);
         return Ok(rows);
     }
-    let before_cutoff = rows.partition_point(|row| row.block_height < cutoff);
     // Every reread answers at the served tip, so it must agree with every
     // earlier page: it repeats, in order, the longest run of cutoff-height
     // outputs seen so far, and names no output an earlier page placed below
@@ -669,6 +661,9 @@ async fn wallet_ordered_utxos(
         if !agrees {
             return Err(UtxoAttemptError::PagesDisagreed);
         }
+        if before_cutoff > 0 && before_cutoff + at_cutoff > max_entries {
+            return Ok(rows);
+        }
         let finished = unbounded || page.complete || at_cutoff < page.outputs.len();
         verified = page.outputs;
         verified.truncate(at_cutoff);
@@ -678,6 +673,42 @@ async fn wallet_ordered_utxos(
     }
     rows.append(&mut verified);
     Ok(rows)
+}
+
+fn utxo_page_replies(
+    rows: Vec<SourceTransparentUnspentOutput>,
+    max_entries: u32,
+    response_limit: usize,
+) -> Result<Vec<lightwalletd::GetAddressUtxosReply>, Status> {
+    let mut budget = AddressUtxoResponseBudget::new(response_limit);
+    let mut replies = Vec::new();
+    let mut height = None;
+    let mut height_start = 0;
+    for row in rows {
+        let reply = utxo_reply(row)?;
+        if height != Some(reply.height) {
+            height = Some(reply.height);
+            height_start = replies.len();
+        }
+        if let Err(status) = budget.record(&reply) {
+            if max_entries == 0 || height_start == 0 {
+                return Err(status);
+            }
+            replies.truncate(height_start);
+            break;
+        }
+        replies.push(reply);
+    }
+    if let Some(first) = replies.first()
+        && max_entries != 0
+        && replies.len() > u32_to_usize(max_entries)
+    {
+        return Err(address_utxo_height_limit_exceeded(
+            first.height,
+            replies.len(),
+        ));
+    }
+    Ok(replies)
 }
 
 fn utxo_reply(
@@ -1439,8 +1470,9 @@ impl compact_tx_streamer_server::CompactTxStreamer
                 lightwalletd::GetAddressUtxosReplyList::default(),
             ));
         };
-        let address_utxos = rows.into_iter().map(utxo_reply).collect::<Result<_, _>>()?;
-        let mut response = Response::new(lightwalletd::GetAddressUtxosReplyList { address_utxos });
+        let mut response = Response::new(lightwalletd::GetAddressUtxosReplyList {
+            address_utxos: rows,
+        });
         response.extensions_mut().insert(UtxoResponsePermit {
             _permit: Arc::new(permit),
         });
@@ -1467,10 +1499,9 @@ impl compact_tx_streamer_server::CompactTxStreamer
             Some((rows, permit)) => Box::pin(try_unfold(
                 (rows.into_iter(), Some(permit)),
                 |(mut rows, mut permit)| async move {
-                    let Some(row) = rows.next() else {
+                    let Some(reply) = rows.next() else {
                         return Ok(None);
                     };
-                    let reply = utxo_reply(row)?;
                     if rows.as_slice().is_empty() {
                         rows = Vec::new().into_iter();
                         permit = None;
@@ -1702,23 +1733,6 @@ mod tests {
         drop(stream);
         assert!(slot_free(&reads, kind).await);
         Ok(())
-    }
-
-    #[test]
-    fn light_wallet_utxo_limit_applies_to_the_requested_response() {
-        let limit = NonZeroU32::MIN.saturating_add(9);
-        for (available, requested, expected) in [(20, 4, 4), (20, 10, 10), (10, 0, 10), (7, 11, 7)]
-        {
-            assert_eq!(
-                wallet_utxo_response_len(available, requested, limit).ok(),
-                Some(expected)
-            );
-        }
-        for requested in [0, 11] {
-            assert!(
-                matches!(wallet_utxo_response_len(20, requested, limit), Err(status) if status.code() == tonic::Code::ResourceExhausted)
-            );
-        }
     }
 
     #[test]

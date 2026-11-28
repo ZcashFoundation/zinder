@@ -8,16 +8,18 @@ use std::sync::{
 };
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashSet},
+    collections::{BinaryHeap, HashSet, binary_heap::PeekMut},
     num::{NonZeroU16, NonZeroU32},
     pin::Pin,
     time::{Duration, Instant},
 };
 
+use prost::Message as _;
 use thiserror::Error;
 use tokio_stream as stream;
 use tokio_stream::StreamExt as _;
 use tonic::{Request, Response, Status};
+use tonic_types::{ErrorDetails, StatusExt as _};
 use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHeight, BlockSelector, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
@@ -71,12 +73,11 @@ pub(crate) type GrpcStream<T> =
 
 /// Default number of subtree roots one native read returns while `GetSubtreeRoots` streams.
 pub const DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
-/// Default maximum transparent UTXOs one `GetAddressUtxos` response returns.
-///
-/// It equals Zebra's `getaddressutxos` result cap, which bounds lightwalletd
-/// on Zebra the same way.
+/// Default maximum transparent UTXOs in one compatibility response.
 pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 =
     NonZeroU32::MIN.saturating_add(99_999);
+/// Maximum encoded reply-list size, applied to both UTXO methods.
+const ADDRESS_UTXO_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Native per-request subtree-root cap expressed as a `NonZeroU32`.
 const MAX_SUBTREE_ROOT_PAGE_SIZE: NonZeroU32 =
     NonZeroU32::MIN.saturating_add(MAX_SUBTREE_ROOTS_PER_REQUEST - 1);
@@ -127,10 +128,9 @@ pub struct LightwalletdResponseLimits {
     /// Most UTXOs one `GetAddressUtxos` or `GetAddressUtxosStream` response
     /// returns.
     ///
-    /// `maxEntries = 0` means every matching UTXO, as in lightwalletd. A
-    /// request that would return more than this bound fails with
-    /// `RESOURCE_EXHAUSTED` instead of dropping rows, so a wallet never sums
-    /// a partial UTXO set as its balance.
+    /// With a positive `maxEntries`, a page omits a subsequent height that
+    /// would exceed the bound. If the first height or an unpaginated response
+    /// exceeds the bound, the call fails with `RESOURCE_EXHAUSTED`.
     pub max_address_utxos: NonZeroU32,
 }
 
@@ -837,7 +837,10 @@ where
                 .map(|query_request| (address, query_request))
             })
             .collect::<Result<Vec<_>, Status>>()?;
-        let first_page_size = address_utxo_first_page_size(distinct_addresses.len(), max_entries);
+        let first_page_size = address_utxo_first_page_size(
+            distinct_addresses.len(),
+            max_entries.map(|target| target.min(response_limit)),
+        );
         for (address, query_request) in distinct_addresses {
             let outputs = self
                 .query_api
@@ -1862,8 +1865,7 @@ where
 }
 
 /// The first page size of every address stream of a UTXO request that lists
-/// `distinct_addresses` distinct addresses and returns at most `max_entries`
-/// rows.
+/// `distinct_addresses` distinct addresses and targets `max_entries` rows.
 ///
 /// Each address gets an even share of [`ADDRESS_UTXO_FIRST_PAGE_BUDGET`],
 /// capped at the 1,024-output page and at `max_entries`, but never fewer than
@@ -1884,28 +1886,16 @@ fn address_utxo_first_page_size(
         )
 }
 
-/// The unspent outputs of several addresses, merged into the order of one
-/// lightwalletd UTXO response: height, txid, output index, then address.
+/// An epoch-bound merge of on-demand address streams.
 ///
-/// Each address's stream is already in that order for its own outputs, so
-/// the merge holds only the next output of each address. The streams read
-/// on demand at the one chain epoch the request resolved, starting at the
-/// first page [`address_utxo_first_page_size`] chooses. A later page holds at
-/// most the outputs the merge has taken from that address plus one first
-/// page, and every output the merge takes is sent as one row. So the outputs
-/// read stay within about twice the rows sent, plus 2 outputs and one first
-/// page for each distinct address, and the first pages together hold at most
-/// 8,192 outputs, or 16 for each distinct address past 512.
+/// The storage index orders by height and outpoint. The merge stages one
+/// height within the response budget and sorts it by transaction position.
 struct AddressUtxoMerge {
     addresses: Vec<MergedAddress>,
     next_outputs: BinaryHeap<Reverse<NextAddressUtxo>>,
-    /// The address whose last row was taken and whose next output is read
-    /// only when the response needs another row, so a response never reads
-    /// past the last row it sends.
-    awaiting_next_output: Option<usize>,
-    max_entries: Option<usize>,
-    response_limit: usize,
-    sent: usize,
+    current_height: std::vec::IntoIter<NextAddressUtxo>,
+    page_entry_limit: Option<usize>,
+    budget: AddressUtxoResponseBudget,
     ended: bool,
 }
 
@@ -1919,23 +1909,22 @@ struct MergedAddress {
 struct NextAddressUtxo {
     reply: lightwalletd::GetAddressUtxosReply,
     address_position: usize,
+    tx_index: u32,
 }
 
 impl NextAddressUtxo {
-    fn order_key(&self) -> (u64, &[u8], i32, &str, usize) {
-        (
-            self.reply.height,
-            self.reply.txid.as_slice(),
-            self.reply.index,
-            self.reply.address.as_str(),
-            self.address_position,
-        )
+    const fn merge_key(&self) -> (u64, usize) {
+        (self.reply.height, self.address_position)
+    }
+
+    fn block_order_key(&self) -> (u32, i32, &[u8]) {
+        (self.tx_index, self.reply.index, self.reply.txid.as_slice())
     }
 }
 
 impl PartialEq for NextAddressUtxo {
     fn eq(&self, other: &Self) -> bool {
-        self.order_key() == other.order_key()
+        self.merge_key() == other.merge_key()
     }
 }
 
@@ -1949,19 +1938,18 @@ impl PartialOrd for NextAddressUtxo {
 
 impl Ord for NextAddressUtxo {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.order_key().cmp(&other.order_key())
+        self.merge_key().cmp(&other.merge_key())
     }
 }
 
 impl AddressUtxoMerge {
-    const fn new(max_entries: Option<usize>, response_limit: usize) -> Self {
+    fn new(max_entries: Option<usize>, response_limit: usize) -> Self {
         Self {
             addresses: Vec::new(),
             next_outputs: BinaryHeap::new(),
-            awaiting_next_output: None,
-            max_entries,
-            response_limit,
-            sent: 0,
+            current_height: Vec::new().into_iter(),
+            page_entry_limit: max_entries.map(|limit| limit.min(response_limit)),
+            budget: AddressUtxoResponseBudget::new(response_limit),
             ended: false,
         }
     }
@@ -1980,12 +1968,13 @@ impl AddressUtxoMerge {
         let Some(merged) = self.addresses.get_mut(address_position) else {
             return Ok(());
         };
-        match merged.outputs.next().await {
-            Some(Ok(utxo)) => {
-                let reply = lightwalletd_address_utxo(&merged.address, &utxo)?;
+        match merged.outputs.next_with_tx_index().await {
+            Some(Ok((tx_index, utxo))) => {
+                let reply = lightwalletd_address_utxo(&merged.address, utxo)?;
                 self.next_outputs.push(Reverse(NextAddressUtxo {
                     reply,
                     address_position,
+                    tx_index,
                 }));
                 Ok(())
             }
@@ -1994,50 +1983,125 @@ impl AddressUtxoMerge {
         }
     }
 
-    /// Reads the next output of the address whose last row was taken.
-    async fn read_awaited_output(&mut self) -> Result<(), Status> {
-        match self.awaiting_next_output.take() {
-            Some(address_position) => self.read_next_output(address_position).await,
-            None => Ok(()),
+    async fn read_height(&mut self) -> Result<Vec<NextAddressUtxo>, Status> {
+        let Some(Reverse(first)) = self.next_outputs.peek() else {
+            return Ok(Vec::new());
+        };
+        let height = first.reply.height;
+        let first_height = self.budget.entries == 0;
+        let mut outputs = Vec::new();
+        while let Some(Reverse(next_output)) = self
+            .next_outputs
+            .peek_mut()
+            .filter(|next_output| next_output.0.reply.height == height)
+            .map(PeekMut::pop)
+        {
+            if !first_height && self.page_entry_limit == Some(self.budget.entries) {
+                self.ended = true;
+                return Ok(Vec::new());
+            }
+            if let Err(status) = self.budget.record(&next_output.reply) {
+                if first_height || self.page_entry_limit.is_none() {
+                    return Err(status);
+                }
+                self.ended = true;
+                return Ok(Vec::new());
+            }
+            self.read_next_output(next_output.address_position).await?;
+            outputs.push(next_output);
         }
-    }
-
-    /// Takes the lowest next output as the next row to send.
-    fn take_next_row(&mut self) -> Option<lightwalletd::GetAddressUtxosReply> {
-        let Reverse(next_output) = self.next_outputs.pop()?;
-        self.awaiting_next_output = Some(next_output.address_position);
-        Some(next_output.reply)
+        if first_height
+            && self
+                .page_entry_limit
+                .is_some_and(|limit| outputs.len() > limit)
+        {
+            return Err(address_utxo_height_limit_exceeded(height, outputs.len()));
+        }
+        outputs
+            .sort_unstable_by(|left, right| left.block_order_key().cmp(&right.block_order_key()));
+        Ok(outputs)
     }
 }
 
 impl ResponseSource for AddressUtxoMerge {
     type Message = lightwalletd::GetAddressUtxosReply;
 
-    /// Sends at most `maxEntries` rows. Without a `maxEntries` within the
-    /// response limit, a row past the limit fails the response with
-    /// `RESOURCE_EXHAUSTED` instead of ending it as if it were complete.
     async fn next(&mut self) -> Option<Result<Self::Message, Status>> {
+        if let Some(output) = self.current_height.next() {
+            return Some(Ok(output.reply));
+        }
         if self.ended
             || self
-                .max_entries
-                .is_some_and(|max_entries| self.sent >= max_entries)
+                .page_entry_limit
+                .is_some_and(|target| self.budget.entries >= target)
         {
             return None;
         }
-        if let Err(status) = self.read_awaited_output().await {
-            self.ended = true;
-            return Some(Err(status));
+        match self.read_height().await {
+            Ok(outputs) => {
+                self.current_height = outputs.into_iter();
+                self.current_height.next().map(|output| Ok(output.reply))
+            }
+            Err(status) => {
+                self.ended = true;
+                Some(Err(status))
+            }
         }
-        if self.next_outputs.is_empty() {
-            return None;
+    }
+}
+
+fn address_utxo_height_limit_exceeded(height: u64, count: usize) -> Status {
+    let mut details = ErrorDetails::new();
+    details.set_error_info(
+        "MAX_ENTRIES_EXCEEDED_AT_HEIGHT",
+        "cash.z.wallet.sdk.rpc",
+        [
+            ("height".to_owned(), height.to_string()),
+            ("count".to_owned(), count.to_string()),
+        ],
+    );
+    Status::with_error_details(
+        tonic::Code::FailedPrecondition,
+        format!("height {height} has {count} unspent outputs, exceeding maxEntries"),
+        details,
+    )
+}
+
+/// Counts each row as a field of the unary reply, including its protobuf
+/// tag and length prefix, so the same byte bound applies to both RPCs.
+struct AddressUtxoResponseBudget {
+    entry_limit: usize,
+    entries: usize,
+    bytes: usize,
+}
+
+impl AddressUtxoResponseBudget {
+    const fn new(entry_limit: usize) -> Self {
+        Self {
+            entry_limit,
+            entries: 0,
+            bytes: 0,
         }
-        if self.sent >= self.response_limit {
-            self.ended = true;
-            return Some(Err(address_utxo_limit_exceeded(self.response_limit)));
+    }
+
+    fn record(&mut self, reply: &lightwalletd::GetAddressUtxosReply) -> Result<(), Status> {
+        if self.entries == self.entry_limit {
+            return Err(Status::resource_exhausted(format!(
+                "more unspent outputs match than the {} one response returns",
+                self.entry_limit
+            )));
         }
-        let row = self.take_next_row()?;
-        self.sent += 1;
-        Some(Ok(row))
+        let bytes = reply.encoded_len();
+        self.bytes = self
+            .bytes
+            .saturating_add(1 + prost::length_delimiter_len(bytes) + bytes);
+        if self.bytes > ADDRESS_UTXO_RESPONSE_MAX_BYTES {
+            return Err(Status::resource_exhausted(format!(
+                "unspent-output response exceeds {ADDRESS_UTXO_RESPONSE_MAX_BYTES} encoded bytes"
+            )));
+        }
+        self.entries += 1;
+        Ok(())
     }
 }
 
@@ -2191,14 +2255,14 @@ fn transparent_address_unspent_outputs_request(
 
 fn lightwalletd_address_utxo(
     address: &str,
-    utxo: &TransparentUnspentOutput,
+    utxo: TransparentUnspentOutput,
 ) -> Result<lightwalletd::GetAddressUtxosReply, Status> {
     Ok(lightwalletd::GetAddressUtxosReply {
         address: address.to_owned(),
         txid: encode_internal_transaction_id(utxo.outpoint.transaction_id).to_vec(),
         index: i32::try_from(utxo.outpoint.output_index)
             .map_err(|_| Status::data_loss("transparent output index exceeds i32"))?,
-        script: utxo.script_pub_key.clone(),
+        script: utxo.script_pub_key,
         value_zat: i64::try_from(utxo.value_zat)
             .map_err(|_| Status::data_loss("transparent output value exceeds i64"))?,
         height: u64::from(utxo.block_height.value()),
@@ -2228,12 +2292,6 @@ fn standard_fee_response(
         }
         Err(error) => Err(status_from_query_error(&error)),
     }
-}
-
-fn address_utxo_limit_exceeded(response_limit: usize) -> Status {
-    Status::resource_exhausted(format!(
-        "more unspent outputs match than the {response_limit} one response returns"
-    ))
 }
 
 /// Maps a tree-state read failure to the lightwalletd status.
@@ -2903,6 +2961,61 @@ mod tests {
             address_count: 1,
             chain_epoch: test_chain_epoch(),
         }
+    }
+
+    #[tokio::test]
+    async fn address_utxo_byte_cap_omits_a_later_height_on_paginated_reads() {
+        let reply = lightwalletd::GetAddressUtxosReply {
+            height: 2,
+            ..Default::default()
+        };
+        let encoded_bytes = lightwalletd::GetAddressUtxosReplyList {
+            address_utxos: vec![reply.clone()],
+        }
+        .encoded_len();
+        for max_entries in [Some(3), None] {
+            let mut merge = AddressUtxoMerge::new(max_entries, 100_000);
+            merge.budget.entries = 1;
+            merge.budget.bytes = ADDRESS_UTXO_RESPONSE_MAX_BYTES - encoded_bytes;
+            for address_position in [0, 1] {
+                merge.next_outputs.push(Reverse(NextAddressUtxo {
+                    reply: reply.clone(),
+                    address_position,
+                    tx_index: 0,
+                }));
+            }
+            let next = merge.next().await;
+            if max_entries.is_some() {
+                assert!(next.is_none());
+            } else {
+                assert!(matches!(
+                    next,
+                    Some(Err(status)) if status.code() == tonic::Code::ResourceExhausted
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn address_utxo_budget_counts_the_reply_list_encoding() -> Result<(), Status> {
+        let reply = lightwalletd::GetAddressUtxosReply {
+            script: vec![0; 128],
+            height: 1,
+            ..Default::default()
+        };
+        let encoded_bytes = lightwalletd::GetAddressUtxosReplyList {
+            address_utxos: vec![reply.clone()],
+        }
+        .encoded_len();
+        let mut budget = AddressUtxoResponseBudget::new(2);
+        budget.bytes = ADDRESS_UTXO_RESPONSE_MAX_BYTES - encoded_bytes;
+        budget.record(&reply)?;
+        assert_eq!(budget.bytes, ADDRESS_UTXO_RESPONSE_MAX_BYTES);
+        assert!(matches!(
+            budget.record(&reply),
+            Err(status) if status.code() == tonic::Code::ResourceExhausted
+        ));
+        Ok(())
     }
 
     /// Up to eight addresses read full first pages, more addresses share the

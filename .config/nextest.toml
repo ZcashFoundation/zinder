@@ -50,12 +50,16 @@ filter = "test(publication_crashes_preserve_the_atomic_build_state) | test(live_
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
-# These tests build a wallet store holding thousands of unspent outputs, for
-# one address whose production-sized stream spans several 1,024-output pages,
-# or for the 60 busy addresses the lightwalletd merge bound is checked
-# across. The build takes seconds alone and more under full-workspace
-# parallelism, which crosses the 20s default kill window.
-filter = "test(abandoned_and_stalled_unspent_output_reads_do_not_stop_publication) | test(cancelling_an_unspent_output_stream_stops_its_storage_reads_and_releases_its_pair) | test(address_utxos_bound_the_outputs_held_across_many_addresses)"
+# These tests build wallet stores with thousands of unspent outputs to
+# exercise reader retention, backpressure, and page bounds. The largest
+# fixture contains 100,002 outputs. Builds can exceed the default kill
+# window under full-workspace parallelism.
+filter = """
+test(abandoned_and_stalled_unspent_output_reads_do_not_stop_publication)
+| test(cancelling_an_unspent_output_stream_stops_its_storage_reads_and_releases_its_pair)
+| test(address_utxos_bound_the_outputs_held_across_many_addresses)
+| test(wallet_utxo_pages_continue_past_the_response_row_limit)
+"""
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
@@ -120,9 +124,10 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # than once for each node. Each RPC has its own 30s timeout.
 filter = """
 package(=zinder-compat-lightwalletd) & (
-  test(cap_sized_cutoff_height_returns_a_smaller_wallet_ordered_prefix)
-  | test(cap_sized_multi_height_prefix_stays_bounded_and_wallet_ordered)
+  test(cap_sized_first_height_reports_the_count_and_accepts_an_exact_retry)
+  | test(cap_sized_multi_height_prefix_stays_bounded_and_ordered)
   | test(later_outputs_can_prevent_proving_a_full_cutoff_height)
+  | test(forwarded_utxo_pages_continue_past_the_response_row_limit)
 )
 """
 slow-timeout = { period = "30s", terminate-after = 2 }

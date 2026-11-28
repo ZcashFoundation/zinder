@@ -15,6 +15,7 @@ use std::{
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tonic::{Code, Request, transport::Server};
+use tonic_types::StatusExt as _;
 use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
@@ -26,7 +27,7 @@ use zinder_core::{
     ConsensusBranchId, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
     SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, TransparentOutpointSpendStatus,
-    TransparentUnspentOutput, wire::encode_branch_id_hex,
+    TransparentOutputFact, TransparentUnspentOutput, wire::encode_branch_id_hex,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -185,7 +186,7 @@ async fn production_pair_serves_transparent_utxo_contract_and_support_signal() -
         }))
         .await?
         .into_inner();
-    assert_eq!(capped.address_utxos.len(), 2);
+    assert_eq!(capped.address_utxos.len(), 1);
 
     let transaction = adapter
         .get_transaction(Request::new(lightwalletd::TxFilter {
@@ -586,13 +587,9 @@ async fn address_utxos_with_zero_max_entries_return_every_utxo_like_lightwalletd
     Ok(())
 }
 
-/// A response bound fails the request instead of dropping UTXOs.
-///
-/// The list fails before it returns any row. The stream sends the rows within
-/// the bound and then fails. A positive `maxEntries` within the bound keeps
-/// lightwalletd's truncation to the oldest rows in chain order.
+/// A height that exceeds the response bound fails even with a smaller target.
 #[tokio::test]
-async fn address_utxos_over_the_response_limit_fail_instead_of_truncating() -> eyre::Result<()> {
+async fn address_utxos_refuse_a_height_over_the_response_limit() -> eyre::Result<()> {
     let utxo_count = 1_001_u32;
     let response_limit = NonZeroU32::MIN.saturating_add(999);
     let (mut store_fixture, address_text) = many_utxo_fixture(0x35, utxo_count)?;
@@ -616,7 +613,7 @@ async fn address_utxos_over_the_response_limit_fail_instead_of_truncating() -> e
         max_entries,
     };
 
-    for max_entries in [0, utxo_count] {
+    for max_entries in [0, response_limit.get(), utxo_count] {
         let list_status = adapter
             .get_address_utxos(Request::new(request(max_entries)))
             .await
@@ -625,8 +622,6 @@ async fn address_utxos_over_the_response_limit_fail_instead_of_truncating() -> e
                 eyre::eyre!("maxEntries {max_entries} must exceed the response limit")
             })?;
         assert_eq!(list_status.code(), Code::ResourceExhausted);
-        // The stream sends rows as it merges them, so it sends the rows within
-        // the bound and then fails rather than ending as if complete.
         let (streamed, stream_status) = drain_until_error(
             adapter
                 .get_address_utxos_stream(Request::new(request(max_entries)))
@@ -634,7 +629,7 @@ async fn address_utxos_over_the_response_limit_fail_instead_of_truncating() -> e
                 .into_inner(),
         )
         .await;
-        assert_eq!(streamed.len(), u32_to_usize(response_limit.get()));
+        assert_eq!(streamed, []);
         assert_eq!(
             stream_status.map(|status| status.code()),
             Some(Code::ResourceExhausted),
@@ -642,20 +637,6 @@ async fn address_utxos_over_the_response_limit_fail_instead_of_truncating() -> e
         );
     }
 
-    let truncated = adapter
-        .get_address_utxos(Request::new(request(response_limit.get())))
-        .await?
-        .into_inner()
-        .address_utxos;
-    assert_eq!(truncated.len(), u32_to_usize(response_limit.get()));
-    assert_eq!(
-        truncated.last().map(|utxo| utxo.txid.clone()),
-        Some(
-            history_transaction_id(response_limit.get() - 1)
-                .as_bytes()
-                .to_vec()
-        )
-    );
     Ok(())
 }
 
@@ -780,6 +761,8 @@ async fn taddress_history_sends_a_transaction_before_reading_the_next_history_pa
 
 /// Fewest outputs the first page of one address's UTXO stream reads.
 const MIN_FIRST_PAGE_OUTPUTS: usize = 16;
+const OUTPUTS_PER_ADDRESS_AT_FIRST_HEIGHT: u32 = 3;
+
 /// Outputs the first pages of one UTXO request's address streams share.
 const FIRST_PAGE_BUDGET: usize = 8 * 1_024;
 
@@ -838,26 +821,142 @@ async fn address_utxos_read_a_busy_address_listed_many_times_once() -> eyre::Res
     Ok(())
 }
 
-/// A request reads no output past the last row it sends, and validates every
-/// address before it reads any.
+/// Checks that both RPCs return the same complete pages in a height walk.
+pub(super) async fn assert_address_utxo_pages(
+    adapter: &impl CompactTxStreamer,
+    mut request: lightwalletd::GetAddressUtxosArg,
+    pages: &[(u64, usize)],
+) -> eyre::Result<()> {
+    for &(height, count) in pages {
+        let page = adapter
+            .get_address_utxos(Request::new(request.clone()))
+            .await?
+            .into_inner()
+            .address_utxos;
+        let stream = adapter
+            .get_address_utxos_stream(Request::new(request.clone()))
+            .await?
+            .into_inner();
+        let streamed = collect_stream(std::pin::pin!(stream)).await?;
+        assert_eq!(streamed, page);
+        assert_eq!(page.len(), count);
+        assert!(page.iter().all(|row| row.height == height));
+        if let Some(last) = page.last() {
+            request.start_height = last.height + 1;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
-async fn address_utxos_read_nothing_they_do_not_send() -> eyre::Result<()> {
+async fn wallet_utxo_pages_continue_past_the_response_row_limit() -> eyre::Result<()> {
+    const OUTPUTS_PER_HEIGHT: u32 = 50_001;
+    let address = transparent_address(0x53);
+    let script = address.script().as_raw_bytes().to_vec();
+    let script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
+    let mut chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::All)
+        .extend_blocks(2);
+    for height in 1..=2 {
+        let block = chain
+            .block_at(BlockHeight::new(height))
+            .ok_or_else(|| eyre::eyre!("UTXO fixture must include block {height}"))?
+            .clone();
+        let transaction_id = history_transaction_id(height);
+        let mut transaction = FixtureTransactionRows::from_raw_transaction(
+            transaction_id,
+            block.height,
+            block.hash,
+            0,
+            history_transaction_bytes(height),
+        );
+        transaction.facts.transparent_outputs = (0..OUTPUTS_PER_HEIGHT)
+            .map(|index| TransparentOutputFact::new(index, 1, script.clone(), script_hash))
+            .collect();
+        transaction
+            .facts
+            .public_facts
+            .counts
+            .transparent_output_count = OUTPUTS_PER_HEIGHT;
+        chain = chain.with_transaction_rows(transaction);
+    }
+    let mut fixture =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let adapter = build_wallet_serving_adapter(&mut fixture)?;
+    let request = lightwalletd::GetAddressUtxosArg {
+        addresses: vec![address.to_string()],
+        start_height: 1,
+        max_entries: 100_001,
+    };
+    assert_address_utxo_pages(&adapter, request, &[(1, 50_001), (2, 50_001), (3, 0)]).await
+}
+
+/// Checks the error detail clients use to retry with a larger limit.
+pub(super) fn assert_address_utxo_height_refused(
+    status: &tonic::Status,
+    height: u64,
+    count: usize,
+) -> eyre::Result<()> {
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    let details = status.get_error_details();
+    let detail = details
+        .error_info()
+        .ok_or_else(|| eyre::eyre!("missing UTXO pagination error detail"))?;
+    assert_eq!(detail.reason, "MAX_ENTRIES_EXCEEDED_AT_HEIGHT");
+    assert_eq!(detail.domain, "cash.z.wallet.sdk.rpc");
+    assert_eq!(detail.metadata.get("height"), Some(&height.to_string()));
+    assert_eq!(detail.metadata.get("count"), Some(&count.to_string()));
+    assert!(status.message().contains(&format!("height {height}")));
+    assert!(
+        status
+            .message()
+            .contains(&format!("{count} unspent outputs"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn address_utxos_refuse_first_height_above_max_entries_and_validate_addresses_first()
+-> eyre::Result<()> {
     let (mut store_fixture, address_text) = many_utxo_fixture(0x52, 100)?;
     let (adapter, reads) = counting_utxo_adapter(&mut store_fixture, None)?;
+    let request = |max_entries| lightwalletd::GetAddressUtxosArg {
+        addresses: vec![address_text.clone()],
+        start_height: 0,
+        max_entries,
+    };
 
-    // `maxEntries` caps the first page at the 16 rows the response sends,
-    // so the response needs no second page.
+    let limit = u32::try_from(MIN_FIRST_PAGE_OUTPUTS)?;
+    let status = adapter
+        .get_address_utxos(Request::new(request(limit)))
+        .await
+        .err()
+        .ok_or_else(|| eyre::eyre!("admitted an oversized first height"))?;
+    assert_address_utxo_height_refused(&status, 2, 100)?;
+    assert_eq!(reads.take_outputs(), 100);
+    let stream = adapter
+        .get_address_utxos_stream(Request::new(request(limit)))
+        .await?
+        .into_inner();
+    let status = first_stream_error(stream).await?;
+    assert_address_utxo_height_refused(&status, 2, 100)?;
+    assert_eq!(reads.take_outputs(), 100);
+
     let rows = adapter
-        .get_address_utxos(Request::new(lightwalletd::GetAddressUtxosArg {
-            addresses: vec![address_text.clone()],
-            start_height: 0,
-            max_entries: u32::try_from(MIN_FIRST_PAGE_OUTPUTS)?,
-        }))
+        .get_address_utxos(Request::new(request(100)))
         .await?
         .into_inner()
         .address_utxos;
-    assert_eq!(rows.len(), MIN_FIRST_PAGE_OUTPUTS);
-    assert_eq!(reads.take_outputs(), MIN_FIRST_PAGE_OUTPUTS);
+    let streamed = collect_stream(
+        adapter
+            .get_address_utxos_stream(Request::new(request(100)))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    assert_eq!(rows.len(), 100);
+    assert_eq!(rows, streamed);
+    reads.take_outputs();
 
     let status = adapter
         .get_address_utxos(Request::new(lightwalletd::GetAddressUtxosArg {
@@ -926,7 +1025,7 @@ async fn address_utxos_bound_the_outputs_held_across_many_addresses() -> eyre::R
     // address up to `maxEntries` exceeds the bound.
     const ADDRESSES: u32 = 60;
     const OUTPUTS_PER_ADDRESS: u32 = 150;
-    const MAX_ENTRIES: u32 = 150;
+    const MAX_ENTRIES: u32 = ADDRESSES * OUTPUTS_PER_ADDRESS_AT_FIRST_HEIGHT;
     let (mut store_fixture, addresses) =
         busy_addresses_fixture(0x60, ADDRESSES, OUTPUTS_PER_ADDRESS)?;
     let (adapter, reads) = counting_utxo_adapter(&mut store_fixture, None)?;
@@ -951,9 +1050,14 @@ async fn address_utxos_bound_the_outputs_held_across_many_addresses() -> eyre::R
     .await?;
     let stream_outputs_read = reads.outputs();
 
-    // The first address holds the lowest transaction ids at the one height.
-    let expected: Vec<_> = (0..MAX_ENTRIES)
-        .map(|index| history_transaction_id(index).as_bytes().to_vec())
+    let expected: Vec<_> = (0..ADDRESSES)
+        .flat_map(|address_index| {
+            (0..OUTPUTS_PER_ADDRESS_AT_FIRST_HEIGHT).map(move |output| {
+                history_transaction_id(address_index * OUTPUTS_PER_ADDRESS + output)
+                    .as_bytes()
+                    .to_vec()
+            })
+        })
         .collect();
     assert_eq!(
         list.iter().map(|row| row.txid.clone()).collect::<Vec<_>>(),
@@ -973,7 +1077,7 @@ async fn address_utxos_bound_the_outputs_held_across_many_addresses() -> eyre::R
         u32_to_usize(ADDRESSES) * first_page
             <= FIRST_PAGE_BUDGET.max(u32_to_usize(ADDRESSES) * MIN_FIRST_PAGE_OUTPUTS)
     );
-    let bound = u32_to_usize(2 * MAX_ENTRIES) + u32_to_usize(ADDRESSES) * (first_page + 2);
+    let bound = 2 * expected.len() + u32_to_usize(ADDRESSES) * (first_page + 2);
     assert!(
         first_page < u32_to_usize(MAX_ENTRIES),
         "the first pages must be the budget share, not `maxEntries`"
@@ -1029,8 +1133,7 @@ async fn taddress_history_ends_with_the_status_of_a_failure_after_partial_delive
     Ok(())
 }
 
-/// Several addresses merge into one response ordered by height, txid,
-/// output index, and then address, in the list and the stream alike.
+/// Several addresses merge into height-complete pages in transaction and output order.
 ///
 /// The addresses receive in interleaved blocks and one transaction pays
 /// both. A repeated address is served once, as lightwalletd drops a repeated
@@ -1048,7 +1151,7 @@ async fn address_utxos_merge_several_addresses_in_chain_order() -> eyre::Result<
         .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(3);
     // (height, transaction, position in its block)
-    let transactions = [(1, 1, 0), (1, 3, 1), (2, 2, 0), (3, 4, 0), (3, 5, 1)];
+    let transactions = [(1, 3, 0), (1, 1, 1), (2, 2, 0), (3, 5, 0), (3, 4, 1)];
     // (transaction, output index, receiving address)
     let outputs = [
         (3, 0, &second),
@@ -1097,12 +1200,12 @@ async fn address_utxos_merge_several_addresses_in_chain_order() -> eyre::Result<
         )
     };
     let expected = [
-        row(1, 1, 0, &first),
         row(1, 3, 0, &second),
+        row(1, 1, 0, &first),
         row(2, 2, 0, &second),
         row(2, 2, 1, &first),
-        row(3, 4, 0, &first),
         row(3, 5, 0, &second),
+        row(3, 4, 0, &first),
     ];
     let observed = |replies: &[lightwalletd::GetAddressUtxosReply]| {
         replies
@@ -1118,29 +1221,35 @@ async fn address_utxos_merge_several_addresses_in_chain_order() -> eyre::Result<
             .collect::<Vec<_>>()
     };
 
-    // Every row, then only the first 3: a repeated `second` must not spend
-    // `maxEntries` on a second copy of its row.
-    for (max_entries, expected_rows) in [(0, expected.len()), (3, 3)] {
-        let request = lightwalletd::GetAddressUtxosArg {
-            addresses: vec![second.to_string(), first.to_string(), second.to_string()],
-            start_height: 0,
-            max_entries,
-        };
-        let list = adapter
-            .get_address_utxos(Request::new(request.clone()))
-            .await?
-            .into_inner()
-            .address_utxos;
-        let streamed = collect_stream(
-            adapter
-                .get_address_utxos_stream(Request::new(request))
+    for (max_entries, page_sizes) in [(0, &[6, 0][..]), (2, &[2, 2, 2, 0]), (3, &[2, 2, 2, 0])] {
+        let mut start_height = 0;
+        let mut walked = Vec::new();
+        for &page_size in page_sizes {
+            let request = lightwalletd::GetAddressUtxosArg {
+                addresses: vec![second.to_string(), first.to_string(), second.to_string()],
+                start_height,
+                max_entries,
+            };
+            let list = adapter
+                .get_address_utxos(Request::new(request.clone()))
                 .await?
-                .into_inner(),
-        )
-        .await?;
-        let expected = expected.get(..expected_rows).unwrap_or_default();
-        assert_eq!(observed(&list), expected, "maxEntries {max_entries}");
-        assert_eq!(observed(&streamed), expected, "maxEntries {max_entries}");
+                .into_inner()
+                .address_utxos;
+            let streamed = collect_stream(
+                adapter
+                    .get_address_utxos_stream(Request::new(request))
+                    .await?
+                    .into_inner(),
+            )
+            .await?;
+            assert_eq!(list, streamed);
+            assert_eq!(list.len(), page_size);
+            if let Some(last) = list.last() {
+                start_height = last.height + 1;
+            }
+            walked.extend(observed(&list));
+        }
+        assert_eq!(walked, expected, "maxEntries {max_entries}");
     }
     Ok(())
 }
@@ -1460,8 +1569,8 @@ fn counting_utxo_adapter(
 
 /// Builds a store where `address_count` addresses each hold `utxo_count` UTXOs.
 ///
-/// Every output is at height 2, one per transaction, with transaction ids
-/// ascending from the first address's outputs to the last's.
+/// Each address receives its first three outputs at height 1 and the rest at
+/// height 2, one per transaction.
 fn busy_addresses_fixture(
     first_address_byte: u8,
     address_count: u32,
@@ -1470,26 +1579,36 @@ fn busy_addresses_fixture(
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(2);
-    let block_two = chain
-        .block_at(BlockHeight::new(2))
-        .ok_or_else(|| eyre::eyre!("UTXO fixture must include block 2"))?
-        .clone();
     let mut chain = chain;
     let mut addresses = Vec::new();
+    let first_height_outputs = utxo_count.min(OUTPUTS_PER_ADDRESS_AT_FIRST_HEIGHT);
     for address_offset in 0..address_count {
         let address =
             transparent_address(first_address_byte.wrapping_add(u8::try_from(address_offset)?));
         let script = address.script().as_raw_bytes().to_vec();
         let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
         for output in 0..utxo_count {
+            let (height, tx_index) = if output < first_height_outputs {
+                (1, address_offset * first_height_outputs + output)
+            } else {
+                (
+                    2,
+                    address_offset * (utxo_count - first_height_outputs)
+                        + (output - first_height_outputs),
+                )
+            };
+            let block = chain
+                .block_at(BlockHeight::new(height))
+                .ok_or_else(|| eyre::eyre!("UTXO fixture must include block {height}"))?
+                .clone();
             let index = address_offset * utxo_count + output;
             let transaction_id = history_transaction_id(index);
             chain = chain
                 .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
                     transaction_id,
-                    block_two.height,
-                    block_two.hash,
-                    index,
+                    block.height,
+                    block.hash,
+                    tx_index,
                     history_transaction_bytes(index),
                 ))
                 .with_address_output_index(TransparentUnspentOutput::new(
@@ -1497,8 +1616,8 @@ fn busy_addresses_fixture(
                     script.clone(),
                     TransparentOutPoint::new(transaction_id, 0),
                     1,
-                    block_two.height,
-                    block_two.hash,
+                    block.height,
+                    block.hash,
                 ));
         }
         addresses.push(address.to_string());

@@ -44,6 +44,7 @@ use std::{
 
 use eyre::{Result, ensure, eyre};
 use tonic::{Code, Status, transport::Endpoint};
+use tonic_types::StatusExt as _;
 use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
@@ -1194,48 +1195,61 @@ async fn address_utxos_respect_max_entries_for_miner_address() -> Result<()> {
     };
     let address = parity_transparent_address()?;
 
-    let request = || lightwalletd::GetAddressUtxosArg {
+    let request = |max_entries| lightwalletd::GetAddressUtxosArg {
         addresses: vec![address.clone()],
         start_height: 1,
-        max_entries: 1,
+        max_entries,
     };
-    let zinder_list = zinder.get_address_utxos(request()).await?.into_inner();
-    let reference_list = reference.get_address_utxos(request()).await?.into_inner();
-    let zinder_stream = drain_address_utxos(
-        zinder
-            .get_address_utxos_stream(request())
-            .await?
-            .into_inner(),
-    )
-    .await?;
-    let reference_stream = drain_address_utxos(
-        reference
-            .get_address_utxos_stream(request())
-            .await?
-            .into_inner(),
-    )
-    .await?;
+    let baseline = reference.get_address_utxos(request(0)).await?.into_inner();
+    let first = baseline
+        .address_utxos
+        .first()
+        .ok_or_else(|| eyre!("miner address {address} has no confirmed outputs"))?;
+    let height = first.height;
+    let first_height: Vec<_> = baseline
+        .address_utxos
+        .into_iter()
+        .filter(|reply| reply.height == height)
+        .collect();
+    let count = u32::try_from(first_height.len())?;
 
+    if count > 1 {
+        let unary = zinder
+            .get_address_utxos(request(1))
+            .await
+            .err()
+            .ok_or_else(|| eyre!("admitted an oversized first height"))?;
+        let streaming =
+            match zinder.get_address_utxos_stream(request(1)).await {
+                Ok(response) => response.into_inner().message().await.err().ok_or_else(|| {
+                    eyre!("oversized first height did not fail before sending rows")
+                })?,
+                Err(status) => status,
+            };
+        for status in [unary, streaming] {
+            assert_eq!(status.code(), Code::FailedPrecondition);
+            let details = status.get_error_details();
+            let detail = details
+                .error_info()
+                .ok_or_else(|| eyre!("missing pagination detail"))?;
+            assert_eq!(detail.reason, "MAX_ENTRIES_EXCEEDED_AT_HEIGHT");
+            assert_eq!(detail.domain, "cash.z.wallet.sdk.rpc");
+            assert_eq!(detail.metadata.get("height"), Some(&height.to_string()));
+            assert_eq!(detail.metadata.get("count"), Some(&count.to_string()));
+        }
+    }
+    let unary = zinder.get_address_utxos(request(count)).await?.into_inner();
+    let streamed = drain_address_utxos(
+        zinder
+            .get_address_utxos_stream(request(count))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    assert_eq!(unary.address_utxos, streamed);
     assert_eq!(
-        zinder_list.address_utxos, zinder_stream,
-        "Zinder max-entry GetAddressUtxos list and stream diverge",
-    );
-    assert_eq!(
-        reference_list.address_utxos, reference_stream,
-        "reference max-entry GetAddressUtxos list and stream diverge",
-    );
-    assert_eq!(
-        normalize_address_utxos(&zinder_stream),
-        normalize_address_utxos(&reference_stream),
-        "max-entry transparent UTXOs diverge for miner address {address}",
-    );
-    assert!(
-        zinder_stream.len() <= 1,
-        "Zinder returned more UTXOs than max_entries for miner address {address}",
-    );
-    assert!(
-        reference_stream.len() <= 1,
-        "reference returned more UTXOs than max_entries for miner address {address}",
+        normalize_address_utxos(&streamed),
+        normalize_address_utxos(&first_height)
     );
     Ok(())
 }

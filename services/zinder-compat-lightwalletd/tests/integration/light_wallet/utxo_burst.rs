@@ -202,15 +202,14 @@ async fn drain_one_utxo_stream(
         })
         .await?
         .into_inner();
-    let mut prev_key = None;
-    let mut count = 0_usize;
+    let expected = [(1, Some(3), 2), (1, Some(2), 1), (2, Some(1), 0)];
+    let mut count = 0;
     while let Some(reply) = stream.message().await? {
-        let key = (reply.height, reply.txid.clone(), reply.index);
-        if let Some(previous) = &prev_key {
-            assert!(previous < &key, "out-of-order UTXO stream reply");
-        }
+        assert_eq!(
+            expected.get(count).copied(),
+            Some((reply.height, reply.txid.first().copied(), reply.index)),
+        );
         assert_eq!(reply.address, addr);
-        prev_key = Some(key);
         count += 1;
     }
     Ok(count)
@@ -314,15 +313,20 @@ async fn single_row_utxo_stream_releases_response_permit_upon_yielding_final_row
         0,
     ));
     let fixture = populated_utxo_fixture_with(2, 1, super::UtxoNode::Zakura, reads)?;
+    let final_height = || {
+        let mut request = utxo_request(1);
+        request.get_mut().start_height = 6;
+        request
+    };
     let mut single_row = fixture
         .adapter
-        .get_address_utxos_stream(utxo_request(1))
+        .get_address_utxos_stream(final_height())
         .await?
         .into_inner();
 
     let while_buffered = fixture
         .adapter
-        .get_address_utxos(utxo_request(1))
+        .get_address_utxos(final_height())
         .await
         .err()
         .ok_or_else(|| eyre!("admitted second UTXO response while single row was buffered"))?;
@@ -337,7 +341,7 @@ async fn single_row_utxo_stream_releases_response_permit_upon_yielding_final_row
 
     let admitted_after_final_row = fixture
         .adapter
-        .get_address_utxos(utxo_request(1))
+        .get_address_utxos(final_height())
         .await?
         .into_inner();
     assert_eq!(admitted_after_final_row.address_utxos.len(), 1);
@@ -407,11 +411,10 @@ async fn stalled_large_utxo_streams_bound_buffered_responses_and_fail_closed() -
     assert_eq!(balance.into_inner().value_zat, 5_001);
 
     drop((stalled_a, stalled_b));
-    let recovered = adapter
-        .get_address_utxos(utxo_request(2))
-        .await?
-        .into_inner();
-    assert_eq!(recovered.address_utxos.len(), 2);
+    let mut request = utxo_request(1);
+    request.get_mut().start_height = 6;
+    let recovered = adapter.get_address_utxos(request).await?.into_inner();
+    assert_eq!(recovered.address_utxos.len(), 1);
     Ok(())
 }
 
