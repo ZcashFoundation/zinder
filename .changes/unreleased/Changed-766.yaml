@@ -1,0 +1,7 @@
+kind: changed
+body: Pass `DEPLOY_X86_64_CPU_BASELINE` (`x86-64-v3` default) to `zinder-bench-binary`, expose port `9105` in the container image, align `deploy/personal/compose.yaml` with `DEPLOY_*` orchestration variables, `ZINDER_DEPLOYMENT__PROFILE=light-wallet`, and dual-stack container listeners, and enforce `dev darkside --help`, profile `config validate`, and fail-closed unknown-key smoke checks in OCI image builds.
+time: 2026-11-28T14:32:00Z
+custom:
+  Bump: minor
+  PR: "766"
+  Upgrade: compatible
