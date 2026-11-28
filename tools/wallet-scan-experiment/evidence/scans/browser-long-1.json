@@ -1,0 +1,171 @@
+{
+  "environment": {
+    "chromium": "159.0.8154.6",
+    "node": "v24.22.3",
+    "os": "linux",
+    "kernel": "7.0.0-38-generic",
+    "arch": "x64",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "availableCpus": 3,
+    "loadStart": [
+      12.79,
+      18,
+      12.74
+    ],
+    "loadEnd": [
+      8.39,
+      18.17,
+      14.58
+    ],
+    "startTime": "2026-11-20T09:23:30.877Z",
+    "endTime": "2026-11-20T09:27:52.410Z"
+  },
+  "inputs": {
+    "corpus": "long.scan",
+    "corpusSha256": "5c7a2f5e13cbdc9c276b3b88f098579a01e57e78daf849b799751c774b7d3afb",
+    "wasmSha256": "50473cde944641a627756f31f9f3196ec0f92aa27f9a145eb93d752f4cba242e",
+    "bindingsSha256": "bf67f472e1bd05827087ac5a3802264662a9c4004a5a8683da5411721d7ec64c",
+    "batchSize": 128,
+    "cycles": 1
+  },
+  "diagnostics": {
+    "actions_with_fixture": 46324,
+    "archived_actions": 46318,
+    "fixture": {
+      "fixture_actions": 6,
+      "foreign_notes": 2,
+      "ironwood_known_receipts": 2,
+      "orchard_known_receipts": 2,
+      "receipts_with_malformed_points": 4,
+      "receipts_with_one_wrong_point": 3,
+      "receipts_without_hints": 4
+    },
+    "receipt_digest_blake2b256": "d22887c278eb22ce6f44f4d106a244b0c666699ee5decc7bb3177e6b2939a3ff",
+    "total_receipts": 12
+  },
+  "validatedReceiptCount": 12,
+  "samples": [
+    {
+      "cycle": 0,
+      "observations": [
+        {
+          "arm": "stock",
+          "elapsedMs": 14524,
+          "threadCpuMs": 14522.655
+        },
+        {
+          "arm": "ordinary-prefilter",
+          "elapsedMs": 14970,
+          "threadCpuMs": 14969.143000000002
+        },
+        {
+          "arm": "hinted",
+          "elapsedMs": 11749.10000038147,
+          "threadCpuMs": 11748.365000000007
+        }
+      ]
+    },
+    {
+      "cycle": 0,
+      "observations": [
+        {
+          "arm": "stock",
+          "elapsedMs": 19483.5,
+          "threadCpuMs": 19453.32300000001
+        },
+        {
+          "arm": "hinted",
+          "elapsedMs": 15648.400000095367,
+          "threadCpuMs": 15605.827000000005
+        },
+        {
+          "arm": "ordinary-prefilter",
+          "elapsedMs": 16968.199999809265,
+          "threadCpuMs": 16951.791999999983
+        }
+      ]
+    },
+    {
+      "cycle": 0,
+      "observations": [
+        {
+          "arm": "ordinary-prefilter",
+          "elapsedMs": 14740.400000095367,
+          "threadCpuMs": 14739.291000000008
+        },
+        {
+          "arm": "stock",
+          "elapsedMs": 16010.800000190735,
+          "threadCpuMs": 16006.412000000011
+        },
+        {
+          "arm": "hinted",
+          "elapsedMs": 13474.099999904633,
+          "threadCpuMs": 13471.213000000005
+        }
+      ]
+    },
+    {
+      "cycle": 0,
+      "observations": [
+        {
+          "arm": "ordinary-prefilter",
+          "elapsedMs": 16606.799999713898,
+          "threadCpuMs": 16604.77900000001
+        },
+        {
+          "arm": "hinted",
+          "elapsedMs": 12014.599999904633,
+          "threadCpuMs": 12014.105000000001
+        },
+        {
+          "arm": "stock",
+          "elapsedMs": 14946.89999961853,
+          "threadCpuMs": 14945.323000000002
+        }
+      ]
+    },
+    {
+      "cycle": 0,
+      "observations": [
+        {
+          "arm": "hinted",
+          "elapsedMs": 11797.800000190735,
+          "threadCpuMs": 11796.447
+        },
+        {
+          "arm": "stock",
+          "elapsedMs": 14174.400000095367,
+          "threadCpuMs": 14172.461999999996
+        },
+        {
+          "arm": "ordinary-prefilter",
+          "elapsedMs": 14458.699999809265,
+          "threadCpuMs": 14456.65600000001
+        }
+      ]
+    },
+    {
+      "cycle": 0,
+      "observations": [
+        {
+          "arm": "hinted",
+          "elapsedMs": 11400.799999713898,
+          "threadCpuMs": 11397.971999999982
+        },
+        {
+          "arm": "ordinary-prefilter",
+          "elapsedMs": 14419,
+          "threadCpuMs": 14415.797999999995
+        },
+        {
+          "arm": "stock",
+          "elapsedMs": 14102.699999809265,
+          "threadCpuMs": 14099.364000000038
+        }
+      ]
+    }
+  ],
+  "elapsedScope": "Warmed synchronous scanner call in Chromium; excludes corpus loading and hint generation.",
+  "cpuScope": "Renderer main-thread ThreadTime between CDP probes around each scan, including dispatch."
+}

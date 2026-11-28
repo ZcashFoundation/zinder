@@ -4,6 +4,8 @@ A wallet that scans shielded pools can omit transparent inputs and outputs from 
 
 An incorrect hint can be a valid Pallas point and still hide a payment. Before treating a failed trial decryption as evidence that an action is unrelated, a wallet must verify that the hint equals `[2^64]EPK` or repeat trial decryption with the original EPK. The measured payload sizes include that original EPK.
 
+[Shifted-key scanner results and reproduction](SCANNING.md) compares stock and assisted trial decryption in native Rust and Chromium on these public actions.
+
 ## Replaying a range
 
 The exporter opens a read-only secondary of a schema v2 Testnet canonical store with the default reorg window and a recorded upgrade schedule. It accepts stores with or without full blocks by default. Pass `--raw-blob-retention all` to require a full-block store. The exporter checks the height and parent hash of each block. This command repeats the mixed-range measurement.

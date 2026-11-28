@@ -5380,14 +5380,23 @@ dependencies = [
 name = "wallet-scan-experiment"
 version = "0.29.0"
 dependencies = [
+ "blake2b_simd",
+ "chacha20",
  "clap",
  "eyre",
+ "hex",
+ "num-bigint 0.4.8",
+ "orchard",
  "pasta_curves",
  "prost",
  "rust-rocksdb",
+ "rustix",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tempfile",
+ "wasm-bindgen",
+ "zcash_note_encryption",
  "zinder-core",
  "zinder-proto",
  "zinder-store",

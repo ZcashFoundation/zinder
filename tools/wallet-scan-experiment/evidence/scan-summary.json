@@ -1,0 +1,226 @@
+[
+  {
+    "runtime": "chromium",
+    "corpus_sha256": "3178713f3197d43a8c7e4693bf6b879953e5fad375cfa9ba74f476adcf4dee90",
+    "archived_actions": 4213,
+    "receipts": 4,
+    "receipt_digest_blake2b256": "d154f4d78de3c6197a65b9d8e67d0ec3eae462eed5e8bce9dee57f51b55047aa",
+    "batch_size": 128,
+    "processes": 3,
+    "samples_per_arm": 18,
+    "median_ms": {
+      "wall": {
+        "stock": 1168.45,
+        "ordinary-prefilter": 1215.5,
+        "hinted": 1038.25
+      },
+      "cpu": {
+        "stock": 1168.476,
+        "ordinary-prefilter": 1215.861,
+        "hinted": 1038.671
+      }
+    },
+    "paired_hinted_reduction_pct": {
+      "wall": {
+        "stock": {
+          "median": 13.487,
+          "process_median_range": [
+            12.919,
+            13.521
+          ]
+        },
+        "ordinary-prefilter": {
+          "median": 15.364,
+          "process_median_range": [
+            13.667,
+            15.896
+          ]
+        }
+      },
+      "cpu": {
+        "stock": {
+          "median": 13.489,
+          "process_median_range": [
+            12.922,
+            13.522
+          ]
+        },
+        "ordinary-prefilter": {
+          "median": 15.357,
+          "process_median_range": [
+            13.668,
+            15.888
+          ]
+        }
+      }
+    }
+  },
+  {
+    "runtime": "chromium",
+    "corpus_sha256": "5c7a2f5e13cbdc9c276b3b88f098579a01e57e78daf849b799751c774b7d3afb",
+    "archived_actions": 46318,
+    "receipts": 12,
+    "receipt_digest_blake2b256": "d22887c278eb22ce6f44f4d106a244b0c666699ee5decc7bb3177e6b2939a3ff",
+    "batch_size": 128,
+    "processes": 1,
+    "samples_per_arm": 6,
+    "median_ms": {
+      "wall": {
+        "stock": 14735.45,
+        "ordinary-prefilter": 14855.2,
+        "hinted": 11906.2
+      },
+      "cpu": {
+        "stock": 14733.989,
+        "ordinary-prefilter": 14854.217,
+        "hinted": 11905.276
+      }
+    },
+    "paired_hinted_reduction_pct": {
+      "wall": {
+        "stock": {
+          "median": 19.132,
+          "process_median_range": [
+            19.132,
+            19.132
+          ]
+        },
+        "ordinary-prefilter": {
+          "median": 19.668,
+          "process_median_range": [
+            19.668,
+            19.668
+          ]
+        }
+      },
+      "cpu": {
+        "stock": {
+          "median": 19.131,
+          "process_median_range": [
+            19.131,
+            19.131
+          ]
+        },
+        "ordinary-prefilter": {
+          "median": 19.668,
+          "process_median_range": [
+            19.668,
+            19.668
+          ]
+        }
+      }
+    }
+  },
+  {
+    "runtime": "native",
+    "corpus_sha256": "3178713f3197d43a8c7e4693bf6b879953e5fad375cfa9ba74f476adcf4dee90",
+    "archived_actions": 4213,
+    "receipts": 4,
+    "receipt_digest_blake2b256": "d154f4d78de3c6197a65b9d8e67d0ec3eae462eed5e8bce9dee57f51b55047aa",
+    "batch_size": 128,
+    "processes": 3,
+    "samples_per_arm": 18,
+    "median_ms": {
+      "wall": {
+        "stock": 265.537,
+        "ordinary-prefilter": 272.765,
+        "hinted": 222.74
+      },
+      "cpu": {
+        "stock": 265.517,
+        "ordinary-prefilter": 272.744,
+        "hinted": 222.732
+      }
+    },
+    "paired_hinted_reduction_pct": {
+      "wall": {
+        "stock": {
+          "median": 15.846,
+          "process_median_range": [
+            14.936,
+            16.934
+          ]
+        },
+        "ordinary-prefilter": {
+          "median": 17.365,
+          "process_median_range": [
+            16.329,
+            17.93
+          ]
+        }
+      },
+      "cpu": {
+        "stock": {
+          "median": 15.853,
+          "process_median_range": [
+            14.939,
+            16.935
+          ]
+        },
+        "ordinary-prefilter": {
+          "median": 17.369,
+          "process_median_range": [
+            16.33,
+            17.926
+          ]
+        }
+      }
+    }
+  },
+  {
+    "runtime": "native",
+    "corpus_sha256": "5c7a2f5e13cbdc9c276b3b88f098579a01e57e78daf849b799751c774b7d3afb",
+    "archived_actions": 46318,
+    "receipts": 12,
+    "receipt_digest_blake2b256": "d22887c278eb22ce6f44f4d106a244b0c666699ee5decc7bb3177e6b2939a3ff",
+    "batch_size": 128,
+    "processes": 1,
+    "samples_per_arm": 6,
+    "median_ms": {
+      "wall": {
+        "stock": 2631.371,
+        "ordinary-prefilter": 2748.481,
+        "hinted": 2251.581
+      },
+      "cpu": {
+        "stock": 2631.191,
+        "ordinary-prefilter": 2745.132,
+        "hinted": 2251.45
+      }
+    },
+    "paired_hinted_reduction_pct": {
+      "wall": {
+        "stock": {
+          "median": 15.657,
+          "process_median_range": [
+            15.657,
+            15.657
+          ]
+        },
+        "ordinary-prefilter": {
+          "median": 18.211,
+          "process_median_range": [
+            18.211,
+            18.211
+          ]
+        }
+      },
+      "cpu": {
+        "stock": {
+          "median": 15.656,
+          "process_median_range": [
+            15.656,
+            15.656
+          ]
+        },
+        "ordinary-prefilter": {
+          "median": 18.211,
+          "process_median_range": [
+            18.211,
+            18.211
+          ]
+        }
+      }
+    }
+  }
+]
