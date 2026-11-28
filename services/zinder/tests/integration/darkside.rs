@@ -261,11 +261,11 @@ async fn darkside_reorg_replaces_blocks_and_removes_orphaned_fixtures() -> Resul
     Ok(())
 }
 
-fn broadcast_fixture() -> Result<(RawTransaction, TransactionId)> {
+fn broadcast_fixture(previous_output_index: u32) -> Result<(RawTransaction, TransactionId)> {
     let key = TransparentTestKey::from_seed(&[17; 32])?;
     let bytes = key.build_p2pkh_spend(&P2pkhSpendArgs {
         coinbase_txid_be: [42; 32],
-        coinbase_vout: 0,
+        coinbase_vout: previous_output_index,
         coinbase_value_zats: 50_000,
         recipient: &key.scratch_recipient_address(1),
         target_height: 120,
@@ -300,7 +300,7 @@ async fn darkside_captures_mempool_broadcasts_and_mines_staged_transactions() ->
     stage_blocks(&mut control, 100, 10, 2).await?;
     control.apply_staged(DarksideHeight { height: 100 }).await?;
     let mut mempool = wallet.get_mempool_stream(Empty {}).await?.into_inner();
-    let (broadcast, txid) = broadcast_fixture()?;
+    let (broadcast, txid) = broadcast_fixture(0)?;
     let hash = encode_internal_transaction_id(txid).to_vec();
     let filter = TxFilter {
         hash: hash.clone(),
@@ -629,7 +629,7 @@ async fn darkside_grpc_web_captures_and_mines_a_broadcast() -> Result<()> {
     browser.stage_blocks(100, 77, 2).await?;
     browser.apply(100).await?;
 
-    let (broadcast, txid) = broadcast_fixture()?;
+    let (broadcast, txid) = broadcast_fixture(0)?;
     let accepted: SendResponse = browser
         .unary("CompactTxStreamer/SendTransaction", &broadcast)
         .await?;
@@ -725,7 +725,7 @@ async fn darkside_bounds_listener_lifetime_and_refuses_implicit_remote_access() 
     stage_blocks(&mut control, 100, 1, 1).await?;
     control.apply_staged(DarksideHeight { height: 100 }).await?;
     let _open = wallet.get_mempool_stream(Empty {}).await?;
-    let (broadcast, _) = broadcast_fixture()?;
+    let (broadcast, _) = broadcast_fixture(0)?;
     assert_ne!(
         wallet
             .send_transaction(broadcast)
@@ -757,7 +757,7 @@ async fn darkside_stages_serialized_fixtures_and_preserves_active_state_on_faile
         .wrap_err("missing raw block fixture")?
         .to_owned();
     let hash = decode_rpc_block_hash_hex(fixture["hash"].as_str().wrap_err("missing block hash")?)?;
-    let (broadcast, _) = broadcast_fixture()?;
+    let (broadcast, _) = broadcast_fixture(0)?;
     let encoded_tx = hex::encode(&broadcast.data);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let origin = format!("http://{}", listener.local_addr()?);
@@ -812,5 +812,99 @@ async fn darkside_stages_serialized_fixtures_and_preserves_active_state_on_faile
     let enriched = wallet.get_block(at(1)).await?.into_inner();
     assert_ne!(enriched.hash, original.hash);
     assert_eq!(enriched.vtx.len(), 2);
+    Ok(())
+}
+
+async fn mempool_txids(
+    wallet: &mut CompactTxStreamerClient<Channel>,
+    suffixes: Vec<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, tonic::Status> {
+    let mut stream = wallet
+        .get_mempool_tx(GetMempoolTxRequest {
+            exclude_txid_suffixes: suffixes,
+            pool_types: vec![PoolType::Transparent.into()],
+        })
+        .await?
+        .into_inner();
+    let mut txids = Vec::new();
+    while let Some(transaction) = stream.message().await? {
+        txids.push(transaction.txid);
+    }
+    Ok(txids)
+}
+
+#[tokio::test]
+async fn darkside_mempool_excludes_only_unambiguous_suffixes() -> Result<()> {
+    let process = TestProcess::start(&[]).await?;
+    let (mut control, mut wallet) = process.clients().await?;
+    control.reset(metadata(100)).await?;
+    stage_blocks(&mut control, 100, 10, 1).await?;
+    control.apply_staged(DarksideHeight { height: 100 }).await?;
+
+    let (first, first_id) = broadcast_fixture(390)?;
+    let (second, second_id) = broadcast_fixture(1083)?;
+    let first_txid = encode_internal_transaction_id(first_id).to_vec();
+    let second_txid = encode_internal_transaction_id(second_id).to_vec();
+    let shared_suffix = vec![0xab];
+    assert_ne!(first_txid, second_txid);
+    assert!(first_txid.ends_with(&shared_suffix));
+    assert!(second_txid.ends_with(&shared_suffix));
+
+    assert_eq!(
+        wallet.send_transaction(first).await?.into_inner(),
+        successful_broadcast(first_id)
+    );
+    assert_eq!(
+        mempool_txids(&mut wallet, Vec::new()).await?.as_slice(),
+        std::slice::from_ref(&first_txid)
+    );
+    assert_eq!(
+        mempool_txids(&mut wallet, vec![Vec::new()]).await?,
+        Vec::<Vec<u8>>::new()
+    );
+
+    assert_eq!(
+        wallet.send_transaction(second).await?.into_inner(),
+        successful_broadcast(second_id)
+    );
+    let expected = [first_txid.clone(), second_txid];
+    assert_eq!(
+        mempool_txids(&mut wallet, vec![Vec::new()]).await?,
+        expected
+    );
+    assert_eq!(
+        mempool_txids(&mut wallet, vec![shared_suffix, first_txid]).await?,
+        expected
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn darkside_mempool_uses_the_compatibility_suffix_limits() -> Result<()> {
+    let process = TestProcess::start(&[]).await?;
+    let (_, mut wallet) = process.clients().await?;
+    let mut suffixes = vec![vec![0xab]; 20_000];
+    assert_eq!(
+        mempool_txids(&mut wallet, suffixes.clone()).await?,
+        Vec::<Vec<u8>>::new()
+    );
+
+    suffixes.push(vec![0xab]);
+    let over_limit = mempool_txids(&mut wallet, suffixes)
+        .await
+        .err()
+        .wrap_err("accepted more than 20,000 suffixes")?;
+    assert_eq!(over_limit.code(), Code::InvalidArgument);
+    assert_eq!(
+        over_limit.message(),
+        "exclude_txid_suffixes contains 20001 entries; at most 20000 are allowed"
+    );
+
+    let too_long = mempool_txids(&mut wallet, vec![vec![0; 33]])
+        .await
+        .err()
+        .wrap_err("accepted a 33-byte suffix")?;
+    assert_eq!(too_long.code(), Code::InvalidArgument);
+    assert_eq!(too_long.message(), "exclude txid 0 is larger than 32 bytes");
     Ok(())
 }

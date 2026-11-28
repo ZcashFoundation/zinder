@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use futures_util::stream;
 use tonic::{Request, Response, Status, Streaming};
+use zinder_compat_lightwalletd::MempoolExclusions;
 use zinder_core::{
     BlockHash,
     wire::{
@@ -25,7 +26,6 @@ use super::{
 };
 
 const MAX_ADDRESSES: usize = 128;
-const MAX_SUFFIXES: usize = 128;
 
 fn tip(scenario: &Scenario) -> Result<&FixtureBlock, Status> {
     scenario
@@ -447,31 +447,17 @@ impl CompactTxStreamer for Darkside {
         request: Request<GetMempoolTxRequest>,
     ) -> Rpc<Self::GetMempoolTxStream> {
         let request = request.into_inner();
+        let mut exclusions = MempoolExclusions::from_suffixes(request.exclude_txid_suffixes)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let shape = ScanShape::select(&request.pool_types, false, true)?;
-        let suffixes = request.exclude_txid_suffixes;
-        if suffixes.len() > MAX_SUFFIXES
-            || suffixes
-                .iter()
-                .any(|suffix| !(1..=32).contains(&suffix.len()))
-        {
-            return Err(Status::invalid_argument("invalid transaction ID suffixes"));
-        }
         let pending = self.scenario.lock().mempool.clone();
-        let mut excluded = BTreeSet::new();
-        for suffix in &suffixes {
-            let mut matching = pending
-                .iter()
-                .filter(|tx| tx.txid_bytes().ends_with(suffix));
-            if let Some(tx) = matching.next()
-                && matching.next().is_none()
-            {
-                excluded.insert(tx.id);
-            }
+        for tx in &pending {
+            exclusions.observe(tx.id);
         }
         Ok(stream_reply(
             self.stream_slot()?,
             pending.into_iter().filter_map(move |tx| {
-                if excluded.contains(&tx.id) {
+                if exclusions.uniquely_matches(tx.txid_bytes()) {
                     return None;
                 }
                 let mut compact = tx.compact();

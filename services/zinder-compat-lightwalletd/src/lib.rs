@@ -35,10 +35,10 @@ pub use grpc::{
     LightwalletdAdmissionError, LightwalletdGrpcAdapter, LightwalletdResponseLimits,
 };
 pub use mempool::{
-    IngestControlMempoolSurface, MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface,
-    MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface, SharedTipChangeWatcher,
-    TipChangeWatcher, TipChangeWatcherError, WatchTipChangeWatcher,
-    spawn_ingest_control_tip_change_publisher,
+    IngestControlMempoolSurface, MempoolEventEnvelopeStream, MempoolExclusions,
+    MempoolExclusionsError, MempoolSnapshotPage, MempoolSurface, MempoolSurfaceError,
+    MempoolTransactionLookup, SharedMempoolSurface, SharedTipChangeWatcher, TipChangeWatcher,
+    TipChangeWatcherError, WatchTipChangeWatcher, spawn_ingest_control_tip_change_publisher,
 };
 pub use network_tip_estimate::estimated_network_height;
 pub use node_tip_witness::{

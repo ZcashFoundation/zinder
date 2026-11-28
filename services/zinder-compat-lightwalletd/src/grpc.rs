@@ -95,8 +95,6 @@ const ADDRESS_UTXO_STREAM_CHANNEL_CAPACITY: usize = 64;
 const ADDRESS_UTXO_FIRST_PAGE_BUDGET: usize = 8 * 1_024;
 /// Fewest outputs the first page of one address's UTXO stream reads.
 const ADDRESS_UTXO_MIN_FIRST_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.saturating_add(15);
-/// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
-pub(crate) const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 20_000;
 /// Most distinct transactions one `GetMempoolStream` sends between tip changes.
 ///
 /// The stream remembers each id it sent so it can skip repeats, and that set
@@ -424,7 +422,8 @@ impl<QueryApi: Sync> LightwalletdGrpcAdapter<QueryApi> {
         request: Request<lightwalletd::GetMempoolTxRequest>,
     ) -> Result<Response<GrpcStream<lightwalletd::CompactTx>>, Status> {
         let request = request.into_inner();
-        validate_excluded_txid_suffixes(&request.exclude_txid_suffixes)?;
+        let exclusions = MempoolExclusions::from_suffixes(request.exclude_txid_suffixes)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let shape = CompactBlockShape::for_mempool(&request.pool_types)?;
         let mempool_surface = self
             .mempool_surface
@@ -435,21 +434,16 @@ impl<QueryApi: Sync> LightwalletdGrpcAdapter<QueryApi> {
             .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
             .await
             .map_err(status_from_mempool_surface_error)?;
-        if request.exclude_txid_suffixes.is_empty() {
+        if exclusions.is_empty() {
             return Ok(Response::new(stream_mempool_compact_transactions(
                 mempool_surface,
                 first_page,
                 shape,
             )));
         }
-        buffered_mempool_transactions(
-            mempool_surface,
-            first_page,
-            shape,
-            request.exclude_txid_suffixes,
-        )
-        .await
-        .map(Response::new)
+        buffered_mempool_transactions(mempool_surface, first_page, shape, exclusions)
+            .await
+            .map(Response::new)
     }
 
     async fn mempool_stream(
@@ -2686,10 +2680,9 @@ async fn buffered_mempool_transactions(
     mempool_surface: SharedMempoolSurface,
     first_page: MempoolSnapshotPage,
     shape: CompactBlockShape,
-    exclude_txid_suffixes: Vec<Vec<u8>>,
+    mut exclusions: MempoolExclusions,
 ) -> Result<GrpcStream<lightwalletd::CompactTx>, Status> {
     let mut entries = mempool_snapshot_entries(mempool_surface, first_page);
-    let mut exclusions = MempoolExclusions::new(exclude_txid_suffixes);
     let mut compact_messages = Vec::new();
     while let Some(entry_outcome) = entries.next().await {
         let entry = entry_outcome?;
@@ -2858,23 +2851,6 @@ fn status_from_mempool_surface_error(error: MempoolSurfaceError) -> Status {
         MempoolSurfaceError::CursorInvalid => Status::invalid_argument("mempool cursor is invalid"),
         MempoolSurfaceError::CursorExpired => Status::failed_precondition("mempool cursor expired"),
     }
-}
-
-fn validate_excluded_txid_suffixes(exclude_suffixes: &[Vec<u8>]) -> Result<(), Status> {
-    if exclude_suffixes.len() > MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST {
-        return Err(Status::invalid_argument(format!(
-            "exclude_txid_suffixes contains {} entries; at most {MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST} are allowed",
-            exclude_suffixes.len(),
-        )));
-    }
-    for (index, suffix) in exclude_suffixes.iter().enumerate() {
-        if suffix.len() > 32 {
-            return Err(Status::invalid_argument(format!(
-                "exclude txid {index} is larger than 32 bytes",
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[allow(
