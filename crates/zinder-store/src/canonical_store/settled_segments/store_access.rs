@@ -676,14 +676,14 @@ fn read_replay_headers(
         .ok_or_else(|| CanonicalStoreError::publication("block_header column family is absent"))?;
     let mut rows = db.raw_iterator_cf_opt(&family, uncached_read_options());
     rows.seek(encode_height_key_ascending(range.start));
+    let scan_error = |source| CanonicalStoreError::RocksDbOperation {
+        operation: "block header replay scan",
+        source,
+    };
     let mut headers = Vec::with_capacity(range.into_iter().len());
     for height in range {
         let Some((key, encoded)) = rows.item() else {
-            rows.status()
-                .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                    operation: "block header replay scan",
-                    source,
-                })?;
+            rows.status().map_err(scan_error)?;
             return Err(CanonicalStoreError::block_replay_sequence(format!(
                 "block header at settled height {} is absent",
                 height.value()
@@ -696,9 +696,23 @@ fn read_replay_headers(
             )));
         }
         headers.push(decode_block_header_record(height, encoded)?);
-        if height != range.end {
-            rows.next();
+        rows.next();
+    }
+    // The next batch seeks to its start, so check for keys that seek would skip.
+    match rows.item() {
+        None => rows.status().map_err(scan_error)?,
+        Some((key, _))
+            if range
+                .end
+                .next()
+                .is_none_or(|height| key < encode_height_key_ascending(height).as_slice()) =>
+        {
+            return Err(CanonicalStoreError::block_replay_sequence(format!(
+                "block header scan found unexpected key {key:02x?} after settled height {}",
+                range.end.value()
+            )));
         }
+        Some(_) => {}
     }
     Ok(headers)
 }
@@ -1794,6 +1808,42 @@ mod tests {
         );
         let persisted = validate_persisted_block_replays(ctx)?;
         assert_eq!(persisted.sequence_digest, checkpoint.sequence_digest());
+
+        let family = db
+            .cf_handle(BLOCK_HEADER_COLUMN_FAMILY)
+            .ok_or("header cf missing")?;
+        let mut malformed_key = encode_height_key_ascending(entries[0].end_block.height).to_vec();
+        malformed_key.push(0);
+        db.put_cf(&family, malformed_key, [0xff])?;
+        assert!(matches!(
+            CanonicalReplayRangeScan::new(ctx, &ready, range)?.collect::<Result<Vec<_>, _>>(),
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn settled_replay_rejects_a_header_key_after_maximum_height() -> TestResult {
+        let dir = TempDir::new()?;
+        let db = open_bridge_test_db(dir.path())?;
+        let family = db
+            .cf_handle(BLOCK_HEADER_COLUMN_FAMILY)
+            .ok_or("header cf missing")?;
+        let (mut block, _) = bridge_block_fixture(1, 1)?;
+        let height = BlockHeight::new(u32::MAX);
+        block.facts.block_header.height = height;
+        let key = encode_height_key_ascending(height);
+        db.put_cf(&family, key, encode_block_header(&block.facts.block_header))?;
+        let range = BlockHeightRange::inclusive(height, height);
+        assert_eq!(read_replay_headers(&db, range)?, [block.facts.block_header]);
+
+        let mut malformed_key = key.to_vec();
+        malformed_key.push(0);
+        db.put_cf(&family, malformed_key, [0xff])?;
+        assert!(matches!(
+            read_replay_headers(&db, range),
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+        ));
         Ok(())
     }
 
