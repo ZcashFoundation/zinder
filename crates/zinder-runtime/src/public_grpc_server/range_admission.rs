@@ -41,7 +41,7 @@ pub enum RangeClientKey {
 }
 
 /// Admission policy for block-range calls on one public wallet listener.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GrpcRangeAdmission {
     /// Maximum open block-range calls per client, including calls waiting to start.
@@ -51,6 +51,14 @@ pub struct GrpcRangeAdmission {
     /// Scheduling delay in milliseconds that triggers shedding, when configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_scheduling_delay_ms: Option<NonZeroU32>,
+}
+
+impl GrpcRangeAdmission {
+    /// Returns whether every field equals the section default.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Default for GrpcRangeAdmission {

@@ -1,7 +1,6 @@
 //! Private owner-control configuration for coherent state-bundle capture.
 
 use std::{
-    fmt,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -10,45 +9,64 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BearerToken, ConfigError,
-    config::{parse_socket_addr, resolve_optional_bearer_token},
+    config::{SecretInput, Toggle, resolve_optional_bearer_token, validate_optional_path},
 };
 
 use super::{
     defaults::DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT, storage::derive_checkpoints_path,
 };
 
-/// Raw `[projector_control]` configuration.
+/// Raw and serializable `[projector_control]` configuration.
 ///
 /// This surface is opt-in. An enabled control endpoint always requires a
 /// bearer-token file or inline token and a loopback address because it commands
 /// the sole wallet primary to create owner checkpoints.
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectorControlSection {
-    /// Loopback TCP address, or an empty string to disable control.
-    pub listen_addr: Option<String>,
+    /// Loopback TCP address, or `"none"` to disable control explicitly.
+    #[serde(skip_serializing_if = "Toggle::is_defaulted")]
+    pub listen_addr: Toggle<SocketAddr>,
     /// File containing the bearer token required for every request.
     /// Mutually exclusive with [`Self::bearer_token`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bearer_token_path: Option<PathBuf>,
     /// Inline bearer token required for every request.
     /// Mutually exclusive with [`Self::bearer_token_path`].
-    pub bearer_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<SecretInput>,
     /// Shared root that contains freshly prepared state-bundle candidates.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint_staging_root: Option<PathBuf>,
 }
 
-impl fmt::Debug for ProjectorControlSection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ProjectorControlSection")
-            .field("listen_addr", &self.listen_addr)
-            .field("bearer_token_path", &self.bearer_token_path)
-            .field(
-                "bearer_token",
-                &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("checkpoint_staging_root", &self.checkpoint_staging_root)
-            .finish()
+impl ProjectorControlSection {
+    /// Returns whether every field in `[projector_control]` is unset.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.listen_addr.is_defaulted()
+            && self.bearer_token_path.is_none()
+            && self.bearer_token.is_none()
+            && self.checkpoint_staging_root.is_none()
+    }
+
+    /// Returns whether any secret or credential path is set in `[projector_control]`.
+    #[must_use]
+    pub const fn has_secrets(&self) -> bool {
+        self.bearer_token_path.is_some() || self.bearer_token.is_some()
+    }
+
+    /// Renders resolved owner-control settings from [`ResolvedProjectorControl`]
+    /// without exposing secret token material.
+    #[must_use]
+    pub fn from_control(control: &ResolvedProjectorControl) -> Self {
+        Self {
+            listen_addr: Toggle::from_resolved_defaulted_on(control.listen_addr),
+            bearer_token_path: control.bearer_token_path.clone(),
+            bearer_token: (control.bearer_token.is_some() && control.bearer_token_path.is_none())
+                .then(SecretInput::redacted_placeholder),
+            checkpoint_staging_root: Some(control.checkpoint_staging_root.clone()),
+        }
     }
 }
 
@@ -79,10 +97,8 @@ pub fn resolve_projector_control_with_data_dir(
     data_dir: Option<&Path>,
 ) -> Result<ResolvedProjectorControl, ConfigError> {
     let listen_addr = match section.listen_addr {
-        None => None,
-        Some(text) if text.trim().is_empty() => None,
-        Some(text) => {
-            let address = parse_socket_addr("projector_control.listen_addr", &text)?;
+        Toggle::Defaulted | Toggle::Disabled => None,
+        Toggle::Enabled(address) => {
             if !address.ip().is_loopback() {
                 return Err(ConfigError::invalid(
                     "projector_control.listen_addr must be a loopback address",
@@ -91,9 +107,20 @@ pub fn resolve_projector_control_with_data_dir(
             Some(address)
         }
     };
+    let bearer_token_path = validate_optional_path(
+        section.bearer_token_path,
+        "projector_control.bearer_token_path",
+    )?;
+    let checkpoint_staging_root = validate_optional_path(
+        section.checkpoint_staging_root,
+        "projector_control.checkpoint_staging_root",
+    )?;
     let bearer_token = resolve_optional_bearer_token(
-        section.bearer_token_path.as_deref(),
-        section.bearer_token.as_deref(),
+        bearer_token_path.as_deref(),
+        section
+            .bearer_token
+            .as_ref()
+            .map(SecretInput::expose_secret),
         "projector_control.bearer_token_path",
         "projector_control.bearer_token",
     )?;
@@ -104,9 +131,9 @@ pub fn resolve_projector_control_with_data_dir(
     }
     Ok(ResolvedProjectorControl {
         listen_addr,
-        bearer_token_path: section.bearer_token_path,
+        bearer_token_path,
         bearer_token,
-        checkpoint_staging_root: section.checkpoint_staging_root.unwrap_or_else(|| {
+        checkpoint_staging_root: checkpoint_staging_root.unwrap_or_else(|| {
             data_dir.map_or_else(
                 || PathBuf::from(DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT),
                 derive_checkpoints_path,
@@ -115,62 +142,17 @@ pub fn resolve_projector_control_with_data_dir(
     })
 }
 
-/// Redacted TOML representation of `[projector_control]`.
-#[derive(Debug, Serialize)]
-pub struct ProjectorControlToml {
-    /// Empty when control is disabled.
-    pub listen_addr: String,
-    /// Token-file path, never token material.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bearer_token_path: Option<String>,
-    /// Redacted placeholder when an inline bearer token is configured.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bearer_token: Option<&'static str>,
-    /// Shared candidate root.
-    pub checkpoint_staging_root: String,
-}
-
-impl ProjectorControlToml {
-    /// Renders resolved owner-control settings from [`ResolvedProjectorControl`]
-    /// without exposing auth material.
-    #[must_use]
-    pub fn from_control(control: &ResolvedProjectorControl) -> Self {
-        Self {
-            listen_addr: control.listen_addr.map_or_default(|addr| addr.to_string()),
-            bearer_token_path: control
-                .bearer_token_path
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            bearer_token: (control.bearer_token.is_some() && control.bearer_token_path.is_none())
-                .then_some("[REDACTED]"),
-            checkpoint_staging_root: control.checkpoint_staging_root.display().to_string(),
-        }
-    }
-
-    /// Renders resolved owner-control settings without exposing auth material.
-    #[must_use]
-    pub fn from_resolved(
-        listen_addr: Option<SocketAddr>,
-        bearer_token_path: Option<&Path>,
-        checkpoint_staging_root: &Path,
-    ) -> Self {
-        Self {
-            listen_addr: listen_addr.map_or_default(|addr| addr.to_string()),
-            bearer_token_path: bearer_token_path.map(|path| path.display().to_string()),
-            bearer_token: None,
-            checkpoint_staging_root: checkpoint_staging_root.display().to_string(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
     use super::{ProjectorControlSection, resolve_projector_control};
+    use crate::{ConfigError, Toggle};
 
     #[test]
     fn enabled_owner_control_requires_a_bearer_token_file() {
         let outcome = resolve_projector_control(ProjectorControlSection {
-            listen_addr: Some("127.0.0.1:9101".to_owned()),
+            listen_addr: Toggle::Enabled(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9101)),
             ..ProjectorControlSection::default()
         });
         assert!(outcome.is_err());
@@ -179,7 +161,7 @@ mod tests {
     #[test]
     fn owner_control_refuses_non_loopback_bind_even_with_auth() {
         let outcome = resolve_projector_control(ProjectorControlSection {
-            listen_addr: Some("0.0.0.0:9101".to_owned()),
+            listen_addr: Toggle::Enabled(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9101)),
             bearer_token_path: Some("/not-read-because-bind-is-invalid".into()),
             ..ProjectorControlSection::default()
         });
@@ -187,8 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_control_derives_checkpoint_staging_root_from_data_dir()
-    -> Result<(), crate::ConfigError> {
+    fn owner_control_derives_checkpoint_staging_root_from_data_dir() -> Result<(), ConfigError> {
         let derived = super::resolve_projector_control_with_data_dir(
             ProjectorControlSection::default(),
             Some(std::path::Path::new("/custom/zinder-data")),

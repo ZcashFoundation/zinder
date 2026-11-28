@@ -912,7 +912,7 @@ running. Disable its ops endpoint, so it cannot fail on the port instead:
   --storage-path .tmp/regtest.zinder-store > .tmp/ingest.log 2>&1 &
 first_pid=$!
 sleep 5
-ZINDER_OPS__LISTEN_ADDR= ./target/release/zinder-ingest --network zcash-regtest \
+ZINDER_OPS__LISTEN_ADDR=none ./target/release/zinder-ingest --network zcash-regtest \
   --storage-path .tmp/regtest.zinder-store
 kill "$first_pid"
 ```

@@ -104,10 +104,10 @@ pub fn config_file_ops_listen_addr(path: &Path) -> Option<String> {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum OpsHealthcheckError {
-    /// The resolved `ops.listen_addr` is empty, which disables the endpoint.
-    #[error("the operational endpoint is disabled because {origin} is empty")]
+    /// The resolved `ops.listen_addr` is set to `"none"`, which disables the endpoint.
+    #[error("the operational endpoint is disabled because {origin} is set to \"none\"")]
     EndpointDisabled {
-        /// Where the empty address came from.
+        /// Where the disabled sentinel came from.
         origin: &'static str,
     },
 
@@ -194,8 +194,8 @@ fn body_suffix(body_excerpt: &str) -> String {
 /// `addr_flag` wins over `environment_value`, the value of
 /// `ZINDER_OPS__LISTEN_ADDR`, which wins over `config_file_value`, the
 /// configuration file's `[ops] listen_addr`, which wins over
-/// `default_ops_listen_addr`. An empty value disables the endpoint, as it does
-/// for the service.
+/// `default_ops_listen_addr`. `"none"` disables the endpoint, as it does for the
+/// service. Empty or whitespace-only values are rejected as invalid addresses.
 pub fn resolve_ops_healthcheck_addr(
     addr_flag: Option<SocketAddr>,
     environment_value: Option<&str>,
@@ -211,7 +211,7 @@ pub fn resolve_ops_healthcheck_addr(
         (None, None) => (DEFAULT_OPS_LISTEN_ADDR_ORIGIN, default_ops_listen_addr),
     };
     let text = text.trim();
-    if text.is_empty() {
+    if text == crate::DISABLED_SENTINEL {
         return Err(OpsHealthcheckError::EndpointDisabled { origin });
     }
     text.parse()
@@ -723,10 +723,11 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_value_means_the_endpoint_is_disabled() {
+    fn none_means_the_endpoint_is_disabled_and_empty_is_rejected() {
         let from_environment =
-            resolve_ops_healthcheck_addr(None, Some("  "), Some("[::]:9106"), "127.0.0.1:9106");
-        let from_config_file = resolve_ops_healthcheck_addr(None, None, Some(""), "127.0.0.1:9106");
+            resolve_ops_healthcheck_addr(None, Some("none"), Some("[::]:9106"), "127.0.0.1:9106");
+        let from_config_file =
+            resolve_ops_healthcheck_addr(None, None, Some("none"), "127.0.0.1:9106");
 
         assert!(
             matches!(
@@ -746,6 +747,14 @@ mod tests {
             ),
             "{from_config_file:?}"
         );
+
+        assert!(matches!(
+            resolve_ops_healthcheck_addr(None, Some(""), None, "127.0.0.1:9106"),
+            Err(OpsHealthcheckError::InvalidAddress {
+                origin: "ZINDER_OPS__LISTEN_ADDR",
+                ..
+            })
+        ));
     }
 
     #[test]

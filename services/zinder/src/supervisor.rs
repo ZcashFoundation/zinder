@@ -156,7 +156,7 @@ fn prepare_managed_children(
     let mut children = Vec::with_capacity(plan.roles.len());
     for (spec, port) in plan.roles.iter().zip(ops_ports) {
         let config_file = dir.join(format!("{}.toml", spec.role.label()));
-        write_private_config(&config_file, &spec.filtered_toml)?;
+        write_private_config(&config_file, &spec.non_secret_toml)?;
         let ops_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), *port);
         let snapshot =
             RoleOpsSnapshot::starting(spec.role, spec.required_for_readyz, Some(ops_addr));
@@ -314,8 +314,8 @@ fn spawn_role_process(
             cmd.env_remove(&env_name);
         }
     }
-    for (key, env_val) in &entry.spec.filtered_env {
-        cmd.env(key, env_val);
+    for (key, secret_val) in &entry.spec.secret_env {
+        cmd.env(key, secrecy::ExposeSecret::expose_secret(secret_val));
     }
     cmd.env("ZINDER_OPS__LISTEN_ADDR", entry.ops_addr.to_string())
         .stdin(Stdio::null())

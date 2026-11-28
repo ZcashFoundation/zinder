@@ -485,3 +485,273 @@ fn combined_explorer_rejects_a_query_listener_requiring_proxy_protocol() -> eyre
     );
     Ok(())
 }
+
+#[test]
+fn inactive_role_typos_in_toml_and_env_fail_closed() -> eyre::Result<()> {
+    let sandbox = TempDir::new()?;
+    let base = format!(
+        "[network]\nname = \"zcash-regtest\"\n[storage]\ndata_dir = \"{}\"\n[node]\njson_rpc_addr = \"http://127.0.0.1:18232\"\n",
+        sandbox.path().display()
+    );
+    let clean_cfg = write_test_config(sandbox.path(), &base)?;
+    let clean_str = clean_cfg.to_str().ok_or_else(|| eyre::eyre!("path"))?;
+
+    let typo_env = zinder_command(&[
+        "config",
+        "validate",
+        "--preset",
+        "light-wallet",
+        "--config",
+        clean_str,
+    ])
+    .env("ZINDER_PROJECTOR__TYPO_KEY", "1")
+    .output()?;
+    assert!(!typo_env.status.success());
+
+    let readers_typo_env = zinder_command(&[
+        "config",
+        "validate",
+        "--readers-only",
+        "--preset",
+        "wallet",
+        "--config",
+        clean_str,
+    ])
+    .env("ZINDER_INGEST__TYPO_KEY", "1")
+    .output()?;
+    assert!(!readers_typo_env.status.success());
+
+    let bad_toml = format!("{base}\n[projector]\ntypo_key = 1\n");
+    let bad_cfg = write_test_config(sandbox.path(), &bad_toml)?;
+    let bad_str = bad_cfg.to_str().ok_or_else(|| eyre::eyre!("path"))?;
+    for extra in [&["--preset", "light-wallet"][..], &["--readers-only"]] {
+        let mut cmd = zinder_command(&["config", "validate", "--config", bad_str]);
+        cmd.args(extra);
+        let rejected = cmd.output()?;
+        assert!(
+            !rejected.status.success(),
+            "expected rejection for {extra:?}: {}",
+            String::from_utf8_lossy(&rejected.stdout)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn readers_only_rejects_every_writer_only_secret_field() -> eyre::Result<()> {
+    let sandbox = TempDir::new()?;
+    let base = format!(
+        "[network]\nname = \"zcash-regtest\"\n[storage]\ndata_dir = \"{}\"\n[node]\njson_rpc_addr = \"http://127.0.0.1:18232\"\n",
+        sandbox.path().display()
+    );
+    let cases = [
+        (
+            "ingest_control.checkpoint_bearer_token",
+            "[ingest_control]\ncheckpoint_bearer_token = \"writer-cp-secret\"\n",
+        ),
+        (
+            "ingest_control.checkpoint_bearer_token_path",
+            "[ingest_control]\ncheckpoint_bearer_token_path = \"/etc/zinder/cp.token\"\n",
+        ),
+        (
+            "projector_control.bearer_token",
+            "[projector_control]\nbearer_token = \"writer-proj-secret\"\n",
+        ),
+        (
+            "projector_control.bearer_token_path",
+            "[projector_control]\nbearer_token_path = \"/etc/zinder/proj.token\"\n",
+        ),
+        (
+            "node.indexer_tls.client_key_pem",
+            "[node.indexer_tls]\nclient_key_pem = \"writer-key-pem\"\n",
+        ),
+        (
+            "node.indexer_tls.client_key_path",
+            "[node.indexer_tls]\nclient_key_path = \"/etc/zinder/client.key\"\n",
+        ),
+        (
+            "node_fallbacks.1.indexer_tls.client_key_pem",
+            "[node_fallbacks.1]\njson_rpc_addr = \"http://127.0.0.1:18233\"\n[node_fallbacks.1.indexer_tls]\nclient_key_pem = \"fb-key-pem\"\n",
+        ),
+        (
+            "node_fallbacks.1.indexer_tls.client_key_path",
+            "[node_fallbacks.1]\njson_rpc_addr = \"http://127.0.0.1:18233\"\n[node_fallbacks.1.indexer_tls]\nclient_key_path = \"/etc/zinder/fb-client.key\"\n",
+        ),
+    ];
+
+    for (expected_field, snippet) in cases {
+        let cfg_path = write_test_config(sandbox.path(), &format!("{base}\n{snippet}"))?;
+        let cfg_str = cfg_path.to_str().ok_or_else(|| eyre::eyre!("path"))?;
+        let rejected = zinder_command(&[
+            "serve",
+            "--readers-only",
+            "--print-config",
+            "--config",
+            cfg_str,
+        ])
+        .output()?;
+        assert!(
+            !rejected.status.success(),
+            "expected --readers-only rejection for {expected_field}"
+        );
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            stderr.contains(expected_field),
+            "expected `{expected_field}` in stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn none_sentinel_versus_empty_string_and_co_supervised_ingest_control() -> eyre::Result<()> {
+    let sandbox = TempDir::new()?;
+    let cfg_path = write_test_config(
+        sandbox.path(),
+        &format!(
+            "[network]\nname = \"zcash-regtest\"\n[storage]\ndata_dir = \"{}\"\n[node]\njson_rpc_addr = \"http://127.0.0.1:18232\"\n",
+            sandbox.path().display()
+        ),
+    )?;
+    let cfg_str = cfg_path.to_str().ok_or_else(|| eyre::eyre!("path"))?;
+
+    let disabled_ops = zinder_command(&["config", "print", "--config", cfg_str])
+        .env("ZINDER_OPS__LISTEN_ADDR", "none")
+        .output()?;
+    assert!(
+        disabled_ops.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disabled_ops.stderr)
+    );
+    let printed = String::from_utf8_lossy(&disabled_ops.stdout);
+    let parsed: toml::Table = toml::from_str(&printed)?;
+    assert_eq!(parsed["ops"]["listen_addr"].as_str(), Some("none"));
+
+    let empty_ops = zinder_command(&["config", "validate", "--config", cfg_str])
+        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .output()?;
+    assert!(!empty_ops.status.success());
+
+    let disabled_ctrl = zinder_command(&["config", "validate", "--config", cfg_str])
+        .env("ZINDER_INGEST_CONTROL__LISTEN_ADDR", "none")
+        .output()?;
+    assert!(!disabled_ctrl.status.success());
+    let stderr = String::from_utf8_lossy(&disabled_ctrl.stderr);
+    assert!(stderr.contains("ingest_control.listen_addr"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn supervision_plan_splits_secrets_redacts_debug_and_rejects_printed_redacted() -> eyre::Result<()>
+{
+    use secrecy::ExposeSecret;
+    use zinder::{
+        cli::{ConfigScopeArgs, Preset},
+        config::{ConfigScope, prepare_supervision_plan_with_env},
+    };
+
+    let sandbox = TempDir::new()?;
+    let cfg_path = write_test_config(
+        sandbox.path(),
+        &format!(
+            concat!(
+                "[network]\nname = \"zcash-regtest\"\n",
+                "[storage]\ndata_dir = \"{}\"\n",
+                "[node]\njson_rpc_addr = \"http://rpcu:rpcpass-secret@127.0.0.1:18232/?tok=nodeq\"\n",
+                "[node.auth]\nmethod = \"basic\"\nusername = \"rpcu\"\npassword = \"pw-secret\"\n",
+                "[ingest_control]\nbearer_token = \"ic-secret\"\ncheckpoint_bearer_token = \"cp-secret\"\n",
+                "[query]\nproxy_protocol_trusted_cidrs = \"10.0.0.0/8\"\n",
+                "[observability]\notlp_endpoint = \"https://private-collector.internal:4317\"\n",
+            ),
+            sandbox.path().display()
+        ),
+    )?;
+    let scope = ConfigScope::serve(ConfigScopeArgs {
+        preset: Some(Preset::Wallet),
+        readers_only: false,
+        full_blocks: false,
+        data_dir: None,
+        config_path: Some(cfg_path),
+    });
+    let plan = prepare_supervision_plan_with_env(&scope, std::iter::empty::<(String, String)>())?;
+    let ingest_spec = plan
+        .roles
+        .iter()
+        .find(|spec| spec.role == zinder::cli::ServiceRole::Ingest)
+        .ok_or_else(|| eyre::eyre!("missing ingest role"))?;
+    let debug_text = format!("{ingest_spec:?}");
+    for secret_needle in [
+        "rpcpass-secret",
+        "pw-secret",
+        "ic-secret",
+        "cp-secret",
+        "private-collector.internal",
+    ] {
+        assert!(!ingest_spec.non_secret_toml.contains(secret_needle));
+        assert!(!debug_text.contains(secret_needle));
+    }
+    assert_eq!(
+        ingest_spec
+            .secret_env
+            .get("ZINDER_NODE__AUTH__PASSWORD")
+            .map(ExposeSecret::expose_secret),
+        Some("pw-secret")
+    );
+    let query_spec = plan
+        .roles
+        .iter()
+        .find(|spec| spec.role == zinder::cli::ServiceRole::Query)
+        .ok_or_else(|| eyre::eyre!("missing query role"))?;
+    assert!(!query_spec.non_secret_toml.contains("10.0.0.0/8"));
+    assert_eq!(
+        query_spec
+            .secret_env
+            .get("ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS")
+            .map(ExposeSecret::expose_secret),
+        Some("10.0.0.0/8")
+    );
+    Ok(())
+}
+
+#[test]
+fn config_print_redacted_output_is_rejected_on_revalidate() -> eyre::Result<()> {
+    let sandbox = TempDir::new()?;
+    let cfg_path = write_test_config(
+        sandbox.path(),
+        &format!(
+            concat!(
+                "[network]\nname = \"zcash-regtest\"\n",
+                "[storage]\ndata_dir = \"{}\"\n",
+                "[node]\njson_rpc_addr = \"http://rpcu:rpcpass-secret@127.0.0.1:18232/?tok=nodeq\"\n",
+                "[node.auth]\nmethod = \"basic\"\nusername = \"rpcu\"\npassword = \"pw-secret\"\n",
+                "[ingest_control]\nbearer_token = \"ic-secret\"\n",
+            ),
+            sandbox.path().display()
+        ),
+    )?;
+    let printed = zinder_command(&[
+        "config",
+        "print",
+        "--preset",
+        "wallet",
+        "--config",
+        cfg_path.to_str().ok_or_else(|| eyre::eyre!("path"))?,
+    ])
+    .output()?;
+    assert!(printed.status.success());
+    let printed_path = sandbox.path().join("printed.toml");
+    std::fs::write(&printed_path, &printed.stdout)?;
+    let revalidated = zinder_command(&[
+        "config",
+        "validate",
+        "--preset",
+        "wallet",
+        "--config",
+        printed_path.to_str().ok_or_else(|| eyre::eyre!("path"))?,
+    ])
+    .output()?;
+    assert!(!revalidated.status.success());
+    let stderr = String::from_utf8_lossy(&revalidated.stderr);
+    assert!(stderr.contains("[REDACTED]"), "{stderr}");
+    Ok(())
+}

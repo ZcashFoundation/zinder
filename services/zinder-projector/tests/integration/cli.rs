@@ -258,14 +258,14 @@ fn print_config_renders_the_complete_fail_closed_contract() -> eyre::Result<()> 
     assert!(stdout.contains("name = \"zcash-regtest\""), "{stdout}");
     assert!(
         stdout.contains(&format!(
-            "canonical_path = {:?}",
+            "path = {:?}",
             canonical_path.display().to_string()
         )),
         "{stdout}"
     );
     assert!(
         stdout.contains(&format!(
-            "canonical_secondary_path = {:?}",
+            "secondary_path = {:?}",
             canonical_secondary_path.display().to_string()
         )),
         "{stdout}"
@@ -482,8 +482,8 @@ fn unknown_storage_field_is_rejected() -> eyre::Result<()> {
 name = "zcash-regtest"
 
 [storage]
-canonical_path = "{}"
-canonical_secondary_path = "{}"
+path = "{}"
+secondary_path = "{}"
 unsupported_path = "{}"
 
 [projector]
@@ -655,7 +655,7 @@ fn startup_creates_nested_secondary_and_reports_missing_paths() -> eyre::Result<
     let nested_secondary = directory.path().join("nested/parent/canonical-secondary");
     let wallet_path = directory.path().join("wallet");
     let created = projector_command()
-        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .env("ZINDER_OPS__LISTEN_ADDR", "none")
         .args([
             "--network",
             "zcash-regtest",
@@ -684,7 +684,7 @@ fn startup_creates_nested_secondary_and_reports_missing_paths() -> eyre::Result<
     fs::write(&file_obstacle, b"not-a-directory")?;
     let uncreatable_secondary = file_obstacle.join("canonical-secondary");
     let failure_output = projector_command()
-        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .env("ZINDER_OPS__LISTEN_ADDR", "none")
         .args([
             "--network",
             "zcash-regtest",
@@ -745,14 +745,14 @@ fn data_dir_optional_build_owner_and_inline_bearer_tokens_work() -> eyre::Result
     let stdout = String::from_utf8(output.stdout)?;
     assert!(
         stdout.contains(&format!(
-            "canonical_path = \"{}\"",
+            "path = \"{}\"",
             custom_dir.join("canonical").display()
         )),
         "{stdout}"
     );
     assert!(
         stdout.contains(&format!(
-            "canonical_secondary_path = \"{}\"",
+            "secondary_path = \"{}\"",
             custom_dir.join("canonical-secondary/projector").display()
         )),
         "{stdout}"

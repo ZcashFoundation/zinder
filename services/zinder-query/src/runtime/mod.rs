@@ -31,7 +31,7 @@ use crate::{
 
 pub use config::{
     QueryConfig, QueryConfigError, QueryConfigOverrides, load_query_config,
-    load_query_config_with_env, query_config_toml,
+    load_query_config_with_env, query_config_toml, resolve_query_config_from_raw,
 };
 
 /// Command-line interface for the native `WalletQuery` gRPC server.

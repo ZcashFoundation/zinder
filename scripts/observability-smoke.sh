@@ -538,7 +538,7 @@ checkpoint_height = ${CHECKPOINT_HEIGHT}
 listen_addr = "${INGEST_CONTROL_ADDR}"
 
 [ops]
-listen_addr = ""
+listen_addr = "none"
 
 [security]
 allow_public_bind = true
@@ -549,8 +549,8 @@ EOF
 name = "${network}"
 
 [storage]
-canonical_path = "${storage_path}"
-canonical_secondary_path = "${projector_canonical_secondary_path}"
+path = "${storage_path}"
+secondary_path = "${projector_canonical_secondary_path}"
 
 [wallet]
 path = "${wallet_path}"
@@ -590,7 +590,7 @@ listen_addr = "${QUERY_GRPC_ADDR}"
 reorg_window_blocks = 100
 
 [ops]
-listen_addr = ""
+listen_addr = "none"
 
 [node]
 json_rpc_addr = "${node_addr}"
@@ -627,7 +627,7 @@ addr = "http://${INGEST_CONTROL_ADDR}"
 listen_addr = "${COMPAT_GRPC_ADDR}"
 
 [ops]
-listen_addr = ""
+listen_addr = "none"
 
 [node]
 json_rpc_addr = "${node_addr}"

@@ -306,7 +306,7 @@ listen_addr = "{}"
 wallet_query_endpoint = "http://127.0.0.1:1"
 
 [ops]
-listen_addr = ""
+listen_addr = "none"
 "#,
         path_str(storage_path)?,
         path_str(secondary_path)?,

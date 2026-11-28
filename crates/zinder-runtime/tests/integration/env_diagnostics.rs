@@ -218,8 +218,15 @@ fn env_csv_and_toml_arrays_deserialize_sequences() -> Result<()> {
     let from_env = load_toy_env(("ZINDER_TYPED__TAGS", "alpha, beta , gamma"))?;
     assert_eq!(from_env.typed.tags, vec!["alpha", "beta", "gamma"]);
 
-    let from_empty_env = load_toy_env(("ZINDER_TYPED__TAGS", ""))?;
-    assert_eq!(from_empty_env.typed.tags, Vec::<String>::new());
+    let from_empty_env = load_toy_env(("ZINDER_TYPED__TAGS", ""));
+    assert!(matches!(
+        from_empty_env,
+        Err(ConfigError::InvalidEnvValue {
+            ref original_name,
+            ref key,
+            ..
+        }) if original_name == "ZINDER_TYPED__TAGS" && key == "typed.tags"
+    ));
 
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("tags.toml");
@@ -352,7 +359,7 @@ fn node_type_errors_and_fallback_merges_preserve_provenance_and_precedence() -> 
         fallbacks[0].node_auth,
         NodeAuth::Basic { ref username, .. } if username == "file-user"
     ));
-    let rendered = toml::to_string(&zinder_runtime::NodeToml::from_node_target(&fallbacks[0]))?;
+    let rendered = toml::to_string(&NodeSection::from_resolved(&fallbacks[0]))?;
     assert!(rendered.contains("password = \"[REDACTED]\""), "{rendered}");
     assert!(!rendered.contains("0123456"), "{rendered}");
     Ok(())

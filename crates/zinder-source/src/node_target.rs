@@ -7,8 +7,7 @@
 //! raw section into the resolved type.
 //!
 //! See [Configuration](../../../docs/reference/configuration.md)
-//! for the canonical TOML schema. The env-var keys (after `config-rs`'s `__`
-//! flattening) are:
+//! for the canonical TOML schema. The env-var keys are:
 //!
 //! | Env var | Field |
 //! | ------- | ----- |
@@ -51,7 +50,7 @@ use std::{
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::{
-    Deserialize, Deserializer, Serialize,
+    Deserialize, Deserializer, Serialize, Serializer,
     de::{self, MapAccess, Visitor},
 };
 use thiserror::Error;
@@ -84,6 +83,85 @@ pub const DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR: f64 = 0.999;
 
 /// Default upper bound for [`NodeHealthConfig::estimated_gap_floor_blocks`].
 pub const DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS: u32 = 10;
+
+/// Explicit sentinel string used to disable optional node fields such as
+/// `node.indexer_grpc_addr`.
+pub const DISABLED_SENTINEL: &str = "none";
+
+/// Placeholder emitted in redacted `Debug` and `Serialize` configuration
+/// outputs and rejected as input.
+pub const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
+
+/// Secret string configuration input that preserves exact bytes while
+/// redacting `Debug` and `Serialize` outputs and rejecting empty values or the
+/// literal `[REDACTED]` placeholder on input.
+#[derive(Clone)]
+pub struct SecretNodeInput(SecretString);
+
+impl SecretNodeInput {
+    /// Validates and wraps a raw credential string.
+    ///
+    /// Rejects empty/whitespace-only inputs and the literal `[REDACTED]`
+    /// placeholder so `--print-config` output cannot be accidentally re-fed as
+    /// a real secret.
+    pub fn new(raw: impl Into<String>) -> Result<Self, &'static str> {
+        let raw = raw.into();
+        if raw.trim().is_empty() {
+            return Err("empty secret value is not allowed");
+        }
+        if raw.trim() == REDACTED_PLACEHOLDER {
+            return Err(
+                "literal `[REDACTED]` is not a valid secret; supply the real credential instead of `--print-config` output",
+            );
+        }
+        Ok(Self(SecretString::from(raw)))
+    }
+
+    /// Constructs a redacted placeholder instance for `--print-config` rendering.
+    #[must_use]
+    pub fn redacted_placeholder() -> Self {
+        Self(SecretString::from(REDACTED_PLACEHOLDER.to_owned()))
+    }
+
+    /// Exposes the underlying credential bytes for explicit resolution paths.
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl fmt::Debug for SecretNodeInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("\"[REDACTED]\"")
+    }
+}
+
+impl PartialEq for SecretNodeInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.expose_secret() == other.0.expose_secret()
+    }
+}
+
+impl Eq for SecretNodeInput {}
+
+impl Serialize for SecretNodeInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(REDACTED_PLACEHOLDER)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretNodeInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(raw).map_err(de::Error::custom)
+    }
+}
 
 /// Resolved upstream node endpoint shared across production binaries and live tests.
 #[non_exhaustive]
@@ -264,10 +342,13 @@ impl NodeTarget {
 
     /// Resolves a [`NodeTarget`] from a deserialized [`NodeSection`].
     ///
-    /// Each production binary calls this after deserializing its raw config
-    /// through `config-rs`. Live tests call [`NodeTarget::from_environment`].
+    /// Live tests call [`NodeTarget::from_environment`].
     pub fn resolve(network: Network, section: NodeSection) -> Result<Self, NodeConfigError> {
-        let json_rpc_addr = section.json_rpc_addr.ok_or(NodeConfigError::MissingField {
+        let json_rpc_addr = reject_blank_optional(
+            section.json_rpc_addr,
+            "node.json_rpc_addr must not be empty",
+        )?
+        .ok_or(NodeConfigError::MissingField {
             field: "node.json_rpc_addr",
         })?;
         let request_timeout = Duration::from_secs(
@@ -287,7 +368,10 @@ impl NodeTarget {
             resolve_max_concurrent_requests(section.max_concurrent_requests)?;
         let node_auth = resolve_node_auth(section.auth)?;
         let health = resolve_node_health(section.health)?;
-        let indexer_grpc_addr = nonempty_optional(section.indexer_grpc_addr);
+        let indexer_grpc_addr = resolve_optional_disabled_url(
+            section.indexer_grpc_addr,
+            "node.indexer_grpc_addr must not be empty; omit it or set it to \"none\" to disable",
+        )?;
         let indexer_tls =
             resolve_node_indexer_tls(indexer_grpc_addr.as_deref(), section.indexer_tls)?;
 
@@ -346,7 +430,7 @@ impl NodeTarget {
     /// Resolves a [`NodeTarget`] directly from the unified env-var schema.
     ///
     /// Reads `ZINDER_NETWORK` and `ZINDER_NODE__*` from `std::env` without
-    /// going through the production loader, which rejects sensitive leaves.
+    /// going through the runtime config loader.
     /// Used by live tests via `zinder_testkit::live::LiveTestEnv` so the same
     /// env-var schema serves production and tests.
     pub fn from_environment() -> Result<Self, NodeConfigError> {
@@ -363,13 +447,22 @@ impl NodeTarget {
             indexer_tls: NodeIndexerTlsSection {
                 ca_cert_path: read_optional("ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH")
                     .map(PathBuf::from),
-                ca_cert_pem: read_optional("ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM"),
+                ca_cert_pem: read_optional_secret(
+                    "ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM",
+                    "node.indexer_tls.ca_cert_pem",
+                )?,
                 client_cert_path: read_optional("ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH")
                     .map(PathBuf::from),
-                client_cert_pem: read_optional("ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM"),
+                client_cert_pem: read_optional_secret(
+                    "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM",
+                    "node.indexer_tls.client_cert_pem",
+                )?,
                 client_key_path: read_optional("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH")
                     .map(PathBuf::from),
-                client_key_pem: read_optional("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM"),
+                client_key_pem: read_optional_secret(
+                    "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM",
+                    "node.indexer_tls.client_key_pem",
+                )?,
                 server_name: read_optional("ZINDER_NODE__INDEXER_TLS__SERVER_NAME"),
             },
             request_timeout_secs: read_optional_parsed::<u64>(
@@ -391,9 +484,12 @@ impl NodeTarget {
             auth: NodeAuthSection {
                 method: read_optional("ZINDER_NODE__AUTH__METHOD"),
                 username: read_optional("ZINDER_NODE__AUTH__USERNAME"),
-                password: read_optional("ZINDER_NODE__AUTH__PASSWORD"),
+                password: read_optional_secret(
+                    "ZINDER_NODE__AUTH__PASSWORD",
+                    "node.auth.password",
+                )?,
                 path: read_optional("ZINDER_NODE__AUTH__PATH").map(PathBuf::from),
-                cookie: read_optional("ZINDER_NODE__AUTH__COOKIE"),
+                cookie: read_optional_secret("ZINDER_NODE__AUTH__COOKIE", "node.auth.cookie")?,
             },
             health: NodeHealthSection {
                 addr: read_optional("ZINDER_NODE__HEALTH__ADDR"),
@@ -424,35 +520,85 @@ impl NodeTarget {
 /// `[ingest].source` per [ADR-0006](../../../docs/adrs/0006-node-source-boundary.md)
 /// because it is a writer-private implementation decision, not a property
 /// of the node.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeSection {
     /// Node JSON-RPC base URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub json_rpc_addr: Option<String>,
     /// Zebra indexer gRPC endpoint URL.
     ///
     /// When set, enables the streaming mempool source backend and chain-tip
-    /// wakeups. Omit to fall back to JSON-RPC polling. An `https://` URL
-    /// negotiates TLS.
+    /// wakeups. Omit or set to `"none"` to fall back to JSON-RPC polling. An
+    /// `https://` URL negotiates TLS.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub indexer_grpc_addr: Option<String>,
     /// Per-RPC request timeout in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_timeout_secs: Option<u64>,
     /// Maximum JSON-RPC response body size accepted from the node.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_response_bytes: Option<u64>,
     /// Per-broadcast timeout in seconds, applied only to `sendrawtransaction`.
     ///
     /// Overrides `request_timeout_secs` for broadcast calls only. Omit to
     /// fall back to `request_timeout_secs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub broadcast_timeout_secs: Option<u64>,
     /// Most JSON-RPC calls this process has in flight to the node at once,
     /// from 1 to 1024. Omit for 64.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_requests: Option<u32>,
     /// TLS subsection for an `https://` indexer endpoint.
+    #[serde(skip_serializing_if = "NodeIndexerTlsSection::is_empty")]
     pub indexer_tls: NodeIndexerTlsSection,
     /// Authentication subsection.
+    #[serde(skip_serializing_if = "NodeAuthSection::is_empty")]
     pub auth: NodeAuthSection,
     /// Upstream-readiness probe subsection.
+    #[serde(skip_serializing_if = "NodeHealthSection::is_empty")]
     pub health: NodeHealthSection,
+}
+
+impl NodeSection {
+    /// Returns whether every field and subsection of `[node]` is unset.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.json_rpc_addr.is_none()
+            && self.indexer_grpc_addr.is_none()
+            && self.request_timeout_secs.is_none()
+            && self.max_response_bytes.is_none()
+            && self.broadcast_timeout_secs.is_none()
+            && self.max_concurrent_requests.is_none()
+            && self.indexer_tls.is_empty()
+            && self.auth.is_empty()
+            && self.health.is_empty()
+    }
+
+    /// Builds a redacted [`NodeSection`] projection from a resolved [`NodeTarget`].
+    #[must_use]
+    pub fn from_resolved(target: &NodeTarget) -> Self {
+        Self {
+            json_rpc_addr: Some(redact_endpoint_url(&target.json_rpc_addr).into_owned()),
+            indexer_grpc_addr: target
+                .indexer_grpc_addr
+                .as_deref()
+                .map(|addr| redact_endpoint_url(addr).into_owned()),
+            request_timeout_secs: Some(target.request_timeout.as_secs()),
+            max_response_bytes: Some(target.max_response_bytes.get()),
+            broadcast_timeout_secs: target.broadcast_timeout.map(|duration| duration.as_secs()),
+            max_concurrent_requests: Some(target.max_concurrent_requests.get()),
+            indexer_tls: target
+                .indexer_tls
+                .as_ref()
+                .map_or_default(NodeIndexerTlsSection::from_resolved),
+            auth: NodeAuthSection::from_resolved(&target.node_auth),
+            health: target
+                .health
+                .as_ref()
+                .map_or_default(NodeHealthSection::from_resolved),
+        }
+    }
 }
 
 /// Raw `[node_fallbacks.N]` tables: the fallback node endpoints, keyed by
@@ -464,16 +610,63 @@ pub struct NodeSection {
 /// merge field by field. A TOML array of tables is refused because the
 /// configuration loader replaces an array with a table as soon as one
 /// environment variable names an entry.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct NodeFallbackSections {
     positions: BTreeMap<u16, NodeSection>,
 }
 
 impl NodeFallbackSections {
+    /// Builds [`NodeFallbackSections`] from a fixed position map.
+    #[must_use]
+    pub const fn from_positions(positions: BTreeMap<u16, NodeSection>) -> Self {
+        Self { positions }
+    }
+
+    /// Builds a redacted [`NodeFallbackSections`] projection from resolved fallback targets.
+    #[must_use]
+    pub fn from_resolved(targets: &[NodeTarget]) -> Self {
+        let positions = (1_u16..)
+            .zip(targets)
+            .map(|(position, target)| (position, NodeSection::from_resolved(target)))
+            .collect();
+        Self { positions }
+    }
+
     /// Returns whether no fallback table is configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.positions.is_empty()
+    }
+
+    /// Iterates over configured `(position, section)` fallback entries.
+    pub fn iter(&self) -> impl Iterator<Item = (&u16, &NodeSection)> {
+        self.positions.iter()
+    }
+
+    /// Mutably iterates over configured `(position, section)` fallback entries.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&u16, &mut NodeSection)> {
+        self.positions.iter_mut()
+    }
+
+    /// Returns whether any fallback configures indexer TLS certificate or key material.
+    #[must_use]
+    pub fn has_any_indexer_tls_material(&self) -> bool {
+        self.positions
+            .values()
+            .any(|section| section.indexer_tls.has_any_material())
+    }
+}
+
+impl Serialize for NodeFallbackSections {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_map(
+            self.positions
+                .iter()
+                .map(|(position, section)| (position.to_string(), section)),
+        )
     }
 }
 
@@ -525,56 +718,95 @@ impl<'de> Visitor<'de> for NodeFallbackSectionsVisitor {
 
 /// Raw `[node.indexer_tls]` config section.
 ///
-/// Empty or whitespace-only fields count as absent, so an environment that sets a
-/// variable to the empty string leaves the field unset. Each credential accepts
-/// either a file path (`*_path`) or inline PEM text (`*_pem`), never both.
-#[derive(Clone, Default, Deserialize, Serialize)]
+/// Each credential accepts either a file path (`*_path`) or inline PEM text
+/// (`*_pem`), never both. Empty or whitespace-only fields and `[REDACTED]`
+/// placeholders are rejected.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeIndexerTlsSection {
     /// PEM CA bundle file path that verifies the indexer's server certificate.
     /// Omit both this and [`Self::ca_cert_pem`] to use the system roots.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ca_cert_path: Option<PathBuf>,
     /// Inline PEM CA bundle that verifies the indexer's server certificate.
     /// Mutually exclusive with [`Self::ca_cert_path`].
-    pub ca_cert_pem: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_cert_pem: Option<SecretNodeInput>,
     /// PEM client certificate chain file path presented to the indexer.
     /// Mutually exclusive with [`Self::client_cert_pem`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_cert_path: Option<PathBuf>,
     /// Inline PEM client certificate chain presented to the indexer.
     /// Mutually exclusive with [`Self::client_cert_path`].
-    pub client_cert_pem: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_cert_pem: Option<SecretNodeInput>,
     /// PEM private key file path for the client certificate.
     /// Mutually exclusive with [`Self::client_key_pem`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_key_path: Option<PathBuf>,
     /// Inline PEM private key for the client certificate.
     /// Mutually exclusive with [`Self::client_key_path`].
-    pub client_key_pem: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_key_pem: Option<SecretNodeInput>,
     /// Name verified against the indexer's certificate when it differs from
     /// the URL host.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub server_name: Option<String>,
 }
 
-impl fmt::Debug for NodeIndexerTlsSection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("NodeIndexerTlsSection")
-            .field("ca_cert_path", &self.ca_cert_path)
-            .field(
-                "ca_cert_pem",
-                &self.ca_cert_pem.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("client_cert_path", &self.client_cert_path)
-            .field(
-                "client_cert_pem",
-                &self.client_cert_pem.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("client_key_path", &self.client_key_path)
-            .field(
-                "client_key_pem",
-                &self.client_key_pem.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("server_name", &self.server_name)
-            .finish()
+impl NodeIndexerTlsSection {
+    /// Returns whether every field in `[node.indexer_tls]` is unset.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.ca_cert_path.is_none()
+            && self.ca_cert_pem.is_none()
+            && self.client_cert_path.is_none()
+            && self.client_cert_pem.is_none()
+            && self.client_key_path.is_none()
+            && self.client_key_pem.is_none()
+            && self.server_name.is_none()
+    }
+
+    /// Returns whether any indexer TLS certificate or private-key source is configured.
+    #[must_use]
+    pub const fn has_any_material(&self) -> bool {
+        self.ca_cert_path.is_some()
+            || self.ca_cert_pem.is_some()
+            || self.client_cert_path.is_some()
+            || self.client_cert_pem.is_some()
+            || self.client_key_path.is_some()
+            || self.client_key_pem.is_some()
+    }
+
+    /// Builds a redacted [`NodeIndexerTlsSection`] projection from resolved [`NodeIndexerTls`].
+    #[must_use]
+    pub fn from_resolved(tls: &NodeIndexerTls) -> Self {
+        let (ca_cert_path, ca_cert_pem) = split_tls_material_section(tls.ca_cert.as_ref());
+        let (client_cert_path, client_cert_pem) =
+            split_tls_material_section(tls.client_identity.as_ref().map(|identity| &identity.cert));
+        let (client_key_path, client_key_pem) =
+            split_tls_material_section(tls.client_identity.as_ref().map(|identity| &identity.key));
+        Self {
+            ca_cert_path,
+            ca_cert_pem,
+            client_cert_path,
+            client_cert_pem,
+            client_key_path,
+            client_key_pem,
+            server_name: tls.server_name.clone(),
+        }
+    }
+}
+
+fn split_tls_material_section(
+    material: Option<&IndexerTlsMaterial>,
+) -> (Option<PathBuf>, Option<SecretNodeInput>) {
+    match material {
+        Some(IndexerTlsMaterial::File(path)) => (Some(path.clone()), None),
+        Some(IndexerTlsMaterial::Inline(_)) => {
+            (None, Some(SecretNodeInput::redacted_placeholder()))
+        }
+        None => (None, None),
     }
 }
 
@@ -722,48 +954,114 @@ pub struct NodeIndexerClientIdentity {
 #[serde(default, deny_unknown_fields)]
 pub struct NodeHealthSection {
     /// Full URL of Zebra's `/ready` endpoint when the operator exposes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub addr: Option<String>,
     /// Probe cadence in milliseconds. Defaults to
     /// [`DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_interval_ms: Option<u64>,
     /// Lower bound for `verificationprogress` used by the JSON-RPC
     /// fallback. Defaults to
     /// [`DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub verification_progress_floor: Option<f64>,
     /// Upper bound for `estimatedheight - blocks` used by the JSON-RPC
     /// fallback. Defaults to
     /// [`DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_gap_floor_blocks: Option<u32>,
 }
 
+impl NodeHealthSection {
+    /// Returns whether every `[node.health]` field is unset.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.addr.is_none()
+            && self.poll_interval_ms.is_none()
+            && self.verification_progress_floor.is_none()
+            && self.estimated_gap_floor_blocks.is_none()
+    }
+
+    /// Builds a redacted [`NodeHealthSection`] projection from resolved [`NodeHealthConfig`].
+    #[must_use]
+    pub fn from_resolved(health: &NodeHealthConfig) -> Self {
+        Self {
+            addr: health
+                .addr
+                .as_deref()
+                .map(|addr| redact_endpoint_url(addr).into_owned()),
+            poll_interval_ms: Some(
+                u64::try_from(health.poll_interval.as_millis()).unwrap_or(u64::MAX),
+            ),
+            verification_progress_floor: Some(health.verification_progress_floor),
+            estimated_gap_floor_blocks: Some(health.estimated_gap_floor_blocks),
+        }
+    }
+}
+
 /// Raw `[node.auth]` config section.
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeAuthSection {
     /// Auth method: `none`, `basic`, or `cookie`. Defaults to `none`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     /// Basic-auth username.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     /// Basic-auth password.
-    pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<SecretNodeInput>,
     /// Cookie-auth file path. Mutually exclusive with [`Self::cookie`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
     /// Cookie-auth inline credentials. Used by `PaaS` deployments that inject
     /// the secret as a configuration value. Mutually exclusive with
     /// [`Self::path`].
-    pub cookie: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cookie: Option<SecretNodeInput>,
 }
 
-impl fmt::Debug for NodeAuthSection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("NodeAuthSection")
-            .field("method", &self.method)
-            .field("username", &self.username)
-            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
-            .field("path", &self.path)
-            .field("cookie", &self.cookie.as_ref().map(|_| "[REDACTED]"))
-            .finish()
+impl NodeAuthSection {
+    /// Returns whether every field in `[node.auth]` is unset.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.method.is_none()
+            && self.username.is_none()
+            && self.password.is_none()
+            && self.path.is_none()
+            && self.cookie.is_none()
+    }
+
+    /// Builds a redacted [`NodeAuthSection`] projection from resolved [`NodeAuth`].
+    ///
+    /// Both cookie sources render as `path = "[REDACTED]"` so operators inspecting
+    /// `--print-config` cannot tell file vs inline injection apart.
+    #[must_use]
+    pub fn from_resolved(auth: &NodeAuth) -> Self {
+        match auth {
+            NodeAuth::None => Self {
+                method: Some("none".to_owned()),
+                username: None,
+                password: None,
+                path: None,
+                cookie: None,
+            },
+            NodeAuth::Basic { username, .. } => Self {
+                method: Some("basic".to_owned()),
+                username: Some(username.clone()),
+                password: Some(SecretNodeInput::redacted_placeholder()),
+                path: None,
+                cookie: None,
+            },
+            NodeAuth::Cookie(_) => Self {
+                method: Some("cookie".to_owned()),
+                username: None,
+                password: None,
+                path: Some(PathBuf::from(REDACTED_PLACEHOLDER)),
+                cookie: None,
+            },
+        }
     }
 }
 
@@ -871,8 +1169,12 @@ fn resolve_max_concurrent_requests(configured: Option<u32>) -> Result<NonZeroU32
 }
 
 fn resolve_node_health(
-    section: NodeHealthSection,
+    mut section: NodeHealthSection,
 ) -> Result<Option<NodeHealthConfig>, NodeConfigError> {
+    section.addr = resolve_optional_disabled_url(
+        section.addr,
+        "node.health.addr must not be empty; omit it or set it to \"none\" to disable",
+    )?;
     if section == NodeHealthSection::default() {
         return Ok(None);
     }
@@ -906,14 +1208,26 @@ fn resolve_node_health(
 
 fn resolve_tls_material(
     path: Option<PathBuf>,
-    pem: Option<String>,
+    pem: Option<SecretNodeInput>,
     field: &'static str,
 ) -> Result<Option<IndexerTlsMaterial>, NodeConfigError> {
-    match (nonempty_path(path), nonempty_optional(pem)) {
+    let checked_path = reject_blank_or_redacted_path(
+        path,
+        "node.indexer_tls path must not be empty or [REDACTED]",
+    )?;
+    let checked_pem = match pem {
+        Some(secret_pem) => Some(SecretNodeInput::new(secret_pem.expose_secret()).map_err(
+            |_| NodeConfigError::Invalid {
+                reason: "node.indexer_tls PEM must not be empty or [REDACTED]",
+            },
+        )?),
+        None => None,
+    };
+    match (checked_path, checked_pem) {
         (Some(_), Some(_)) => Err(NodeConfigError::IndexerTlsPathAndPemConflict { field }),
         (Some(file_path), None) => Ok(Some(IndexerTlsMaterial::File(file_path))),
         (None, Some(inline_pem)) => Ok(Some(IndexerTlsMaterial::Inline(SecretString::from(
-            inline_pem,
+            inline_pem.expose_secret().to_owned(),
         )))),
         (None, None) => Ok(None),
     }
@@ -934,7 +1248,10 @@ fn resolve_node_indexer_tls(
         section.client_key_pem,
         "client_key",
     )?;
-    let server_name = nonempty_optional(section.server_name);
+    let server_name = reject_blank_optional(
+        section.server_name,
+        "node.indexer_tls.server_name must not be empty",
+    )?;
     if ca_cert.is_none() && client_cert.is_none() && client_key.is_none() && server_name.is_none() {
         return Ok(None);
     }
@@ -1026,31 +1343,55 @@ fn resolve_node_auth(section: NodeAuthSection) -> Result<NodeAuth, NodeConfigErr
         "basic" => {
             reject_present(section.path.is_some(), "node.auth.path", "basic")?;
             reject_present(section.cookie.is_some(), "node.auth.cookie", "basic")?;
-            let username = section.username.ok_or(NodeConfigError::MissingField {
-                field: "node.auth.username",
-            })?;
+            let username =
+                reject_blank_optional(section.username, "node.auth.username must not be empty")?
+                    .ok_or(NodeConfigError::MissingField {
+                        field: "node.auth.username",
+                    })?;
             let password = section.password.ok_or(NodeConfigError::MissingField {
                 field: "node.auth.password",
             })?;
-            Ok(NodeAuth::basic(username, password))
+            let validated_password =
+                SecretNodeInput::new(password.expose_secret()).map_err(|_| {
+                    NodeConfigError::Invalid {
+                        reason: "node.auth.password must not be empty or [REDACTED]",
+                    }
+                })?;
+            Ok(NodeAuth::basic(
+                username,
+                validated_password.expose_secret().to_owned(),
+            ))
         }
         "cookie" => {
             reject_present(section.username.is_some(), "node.auth.username", "cookie")?;
             reject_present(section.password.is_some(), "node.auth.password", "cookie")?;
-            let source = match (section.path, section.cookie) {
-                (Some(_), Some(_)) => {
-                    return Err(NodeConfigError::Invalid {
-                        reason: "node.auth.path and node.auth.cookie are mutually exclusive",
-                    });
-                }
-                (Some(path), None) => CookieSource::File(path),
-                (None, Some(content)) => CookieSource::Inline(SecretString::from(content)),
-                (None, None) => {
-                    return Err(NodeConfigError::MissingField {
-                        field: "node.auth.path or node.auth.cookie",
-                    });
-                }
-            };
+            let cookie_path = reject_blank_or_redacted_path(
+                section.path,
+                "node.auth.path must not be empty or [REDACTED]",
+            )?;
+            let source =
+                match (cookie_path, section.cookie) {
+                    (Some(_), Some(_)) => {
+                        return Err(NodeConfigError::Invalid {
+                            reason: "node.auth.path and node.auth.cookie are mutually exclusive",
+                        });
+                    }
+                    (Some(path), None) => CookieSource::File(path),
+                    (None, Some(content)) => {
+                        let validated_cookie = SecretNodeInput::new(content.expose_secret())
+                            .map_err(|_| NodeConfigError::Invalid {
+                                reason: "node.auth.cookie must not be empty or [REDACTED]",
+                            })?;
+                        CookieSource::Inline(SecretString::from(
+                            validated_cookie.expose_secret().to_owned(),
+                        ))
+                    }
+                    (None, None) => {
+                        return Err(NodeConfigError::MissingField {
+                            field: "node.auth.path or node.auth.cookie",
+                        });
+                    }
+                };
             Ok(NodeAuth::Cookie(source))
         }
         other => Err(NodeConfigError::UnknownAuthMethod {
@@ -1089,12 +1430,61 @@ fn read_optional(env_var: &'static str) -> Option<String> {
     std::env::var(env_var).ok()
 }
 
-fn nonempty_optional(text: Option<String>) -> Option<String> {
-    text.filter(|text| !text.trim().is_empty())
+fn read_optional_secret(
+    env_var: &'static str,
+    field: &'static str,
+) -> Result<Option<SecretNodeInput>, NodeConfigError> {
+    let Some(raw) = read_optional(env_var) else {
+        return Ok(None);
+    };
+    SecretNodeInput::new(raw)
+        .map(Some)
+        .map_err(|reason| NodeConfigError::EnvParseFailed {
+            field,
+            reason: reason.to_owned(),
+        })
 }
 
-fn nonempty_path(path: Option<PathBuf>) -> Option<PathBuf> {
-    path.filter(|path| !path.as_os_str().to_string_lossy().trim().is_empty())
+fn reject_blank_optional(
+    text: Option<String>,
+    reason: &'static str,
+) -> Result<Option<String>, NodeConfigError> {
+    match text {
+        Some(text) if text.trim().is_empty() || text.trim() == REDACTED_PLACEHOLDER => {
+            Err(NodeConfigError::Invalid { reason })
+        }
+        other => Ok(other),
+    }
+}
+
+fn resolve_optional_disabled_url(
+    text: Option<String>,
+    reason: &'static str,
+) -> Result<Option<String>, NodeConfigError> {
+    match text {
+        None => Ok(None),
+        Some(text) if text.trim().is_empty() || text.trim() == REDACTED_PLACEHOLDER => {
+            Err(NodeConfigError::Invalid { reason })
+        }
+        Some(text) if text.trim() == DISABLED_SENTINEL => Ok(None),
+        Some(text) => Ok(Some(text)),
+    }
+}
+
+fn reject_blank_or_redacted_path(
+    path: Option<PathBuf>,
+    reason: &'static str,
+) -> Result<Option<PathBuf>, NodeConfigError> {
+    match path {
+        Some(path) => {
+            let trimmed = path.as_os_str().to_string_lossy();
+            if trimmed.trim().is_empty() || trimmed.trim() == REDACTED_PLACEHOLDER {
+                return Err(NodeConfigError::Invalid { reason });
+            }
+            Ok(Some(path))
+        }
+        None => Ok(None),
+    }
 }
 
 fn read_optional_parsed<TargetType>(
@@ -1150,6 +1540,13 @@ mod tests {
         }
     }
 
+    fn test_secret(text: &str) -> Result<SecretNodeInput, NodeConfigError> {
+        SecretNodeInput::new(text).map_err(|reason| NodeConfigError::EnvParseFailed {
+            field: "test_secret",
+            reason: reason.to_owned(),
+        })
+    }
+
     #[test]
     fn resolve_basic_auth_round_trip() -> Result<(), NodeConfigError> {
         let section = NodeSection {
@@ -1163,7 +1560,7 @@ mod tests {
             auth: NodeAuthSection {
                 method: Some("basic".to_owned()),
                 username: Some("zebra".to_owned()),
-                password: Some("zebra".to_owned()),
+                password: Some(test_secret("zebra")?),
                 path: None,
                 cookie: None,
             },
@@ -1233,21 +1630,27 @@ mod tests {
     }
 
     #[test]
-    fn resolve_omits_indexer_grpc_addr_when_blank() -> Result<(), NodeConfigError> {
-        let section = NodeSection {
+    fn resolve_accepts_none_sentinel_and_rejects_blank_indexer_grpc_addr()
+    -> Result<(), NodeConfigError> {
+        let disabled = NodeSection {
             json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
-            indexer_grpc_addr: Some("   ".to_owned()),
-            request_timeout_secs: None,
-            max_response_bytes: None,
-            broadcast_timeout_secs: None,
-            max_concurrent_requests: None,
-            indexer_tls: NodeIndexerTlsSection::default(),
-            auth: NodeAuthSection::default(),
-            health: NodeHealthSection::default(),
+            indexer_grpc_addr: Some("none".to_owned()),
+            ..NodeSection::default()
         };
-        let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
-
+        let target = NodeTarget::resolve(Network::ZcashRegtest, disabled)?;
         assert!(target.indexer_grpc_addr.is_none());
+
+        for blank in ["", "   "] {
+            let invalid = NodeSection {
+                json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+                indexer_grpc_addr: Some(blank.to_owned()),
+                ..NodeSection::default()
+            };
+            assert!(matches!(
+                NodeTarget::resolve(Network::ZcashRegtest, invalid),
+                Err(NodeConfigError::Invalid { .. })
+            ));
+        }
         Ok(())
     }
 
@@ -1316,13 +1719,13 @@ mod tests {
     #[test]
     fn indexer_tls_section_resolves_inline_pems_and_mixed_sources() -> Result<(), NodeConfigError> {
         let section = NodeIndexerTlsSection {
-            ca_cert_pem: Some(
-                "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n".to_owned(),
-            ),
+            ca_cert_pem: Some(test_secret(
+                "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n",
+            )?),
             client_cert_path: Some(PathBuf::from("/run/secrets/indexer-client.pem")),
-            client_key_pem: Some(
-                "-----BEGIN PRIVATE KEY-----\nclient-key\n-----END PRIVATE KEY-----\n".to_owned(),
-            ),
+            client_key_pem: Some(test_secret(
+                "-----BEGIN PRIVATE KEY-----\nclient-key\n-----END PRIVATE KEY-----\n",
+            )?),
             server_name: Some("zakura.internal".to_owned()),
             ..NodeIndexerTlsSection::default()
         };
@@ -1345,12 +1748,13 @@ mod tests {
     }
 
     #[test]
-    fn indexer_tls_rejects_simultaneous_path_and_pem_for_same_credential() {
+    fn indexer_tls_rejects_simultaneous_path_and_pem_for_same_credential()
+    -> Result<(), NodeConfigError> {
         for (conflict, expected_field) in [
             (
                 NodeIndexerTlsSection {
                     ca_cert_path: Some(PathBuf::from("/ca.pem")),
-                    ca_cert_pem: Some("-----BEGIN CERTIFICATE-----\nca\n".to_owned()),
+                    ca_cert_pem: Some(test_secret("-----BEGIN CERTIFICATE-----\nca\n")?),
                     ..NodeIndexerTlsSection::default()
                 },
                 "ca_cert",
@@ -1358,17 +1762,17 @@ mod tests {
             (
                 NodeIndexerTlsSection {
                     client_cert_path: Some(PathBuf::from("/client.pem")),
-                    client_cert_pem: Some("-----BEGIN CERTIFICATE-----\nclient\n".to_owned()),
-                    client_key_pem: Some("-----BEGIN PRIVATE KEY-----\nkey\n".to_owned()),
+                    client_cert_pem: Some(test_secret("-----BEGIN CERTIFICATE-----\nclient\n")?),
+                    client_key_pem: Some(test_secret("-----BEGIN PRIVATE KEY-----\nkey\n")?),
                     ..NodeIndexerTlsSection::default()
                 },
                 "client_cert",
             ),
             (
                 NodeIndexerTlsSection {
-                    client_cert_pem: Some("-----BEGIN CERTIFICATE-----\nclient\n".to_owned()),
+                    client_cert_pem: Some(test_secret("-----BEGIN CERTIFICATE-----\nclient\n")?),
                     client_key_path: Some(PathBuf::from("/client.key")),
-                    client_key_pem: Some("-----BEGIN PRIVATE KEY-----\nkey\n".to_owned()),
+                    client_key_pem: Some(test_secret("-----BEGIN PRIVATE KEY-----\nkey\n")?),
                     ..NodeIndexerTlsSection::default()
                 },
                 "client_key",
@@ -1384,23 +1788,24 @@ mod tests {
                     if field == expected_field
             ));
         }
+        Ok(())
     }
 
     #[test]
     fn debug_formatting_redacts_inline_pems_and_node_secrets() -> Result<(), NodeConfigError> {
         let tls_section = NodeIndexerTlsSection {
-            ca_cert_pem: Some("ca-secret-pem".to_owned()),
-            client_cert_pem: Some("client-cert-secret".to_owned()),
-            client_key_pem: Some("client-key-secret".to_owned()),
+            ca_cert_pem: Some(test_secret("ca-secret-pem")?),
+            client_cert_pem: Some(test_secret("client-cert-secret")?),
+            client_key_pem: Some(test_secret("client-key-secret")?),
             server_name: Some("zakura.internal".to_owned()),
             ..NodeIndexerTlsSection::default()
         };
         let auth_section = NodeAuthSection {
             method: Some("basic".to_owned()),
             username: Some("zebra".to_owned()),
-            password: Some("password-secret".to_owned()),
+            password: Some(test_secret("password-secret")?),
             path: None,
-            cookie: Some("cookie-secret".to_owned()),
+            cookie: Some(test_secret("cookie-secret")?),
         };
         let section_debug = format!("{tls_section:?} {auth_section:?}");
         for secret in [
@@ -1417,9 +1822,9 @@ mod tests {
             indexer_tls_section(
                 Some("https://zakura:8230"),
                 NodeIndexerTlsSection {
-                    ca_cert_pem: Some("ca-secret-pem".to_owned()),
-                    client_cert_pem: Some("client-cert-secret".to_owned()),
-                    client_key_pem: Some("client-key-secret".to_owned()),
+                    ca_cert_pem: Some(test_secret("ca-secret-pem")?),
+                    client_cert_pem: Some(test_secret("client-cert-secret")?),
+                    client_key_pem: Some(test_secret("client-key-secret")?),
                     ..NodeIndexerTlsSection::default()
                 },
             ),
@@ -1458,7 +1863,7 @@ mod tests {
 
     #[test]
     fn indexer_tls_section_requires_indexer_url() {
-        for indexer_grpc_addr in [None, Some(""), Some("  ")] {
+        for indexer_grpc_addr in [None, Some("none")] {
             let outcome = NodeTarget::resolve(
                 Network::ZcashRegtest,
                 indexer_tls_section(indexer_grpc_addr, mutual_tls_section()),
@@ -1478,7 +1883,7 @@ mod tests {
             ..mutual_tls_section()
         };
         let without_certificate = NodeIndexerTlsSection {
-            client_cert_path: Some(PathBuf::from(" ")),
+            client_cert_path: None,
             ..mutual_tls_section()
         };
 
@@ -1496,24 +1901,31 @@ mod tests {
     }
 
     #[test]
-    fn blank_indexer_tls_fields_count_as_absent() -> Result<(), NodeConfigError> {
-        let blank = NodeIndexerTlsSection {
-            ca_cert_path: Some(PathBuf::new()),
-            ca_cert_pem: Some("   ".to_owned()),
-            client_cert_path: Some(PathBuf::from("   ")),
-            client_cert_pem: Some(String::new()),
-            client_key_path: Some(PathBuf::new()),
-            client_key_pem: Some(" \n ".to_owned()),
-            server_name: Some(String::new()),
-        };
-
-        let target = NodeTarget::resolve(
-            Network::ZcashRegtest,
-            indexer_tls_section(Some("http://127.0.0.1:8230"), blank),
-        )?;
-
-        assert!(target.indexer_tls.is_none());
-        Ok(())
+    fn blank_indexer_tls_fields_are_rejected() {
+        for section in [
+            NodeIndexerTlsSection {
+                ca_cert_path: Some(PathBuf::new()),
+                ..NodeIndexerTlsSection::default()
+            },
+            NodeIndexerTlsSection {
+                client_cert_path: Some(PathBuf::from("   ")),
+                ..NodeIndexerTlsSection::default()
+            },
+            NodeIndexerTlsSection {
+                server_name: Some(String::new()),
+                ..NodeIndexerTlsSection::default()
+            },
+        ] {
+            assert!(matches!(
+                NodeTarget::resolve(
+                    Network::ZcashRegtest,
+                    indexer_tls_section(Some("https://zakura:8230"), section),
+                ),
+                Err(NodeConfigError::Invalid { .. })
+            ));
+        }
+        assert!(SecretNodeInput::new("   ").is_err());
+        assert!(SecretNodeInput::new("[REDACTED]").is_err());
     }
 
     #[test]
@@ -1530,7 +1942,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_basic_auth_with_path() {
+    fn resolve_rejects_basic_auth_with_path() -> Result<(), NodeConfigError> {
         let section = NodeSection {
             json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
             indexer_grpc_addr: None,
@@ -1542,7 +1954,7 @@ mod tests {
             auth: NodeAuthSection {
                 method: Some("basic".to_owned()),
                 username: Some("zebra".to_owned()),
-                password: Some("zebra".to_owned()),
+                password: Some(test_secret("zebra")?),
                 path: Some(PathBuf::from("/etc/zebra/cookie")),
                 cookie: None,
             },
@@ -1557,6 +1969,7 @@ mod tests {
                 method: "basic",
             })
         ));
+        Ok(())
     }
 
     #[test]
@@ -1602,7 +2015,7 @@ mod tests {
                 username: None,
                 password: None,
                 path: None,
-                cookie: Some("user:cookie-secret".to_owned()),
+                cookie: Some(test_secret("user:cookie-secret")?),
             },
             health: NodeHealthSection::default(),
         };
@@ -1616,7 +2029,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_cookie_auth_with_both_path_and_inline() {
+    fn resolve_rejects_cookie_auth_with_both_path_and_inline() -> Result<(), NodeConfigError> {
         let section = NodeSection {
             json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
             indexer_grpc_addr: None,
@@ -1630,7 +2043,7 @@ mod tests {
                 username: None,
                 password: None,
                 path: Some(PathBuf::from("/var/run/auth/.cookie")),
-                cookie: Some("user:cookie-secret".to_owned()),
+                cookie: Some(test_secret("user:cookie-secret")?),
             },
             health: NodeHealthSection::default(),
         };
@@ -1642,6 +2055,7 @@ mod tests {
                 reason: "node.auth.path and node.auth.cookie are mutually exclusive",
             })
         ));
+        Ok(())
     }
 
     #[test]

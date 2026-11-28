@@ -19,13 +19,30 @@ use crate::config::{ConfigError, require_field};
 /// opts in.
 pub const DEFAULT_ALLOW_PUBLIC_BIND: bool = false;
 
-/// Raw `[security]` config section.
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+/// Raw and serializable `[security]` config section.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecuritySection {
     /// Opt-in to binding plaintext serving surfaces to public or
     /// unspecified addresses. Defaults to `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_public_bind: Option<bool>,
+}
+
+impl SecuritySection {
+    /// Returns whether `[security]` has no explicit setting.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.allow_public_bind.is_none()
+    }
+
+    /// Builds a `[security]` section projection from a resolved opt-in flag.
+    #[must_use]
+    pub const fn from_resolved(allow_public_bind: bool) -> Self {
+        Self {
+            allow_public_bind: Some(allow_public_bind),
+        }
+    }
 }
 
 /// Resolves the public-bind opt-in from a [`SecuritySection`].
@@ -34,21 +51,6 @@ pub struct SecuritySection {
 /// absent field still resolves rather than failing on a missing value.
 pub fn resolve_allow_public_bind(section: SecuritySection) -> Result<bool, ConfigError> {
     require_field(section.allow_public_bind, "security.allow_public_bind")
-}
-
-/// Redacted TOML projection of `[security]` for `--print-config`.
-#[derive(Debug, Serialize)]
-pub struct SecurityToml {
-    /// Resolved public-bind opt-in.
-    pub allow_public_bind: bool,
-}
-
-impl SecurityToml {
-    /// Builds a [`SecurityToml`] from a resolved opt-in flag.
-    #[must_use]
-    pub const fn from_resolved(allow_public_bind: bool) -> Self {
-        Self { allow_public_bind }
-    }
 }
 
 #[cfg(test)]

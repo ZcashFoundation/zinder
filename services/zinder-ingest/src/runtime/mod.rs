@@ -65,6 +65,7 @@ use crate::{
 pub use config::{
     IngestCommandConfig, IngestConfigError, IngestConfigOverrides, IngestCoverage,
     load_ingest_config, load_ingest_config_with_env, redacted_ingest_config_toml,
+    resolve_ingest_config_from_raw,
 };
 
 /// Suffix of the reader-local metadata directory the in-process canonical

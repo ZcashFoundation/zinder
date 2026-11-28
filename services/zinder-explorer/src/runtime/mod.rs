@@ -37,7 +37,7 @@ use crate::{
 
 pub use config::{
     ExplorerConfig, ExplorerConfigError, ExplorerConfigOverrides, explorer_config_toml,
-    load_explorer_config, load_explorer_config_with_env,
+    load_explorer_config, load_explorer_config_with_env, resolve_explorer_config_from_raw,
 };
 
 type SharedCanonicalSecondary = Arc<RwLock<RocksDbCanonicalSecondary>>;

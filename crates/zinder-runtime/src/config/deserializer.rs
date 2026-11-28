@@ -337,6 +337,13 @@ const fn toml_kind_label(toml_val: &toml::Value) -> &'static str {
     }
 }
 
+fn empty_env_error(origin: &EnvOrigin) -> DeserError {
+    DeserError::invalid_env(
+        origin,
+        "empty value is not allowed; unset the variable to use the default or set it to \"none\" to disable",
+    )
+}
+
 struct NodeDeserializer<'de> {
     node: NodeRef<'de>,
     path: String,
@@ -357,10 +364,14 @@ impl<'de> NodeDeserializer<'de> {
         T: FromStr + TryFrom<i64> + TryFrom<u64>,
     {
         match self.node {
-            NodeRef::Node(ConfigNode::Env { origin, raw }) => raw
-                .trim()
-                .parse::<T>()
-                .map_err(|_| DeserError::invalid_env(origin, format!("expected {expected}"))),
+            NodeRef::Node(ConfigNode::Env { origin, raw }) => {
+                if raw.is_empty() {
+                    return Err(empty_env_error(origin));
+                }
+                raw.trim()
+                    .parse::<T>()
+                    .map_err(|_| DeserError::invalid_env(origin, format!("expected {expected}")))
+            }
             NodeRef::EnvSegment { origin, segment } => segment
                 .trim()
                 .parse::<T>()
@@ -396,10 +407,14 @@ impl<'de> NodeDeserializer<'de> {
         T: FromStr + TryFrom<i64> + TryFrom<u64>,
     {
         match self.node {
-            NodeRef::Node(ConfigNode::Env { origin, raw }) => raw
-                .trim()
-                .parse::<T>()
-                .map_err(|_| DeserError::invalid_env(origin, format!("expected {expected}"))),
+            NodeRef::Node(ConfigNode::Env { origin, raw }) => {
+                if raw.is_empty() {
+                    return Err(empty_env_error(origin));
+                }
+                raw.trim()
+                    .parse::<T>()
+                    .map_err(|_| DeserError::invalid_env(origin, format!("expected {expected}")))
+            }
             NodeRef::EnvSegment { origin, segment } => segment
                 .trim()
                 .parse::<T>()
@@ -426,7 +441,12 @@ impl<'de> NodeDeserializer<'de> {
         V: Visitor<'de>,
     {
         match self.node {
-            NodeRef::Node(ConfigNode::Env { raw, .. }) => visitor.visit_str(raw.as_str()),
+            NodeRef::Node(ConfigNode::Env { origin, raw }) => {
+                if raw.is_empty() {
+                    return Err(empty_env_error(origin));
+                }
+                visitor.visit_str(raw.as_str())
+            }
             NodeRef::EnvSegment { segment, .. } | NodeRef::DefaultStr(segment) => {
                 visitor.visit_str(segment)
             }
@@ -454,10 +474,14 @@ impl<'de> NodeDeserializer<'de> {
         let float_val = self.parse_f64(label)?;
         if as_f32 {
             let trimmed = match self.node {
-                NodeRef::Node(ConfigNode::Env { origin, raw }) => raw
-                    .trim()
-                    .parse::<f32>()
-                    .map_err(|_| DeserError::invalid_env(origin, format!("expected {label}")))?,
+                NodeRef::Node(ConfigNode::Env { origin, raw }) => {
+                    if raw.is_empty() {
+                        return Err(empty_env_error(origin));
+                    }
+                    raw.trim()
+                        .parse::<f32>()
+                        .map_err(|_| DeserError::invalid_env(origin, format!("expected {label}")))?
+                }
                 NodeRef::EnvSegment { origin, segment } => segment
                     .trim()
                     .parse::<f32>()
@@ -479,10 +503,14 @@ impl<'de> NodeDeserializer<'de> {
 
     fn parse_f64(&self, label: &str) -> Result<f64, DeserError> {
         match self.node {
-            NodeRef::Node(ConfigNode::Env { origin, raw }) => raw
-                .trim()
-                .parse::<f64>()
-                .map_err(|_| DeserError::invalid_env(origin, format!("expected {label}"))),
+            NodeRef::Node(ConfigNode::Env { origin, raw }) => {
+                if raw.is_empty() {
+                    return Err(empty_env_error(origin));
+                }
+                raw.trim()
+                    .parse::<f64>()
+                    .map_err(|_| DeserError::invalid_env(origin, format!("expected {label}")))
+            }
             NodeRef::EnvSegment { origin, segment } => segment
                 .trim()
                 .parse::<f64>()
@@ -637,7 +665,12 @@ impl<'de> Deserializer<'de> for NodeDeserializer<'de> {
                 let mut access = ConfigTableAccess::new(entries, self.path);
                 visitor.visit_map(&mut access)
             }
-            NodeRef::Node(ConfigNode::Env { raw, .. }) => visitor.visit_str(raw.as_str()),
+            NodeRef::Node(ConfigNode::Env { origin, raw }) => {
+                if raw.is_empty() {
+                    return Err(empty_env_error(origin));
+                }
+                visitor.visit_str(raw.as_str())
+            }
             NodeRef::EnvSegment { segment, .. } | NodeRef::DefaultStr(segment) => {
                 visitor.visit_str(segment)
             }
@@ -655,14 +688,19 @@ impl<'de> Deserializer<'de> for NodeDeserializer<'de> {
         V: Visitor<'de>,
     {
         match self.node {
-            NodeRef::Node(ConfigNode::Env { origin, raw }) => match raw.as_str() {
-                "true" => visitor.visit_bool(true),
-                "false" => visitor.visit_bool(false),
-                _ => Err(DeserError::invalid_env(
-                    origin,
-                    "expected boolean (`true` or `false`)",
-                )),
-            },
+            NodeRef::Node(ConfigNode::Env { origin, raw }) => {
+                if raw.is_empty() {
+                    return Err(empty_env_error(origin));
+                }
+                match raw.as_str() {
+                    "true" => visitor.visit_bool(true),
+                    "false" => visitor.visit_bool(false),
+                    _ => Err(DeserError::invalid_env(
+                        origin,
+                        "expected boolean (`true` or `false`)",
+                    )),
+                }
+            }
             NodeRef::EnvSegment { origin, segment } => match segment {
                 "true" => visitor.visit_bool(true),
                 "false" => visitor.visit_bool(false),
@@ -737,7 +775,12 @@ impl<'de> Deserializer<'de> for NodeDeserializer<'de> {
 
     fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.node {
-            NodeRef::Node(ConfigNode::Env { raw, .. }) => visitor.visit_bytes(raw.as_bytes()),
+            NodeRef::Node(ConfigNode::Env { origin, raw }) => {
+                if raw.is_empty() {
+                    return Err(empty_env_error(origin));
+                }
+                visitor.visit_bytes(raw.as_bytes())
+            }
             NodeRef::Node(ConfigNode::Toml(toml::Value::String(text)))
             | NodeRef::Toml(toml::Value::String(text)) => visitor.visit_bytes(text.as_bytes()),
             other @ (NodeRef::Node(_)
@@ -786,6 +829,9 @@ impl<'de> Deserializer<'de> for NodeDeserializer<'de> {
                 | ConfigNode::Override(PrimitiveValue::List(elements)),
             ) => visitor.visit_seq(DefaultSeqAccess::new(elements, &self.path)),
             NodeRef::Node(ConfigNode::Env { origin, raw }) => {
+                if raw.trim().is_empty() {
+                    return Err(empty_env_error(origin));
+                }
                 visitor.visit_seq(EnvSeqAccess::new(origin, raw.as_str(), &self.path))
             }
             other @ (NodeRef::Node(_)
@@ -847,6 +893,9 @@ impl<'de> Deserializer<'de> for NodeDeserializer<'de> {
     ) -> Result<V::Value, Self::Error> {
         match self.node {
             NodeRef::Node(ConfigNode::Env { origin, raw }) => {
+                if raw.is_empty() {
+                    return Err(empty_env_error(origin));
+                }
                 visitor.visit_enum(EnumStringAccess::new(raw.as_str(), Some(origin), variants))
             }
             NodeRef::EnvSegment { origin, segment } => {
