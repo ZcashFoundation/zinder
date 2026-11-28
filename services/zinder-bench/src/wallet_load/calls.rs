@@ -427,15 +427,10 @@ pub(crate) struct RpcSummary {
     cancelled_after_messages: u64,
 }
 
-/// Requested tree-state heights against Zinder's construction checkpoints.
+/// Requested tree-state heights and their alignment with the 100-block cadence.
 ///
-/// First-sync construction stores a checkpoint every 100 blocks, so a height
-/// on that stride is a stored checkpoint. Below the first-sync tip, any other
-/// height replays its offset from the stride, `height % 100` blocks. Above
-/// that tip every block has a checkpoint, and a store whose checkpoint pass
-/// has run has one at every settled block, so the offsets are an upper bound
-/// on the replay work. `server_observed`, present when the run read the
-/// server's metrics, is what the server actually did.
+/// Cadence offsets describe the workload. When available, server metrics
+/// report stored and replayed requests and observed replay work.
 #[derive(Debug, Serialize)]
 pub(crate) struct TreeStateHeights {
     requested: u64,

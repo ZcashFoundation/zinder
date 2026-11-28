@@ -1,0 +1,46 @@
+{
+  "contract_identity": "canonical-fixture-replay-plan",
+  "format_version": 1,
+  "fixture_manifest_sha256": "a795d62a380464b7669356119d2e018849618b0d7a11ba9f3cadf16c77b7b1e9",
+  "network_upgrade_activations_fingerprint_version": 1,
+  "network_upgrade_activations_fingerprint_hex": "91de3cb1f523f579c12c393d2efb29eb4a2cdc7737804e36763aaf41d6d0871d",
+  "history_predecessor": {
+    "block_id": {
+      "height": 602,
+      "hash_hex": "e2cf00ba378184f158d5f0a2a735890034e692d79da68027c17973cd3882b063"
+    },
+    "block_time_seconds": 1297244801,
+    "frontiers": {
+      "sapling": {
+        "final_root_hex": "3e49b5f954aa9d3545bc6c37744661eea48d7c34e3000d82b7f0010c30f4c2fb",
+        "final_state_hex": "000000"
+      },
+      "orchard": {
+        "final_root_hex": "ae2935f1dfd8a24aed7c70df7de3a668eb7a49b1319880dde2bbd9031ae5d82f",
+        "final_state_hex": "000000"
+      },
+      "ironwood": null
+    }
+  },
+  "source_tip_checkpoint": {
+    "block_id": {
+      "height": 606,
+      "hash_hex": "7f453a9095109c4d2180970410c6a66efa448b4b8bfd112bfa59da78a87279a3"
+    },
+    "block_time_seconds": 1297244832,
+    "frontiers": {
+      "sapling": {
+        "final_root_hex": "3e49b5f954aa9d3545bc6c37744661eea48d7c34e3000d82b7f0010c30f4c2fb",
+        "final_state_hex": "000000"
+      },
+      "orchard": {
+        "final_root_hex": "ae2935f1dfd8a24aed7c70df7de3a668eb7a49b1319880dde2bbd9031ae5d82f",
+        "final_state_hex": "000000"
+      },
+      "ironwood": {
+        "final_root_hex": "4168e2b638e4d369706dfbc2b6fb93efca2f947e567a7a76c69940e4bf373319",
+        "final_state_hex": "01e09591151468fbc5b2a82dfcd8ad841219366c3e34c6e1164dfec345d0a39905014be9998d2e27171541717a142e048a7a7b7c0b685a272b9ba48b1cbc2a4ff42a1f00000000000000000000000000000000000000000000000000000000000000"
+      }
+    }
+  }
+}

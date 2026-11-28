@@ -6,7 +6,7 @@ use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -243,6 +243,8 @@ pub struct CanonicalFixtureRocksDbReplayConfig {
     pub source_segment_delay: Duration,
     /// Tree-state checkpoint coverage persisted during canonical construction.
     pub tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Optional threshold override for commitment-budget coverage.
+    pub tree_state_commitment_budget: Option<NonZeroU32>,
 }
 
 /// Exact load, publication, and cold-reopen evidence from canonical replay.
@@ -254,6 +256,12 @@ pub struct CanonicalFixtureRocksDbReplayOutcome {
     pub replay_plan_digest_sha256: String,
     /// Actual tree-state checkpoint coverage persisted during canonical construction.
     pub tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Effective commitment threshold, when selected.
+    pub tree_state_commitment_budget: Option<NonZeroU32>,
+    /// Fresh builder open through trusted READY publication.
+    pub ready_duration: Duration,
+    /// Independent primary open through append-anchor authentication.
+    pub reopen_duration: Duration,
     /// Block-family evidence accepted by the real canonical loader.
     pub block_load_evidence: CanonicalBlockLoadEvidence,
     /// Exact completed-subtree evidence accepted by the canonical loader.
@@ -392,10 +400,12 @@ struct AdmittedCanonicalFixtureReplay {
     fixture_source: CanonicalFixtureNodeSource,
     source_tip_checkpoint: CommitmentTreeCheckpoint,
     builder: RocksDbCanonicalBuilder,
+    build_started: Instant,
 }
 
 #[derive(Clone, Copy)]
 struct PublishedCanonicalFixtureEvidence {
+    ready_duration: Duration,
     ready: CanonicalStoreReadyEvidence,
     event_fence: CanonicalEventFence,
 }
@@ -405,6 +415,7 @@ struct ReopenedCanonicalFixtureEvidence {
     ready: CanonicalStoreReadyEvidence,
     event_fence: CanonicalEventFence,
     replayed_block_count: u64,
+    reopen_duration: Duration,
 }
 
 struct CanonicalFixtureColdReopenExpectation<'a> {
@@ -466,13 +477,17 @@ fn admit_canonical_fixture_replay(
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.supported_reorg_depth)?,
     )?;
+    let selection = config
+        .tree_state_checkpoint_coverage
+        .resolve(config.tree_state_commitment_budget)?;
+    let build_started = Instant::now();
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &config.canonical_store_path,
         build_plan,
         config.resource_budget,
     )?;
-    let builder = if config.tree_state_checkpoint_coverage.stores_every_block() {
-        builder.with_every_block_tree_state_checkpoints()?
+    let builder = if let Some(selection) = selection {
+        builder.with_tree_state_checkpoint_selection(selection)?
     } else {
         builder
     };
@@ -484,6 +499,7 @@ fn admit_canonical_fixture_replay(
         fixture_source,
         source_tip_checkpoint,
         builder,
+        build_started,
     })
 }
 
@@ -507,19 +523,16 @@ fn authenticate_canonical_fixture_load(
             "canonical fixture replay load tip differs from the admitted source checkpoint",
         ));
     }
-    let actual_coverage = TreeStateCheckpointCoverage::from_every_block(
-        canonical_load
-            .builder
-            .stores_every_block_tree_state_checkpoints(),
-    );
-    let expected_checkpoint_count = actual_coverage.expected_checkpoint_count(
+    let (actual_coverage, _) = TreeStateCheckpointCoverage::from_selection(
+        canonical_load.builder.tree_state_checkpoint_selection(),
+    )?;
+    if !actual_coverage.checkpoint_count_matches(
         canonical_load.block_evidence.first_height.value(),
         canonical_load.block_evidence.tip_height.value(),
-    );
-    if Some(canonical_load.block_evidence.tree_state_checkpoint_count) != expected_checkpoint_count
-    {
+        canonical_load.block_evidence.tree_state_checkpoint_count,
+    ) {
         return Err(BenchError::fixture_format(format!(
-            "canonical fixture replay persisted {} tree-state checkpoints for {actual_coverage} coverage, expected {expected_checkpoint_count:?}",
+            "canonical fixture replay persisted {} tree-state checkpoints for {actual_coverage} coverage",
             canonical_load.block_evidence.tree_state_checkpoint_count
         )));
     }
@@ -551,6 +564,7 @@ async fn derive_settled_tip(
 fn publish_canonical_fixture(
     builder: RocksDbCanonicalBuilder,
     settled_tip: BlockId,
+    build_started: Instant,
 ) -> Result<PublishedCanonicalFixtureEvidence, BenchError> {
     let validated = builder.prepare_trusted_fresh_publication()?;
     let prepared_publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
@@ -559,6 +573,7 @@ fn publish_canonical_fixture(
     ))?;
     let published_store = validated.publish_baseline(prepared_publication)?;
     Ok(PublishedCanonicalFixtureEvidence {
+        ready_duration: build_started.elapsed(),
         ready: published_store.ready_evidence(),
         event_fence: published_store.event_fence(),
     })
@@ -568,6 +583,7 @@ fn certify_reopened_canonical_fixture(
     config: &CanonicalFixtureRocksDbReplayConfig,
     expected: &CanonicalFixtureColdReopenExpectation<'_>,
 ) -> Result<ReopenedCanonicalFixtureEvidence, BenchError> {
+    let reopen_started = Instant::now();
     let reopened_store = RocksDbCanonicalStore::open_ready(
         &config.canonical_store_path,
         expected.activations,
@@ -600,6 +616,7 @@ fn certify_reopened_canonical_fixture(
             "canonical fixture replay cold-reopen append anchor differs from the derived settled tip",
         ));
     }
+    let reopen_duration = reopen_started.elapsed();
     let mut replayed_block_count = 0_u64;
     for replay in reopened_store.scan_canonical_replay()? {
         replay?;
@@ -619,6 +636,7 @@ fn certify_reopened_canonical_fixture(
         ready,
         event_fence,
         replayed_block_count,
+        reopen_duration,
     })
 }
 
@@ -709,11 +727,10 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
         &admitted.manifest,
         &admitted.source_tip_checkpoint,
     )?;
-    let tree_state_checkpoint_coverage = TreeStateCheckpointCoverage::from_every_block(
-        canonical_load
-            .builder
-            .stores_every_block_tree_state_checkpoints(),
-    );
+    let (tree_state_checkpoint_coverage, tree_state_commitment_budget) =
+        TreeStateCheckpointCoverage::from_selection(
+            canonical_load.builder.tree_state_checkpoint_selection(),
+        )?;
     let block_load_evidence = canonical_load.block_evidence;
     let subtree_root_load_evidence = canonical_load.subtree_root_evidence;
     let settled_tip = derive_settled_tip(
@@ -722,7 +739,8 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
         config.supported_reorg_depth,
     )
     .await?;
-    let published = publish_canonical_fixture(canonical_load.builder, settled_tip)?;
+    let published =
+        publish_canonical_fixture(canonical_load.builder, settled_tip, admitted.build_started)?;
     let reopened = certify_reopened_canonical_fixture(
         &config,
         &CanonicalFixtureColdReopenExpectation {
@@ -741,6 +759,9 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
         fixture_manifest_digest_sha256: admitted.fixture_manifest_digest_sha256,
         replay_plan_digest_sha256: admitted.replay_plan_digest_sha256,
         tree_state_checkpoint_coverage,
+        tree_state_commitment_budget,
+        ready_duration: published.ready_duration,
+        reopen_duration: reopened.reopen_duration,
         block_load_evidence,
         subtree_root_load_evidence,
         source_tip_checkpoint_authenticated: true,

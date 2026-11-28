@@ -83,6 +83,7 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 
 | File | Purpose |
 | --- | --- |
+| [bench-checkpoint-policy-mainnet.py](bench-checkpoint-policy-mainnet.py) | Replays the hash-pinned Mainnet archive for the four-arm checkpoint policy comparison |
 | [compact-range-campaign.example.json](compact-range-campaign.example.json) | Example campaign manifest for compact-range benchmark runs |
 | [compare-benchmark-campaign.py](compare-benchmark-campaign.py) | Compares candidate and baseline benchmark campaigns against regression thresholds |
 | [compare-wallet-readers.py](compare-wallet-readers.py) | Runs paired reader performance comparisons against frozen Testnet oracle endpoints |
