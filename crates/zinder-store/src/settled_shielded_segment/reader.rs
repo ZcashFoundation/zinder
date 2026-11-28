@@ -17,9 +17,7 @@ use zinder_proto::compat::lightwalletd::{EncodedBlock, EncodedBlockBatcher};
 
 use crate::{
     HeightOrder,
-    positional_source::{
-        ByteRange, DiscardScanPages, PositionalByteSource, ScanDropBehind, bounded_file_scan,
-    },
+    positional_source::{ByteRange, PositionalByteSource, ScanDropBehind, TrackedScanPages},
     segment_verity,
 };
 
@@ -1139,7 +1137,7 @@ impl SettledShieldedSegmentIndex {
 /// Authenticated positional reader over one settled `ZSHRNG02` shielded segment.
 pub struct SettledShieldedSegmentReader<S = File> {
     source: S,
-    discard_scan_pages: Option<DiscardScanPages<S>>,
+    scan_pages: Option<Box<TrackedScanPages<S>>>,
     index: SettledShieldedSegmentIndex,
 }
 
@@ -1196,9 +1194,9 @@ impl SettledShieldedSegmentReader<File> {
         if options.require_fs_verity && !kernel_verified {
             return Err(SettledShieldedSegmentError::FsVerityRequired);
         }
-        let discard_scan_pages = bounded_file_scan(&file, constrained);
+        let scan_pages = TrackedScanPages::for_file(&file, constrained);
         let mut reader = Self::admit_with_verity(file, expected, options, kernel_verified)?;
-        reader.discard_scan_pages = discard_scan_pages;
+        reader.scan_pages = scan_pages;
         Ok(reader)
     }
 }
@@ -1243,7 +1241,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
         )?;
         let reader = Self {
             source,
-            discard_scan_pages: None,
+            scan_pages: None,
             index,
         };
         if options.verify_full_payload {
@@ -1694,9 +1692,11 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
             ),
             _ => None,
         };
-        let mut drop_behind = scan
-            .then(|| ScanDropBehind::new(&self.source, self.discard_scan_pages))
-            .flatten();
+        let mut drop_behind = self
+            .scan_pages
+            .as_deref()
+            .filter(|_| scan)
+            .map(|pages| ScanDropBehind::tracked(&self.source, pages));
         let mut emit_step = |step: &ShieldedReadStep,
                              step_scratch: &mut ShieldedReadScratch,
                              step_sink: &mut StepOutputSink<'_>|

@@ -39,6 +39,7 @@ zstd.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 composefs-ioctls.workspace = true
+rustix = { workspace = true, features = ["param"] }
 
 [dev-dependencies]
 incrementalmerkletree.workspace = true
