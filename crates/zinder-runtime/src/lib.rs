@@ -50,6 +50,7 @@
 mod allocator;
 mod auth;
 mod bind_guard;
+mod browser_transport;
 mod canonical_fence_attestation;
 mod composed_readiness;
 mod config;
@@ -82,6 +83,7 @@ pub use auth::{
 pub use bind_guard::{
     BindAddressClass, classify_bind_address, guard_optional_serving_bind, guard_serving_bind,
 };
+pub use browser_transport::{BrowserOrigins, is_grpc_web_request};
 pub use canonical_fence_attestation::{
     CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
     CanonicalFenceDivergence, CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation,

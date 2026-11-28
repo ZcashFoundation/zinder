@@ -328,7 +328,7 @@ fn invalid_sections_and_conflicting_explorer_views_are_rejected() -> eyre::Resul
 }
 
 #[test]
-fn explorer_print_config_redacts_cipherscan_and_wallet_query_urls() -> eyre::Result<()> {
+fn explorer_print_config_preserves_browser_origins_and_redacts_urls() -> eyre::Result<()> {
     let sandbox = TempDir::new()?;
     let storage_root = sandbox.path().join("explorer-root");
     let config_body = format!(
@@ -336,7 +336,8 @@ fn explorer_print_config_redacts_cipherscan_and_wallet_query_urls() -> eyre::Res
             "[network]\nname = \"zcash-regtest\"\n\n",
             "[storage]\ndata_dir = \"{}\"\n\n",
             "[node]\njson_rpc_addr = \"http://127.0.0.1:18232\"\n\n",
-            "[explorer]\nwallet_query_endpoint = \"http://exp-user:exp-secret@127.0.0.1:9102/?tok=wq-secret#frag\"\n\n",
+            "[explorer]\nwallet_query_endpoint = \"http://exp-user:exp-secret@127.0.0.1:9102/?tok=wq-secret#frag\"\n",
+            "browser_origins = [\"https://explorer.example\"]\n\n",
             "[cipherscan]\n",
             "explorer_query_endpoint = \"http://cs-exp:cs-exp-secret@127.0.0.1:9068/?k=1\"\n",
             "wallet_query_endpoint = \"http://cs-wal:cs-wal-secret@127.0.0.1:9102/?k=2\"\n",
@@ -361,7 +362,9 @@ fn explorer_print_config_redacts_cipherscan_and_wallet_query_urls() -> eyre::Res
             "--print-config",
         ],
     ] {
-        let output = zinder_command(&args).output()?;
+        let output = zinder_command(&args)
+            .env("ZINDER_QUERY__BROWSER_ORIGINS", "https://wallet.example")
+            .output()?;
         assert!(
             output.status.success(),
             "`{}` failed: {}",
@@ -386,6 +389,16 @@ fn explorer_print_config_redacts_cipherscan_and_wallet_query_urls() -> eyre::Res
             );
         }
         assert!(stdout.contains("[REDACTED]"), "{stdout}");
+        let printed: toml::Table = toml::from_str(&stdout)?;
+        for (role, origin) in [
+            ("query", "https://wallet.example"),
+            ("explorer", "https://explorer.example"),
+        ] {
+            assert_eq!(
+                printed[role]["browser_origins"],
+                toml::Value::try_from([origin])?
+            );
+        }
     }
     Ok(())
 }

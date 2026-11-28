@@ -13,15 +13,16 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use parking_lot::RwLock;
-use tokio::task::JoinHandle;
+use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
+use zinder_proto::v1::explorer::explorer_query_server::SERVICE_NAME;
 use zinder_runtime::{
     ComposedReadiness, OpsEndpointHandle, OpsHealthcheckArgs, Readiness, ReadinessCause,
-    ReadinessInput, ReadinessState, RuntimeService, StartupPhase, SupervisedRuntime,
-    SupervisedTasks, TracingSubscriberError, host_cpu_meets_compiled_baseline,
-    host_cpu_meets_pasta_backend_baseline, install_tracing_subscriber,
-    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
+    ReadinessInput, ReadinessState, RuntimeService, RuntimeSupervisionError, StartupPhase,
+    SupervisedRuntime, SupervisedTasks, TracingSubscriberError, guard_serving_bind,
+    host_cpu_meets_compiled_baseline, host_cpu_meets_pasta_backend_baseline,
+    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
@@ -143,14 +144,23 @@ async fn dispatch_cli(
 
 /// Supervises the explorer server inside a parent runtime such as `zinder serve`.
 ///
-/// The caller owns the operational HTTP endpoint, metrics recorder, CPU checks,
-/// and terminating-signal handling. `readiness` receives explorer readiness
+/// The caller provides a bound gRPC listener and owns the operational HTTP
+/// endpoint, metrics recorder, CPU checks, and terminating-signal handling. `readiness` receives explorer readiness
 /// updates and `cancel` triggers bounded shutdown.
 pub async fn serve_supervised(
     mut explorer_config: ExplorerConfig,
     readiness: Readiness,
     cancel: CancellationToken,
+    listener: TcpListener,
 ) -> Result<(), ExplorerConfigError> {
+    explorer_config.listen_addr = listener
+        .local_addr()
+        .map_err(|source| RuntimeSupervisionError::GrpcServer { source })?;
+    guard_serving_bind(
+        "explorer.listen_addr",
+        explorer_config.listen_addr,
+        explorer_config.allow_public_bind,
+    )?;
     explorer_config.ops_listen_addr = None;
     let runtime = SupervisedRuntime::new(RuntimeService::Explorer);
     let shutdown = runtime.shutdown_request();
@@ -158,7 +168,7 @@ pub async fn serve_supervised(
         cancel.cancelled().await;
         shutdown.request();
     });
-    let outcome = serve_explorer(explorer_config, runtime, readiness).await;
+    let outcome = serve_explorer(explorer_config, runtime, readiness, Some(listener)).await;
     cancel_bridge.abort();
     outcome
 }
@@ -238,7 +248,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     };
     let runtime = SupervisedRuntime::new(RuntimeService::Explorer);
     let _signal_handle = runtime.request_shutdown_on_terminating_signal();
-    serve_explorer(explorer_config, runtime, Readiness::default()).await
+    serve_explorer(explorer_config, runtime, Readiness::default(), None).await
 }
 
 fn open_explorer_stores(
@@ -280,10 +290,15 @@ fn build_materialized_view_catchup_task(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the linear startup sequence keeps operator-visible failure ordering auditable"
+)]
 async fn serve_explorer(
     explorer_config: ExplorerConfig,
     runtime: SupervisedRuntime,
     readiness: Readiness,
+    listener: Option<TcpListener>,
 ) -> Result<(), ExplorerConfigError> {
     let start_api_phase = StartupPhase::StartApi.start();
 
@@ -311,11 +326,14 @@ async fn serve_explorer(
         materialized_view_store.clone(),
     );
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
-    let router = runtime.public_grpc_router(
-        grpc_adapter.clone().into_server(),
-        zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+    let router = runtime.public_grpc_router_with_transport(
+        (
+            grpc_adapter.clone().into_server(),
+            zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        ),
         explorer_config.client_address_source,
         &readiness,
+        |server| server.with_browser_transport(&explorer_config.browser_origins, SERVICE_NAME),
     )?;
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::Explorer,
@@ -351,8 +369,18 @@ async fn serve_explorer(
         "explorer query gRPC server started"
     );
 
-    let server =
-        router.serve_with_shutdown(explorer_config.listen_addr, runtime.grpc_server_shutdown());
+    let shutdown = runtime.grpc_server_shutdown();
+    let server = async move {
+        if let Some(listener) = listener {
+            router
+                .serve_with_incoming_shutdown(listener, shutdown)
+                .await
+        } else {
+            router
+                .serve_with_shutdown(explorer_config.listen_addr, shutdown)
+                .await
+        }
+    };
     runtime
         .supervise(server, tasks, || composed_readiness.publish_shutting_down())
         .await?;

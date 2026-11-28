@@ -18,6 +18,7 @@ Zinder serves two wallet protocols on separate endpoints. A client speaks one of
 | An existing lightwalletd client or SDK | `CompactTxStreamer` | `zinder-compat-lightwalletd` | 9067 |
 | A browser wallet using lightwalletd | gRPC-Web on the same `CompactTxStreamer` endpoint | `zinder-compat-lightwalletd` | 9067 |
 | A new native application or backend | Native `zinder.v1.wallet.WalletQuery` gRPC | `zinder-query` | 9102 |
+| A new browser wallet or dashboard | gRPC-Web on the configured `WalletQuery` or `ExplorerQuery` listener | `zinder-query` or `zinder-explorer` | 9102 or 9068 |
 | A Rust application | The `zinder-client` crate over `WalletQuery` | `zinder-query` | 9102 |
 | An explorer or analytics backend | `zinder.v1.explorer.ExplorerQuery`, plus `WalletQuery` | `zinder-explorer` (`--preset explorer`) | 9068 |
 | A Cipherscan frontend | Cipherscan-compatible REST and WebSocket | `zinder-compat-cipherscan` (`--preset explorer`) | 9070 |
@@ -45,7 +46,7 @@ The Zcash Foundation runs these public endpoints, which any client can use:
 | lightwalletd `CompactTxStreamer` | `https://lwd.zfnd.org:443` | `https://testnet.lwd.zfnd.org:443` |
 | Native `WalletQuery`, including `zinder-client` | `https://zinder.zfnd.org:443` | `https://testnet.zinder.zfnd.org:443` |
 
-Each address is a gRPC endpoint over TLS, not a website. Give it to a gRPC client, such as a wallet, `grpcurl`, or `zinder-client`; browser requests return an empty 404 response.
+Give these TLS endpoints to a gRPC client, such as a wallet, `grpcurl`, or `zinder-client`. A browser application needs a gRPC-Web client and an origin enabled by the operator.
 
 On the Foundation's Mainnet endpoints, wallets behind one public IPv4 address share bandwidth, and `GetBlockRangeNullifiers` has burst/rate limits. NGINX admission refusals return trailers-only gRPC `UNAVAILABLE` (14) without a numeric retry delay on current configs. Retry **read** RPCs with exponential backoff (honoring `grpc-retry-pushback-ms` if a response includes it), and **do not automatically retry transaction submission (`SendTransaction` or `BroadcastTransaction`)** without first checking transaction status or idempotency.
 
@@ -80,7 +81,7 @@ Wallet and light-wallet endpoints answer with `"taddrSupport": true`. Compact-bl
 
 ### Browser wallets
 
-Give your browser wallet the same HTTPS lightwalletd URL as a native wallet. The operator [enables your wallet site's origin](../runbooks/exposing-over-tls.md#enable-browser-wallets) on that endpoint. For example, once your application has initialized WebZjs, read the Testnet tip using your operator's Testnet URL:
+Give your browser wallet the same HTTPS lightwalletd URL as a native wallet. The operator [enables your wallet site's origin](../runbooks/exposing-over-tls.md#enable-browser-clients) on that endpoint. For example, once your application has initialized WebZjs, read the Testnet tip using your operator's Testnet URL:
 
 ```javascript
 const wallet = new WebWallet("test", "https://lightwalletd.example.org", 1, 1);
@@ -90,6 +91,20 @@ const tip = await wallet.get_latest_block();
 Use a wallet or light-wallet endpoint for sync, which needs subtree roots and tree state as well as blocks. Browser clients can call unary and server-streaming RPCs. For transparent balances, use `GetTaddressBalance`, which takes the address list in one request. Read a stream through its terminal gRPC status before treating the result as complete.
 
 WebZjs requests binary gRPC-Web by default. If your SDK supports binary server streaming, use `application/grpc-web+proto` for block ranges. Text mode base64-encodes the same frames, adding about a third to the response body before HTTP compression.
+
+## Browser clients for the native APIs
+
+Generate a gRPC-Web client from the `WalletQuery` or `ExplorerQuery` protobuf
+definitions. Point it at the same HTTPS URL as native gRPC after the operator
+[enables your site's origin](../runbooks/exposing-over-tls.md#enable-browser-clients).
+Use binary or text gRPC-Web for unary RPCs. For server streams such as
+WalletQuery's `CompactBlocksInRange` and `ChainEvents` or ExplorerQuery's
+`RecentTransactions`, choose an encoding your client supports for streaming.
+Read through the terminal gRPC status before treating a stream as complete.
+
+On settled `ChainEvents` streams, browsers can read the
+`zinder-chain-event-family` response header. If ExplorerQuery requires a
+bearer token, send it in the RPC's `authorization` metadata.
 
 ## Native gRPC clients
 

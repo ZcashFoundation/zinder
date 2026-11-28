@@ -231,6 +231,7 @@ Every `ZINDER_*` variable a binary accepts is listed below, with its TOML field.
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__MEMTABLE_BUDGET_BYTES` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.memtable_budget_bytes` | Canonical-store total RocksDB memtable budget across column families. Defaults to 268435456 for writers and 16777216 for readers. |
 | `ZINDER_STORAGE__CANONICAL__ROCKSDB__STATISTICS_LEVEL` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.canonical.rocksdb.statistics_level` | Canonical-store RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
 | `ZINDER_QUERY__LISTEN_ADDR` | zinder-query | Optional | `query.listen_addr` | Listen address for the native WalletQuery gRPC endpoint. Defaults to `127.0.0.1:9102`. |
+| `ZINDER_QUERY__BROWSER_ORIGINS` | zinder-query | Optional | `query.browser_origins` | Enables gRPC-Web on the WalletQuery listener for the configured origins. Defaults to disabled. See [Browser origins](#browser-origins). |
 | `ZINDER_QUERY__REORG_WINDOW_BLOCKS` | zinder-query | Optional | `query.reorg_window_blocks` | Exact canonical replacement-depth identity expected by native query. Must be greater than zero and match the canonical writer. Defaults to 1000. |
 | `ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS` | zinder-query | Optional | `query.pair_convergence_attempts` | Maximum bounded attempts to converge and admit native query's canonical and wallet secondary pair. Must be in 1..=64; defaults to 12. |
 | `ZINDER_QUERY__EPOCH_PIN_RETENTION_SECONDS` | zinder-query | Optional | `query.epoch_pin_retention_seconds` | Seconds an exposed epoch can still answer pins after replacement. Must be in 60..=300. Defaults to 60. A longer window can delay publication when all four serving generation slots are occupied. |
@@ -329,6 +330,7 @@ Every `ZINDER_*` variable a binary accepts is listed below, with its TOML field.
 | `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | zinder-explorer | Optional | `explorer.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0011). Mutually exclusive with `ZINDER_EXPLORER__BEARER_TOKEN`. |
 | `ZINDER_EXPLORER__BEARER_TOKEN` | zinder-explorer | Optional | `explorer.bearer_token` | Inline shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0011). Mutually exclusive with `ZINDER_EXPLORER__BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | zinder-explorer | Optional | `explorer.listen_addr` | Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068. |
+| `ZINDER_EXPLORER__BROWSER_ORIGINS` | zinder-explorer | Optional | `explorer.browser_origins` | Enables gRPC-Web on the ExplorerQuery listener for the configured origins. Defaults to disabled. See [Browser origins](#browser-origins). |
 | `ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS` | zinder-explorer | Optional | `explorer.trust_proxy_client_address` | Counts each ExplorerQuery request against the client connection that a reverse proxy names in the `x-zinder-client-address` header, instead of the proxy's own connection, when the receive limit picks which client to refuse. Set it only when clients reach the listener solely through a proxy that replaces the header. Defaults to false. |
 | `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Optional | `explorer.wallet_query_endpoint` | WalletQuery gRPC endpoint backing the explorer's wallet-composed reads (transaction detail, block views, search, mempool activity). Empty/unset disables the explorer capabilities that compose canonical wallet reads. |
 | `ZINDER_CIPHERSCAN__LISTEN_ADDR` | zinder-compat-cipherscan | Optional | `cipherscan.listen_addr` | Listen address for the Cipherscan-compatible REST endpoint. Defaults to 127.0.0.1:9070. A public or unspecified address needs `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`. |
@@ -339,6 +341,21 @@ Every `ZINDER_*` variable a binary accepts is listed below, with its TOML field.
 | `ZINDER_CIPHERSCAN__BEARER_TOKEN_PATH` | zinder-compat-cipherscan | Optional | `cipherscan.bearer_token_path` | Path to the shared-secret bearer token the adapter presents to both the ExplorerQuery and WalletQuery endpoints (ADR-0011). Mutually exclusive with `ZINDER_CIPHERSCAN__BEARER_TOKEN`. Unset sends no token. |
 | `ZINDER_CIPHERSCAN__BEARER_TOKEN` | zinder-compat-cipherscan | Optional | `cipherscan.bearer_token` | Inline shared-secret bearer token the adapter presents to both the ExplorerQuery and WalletQuery endpoints (ADR-0011). Mutually exclusive with `ZINDER_CIPHERSCAN__BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
 <!-- env-var-table:public-interfaces:end -->
+
+### Browser origins
+
+Set `query.browser_origins`, `explorer.browser_origins`, or
+`compat.browser_origins` on each listener that needs gRPC-Web. Use a TOML array
+such as `["https://wallet.example.org", "http://localhost:5173"]` or a
+comma-separated list in the matching environment variable. Origins include the
+scheme, host, and any nondefault port.
+
+An empty list keeps the listener on native HTTP/2 gRPC. A nonempty list also
+enables HTTP/1.1 and accepts gRPC-Web over either HTTP version. A gRPC-Web
+request with an unlisted `Origin` receives HTTP 403. Use `*` alone to allow
+every origin on a listener without Explorer bearer authentication. When you
+configure an inline or file-backed Explorer bearer token, list specific
+origins to enable gRPC-Web. ExplorerQuery checks the token on each RPC.
 
 ## Listener and request limits
 
@@ -384,7 +401,7 @@ While a response is open, the transport holds less than about 1,216 KiB of its p
 
 The server ends a response, or waits for its producer, only once HTTP/2 has encoded every byte sent so far. It sends the last byte as a frame of its own, which HTTP/2 encodes only after everything queued ahead of it on the stream. A response that has ended therefore waits for nothing but the client's socket. A client that lowers its stream window with an HTTP/2 `SETTINGS` frame before that point leaves the rest waiting for window again, and the stream is reset if that still keeps the rest from being encoded when its piece has waited 60 seconds. Zinder sets no process-wide bound on the data responses hold, because a client can open many connections. Limit connections per client at your proxy.
 
-Once a write to a connection blocks, the connection must write 16 KiB, or finish writing everything it had buffered, within 60 seconds or it is closed. This closes a connection whose client has stopped reading every stream on it, which not even a reset can reach. A client that reads its socket a few bytes at a time stays within the memory bounds above but has no deadline: its connection stays open while it reads 16 KiB a minute, and HTTP/2 frees a reset stream's data only when it next writes to that connection. An HTTP/1.1 connection, which gRPC-Web uses when `compat.browser_origins` is set, carries one response at a time, so a stalled response closes its connection. [ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md) records this policy.
+Once a write to a connection blocks, the connection must write 16 KiB, or finish writing everything it had buffered, within 60 seconds or it is closed. This closes a connection whose client has stopped reading every stream on it, which not even a reset can reach. A client that reads its socket a few bytes at a time stays within the memory bounds above but has no deadline: its connection stays open while it reads 16 KiB a minute, and HTTP/2 frees a reset stream's data only when it next writes to that connection. An HTTP/1.1 connection on a browser-enabled listener carries one response at a time, so a stalled response closes its connection. [ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md) records this policy.
 
 ### Wallet block-range admission
 

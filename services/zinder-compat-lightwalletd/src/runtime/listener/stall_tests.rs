@@ -31,7 +31,8 @@ use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Status, body::Body, server::NamedService};
 use tower::Service;
 use zinder_runtime::{
-    ClientAddressSource, Readiness, ReadinessState, RuntimeService, SupervisedRuntime,
+    BrowserOrigins, ClientAddressSource, Readiness, ReadinessState, RuntimeService,
+    SupervisedRuntime,
 };
 
 use super::{BrowserListener, SERVICE_NAME, serve_listener};
@@ -195,7 +196,7 @@ async fn serve_with_response_delay(response_delay: Duration) -> Result<TestServe
     let readiness = Readiness::new(ReadinessState::ready(Some(1)));
     let incoming = TcpListener::bind("127.0.0.1:0").await?;
     let address = incoming.local_addr()?;
-    let origins = [HeaderValue::from_static(ORIGIN)];
+    let origins: BrowserOrigins = toml::Value::String(ORIGIN.to_owned()).try_into()?;
     let listener = BrowserListener {
         browser_origins: &origins,
         client_address: ClientAddressSource::Connection,

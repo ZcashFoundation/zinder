@@ -143,8 +143,12 @@ Every other crate is internal: `zinder-store`, `zinder-source`,
 On a public gRPC listener, register application middleware with
 `PublicGrpcServer::layer`. The client's `grpc-timeout` covers the work
 those layers do after readiness and before the response starts. Register
-gRPC-Web and CORS adapters with `PublicGrpcServer::transport_layer` so
-they can format a deadline response for the client.
+the shared gRPC-Web and CORS policy with
+`PublicGrpcServer::with_browser_transport`. It translates requests before
+the receive limits inspect their frames and formats deadline responses for
+browser clients. The configured application RPC service can accept gRPC-Web.
+Health and reflection use native HTTP/2 gRPC.
+
 On a listener reserved for an allowlisted TCP proxy, pass the resolved
 `GrpcProxyProtocol` to `PublicGrpcServer::with_proxy_protocol` and use
 `ClientAddressSource::Connection` to identify the forwarded client.

@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
-    BearerToken, BearerTokenError, ClientAddressSource, ConfigError, ConfigLoader, NetworkSection,
-    NetworkToml, OpsSection, OpsServerError, OpsToml, ResolvedSecondaryStorage, RuntimeService,
-    SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
+    BearerToken, BearerTokenError, BrowserOrigins, ClientAddressSource, ConfigError, ConfigLoader,
+    NetworkSection, NetworkToml, OpsSection, OpsServerError, OpsToml, ResolvedSecondaryStorage,
+    RuntimeService, SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
     derive_canonical_path, derive_explorer_secondary_path, guard_optional_serving_bind,
     guard_serving_bind, parse_socket_addr, require_field, resolve_allow_public_bind,
     resolve_ops_listen_addr, resolve_optional_bearer_token, resolve_secondary_storage,
@@ -30,6 +30,8 @@ pub struct ExplorerConfig {
     pub storage: ResolvedSecondaryStorage,
     /// Listen address for the `ExplorerQuery` gRPC endpoint.
     pub listen_addr: SocketAddr,
+    /// Browser origins permitted to use gRPC-Web. An empty list disables it.
+    pub browser_origins: BrowserOrigins,
     /// Operational HTTP endpoint address, or `None` when disabled.
     pub ops_listen_addr: Option<SocketAddr>,
     /// Optional trace export settings.
@@ -179,6 +181,7 @@ struct ExplorerRawConfig {
 #[serde(default, deny_unknown_fields)]
 struct ExplorerSection {
     listen_addr: Option<String>,
+    browser_origins: BrowserOrigins,
     bearer_token_path: Option<PathBuf>,
     bearer_token: Option<String>,
     wallet_query_endpoint: Option<String>,
@@ -190,6 +193,7 @@ impl std::fmt::Debug for ExplorerSection {
         formatter
             .debug_struct("ExplorerSection")
             .field("listen_addr", &self.listen_addr)
+            .field("browser_origins", &self.browser_origins)
             .field("bearer_token_path", &self.bearer_token_path)
             .field(
                 "bearer_token",
@@ -218,6 +222,7 @@ struct ExplorerConfigToml {
 #[derive(Debug, Serialize)]
 struct ExplorerToml {
     listen_addr: String,
+    browser_origins: BrowserOrigins,
     #[serde(skip_serializing_if = "Option::is_none")]
     bearer_token_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,6 +241,7 @@ impl ExplorerConfigToml {
             storage: SecondaryStorageToml::from_resolved(&config.storage),
             explorer: ExplorerToml {
                 listen_addr: config.listen_addr.to_string(),
+                browser_origins: config.browser_origins.clone(),
                 bearer_token_path: config
                     .bearer_token_path
                     .as_ref()
@@ -274,6 +280,13 @@ fn resolve_explorer_config(
     let listen_addr_text = require_field(raw.explorer.listen_addr, "explorer.listen_addr")?;
     let listen_addr = parse_socket_addr("explorer.listen_addr", &listen_addr_text)?;
     let bearer_token_path = raw.explorer.bearer_token_path;
+    if raw.explorer.browser_origins.allows_any_origin()
+        && (bearer_token_path.is_some() || raw.explorer.bearer_token.is_some())
+    {
+        return Err(ConfigError::invalid(
+            "explorer.browser_origins requires specific origins when an Explorer bearer token is configured",
+        ).into());
+    }
     let bearer_token = resolve_optional_bearer_token(
         bearer_token_path.as_deref(),
         raw.explorer.bearer_token.as_deref(),
@@ -297,6 +310,7 @@ fn resolve_explorer_config(
         network,
         storage,
         listen_addr,
+        browser_origins: raw.explorer.browser_origins,
         ops_listen_addr,
         observability: raw.observability,
         allow_public_bind,

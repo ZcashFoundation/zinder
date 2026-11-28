@@ -86,13 +86,29 @@ Caddy checks `HEAD /readyz` once per new gRPC call (16 pooled connections, leavi
 
 Before announcing a public endpoint, configure client authentication and per-client limits on connections, requests, and concurrent streams in Caddy or your edge gateway. Leave headroom for normal wallet sync bursts; per-client connection limits at the proxy prevent one client from opening many connections to bypass Zinder's per-connection receive limit.
 
-## Enable browser wallets
+<a id="enable-browser-wallets"></a>
 
-Set `compat.browser_origins` (`ZINDER_COMPAT__BROWSER_ORIGINS`) to the exact wallet `location.origin` values (e.g. `["https://wallet.example.org"]`, or `http://localhost:5173` for local development) and restart compatibility. Caddy forwards gRPC-Web on the same port as native gRPC. Keep `compat.serving = "wallet"` (default) or `"light-wallet"` for syncing wallets, and keep edge rate limits in the proxy.
+## Enable browser clients
 
-Browsers that negotiate `h3` can carry gRPC-Web calls to Caddy over HTTP/3. Caddy forwards the same gRPC-Web requests to Zinder over `h2c`. In the browser network panel, check that CORS preflight succeeds, the Protocol column shows `h3` after the browser discovers HTTP/3, and `GetBlockRange` advances scanned height. With UDP `443` blocked on the test client, repeat the call and confirm it succeeds over `h2`.
+Set the target listener's [browser origins](../reference/configuration.md#browser-origins)
+to the browser application's `location.origin` and restart that runtime.
+Forward both OPTIONS preflights and gRPC-Web POST requests through the same
+Caddy site as native gRPC. Keep edge rate limits in the proxy. For lightwalletd
+sync, select `compat.serving = "wallet"` or `"light-wallet"`.
 
-If preflight fails, check `/readyz` first (Caddy runs `forward_auth` on `OPTIONS` too, which browsers report as CORS failures), then compare the exact `Origin` header including port. See [Configuration](../reference/configuration.md) for the wildcard option.
+Browsers that negotiate HTTP/3 can send gRPC-Web calls to Caddy over `h3`.
+Caddy forwards the requests to Zinder over `h2c`. In the browser network
+panel, check that preflight grants your origin and that the RPC completes.
+For lightwalletd sync, confirm that `GetBlockRange` advances scanned height.
+Check that the Protocol column shows `h3` after discovery. Block UDP port
+443 on the test client and repeat the call to confirm it also works over
+`h2`.
+
+If preflight fails, check `/readyz` first because Caddy applies
+`forward_auth` to OPTIONS too. Then compare the request's `Origin` header,
+including its port, with the configured origin. If ExplorerQuery requires a
+bearer token, let preflight request the `authorization` header and send the
+token on the POST.
 
 ## Expose the native endpoint too
 

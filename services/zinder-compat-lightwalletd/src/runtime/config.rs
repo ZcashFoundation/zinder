@@ -8,21 +8,19 @@ use std::{
 };
 
 use clap::ValueEnum;
-use http::HeaderValue;
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use url::Url;
 use zinder_core::Network;
 use zinder_query::{
     DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
     ForwardedReadConfig, MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
 };
 use zinder_runtime::{
-    BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
-    ClientAddressSource, ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection,
-    DeploymentToml, GrpcProxyProtocol, GrpcRangeAdmission, IngestControlReaderToml,
-    IngestControlSection, NetworkSection, NetworkToml, NodeFallbacksToml, NodeToml, OpsSection,
-    OpsToml, ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader,
+    BearerToken, BearerTokenError, BrowserOrigins, CanonicalSecondaryStorageSection,
+    CanonicalSecondaryStorageToml, ClientAddressSource, ConfigError, ConfigLoader,
+    DeploymentProfile, DeploymentSection, DeploymentToml, GrpcProxyProtocol, GrpcRangeAdmission,
+    IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml, NodeFallbacksToml,
+    NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader,
     RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, RuntimeService, SecuritySection,
     SecurityToml, derive_canonical_path, derive_canonical_secondary_path, derive_wallet_path,
     derive_wallet_secondary_path, guard_optional_serving_bind, guard_serving_bind,
@@ -93,7 +91,7 @@ pub struct LightwalletdConfig {
     /// Public lightwalletd `gRPC` / gRPC-Web listen address.
     pub listen_addr: SocketAddr,
     /// Allowed browser CORS origins for gRPC-Web, or empty to disable HTTP/1.1 browser transport.
-    pub browser_origins: Vec<HeaderValue>,
+    pub browser_origins: BrowserOrigins,
     /// Operational HTTP endpoint address, or `None` when disabled.
     pub ops_listen_addr: Option<SocketAddr>,
     /// Optional trace export settings.
@@ -364,8 +362,7 @@ struct LightwalletdRawConfig {
 #[serde(default, deny_unknown_fields)]
 struct CompatSection {
     listen_addr: Option<String>,
-    #[serde(deserialize_with = "deserialize_browser_origins")]
-    browser_origins: Vec<HeaderValue>,
+    browser_origins: BrowserOrigins,
     reorg_window_blocks: Option<u32>,
     pair_convergence_attempts: Option<u8>,
     max_concurrent_block_range_streams: Option<u32>,
@@ -384,65 +381,6 @@ struct CompatSection {
     trust_proxy_client_address: Option<bool>,
     proxy_protocol_trusted_cidrs: Option<String>,
     range_admission: GrpcRangeAdmission,
-}
-
-fn deserialize_browser_origins<'de, D>(deserializer: D) -> Result<Vec<HeaderValue>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(
-        untagged,
-        expecting = "an array of browser origins or a comma-separated list"
-    )]
-    enum Origins {
-        List(Vec<String>),
-        CommaSeparated(String),
-    }
-
-    let origins = match Origins::deserialize(deserializer)? {
-        Origins::List(origins) => origins,
-        Origins::CommaSeparated(origins) if origins.is_empty() => Vec::new(),
-        Origins::CommaSeparated(origins) => origins
-            .split(',')
-            .map(|origin| origin.trim().to_owned())
-            .collect(),
-    };
-    if origins.iter().any(|origin| origin == "*") {
-        if origins.len() == 1 {
-            return Ok(vec![HeaderValue::from_static("*")]);
-        }
-        return Err(D::Error::custom(
-            "compat.browser_origins must use '*' alone",
-        ));
-    }
-
-    let invalid_origin = || {
-        D::Error::custom(
-            "compat.browser_origins requires an exact HTTP or HTTPS origin such as https://wallet.example",
-        )
-    };
-    let mut headers = Vec::with_capacity(origins.len());
-    for origin in origins {
-        let (scheme, authority) = origin
-            .strip_suffix('/')
-            .unwrap_or(&origin)
-            .split_once("://")
-            .ok_or_else(invalid_origin)?;
-        if !(scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
-            || authority.contains(['/', '\\', '@', '?', '#'])
-            || authority.bytes().any(|b| b.is_ascii_control() || b == b' ')
-        {
-            return Err(invalid_origin());
-        }
-        let url = Url::parse(&origin).map_err(|_| invalid_origin())?;
-        let serialized = url.origin().ascii_serialization();
-        if serialized.contains('*') {
-            return Err(invalid_origin());
-        }
-        headers.push(HeaderValue::try_from(serialized).map_err(|_| invalid_origin())?);
-    }
-    Ok(headers)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -750,11 +688,7 @@ impl LightwalletdConfigToml {
             }),
             compat: CompatToml {
                 listen_addr: config.listen_addr.to_string(),
-                browser_origins: config
-                    .browser_origins
-                    .iter()
-                    .map(|origin| String::from_utf8_lossy(origin.as_bytes()).into_owned())
-                    .collect(),
+                browser_origins: config.browser_origins.clone(),
                 reorg_window_blocks: config.canonical_reorg_policy.reorg_window_blocks(),
                 pair_convergence_attempts: config.pair_convergence_attempts.get(),
                 max_concurrent_block_range_streams: config.max_concurrent_block_range_streams.get(),
@@ -799,7 +733,7 @@ impl LightwalletdConfigToml {
 #[derive(Serialize)]
 struct CompatToml {
     listen_addr: String,
-    browser_origins: Vec<String>,
+    browser_origins: BrowserOrigins,
     reorg_window_blocks: u32,
     pair_convergence_attempts: u8,
     max_concurrent_block_range_streams: u32,
