@@ -671,7 +671,7 @@ pub mod compact_blocks_in_range_chunk {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Body {
         /// Leading header carrying the chain epoch that answers the entire range
-        /// (ADR-0019). Sent once, before any item.
+        /// (ADR-0003, ADR-0014). Sent once, before any item.
         #[prost(message, tag = "1")]
         Header(super::ChainView),
         /// Compact block at the next requested height. Sent after the header.
@@ -1576,7 +1576,7 @@ pub mod transparent_unspent_outputs_chunk {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Body {
         /// Leading header carrying the chain epoch pinned for the entire stream
-        /// (ADR-0019). Sent once, before any item.
+        /// (ADR-0003, ADR-0014). Sent once, before any item.
         #[prost(message, tag = "1")]
         Header(super::ChainView),
         /// One unspent transparent output. Sent after the header.
@@ -1778,7 +1778,7 @@ pub mod transparent_address_tx_ids_chunk {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Body {
         /// Leading header carrying the chain epoch pinned for the entire stream
-        /// (ADR-0019). Sent once, before any item.
+        /// (ADR-0003, ADR-0014). Sent once, before any item.
         #[prost(message, tag = "1")]
         Header(super::ChainView),
         /// One indexed transparent-address tx-history entry. Sent after the header.

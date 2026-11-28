@@ -594,7 +594,7 @@ message TransactionStatusResponse {
 message CompactBlocksInRangeChunk {
   oneof body {
     // Leading header carrying the chain epoch that answers the entire range
-    // (ADR-0019). Sent once, before any item.
+    // (ADR-0003, ADR-0014). Sent once, before any item.
     ChainView header = 1;
 
     // Compact block at the next requested height. Sent after the header.
@@ -1391,7 +1391,7 @@ message TransparentUnspentOutput {
 message TransparentUnspentOutputsChunk {
   oneof body {
     // Leading header carrying the chain epoch pinned for the entire stream
-    // (ADR-0019). Sent once, before any item.
+    // (ADR-0003, ADR-0014). Sent once, before any item.
     ChainView header = 1;
 
     // One unspent transparent output. Sent after the header.
@@ -1564,7 +1564,7 @@ message TransparentAddressTxId {
 message TransparentAddressTxIdsChunk {
   oneof body {
     // Leading header carrying the chain epoch pinned for the entire stream
-    // (ADR-0019). Sent once, before any item.
+    // (ADR-0003, ADR-0014). Sent once, before any item.
     ChainView header = 1;
 
     // One indexed transparent-address tx-history entry. Sent after the header.
