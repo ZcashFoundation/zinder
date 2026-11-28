@@ -538,8 +538,16 @@ impl SettledSegmentReaderCache {
     }
 
     pub(in crate::canonical_store) fn record_corpus_admission(&self, role: StoreRole) {
+        self.record_corpus_admission_transition(role, true);
+    }
+
+    pub(in crate::canonical_store) fn record_corpus_admission_transition(
+        &self,
+        role: StoreRole,
+        warn_if_constrained: bool,
+    ) {
         let page_cache = self.inner.lock().page_cache;
-        page_cache.record_admission(role, true);
+        page_cache.record_admission(role, warn_if_constrained);
     }
 
     pub(in crate::canonical_store) fn prepare_corpus_growth(

@@ -4,6 +4,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    future::Future,
     num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
     sync::Arc,
@@ -24,9 +25,9 @@ use zinder_ingest::{
 };
 use zinder_runtime::{ComposedReadiness, Readiness};
 use zinder_store::{
-    CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalReorgPolicy,
-    CanonicalStoreRequirements, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
-    RocksDbIoMode,
+    CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalReorgPolicy, CanonicalRetainedEvent,
+    CanonicalStoreError, CanonicalStoreRequirements, RawBlobRetention, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore, RocksDbIoMode, SharedSecondaryResources,
 };
 use zinder_wallet_projection::WalletCanonicalSourceIdentity;
 use zinder_wallet_rocksdb::{
@@ -279,6 +280,7 @@ fn advance_quiescent_wallet(
         &mut wallet,
         &mut unused_durations,
         &mut unused_transitions,
+        false,
     )? > 0
     {}
     let wallet_height = WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence())
@@ -346,7 +348,7 @@ pub(crate) async fn drive_active_pipelines(
         final_tip_height: args.chain.final_tip_height.value(),
         cancel: args.cancel.clone(),
     });
-    let projector_handle = has_projector
+    let mut projector_handle = has_projector
         .then(|| {
             spawn_projector_loop(ProjectorLoopInputs {
                 paths: args.paths,
@@ -359,7 +361,7 @@ pub(crate) async fn drive_active_pipelines(
         })
         .transpose()?;
 
-    let writer_res = spawn_writer_thread(WriterThreadArgs {
+    let writer = spawn_writer_thread(WriterThreadArgs {
         store: canonical_store,
         source: args.source.clone(),
         activations,
@@ -369,8 +371,8 @@ pub(crate) async fn drive_active_pipelines(
         writer_progress_tx: args.writer_progress_tx.clone(),
         commit_instants: Arc::clone(&args.commit_instants),
         cancel: args.cancel.clone(),
-    })
-    .await;
+    });
+    let writer_res = wait_for_writer(writer, &mut projector_handle, &args.cancel).await;
 
     args.writer_progress_tx.send_modify(|prog| {
         prog.commits_done = true;
@@ -395,6 +397,34 @@ pub(crate) async fn drive_active_pipelines(
         args.source.rpc_counts(),
     )
     .await
+}
+
+async fn wait_for_writer(
+    writer: impl Future<Output = Result<WriterOutput, BenchError>>,
+    projector: &mut Option<JoinHandle<Result<ProjectorOutput, BenchError>>>,
+    cancel: &CancellationToken,
+) -> Result<WriterOutput, BenchError> {
+    let Some(handle) = projector.as_mut() else {
+        return writer.await;
+    };
+    tokio::pin!(writer);
+    let projector_result = tokio::select! {
+        biased;
+        projector_outcome = handle => projector_outcome,
+        writer_outcome = &mut writer => return writer_outcome,
+    };
+    // The join result has been consumed. Cancel and drain the writer before
+    // the pipeline drops the scratch directories it still owns.
+    *projector = None;
+    cancel.cancel();
+    let _ = writer.await;
+    match projector_result {
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(BenchError::tip_replay(error.to_string())),
+        Ok(Ok(_)) => Err(BenchError::tip_replay(
+            "projector exited before writer completion",
+        )),
+    }
 }
 
 fn open_active_canonical_store(
@@ -606,13 +636,14 @@ fn spawn_projector_loop(
     inputs: ProjectorLoopInputs<'_>,
 ) -> Result<JoinHandle<Result<ProjectorOutput, BenchError>>, BenchError> {
     let reorg_policy = CanonicalReorgPolicy::new(inputs.chain.reorg_window_blocks)?;
+    let resources = SharedSecondaryResources::new(reader_budget(inputs.io_mode));
     let secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
         &inputs.paths.canonical_dir,
         &inputs.paths.projector_sec_dir,
         inputs.chain.network,
         CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         reorg_policy,
-        reader_budget(inputs.io_mode),
+        &resources,
     )?;
     let secondary_io_mode = secondary.io_mode().as_str().to_owned();
     let mut wallet = RocksDbWalletStore::open_ready_for_following(
@@ -668,7 +699,8 @@ async fn drive_projector_task(
             tokio::task::spawn_blocking(move || {
                 let mut durs = Vec::new();
                 let mut trans = 0_u32;
-                let drained = drain_projector_events(&mut sec, &mut wal, &mut durs, &mut trans)?;
+                let drained =
+                    drain_projector_events(&mut sec, &mut wal, &mut durs, &mut trans, true)?;
                 let wallet_tip =
                     WalletCanonicalSourceIdentity::from_ready_evidence(wal.ready_evidence())
                         .source_position()
@@ -769,11 +801,12 @@ fn drain_projector_events(
     wallet: &mut RocksDbWalletFollowingStore,
     durations: &mut Vec<Duration>,
     transitions: &mut u32,
+    active_writer: bool,
 ) -> Result<usize, BenchError> {
     let mut total_applied = 0_usize;
     for attempt in 0..=MAX_MISSING_TABLE_RETRIES {
         let (applied, hit_missing_table) =
-            try_drain_projector_batch(secondary, wallet, durations, transitions)?;
+            try_drain_projector_batch(secondary, wallet, durations, transitions, active_writer)?;
         total_applied = total_applied.saturating_add(applied);
         if !hit_missing_table || attempt == MAX_MISSING_TABLE_RETRIES {
             break;
@@ -788,8 +821,16 @@ fn try_drain_projector_batch(
     wallet: &mut RocksDbWalletFollowingStore,
     durations: &mut Vec<Duration>,
     transitions: &mut u32,
+    active_writer: bool,
 ) -> Result<(usize, bool), BenchError> {
-    if let Err(err) = catch_up_canonical_secondary(secondary) {
+    let catch_up = if active_writer {
+        secondary
+            .try_catch_up_following()
+            .and_then(|_| secondary.chain_epoch())
+    } else {
+        catch_up_canonical_secondary(secondary)
+    };
+    if let Err(err) = catch_up {
         if err.is_missing_table_file() {
             return Ok((0, true));
         }
@@ -811,41 +852,66 @@ fn try_drain_projector_batch(
         if !matches!(event.kind(), CanonicalEventKind::Committed) {
             continue;
         }
-        let committed = event.committed_range();
-        let fence = event.resulting_fence();
         let epoch = match secondary.chain_epoch_at(event.resulting_epoch_id()) {
             Ok(epoch) => epoch,
             Err(err) if err.is_missing_table_file() => return Ok((applied, true)),
             Err(err) => return Err(err.into()),
         };
         let settled_tip = BlockId::new(epoch.settled_tip_height, epoch.settled_tip_hash);
-        let current_source =
-            WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
         let started = Instant::now();
-        let replay_rows = match secondary.scan_canonical_replay_range(committed) {
-            Ok(rows) => rows,
-            Err(err) if err.is_missing_table_file() => return Ok((applied, true)),
-            Err(err) => return Err(err.into()),
-        };
-        let max_bytes = NonZeroU64::new(MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES)
-            .unwrap_or(NonZeroU64::MIN);
-        match wallet.apply_canonical_event_range(
-            current_source,
-            event,
-            fence,
-            settled_tip,
-            max_bytes,
-            replay_rows,
-        ) {
+        match apply_projector_event(secondary, wallet, event, settled_tip) {
             Ok(()) => {}
-            Err(ref err) if is_wallet_replay_missing_table(err) => return Ok((applied, true)),
-            Err(err) => return Err(err.into()),
+            Err(
+                BenchError::CanonicalStorage {
+                    source: CanonicalStoreError::MissingLiveTailReplay { height },
+                }
+                | BenchError::WalletStorage {
+                    source:
+                        RocksDbWalletError::CanonicalReplay {
+                            source: CanonicalStoreError::MissingLiveTailReplay { height },
+                        },
+                },
+            ) if active_writer => {
+                secondary.reopen_after_missing_live_tail(height)?;
+                apply_projector_event(secondary, wallet, event, settled_tip)?;
+            }
+            Err(BenchError::CanonicalStorage { ref source }) if source.is_missing_table_file() => {
+                return Ok((applied, true));
+            }
+            Err(BenchError::WalletStorage { ref source })
+                if is_wallet_replay_missing_table(source) =>
+            {
+                return Ok((applied, true));
+            }
+            Err(err) => return Err(err),
         }
         durations.push(started.elapsed());
         *transitions = transitions.saturating_add(1);
         applied = applied.saturating_add(1);
     }
     Ok((applied, false))
+}
+
+fn apply_projector_event(
+    secondary: &RocksDbCanonicalSecondary,
+    wallet: &mut RocksDbWalletFollowingStore,
+    event: CanonicalRetainedEvent,
+    settled_tip: BlockId,
+) -> Result<(), BenchError> {
+    let current_source =
+        WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+    let replay_rows = secondary.scan_canonical_replay_range(event.committed_range())?;
+    let max_bytes =
+        NonZeroU64::new(MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES).unwrap_or(NonZeroU64::MIN);
+    wallet.apply_canonical_event_range(
+        current_source,
+        event,
+        event.resulting_fence(),
+        settled_tip,
+        max_bytes,
+        replay_rows,
+    )?;
+    Ok(())
 }
 
 struct CatchupLoopInputs {
@@ -923,6 +989,71 @@ fn follow_config_for(target_height: BlockHeight) -> CanonicalFollowConfig {
         mempool_ready_gate: None,
         max_replacement_bytes: DEFAULT_MAX_REPLACEMENT_BYTES,
         node_failover: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::active_writer_publication::chain_fixture::ChainSpecConfig;
+
+    #[tokio::test]
+    async fn projector_failure_cancels_an_active_writer() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let config = ActiveWriterPublicationConfig {
+            base_blocks: 8,
+            live_blocks: 20,
+            reorg_window_blocks: 4,
+            io_mode: RocksDbIoMode::Buffered,
+            ..ActiveWriterPublicationConfig::default()
+        };
+        let chain = GeneratedChain::build(ChainSpecConfig {
+            base_blocks: config.base_blocks,
+            live_blocks: config.live_blocks,
+            reorg_window_blocks: config.reorg_window_blocks,
+            dense_block_cadence: 3,
+            dense_txs_per_block: 1,
+            dense_orchard_actions_per_tx: 2,
+        })?;
+        let template = TemplateStores::build(&chain, &config).await?;
+        let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
+            &template.canonical_path,
+            &chain.activations,
+            RawBlobRetention::All,
+            CanonicalReorgPolicy::new(chain.reorg_window_blocks)?,
+            writer_budget(config.io_mode),
+        )?;
+        let cancel = CancellationToken::new();
+        let (writer_progress_tx, mut writer_rx) = watch::channel(WriterProgress::default());
+        let mut projector = Some(tokio::spawn(async move {
+            writer_rx
+                .wait_for(|progress| progress.commits_completed > 0)
+                .await
+                .map_err(|error| BenchError::tip_replay(error.to_string()))?;
+            Err(BenchError::tip_replay("injected projector failure"))
+        }));
+        let writer = spawn_writer_thread(WriterThreadArgs {
+            store,
+            source: AdvancingChainSource::new(&chain, chain.base_tip_height),
+            activations: Arc::clone(&chain.activations),
+            start_height: chain.base_tip_height.value() + 1,
+            end_height: chain.final_tip_height.value(),
+            commit_interval: Duration::from_millis(200),
+            writer_progress_tx: writer_progress_tx.clone(),
+            commit_instants: Arc::new(Mutex::new(BTreeMap::new())),
+            cancel: cancel.clone(),
+        });
+        let pipeline_outcome = wait_for_writer(writer, &mut projector, &cancel).await;
+        assert!(matches!(
+            pipeline_outcome,
+            Err(BenchError::TipReplay { reason }) if reason == "injected projector failure"
+        ));
+        assert!(cancel.is_cancelled());
+        assert!(projector.is_none());
+        let progress = *writer_progress_tx.borrow();
+        assert!(progress.commits_completed > 0);
+        assert!(progress.last_committed_height < chain.final_tip_height.value());
+        Ok(())
     }
 }
 

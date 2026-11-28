@@ -31,6 +31,7 @@ use zinder_store::RocksDbIoMode;
 mod build_provenance;
 #[path = "canonical_replay_storage/command.rs"]
 mod canonical_replay_storage_command;
+mod checkpoint_policy_comparison;
 #[path = "postgres_segmented/command.rs"]
 mod postgres_segmented_command;
 mod rocksdb_canonical_fixture_replay;
@@ -100,6 +101,9 @@ enum Command {
     /// Replay an authenticated fixture into a fresh canonical `RocksDB` store.
     #[command(name = "rocksdb-canonical-fixture-replay")]
     RocksDbCanonicalFixtureReplay(RocksDbCanonicalFixtureReplayArgs),
+    /// Compare sparse, two commitment budgets, and every-block construction.
+    #[command(name = "rocksdb-checkpoint-policy-comparison")]
+    RocksDbCheckpointPolicyComparison(checkpoint_policy_comparison::CheckpointPolicyComparisonArgs),
     /// Compare transaction-only and complete raw-blob retention over one fixture.
     #[command(name = "rocksdb-raw-blob-retention-comparison")]
     RocksDbRawBlobRetentionComparison(RocksDbRawBlobRetentionComparisonArgs),
@@ -364,6 +368,10 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             let output = run_rocksdb_canonical_fixture_replay(args).await?;
             emit_report(&output.report, output.report_path.as_deref())?;
             output.report.validate()
+        }
+        Command::RocksDbCheckpointPolicyComparison(args) => {
+            let report = checkpoint_policy_comparison::run(&args).await?;
+            emit_report(&report, args.report.as_deref())
         }
         Command::RocksDbRawBlobRetentionComparison(args) => {
             let output = run_rocksdb_raw_blob_retention_comparison(args).await?;

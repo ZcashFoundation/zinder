@@ -117,6 +117,9 @@ pub(crate) struct RocksDbCanonicalFixtureReplayArgs {
     /// Tree-state checkpoint coverage persisted during canonical construction.
     #[arg(long = "tree-state-checkpoint-coverage", value_enum, default_value_t)]
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    /// Commitment threshold for commitment-budget coverage. Defaults to the ingest threshold.
+    #[arg(long)]
+    tree_state_commitment_budget: Option<NonZeroU32>,
     /// Write the JSON report to this path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -136,6 +139,7 @@ struct ValidatedReplayArgs {
     supported_reorg_depth: u32,
     source_segment_delay: Duration,
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    tree_state_commitment_budget: Option<NonZeroU32>,
     block_source: CanonicalFixtureBlockSource,
     json_rpc_addr: Option<String>,
     indexer_grpc_addr: Option<String>,
@@ -179,6 +183,7 @@ pub(crate) async fn run_rocksdb_canonical_fixture_replay(
         supported_reorg_depth: validated.supported_reorg_depth,
         source_segment_delay: validated.source_segment_delay,
         tree_state_checkpoint_coverage: validated.tree_state_checkpoint_coverage,
+        tree_state_commitment_budget: validated.tree_state_commitment_budget,
     };
     let outcome = replay_with_block_source(&validated, &manifest, replay_config).await?;
     let total_seconds = replay_started.elapsed().as_secs_f64();
@@ -252,6 +257,11 @@ impl RocksDbCanonicalFixtureReplayArgs {
             supported_reorg_depth: supported_reorg_depth.get(),
             source_segment_delay: Duration::from_millis(self.source_segment_delay_millis),
             tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
+            tree_state_commitment_budget: TreeStateCheckpointCoverage::from_selection(
+                self.tree_state_checkpoint_coverage
+                    .resolve(self.tree_state_commitment_budget)?,
+            )?
+            .1,
             block_source: self.block_source,
             json_rpc_addr: block_source_args.json_rpc_addr,
             indexer_grpc_addr: block_source_args.indexer_grpc_addr,
@@ -431,16 +441,15 @@ fn replay_measurements(
 ) -> RocksDbCanonicalFixtureReplayMeasurements {
     let source_load = source_load_summary(&measured.outcome);
     let canonical_ready = ready_summary(&measured.outcome);
+    let resource_limits = resource_limits(validated, &measured.outcome, measured.resource_budget);
     RocksDbCanonicalFixtureReplayMeasurements {
         replay_plan_fixture_manifest_sha256: measured.outcome.fixture_manifest_digest_sha256,
         replay_plan_digest_sha256: measured.outcome.replay_plan_digest_sha256,
-        resource_limits: resource_limits(
-            validated,
-            measured.outcome.tree_state_checkpoint_coverage,
-            measured.resource_budget,
-        ),
+        resource_limits,
         publication_proof_provenance: "trusted-fresh-writer",
         total_seconds: measured.total_seconds,
+        ready_seconds: measured.outcome.ready_duration.as_secs_f64(),
+        reopen_seconds: measured.outcome.reopen_duration.as_secs_f64(),
         source_load,
         canonical_ready,
         physical_store_bytes: measured.physical_store_bytes,
@@ -452,7 +461,7 @@ fn replay_measurements(
 
 fn resource_limits(
     validated: &ValidatedReplayArgs,
-    tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    outcome: &CanonicalFixtureRocksDbReplayOutcome,
     resource_budget: RocksDbResourceBudget,
 ) -> RocksDbCanonicalFixtureReplayResourceLimits {
     RocksDbCanonicalFixtureReplayResourceLimits {
@@ -487,7 +496,8 @@ fn resource_limits(
         supported_reorg_depth: validated.supported_reorg_depth,
         source_segment_delay_millis: u64::try_from(validated.source_segment_delay.as_millis())
             .unwrap_or(u64::MAX),
-        tree_state_checkpoint_coverage,
+        tree_state_checkpoint_coverage: outcome.tree_state_checkpoint_coverage,
+        tree_state_commitment_budget: outcome.tree_state_commitment_budget,
         canonical_rocksdb: resource_budget.into(),
     }
 }
@@ -510,6 +520,8 @@ fn source_load_summary(
         transaction_blob_count: load.transaction_blob_count,
         block_blob_count: load.block_blob_count,
         tree_state_checkpoint_count: load.tree_state_checkpoint_count,
+        tree_state_checkpoint_logical_bytes: load.tree_state_checkpoint_logical_bytes,
+        tree_state_checkpoint_sst_bytes: load.tree_state_checkpoint_sst_bytes,
         subtree_root_count: outcome.subtree_root_load_evidence.subtree_root_count,
         logical_replay_bytes: load.logical_replay_bytes,
         settled_segment_index_logical_bytes: load.settled_segment_index_logical_bytes,

@@ -210,8 +210,8 @@ pub trait CanonicalFenceProbe {
     ///
     /// A reader that authenticates each retained event against the writer
     /// before it uses that event can work from a secondary the writer has
-    /// moved past. The default requires the writer to attest the secondary's
-    /// exact fence.
+    /// moved past once the writer attests the secondary's schedule. The
+    /// default requires the writer to attest the secondary's exact fence.
     fn accepts_trailing(&self, _lag: CanonicalFenceLag) -> bool {
         false
     }
@@ -252,11 +252,11 @@ pub enum CanonicalFenceConvergenceError<ProbeError> {
 ///
 /// The writer keeps committing while a secondary converges, so lag is retried
 /// with capped exponential backoff until the policy's deadline or attempt
-/// bound, unless the probe accepts the lag of a round, which ends convergence
-/// with [`CanonicalFenceConvergence::Trailing`]. A matching fence whose
-/// network-upgrade schedule revision the probe has not caught up to is
-/// retried like lag. Divergence fails on the round that observes it. Every
-/// status that names a fence on `network` reaches
+/// bound, unless the probe accepts the lag of a round and the writer attests
+/// the secondary's schedule. That round ends with
+/// [`CanonicalFenceConvergence::Trailing`]. A matching fence whose schedule
+/// is still behind is retried like lag. Divergence fails on the round that
+/// observes it. Every status that names a fence on `network` reaches
 /// [`CanonicalFenceProbe::observe_writer_status`] before its fence is
 /// compared, so a refusal it carries is never lost to a retry.
 ///
@@ -323,7 +323,7 @@ where
                 }
                 CanonicalFenceRelation::SecondaryBehind(lag) => {
                     probe.secondary_behind(lag, started.elapsed());
-                    if probe.accepts_trailing(lag) {
+                    if probe.attests_writer_schedule(&status) && probe.accepts_trailing(lag) {
                         return Ok(CanonicalFenceConvergence::Trailing(lag));
                     }
                 }
@@ -1108,6 +1108,36 @@ mod tests {
             Ok(CanonicalFenceConvergence::Converged(_))
         ));
         assert_eq!(probe.catch_ups, 3);
+    }
+
+    #[tokio::test]
+    async fn a_trailing_caught_up_fence_requires_writer_schedule_attestation() {
+        let mut probe = ScriptedProbe::new(None);
+        probe.schedule_lag_catch_ups = 1;
+        probe.accepts_trailing = true;
+        let policy = CanonicalFenceConvergencePolicy {
+            max_attempts: Some(NonZeroU32::MIN),
+            ..fast_policy(Duration::from_secs(5))
+        };
+        let cancel = CancellationToken::new();
+
+        let unattested =
+            converge_on_canonical_writer_fence(&mut probe, NETWORK, policy, &cancel).await;
+        assert!(matches!(
+            unattested,
+            Err(CanonicalFenceConvergenceError::DidNotConverge)
+        ));
+
+        let attested =
+            converge_on_canonical_writer_fence(&mut probe, NETWORK, policy, &cancel).await;
+        assert!(matches!(
+            attested,
+            Ok(CanonicalFenceConvergence::Trailing(CanonicalFenceLag {
+                lag_chain_epochs: 1,
+                secondary_visible_tip_height: 2,
+                writer_visible_tip_height: 3,
+            }))
+        ));
     }
 
     #[test]

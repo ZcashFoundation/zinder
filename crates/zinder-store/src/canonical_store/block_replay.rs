@@ -659,11 +659,8 @@ fn next_buffered_replay(
         range.start,
         &store_access::uncached_read_options(),
     )?
-    .ok_or_else(|| {
-        CanonicalStoreError::block_replay_sequence(format!(
-            "canonical replay at height {} is absent",
-            range.start.value()
-        ))
+    .ok_or(CanonicalStoreError::MissingLiveTailReplay {
+        height: range.start,
     })?;
     let step = store_access::replay_step_from_live_tail_bytes(range.start, &encoded)?;
     validate_replay_versions(step.replay.format_version(), step.replay.reference_digest())?;
@@ -1442,7 +1439,7 @@ mod tests {
         )?;
         assert!(matches!(
             exhaust_slice(&missing_internal.canonical_replay_slice_source(), slice_1_3),
-            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+            Err(CanonicalStoreError::MissingLiveTailReplay { height }) if height == BlockHeight::new(2)
         ));
 
         let missing_final = published_store(
@@ -1462,7 +1459,7 @@ mod tests {
             .delete_cf(&final_cf, encode_height_key_ascending(BlockHeight::new(3)))?;
         assert!(matches!(
             exhaust_slice(&missing_final.canonical_replay_slice_source(), slice_1_3),
-            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+            Err(CanonicalStoreError::MissingLiveTailReplay { height }) if height == BlockHeight::new(3)
         ));
 
         let detached = published_store(

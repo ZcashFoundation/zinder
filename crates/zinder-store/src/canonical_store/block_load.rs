@@ -195,6 +195,8 @@ pub struct CanonicalBlockLoadEvidence {
     pub block_blob_logical_bytes: u64,
     /// Tree-checkpoint key and value bytes submitted to the SST writers.
     pub tree_state_checkpoint_logical_bytes: u64,
+    /// Physical bytes occupied by the staged tree-state checkpoint SSTs.
+    pub tree_state_checkpoint_sst_bytes: u64,
     /// Total key and value bytes submitted across the 7 staged `RocksDB` SST families.
     pub logical_bytes: u64,
     /// Physical bytes occupied by every staged SST.
@@ -676,6 +678,7 @@ fn prepare_canonical_block_load(
     ]
     .into_iter()
     .try_fold(0_u64, checked_add_sst_bytes)?;
+    let tree_state_checkpoint_sst_bytes = tree_state_checkpoint.file_bytes;
     let families = vec![
         PreparedColumnFamily::new(BLOCK_HEADER_COLUMN_FAMILY, header),
         PreparedColumnFamily::new(BLOCK_HASH_INDEX_COLUMN_FAMILY, block_hash),
@@ -702,6 +705,7 @@ fn prepare_canonical_block_load(
         sst_file_bytes,
         sst_file_count,
         predecessor_checkpoint_logical_bytes,
+        tree_state_checkpoint_sst_bytes,
     )?;
     Ok(PreparedCanonicalBlockLoad {
         network,
@@ -1701,6 +1705,7 @@ impl BlockSequence {
         sst_file_bytes: u64,
         sst_file_count: u64,
         predecessor_checkpoint_logical_bytes: u64,
+        tree_state_checkpoint_sst_bytes: u64,
     ) -> Result<FinishedBlockSequence, CanonicalStoreError> {
         let mut family_logical_bytes = self.family_logical_bytes;
         family_logical_bytes.tree_state_checkpoint = checked_add_logical_bytes(
@@ -1746,6 +1751,7 @@ impl BlockSequence {
             transaction_blob_logical_bytes: self.transaction_blob_logical_bytes,
             block_blob_logical_bytes: self.block_blob_logical_bytes,
             tree_state_checkpoint_logical_bytes: family_logical_bytes.tree_state_checkpoint,
+            tree_state_checkpoint_sst_bytes,
             logical_bytes,
             sst_file_bytes,
             sst_file_count,

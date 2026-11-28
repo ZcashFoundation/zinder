@@ -127,8 +127,8 @@ zinder-bench rocksdb-raw-blob-retention-comparison \
 
 All four store paths must be absent, have existing parents, and be pairwise
 disjoint from each other and the fixture. The command uses the same fixture,
-pipeline limits, tree-state checkpoint coverage (`cadence-and-tip` by default, or
-`every-block` via `--tree-state-checkpoint-coverage`), reorg policy, wallet
+pipeline limits, tree-state checkpoint coverage (`cadence-and-tip` by default),
+reorg policy, wallet
 workload, writer budget, and reader budget for both arms. It fails instead of
 reporting if their authenticated fixture, replay plan, logical replay,
 subtree-root load coverage and digest, fence, or effective-limit identities
@@ -668,6 +668,88 @@ rebuild a wallet from the kept canonical store with `rocksdb-wallet-rebuild`.
 
 ## 6. Measure tree-state reconstruction at wallet anchors
 
+### Compare fresh checkpoint policies
+
+From the repository root, run the four-arm comparison on the checked-in
+Regtest fixture:
+
+```bash
+mkdir -p .tmp && CARGO_TARGET_DIR="$PWD/.tmp/target" cargo run -p zinder-bench -- \
+  rocksdb-checkpoint-policy-comparison \
+  --fixture services/zinder-bench/fixtures/checkpoint-policy \
+  --scratch-directory .tmp
+```
+
+The command builds four fresh stores with `cadence-and-tip`, commitment
+budgets of 1 and 3, and `every-block`. The fixture uses block 603 from
+`z3-regtest-ironwood-block-603.json` followed by three linked synthetic
+coinbase-only blocks. It exercises a checkpoint off cadence and replay
+between stored rows. The command removes its temporary stores and writes
+JSON to stdout. Pass `--report PATH` to write to a new file.
+
+Each arm reports time from builder open to READY and time to reopen and
+authenticate the append anchor. The checkpoint row count and logical bytes
+include the history predecessor. The SST byte count measures staged
+checkpoint files before ingest. Maximum replay blocks and commitments cover
+every retained height. The command warms a loopback lightwalletd gRPC
+connection at the stored tip and times one request per sampled height.
+It classifies each sample using the store's lookup at that height, and
+reports nearest-rank miss p50, p90, and p99 with the miss sample count.
+An arm with no misses reports `null` percentiles. The run fails if any arm
+returns different protobuf response bytes or a different canonical sequence.
+
+`rocksdb-canonical-fixture-replay`, `rocksdb-raw-blob-retention-comparison`,
+and `rocksdb-storage-lifecycle` accept
+`--tree-state-checkpoint-coverage commitment-budget`. Set
+`--tree-state-commitment-budget N` to override the ingest default of
+1,024 commitments. The report includes the resolved threshold alongside the
+coverage. Zero is invalid, and the threshold flag applies only to
+`commitment-budget`.
+
+#### Re-run the recorded Mainnet window
+
+Mainnet re-verification requires the external `z470-window-1730000.tar.zst`
+archive and is deferred when it is unavailable. With Python 3.11, GNU tar,
+and zstd installed, run:
+
+```bash
+python3 scripts/bench-checkpoint-policy-mainnet.py \
+  --archive /path/to/z470-window-1730000.tar.zst \
+  --report .tmp/checkpoint-policy-mainnet.json
+```
+
+The script verifies the archive's SHA-256
+`da252aaa5ca976f98060a512db0345a3564a53a9328d3acb97fd2717f5b6d655`
+before extraction, then serves its blocks, boundary checkpoints, and
+subtree roots over loopback. The release build measures heights
+1,730,000–1,731,999 at budgets 256 and 4,096. It uses the current default
+raw-blob retention (`none`). The original campaign retained transactions,
+a mode since retired. It samples every 17th block
+and the tip for 119 requests per arm.
+
+The original campaign observed the following results with four pinned CPU
+cores on a Ryzen 9 9950X.
+The two READY values show the run-to-run spread observed when the campaign
+reversed arm order. Miss latencies were measured once per policy. Compare
+latencies on a matching host and build profile, and use repeated runs to
+establish local timing variance. [Recorded #479 campaign](https://github.com/ZcashFoundation/zinder/pull/479)
+
+| Policy | READY (s) | Checkpoint rows | Staged checkpoint SST (bytes) | Max replayed commitments | Misses | Miss p50 / p99 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cadence and tip | 72.97 / 77.29 | 22 | 15,769 | 100,420 | 116 | 1,363.52 / 4,461.67 |
+| Budget 256 | 78.76 / 81.07 | 1,256 | 722,331 | 255 | 51 | 3.82 / 8.67 |
+| Budget 4,096 | 64.84 / 71.15 | 332 | 195,316 | 4,092 | 104 | 52.74 / 108.04 |
+| Every block | 64.25 / 66.45 | 2,001 | 1,061,433 | 0 | 0 | — |
+
+The recorded canonical sequence SHA-256 is
+`dfaa03a4f76b80bedb6ad613ff655ffbdd2180219f2139208779042e644526f1`.
+The recorded response SHA-256 is
+`4e322b8aa771d818b3a3f5c4b76d033de174e193c294b163638cd499995bc627`.
+The digest frames each protobuf response with an eight-byte little-endian
+length in request order.
+
+### Measure replay at wallet anchors
+
 `TreeStateAtHeight` and lightwalletd `GetTreeState` answer a height without a
 stored checkpoint by replaying stored compact blocks from the checkpoint below
 it. Sparse construction (`--tree-state-checkpoint-coverage cadence-and-tip`)
@@ -716,21 +798,21 @@ the command. This option conflicts
 with the three sampling options; omitting it preserves the default sampling and
 stored-checkpoint skipping behavior.
 
-Report format version 3 adds `heights_file_sha256` (null for default sampling)
-and `source` (`stored` or `replayed`) on each anchor. `read_path` distinguishes
-`wallet-query-store` for explicit heights from the default
-`validated-checkpoint` diagnostic. Explicit reads measure `tree_state_lookup`
-and, when needed, `replay_tree_state` together, matching WalletQuery's storage
-path without repeating final checkpoint root validation. Selection performs no
-seed reads outside that measured region. These counters cover the store calls,
-not RPC admission, scheduling, response encoding, or transport. Stored outcomes record zero
-replayed blocks and commitments while retaining the same cold/warm timing and
-RocksDB counters as replays. Logical key reads and thread-local block read
-counts/bytes come from the existing read measurement primitive. The labels
-cold/warm describe first and immediate repeat reads in this secondary; they do
-not prove an empty operating-system page cache. Use identical height-file and
-binary digests for paired sparse/dense measurements. These local read counters
-do not measure a network request or wallet scan end to end.
+To record the construction threshold for a previously built store, pass
+`--tree-state-checkpoint-coverage commitment-budget` and its
+`--tree-state-commitment-budget` override, if any. The report records the
+resolved value under `declared_checkpoint_policy` and checks it against
+sampled replays. The store lookup supplies the source and replay depth for
+each request.
+
+Report format version 4 uses `wallet-query-store` for both sampling modes.
+Each timing covers `tree_state_lookup` and any required `replay_tree_state`,
+the WalletQuery storage path. Default sampling looks up candidates first
+to skip stored anchors. A height file measures every listed request without
+that preselection. Stored outcomes record zero replayed blocks and
+commitments. Cold and warm label the first read and its immediate repeat in
+the same secondary. The report measures storage calls and their RocksDB
+counters. Use identical height files and binary digests for paired runs.
 
 ### Attribute compact-block and subtree-root reads
 
@@ -1336,9 +1418,8 @@ campaign case's `match` list when comparing reports that expose this flag.
 - `contract_identity`: exact benchmark report contract identity. The current identity is
   `benchmark-report`; missing or earlier identities are rejected.
 - `report_format_version`: machine-readable report contract version.
-  `canonical-replay-storage` reports use version 4,
-  `rocksdb-canonical-fixture-replay` reports version 5, and
-  `rocksdb-storage-lifecycle` reports version 6.
+  `canonical-replay-storage`, `rocksdb-canonical-fixture-replay`, and
+  `rocksdb-storage-lifecycle` reports all use version 1.
 - `measurement_kind`: `rocksdb-canonical-fixture-replay`,
   `canonical-replay-storage`, or `rocksdb-storage-lifecycle`. The tagged shape
   prevents block-local replay evidence from acquiring placeholder lifecycle or
@@ -1365,13 +1446,14 @@ campaign case's `match` list when comparing reports that expose this flag.
   measured lifecycle and its end-to-end loaded-block rate.
 - Canonical-fixture `resource_limits`: the CPU and memory envelope, the exact
   source-planner, admission, preparation, deterministic delay, and
-  `tree_state_checkpoint_coverage` (`every-block` or `cadence-and-tip`)
-  settings, and the canonical `RocksDB` budget used by the run.
+  `tree_state_checkpoint_coverage` and resolved
+  `tree_state_commitment_budget` settings, and the canonical `RocksDB`
+  budget used by the run.
 - Storage-lifecycle `resource_limits.tree_state_checkpoint_coverage`,
   `resource_limits.canonical_publication_mode`, and
-  `canonical_storage_ready.tree_state_checkpoint_count` (versions 5 and 6): the actual
-  construction checkpoint coverage (`every-block` or `cadence-and-tip`), the
-  canonical publication mode (`trusted-fresh` or `cold-certified`), and the
+  `canonical_storage_ready.tree_state_checkpoint_count` (version 1): the actual
+  construction checkpoint coverage, its resolved commitment budget in
+  `resource_limits.tree_state_commitment_budget`, the canonical publication mode (`trusted-fresh` or `cold-certified`), and the
   persisted checkpoint row count (including the predecessor checkpoint).
 - Canonical-fixture `source_fetch_attribution` reports completed segment
   requests, request and payload rates over replay wall time, cumulative
