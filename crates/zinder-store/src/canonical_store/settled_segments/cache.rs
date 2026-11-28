@@ -94,6 +94,82 @@ enum LoadedModuleReader {
     RawBlock(Arc<SettledRawBlockSegmentReader>),
 }
 
+impl LoadedModuleReader {
+    const fn kind(&self) -> SettledSegmentKind {
+        match self {
+            Self::Shielded(_) => SettledSegmentKind::Shielded,
+            Self::Supplement(_) => SettledSegmentKind::Supplement,
+            Self::RawBlock(_) => SettledSegmentKind::RawBlock,
+        }
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "Prometheus gauges use f64 and segment indexes fit within its exact integer range"
+    )]
+    fn index_heap_bytes(&self) -> f64 {
+        (match self {
+            Self::Shielded(reader) => reader.index_heap_bytes(),
+            Self::Supplement(reader) => reader.index_heap_bytes(),
+            Self::RawBlock(reader) => reader.index_heap_bytes(),
+        }) as f64
+    }
+}
+
+const SEGMENT_KINDS: [SettledSegmentKind; 3] = [
+    SettledSegmentKind::Shielded,
+    SettledSegmentKind::Supplement,
+    SettledSegmentKind::RawBlock,
+];
+
+struct CacheKindMetrics {
+    open_readers: metrics::Gauge,
+    index_heap_bytes: metrics::Gauge,
+    hits: metrics::Counter,
+    misses: metrics::Counter,
+    evictions: metrics::Counter,
+}
+
+impl CacheKindMetrics {
+    fn new(kind: SettledSegmentKind) -> Self {
+        let kind = kind.metric_label();
+        Self {
+            open_readers: metrics::gauge!("zinder_store_settled_segment_cache_open_readers", "kind" => kind),
+            index_heap_bytes: metrics::gauge!("zinder_store_settled_segment_cache_index_heap_bytes", "kind" => kind),
+            hits: metrics::counter!("zinder_store_settled_segment_cache_hits_total", "kind" => kind),
+            misses: metrics::counter!("zinder_store_settled_segment_cache_misses_total", "kind" => kind),
+            evictions: metrics::counter!("zinder_store_settled_segment_cache_evictions_total", "kind" => kind),
+        }
+    }
+}
+
+struct CacheMetrics([CacheKindMetrics; 3]);
+
+impl CacheMetrics {
+    fn for_kind(&self, kind: SettledSegmentKind) -> &CacheKindMetrics {
+        &self.0[match kind {
+            SettledSegmentKind::Shielded => 0,
+            SettledSegmentKind::Supplement => 1,
+            SettledSegmentKind::RawBlock => 2,
+        }]
+    }
+
+    fn remove_slot(&self, slot: &CachedSlot, evicted: bool) {
+        for kind in SEGMENT_KINDS {
+            if let Some(reader) = slot.module(kind) {
+                let metrics = self.for_kind(kind);
+                metrics.open_readers.decrement(1.0);
+                metrics
+                    .index_heap_bytes
+                    .decrement(reader.index_heap_bytes());
+                if evicted {
+                    metrics.evictions.increment(1);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 enum CachedOpenFailure {
     Io {
@@ -254,7 +330,19 @@ impl CachedSlot {
         }
     }
 
-    fn set_module(&mut self, reader: LoadedModuleReader) {
+    fn set_module(&mut self, reader: LoadedModuleReader, metrics: &CacheMetrics) {
+        let kind = reader.kind();
+        let metrics = metrics.for_kind(kind);
+        let prior = self.module(kind);
+        let prior_bytes = prior
+            .as_ref()
+            .map_or(0.0, LoadedModuleReader::index_heap_bytes);
+        metrics
+            .index_heap_bytes
+            .increment(reader.index_heap_bytes() - prior_bytes);
+        if prior.is_none() {
+            metrics.open_readers.increment(1.0);
+        }
         match reader {
             LoadedModuleReader::Shielded(inner) => self.shielded = Some(inner),
             LoadedModuleReader::Supplement(inner) => self.supplement = Some(inner),
@@ -307,8 +395,17 @@ pub(crate) struct SettledSegmentReaderCache {
     max_open_segments: usize,
     require_fs_verity: bool,
     inner: Mutex<LruReaderState>,
+    metrics: CacheMetrics,
     #[cfg(test)]
     test_hooks: CacheTestHooks,
+}
+
+impl Drop for SettledSegmentReaderCache {
+    fn drop(&mut self) {
+        for slot in self.inner.get_mut().slots.values() {
+            self.metrics.remove_slot(slot, false);
+        }
+    }
 }
 
 impl fmt::Debug for SettledSegmentReaderCache {
@@ -383,6 +480,7 @@ impl SettledSegmentReaderCache {
             max_open_segments,
             require_fs_verity,
             inner: Mutex::new(LruReaderState::new(max_open_segments)),
+            metrics: CacheMetrics(SEGMENT_KINDS.map(CacheKindMetrics::new)),
             #[cfg(test)]
             test_hooks: CacheTestHooks::default(),
         })
@@ -475,9 +573,12 @@ impl SettledSegmentReaderCache {
         {
             guard.lru_order.remove(pos);
         }
-        let removed = guard.slots.remove(&start_height).is_some();
+        let removed = guard.slots.remove(&start_height);
+        if let Some(slot) = &removed {
+            self.metrics.remove_slot(slot, false);
+        }
         drop(guard);
-        removed
+        removed.is_some()
     }
 
     /// Drops all cached open readers.
@@ -485,7 +586,9 @@ impl SettledSegmentReaderCache {
     pub(crate) fn clear(&self) {
         let mut guard = self.inner.lock();
         guard.generation = guard.generation.wrapping_add(1);
-        guard.slots.clear();
+        for (_, slot) in guard.slots.drain() {
+            self.metrics.remove_slot(&slot, false);
+        }
         guard.lru_order.clear();
     }
 
@@ -577,31 +680,28 @@ impl SettledSegmentReaderCache {
         entry.validate()?;
         let expected_pin = CacheIdentityPin::from_entry(entry);
         let mut guard = self.inner.lock();
-        insert_module_into_slot(
+        self.insert_module_into_slot(
             &mut guard,
             entry.start_height,
             &expected_pin,
             LoadedModuleReader::Shielded(shielded),
-            self.max_open_segments,
         )
         .map_err(|failure| failure.to_error())?;
         if let Some(sup_reader) = supplement {
-            insert_module_into_slot(
+            self.insert_module_into_slot(
                 &mut guard,
                 entry.start_height,
                 &expected_pin,
                 LoadedModuleReader::Supplement(sup_reader),
-                self.max_open_segments,
             )
             .map_err(|failure| failure.to_error())?;
         }
         if let Some(raw_reader) = raw_block {
-            insert_module_into_slot(
+            self.insert_module_into_slot(
                 &mut guard,
                 entry.start_height,
                 &expected_pin,
                 LoadedModuleReader::RawBlock(raw_reader),
-                self.max_open_segments,
             )
             .map_err(|failure| failure.to_error())?;
         }
@@ -635,7 +735,14 @@ impl SettledSegmentReaderCache {
     ) -> Result<LoadedModuleReader, SettledSegmentsError> {
         entry.validate()?;
         let expected_pin = CacheIdentityPin::from_entry(entry);
-        match self.lookup_or_claim_miss(entry.start_height, kind, &expected_pin)? {
+        let acquisition = self.lookup_or_claim_miss(entry.start_height, kind, &expected_pin)?;
+        let metrics = self.metrics.for_kind(kind);
+        if matches!(acquisition, MissAcquisition::Hit(_)) {
+            metrics.hits.increment(1);
+        } else {
+            metrics.misses.increment(1);
+        }
+        match acquisition {
             MissAcquisition::Hit(reader) => Ok(reader),
             MissAcquisition::Wait(inflight) => {
                 let mut state_guard = inflight.state.lock();
@@ -750,16 +857,48 @@ impl SettledSegmentReaderCache {
         }
         let reader = loaded?;
         if guard.generation == inflight.generation {
-            insert_module_into_slot(
+            self.insert_module_into_slot(
                 &mut guard,
                 key.start_height,
                 expected_pin,
                 reader.clone(),
-                self.max_open_segments,
             )?;
         }
         drop(guard);
         Ok(reader)
+    }
+
+    fn insert_module_into_slot(
+        &self,
+        guard: &mut LruReaderState,
+        start_height: BlockHeight,
+        expected_pin: &CacheIdentityPin,
+        reader: LoadedModuleReader,
+    ) -> Result<(), CachedOpenFailure> {
+        if let Some(existing) = guard.slots.get_mut(&start_height) {
+            if existing.pin != *expected_pin {
+                return Err(CachedOpenFailure::ChainLinkage(format!(
+                    "cached segment at start_height {} changed identity concurrently",
+                    start_height.value()
+                )));
+            }
+            existing.set_module(reader, &self.metrics);
+            guard.touch(start_height);
+            return Ok(());
+        }
+        while guard.slots.len() >= self.max_open_segments {
+            let Some(evict_height) = guard.lru_order.pop_front() else {
+                break;
+            };
+            if let Some(slot) = guard.slots.remove(&evict_height) {
+                self.metrics.remove_slot(&slot, true);
+            }
+        }
+        let mut new_slot = CachedSlot::empty(expected_pin.clone());
+        new_slot.set_module(reader, &self.metrics);
+        guard.slots.insert(start_height, new_slot);
+        guard.lru_order.push_back(start_height);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -783,37 +922,6 @@ impl SettledSegmentReaderCache {
             }
         }
     }
-}
-
-fn insert_module_into_slot(
-    guard: &mut LruReaderState,
-    start_height: BlockHeight,
-    expected_pin: &CacheIdentityPin,
-    reader: LoadedModuleReader,
-    max_open_segments: usize,
-) -> Result<(), CachedOpenFailure> {
-    if let Some(existing) = guard.slots.get_mut(&start_height) {
-        if existing.pin != *expected_pin {
-            return Err(CachedOpenFailure::ChainLinkage(format!(
-                "cached segment at start_height {} changed identity concurrently",
-                start_height.value()
-            )));
-        }
-        existing.set_module(reader);
-        guard.touch(start_height);
-        return Ok(());
-    }
-    while guard.slots.len() >= max_open_segments {
-        let Some(evict_height) = guard.lru_order.pop_front() else {
-            break;
-        };
-        guard.slots.remove(&evict_height);
-    }
-    let mut new_slot = CachedSlot::empty(expected_pin.clone());
-    new_slot.set_module(reader);
-    guard.slots.insert(start_height, new_slot);
-    guard.lru_order.push_back(start_height);
-    Ok(())
 }
 
 fn open_single_module(
