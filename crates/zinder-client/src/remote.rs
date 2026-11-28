@@ -23,19 +23,22 @@ use zinder_core::wire::{
 use zinder_core::{
     ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeader, BlockHeight,
     BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId, ChainValuePool,
-    ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId,
-    MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MempoolEntry, MempoolEvictionReason, MinedTransaction,
-    MinedTransactionChainContext, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
-    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
+    ChainValuePoolsAtTip, CompactBlockArtifact, CompactBlockNullifiers, CompactPool,
+    ConsensusBranchId, MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MAX_TRANSPARENT_ADDRESSES_PER_BATCH,
+    MempoolEntry, MempoolEvictionReason, MinedTransaction, MinedTransactionChainContext, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    StandardFee, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressBalance,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
     TransparentOutpointSpendStatus, TransparentUnspentOutput, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::{
     CHAIN_EVENT_FAMILY_HEADER, TransactionAbsence, WalletWireDecodeError, chain_epoch_from_message,
-    compact_block_from_message as compact_block_from_wire_message, mempool_entry_from_message,
-    outpoint_message, transparent_outpoint_spend_status_entry_from_message,
+    compact_block_from_message as compact_block_from_wire_message,
+    compact_block_nullifiers_from_message, compact_pool_message, mempool_entry_from_message,
+    outpoint_message, standard_fee_from_message,
+    transparent_outpoint_spend_status_entry_from_message,
 };
 
 use crate::error::ZINDER_ERROR_DOMAIN;
@@ -45,10 +48,10 @@ use crate::tls::{self, TlsRoots};
 use crate::{
     BlockId, Capability, CapabilityDescriptor, ChainEpochCommitted, ChainEvent, ChainEventCursor,
     ChainEventEnvelope, ChainEventStream, ChainEventStreamFamily, ChainIndex, ChainRangeReverted,
-    EndpointBackedIndex, EventStreamStart, IndexStream, IndexerError, MempoolEvent,
-    MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor,
-    MempoolSnapshotRequest, MempoolSnapshotView, NodeServerInfo, RetryPolicy, ServerInfo,
-    TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
+    CompactRangeQuery, EndpointBackedIndex, EventStreamStart, IndexStream, IndexerError,
+    MempoolEvent, MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream,
+    MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView, NodeServerInfo,
+    RetryPolicy, ServerInfo, TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
     TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
     TransparentOutpointSpendStatuses, TransparentUnspentOutputChunk,
@@ -311,6 +314,69 @@ impl RemoteChainIndex {
     /// HTTP/2 multiplexer until [`Self::rebuild_channel`] swaps it out.
     fn client(&self) -> WalletQueryClient<Channel> {
         (**self.client.load()).clone()
+    }
+
+    async fn require_capability(&self, capability: Capability) -> Result<(), IndexerError> {
+        let descriptor = tokio::time::timeout(CONNECT_TIMEOUT, self.server_info())
+            .await
+            .map_err(|_| IndexerError::ServiceUnavailable {
+                reason: "wallet capability lookup timed out".to_owned(),
+            })??;
+        ensure_advertised_capability(&descriptor, capability)
+    }
+
+    fn unspent_outputs_stream(
+        &self,
+        response: tonic::Streaming<wallet::TransparentUnspentOutputsChunk>,
+        addresses: HashSet<TransparentAddressScriptHash>,
+        start_height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> TransparentAddressUnspentOutputsStream {
+        let recovery = self.clone();
+        let addresses = Arc::new(addresses);
+        let decoded = futures_util::stream::unfold(Some((response, None)), move |state| {
+            let recovery = recovery.clone();
+            let addresses = Arc::clone(&addresses);
+            async move {
+                let (mut response, mut chain_epoch) = state?;
+                loop {
+                    let message = match response.message().await {
+                        Ok(Some(message)) => message,
+                        Ok(None) => {
+                            return missing_transparent_unspent_header_error(chain_epoch.is_some())
+                                .map(|error| (Err(error), None));
+                        }
+                        Err(status) => return Some((Err(recovery.map_status(status)), None)),
+                    };
+                    match transparent_unspent_output_stream_item(
+                        recovery.network,
+                        at_epoch_id,
+                        &mut chain_epoch,
+                        message,
+                    ) {
+                        Ok(None) => {}
+                        Ok(Some(output)) => {
+                            if !addresses.contains(&output.output.address_script_hash)
+                                || output.output.block_height < start_height
+                                || output.output.block_height
+                                    > output.chain_epoch.visible_tip_height
+                            {
+                                return Some((
+                                    Err(IndexerError::malformed(
+                                        "transparent_unspent_output",
+                                        "output does not match the requested addresses and height bounds",
+                                    )),
+                                    None,
+                                ));
+                            }
+                            return Some((Ok(output), Some((response, chain_epoch))));
+                        }
+                        Err(error) => return Some((Err(error), None)),
+                    }
+                }
+            }
+        });
+        Box::pin(futures_util::StreamExt::fuse(decoded))
     }
 
     /// Maps a tonic [`Status`](tonic::Status) into the typed [`IndexerError`]
@@ -652,13 +718,33 @@ impl ChainIndex for RemoteChainIndex {
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
+        if block_range.start > block_range.end {
+            return Err(IndexerError::invalid_request(
+                "compact block range start exceeds end",
+            ));
+        }
+        self.scan_compact_blocks(CompactRangeQuery {
+            at_epoch_id,
+            ..CompactRangeQuery::new(block_range.start, block_range.end)
+        })
+        .await
+    }
+
+    async fn scan_compact_blocks(
+        &self,
+        query: CompactRangeQuery,
+    ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
+        if query.start_height > query.end_height || !query.pools.is_empty() {
+            self.require_capability(Capability::CompactBlockScan)
+                .await?;
+        }
         let response = self
             .read_rpc(
                 wallet::CompactBlocksInRangeRequest {
-                    start_height: block_range.start.value(),
-                    end_height: block_range.end.value(),
-                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-                    pool_types: Vec::new(),
+                    start_height: query.start_height.value(),
+                    end_height: query.end_height.value(),
+                    at_epoch_id: query.at_epoch_id.map(ChainEpochId::value),
+                    pool_types: encode_compact_pools(&query.pools),
                 },
                 async |mut client, request| client.compact_blocks_in_range(request).await,
             )
@@ -671,7 +757,49 @@ impl ChainIndex for RemoteChainIndex {
             });
         Ok(compact_block_range_stream(
             Box::pin(wire_stream),
-            CompactBlockRangeStreamState::new(self.network, at_epoch_id, block_range),
+            CompactBlockRangeStreamState::new(
+                self.network,
+                query.at_epoch_id,
+                BlockHeightRange::inclusive(query.start_height, query.end_height),
+            ),
+        ))
+    }
+
+    async fn scan_compact_nullifiers(
+        &self,
+        query: CompactRangeQuery,
+    ) -> Result<IndexStream<CompactBlockNullifiers>, IndexerError> {
+        if query.pools.contains(&CompactPool::Transparent) {
+            return Err(IndexerError::invalid_request(
+                "compact nullifier scans accept shielded pools only",
+            ));
+        }
+        self.require_capability(Capability::CompactNullifierRange)
+            .await?;
+        let response = self
+            .read_rpc(
+                wallet::CompactNullifiersInRangeRequest {
+                    start_height: query.start_height.value(),
+                    end_height: query.end_height.value(),
+                    at_epoch_id: query.at_epoch_id.map(ChainEpochId::value),
+                    pool_types: encode_compact_pools(&query.pools),
+                },
+                async |mut client, request| client.compact_nullifiers_in_range(request).await,
+            )
+            .await
+            .map_err(|status| self.map_status(status))?;
+        let recovery = self.clone();
+        let wire_stream = tokio_stream::StreamExt::map(response.into_inner(), move |chunk| {
+            chunk.map_err(|status| recovery.map_status(status))
+        });
+        Ok(compact_range_stream(
+            Box::pin(wire_stream),
+            CompactBlockRangeStreamState::new(
+                self.network,
+                query.at_epoch_id,
+                BlockHeightRange::inclusive(query.start_height, query.end_height),
+            ),
+            CompactBlockRangeStreamState::accept_nullifiers,
         ))
     }
 
@@ -917,11 +1045,7 @@ impl ChainIndex for RemoteChainIndex {
         query: TransparentAddressUnspentOutputsQuery,
     ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
         let request = wallet::TransparentAddressUnspentOutputsRequest {
-            address: Some(wallet::AddressLookup {
-                selector: Some(wallet::address_lookup::Selector::ScriptHash(
-                    query.address_script_hash.as_bytes().to_vec(),
-                )),
-            }),
+            address: Some(address_lookup_message(query.address_script_hash)),
             start_height: query.start_height.value(),
             at_epoch_id: query.at_epoch_id.map(ChainEpochId::value),
         };
@@ -931,38 +1055,85 @@ impl ChainIndex for RemoteChainIndex {
             })
             .await
             .map_err(|status| self.map_status(status))?;
-        let expected_network = self.network;
-        let expected_epoch_id = query.at_epoch_id;
-        let recovery = self.clone();
-        // The leading header pins the chain epoch for the whole stream; the
-        // closure captures it and drops the header (yielding no item).
-        let mut pinned_chain_epoch: Option<ChainEpoch> = None;
-        let header_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let header_seen_while_decoding = std::sync::Arc::clone(&header_seen);
-        let stream = response.into_inner().filter_map(move |message_result| {
-            message_result
-                .map_err(|status| recovery.map_status(status))
-                .and_then(|message| {
-                    transparent_unspent_output_stream_item(
-                        expected_network,
-                        expected_epoch_id,
-                        &mut pinned_chain_epoch,
-                        &header_seen_while_decoding,
-                        message,
-                    )
-                })
-                .transpose()
-        });
-        let terminal = futures_util::StreamExt::filter_map(
-            futures_util::stream::once(async move {
-                missing_transparent_unspent_header_error(
-                    header_seen.load(std::sync::atomic::Ordering::Acquire),
-                )
-                .map(Err)
-            }),
-            |terminal_result| async move { terminal_result },
-        );
-        Ok(Box::pin(futures_util::StreamExt::chain(stream, terminal)))
+        Ok(self.unspent_outputs_stream(
+            response.into_inner(),
+            HashSet::from([query.address_script_hash]),
+            query.start_height,
+            query.at_epoch_id,
+        ))
+    }
+
+    async fn transparent_address_balances(
+        &self,
+        addresses: &[TransparentAddressScriptHash],
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressBalance, IndexerError> {
+        validate_address_batch(addresses)?;
+        self.require_capability(Capability::TransparentAddressBalances)
+            .await?;
+        let response = self
+            .read_rpc(
+                wallet::TransparentAddressBalancesRequest {
+                    addresses: addresses
+                        .iter()
+                        .copied()
+                        .map(address_lookup_message)
+                        .collect(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.transparent_address_balances(request).await,
+            )
+            .await
+            .map_err(|status| self.map_status(status))?
+            .into_inner();
+        let chain_epoch =
+            chain_epoch_from_chain_view_with_pin(self.network, at_epoch_id, response.chain_view)?;
+        let distinct_addresses: HashSet<_> = addresses.iter().collect();
+        if usize::try_from(response.address_count) != Ok(distinct_addresses.len()) {
+            return Err(IndexerError::malformed(
+                "transparent_address_balances.address_count",
+                "the number of distinct addresses does not match the request",
+            ));
+        }
+        Ok(TransparentAddressBalance {
+            confirmed_zat: response.confirmed_zat,
+            address_count: response.address_count,
+            chain_epoch,
+        })
+    }
+
+    async fn transparent_addresses_unspent_outputs(
+        &self,
+        addresses: &[TransparentAddressScriptHash],
+        start_height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
+        validate_address_batch(addresses)?;
+        self.require_capability(Capability::TransparentAddressesUnspentOutputs)
+            .await?;
+        let response = self
+            .read_rpc(
+                wallet::TransparentAddressesUnspentOutputsRequest {
+                    addresses: addresses
+                        .iter()
+                        .copied()
+                        .map(address_lookup_message)
+                        .collect(),
+                    start_height: start_height.value(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| {
+                    client.transparent_addresses_unspent_outputs(request).await
+                },
+            )
+            .await
+            .map_err(|status| self.map_status(status))?;
+        Ok(self.unspent_outputs_stream(
+            response.into_inner(),
+            addresses.iter().copied().collect(),
+            start_height,
+            at_epoch_id,
+        ))
     }
 
     async fn transparent_address_tx_ids_in_range(
@@ -1039,6 +1210,30 @@ impl ChainIndex for RemoteChainIndex {
             chain_epoch,
             statuses,
         })
+    }
+}
+
+fn encode_compact_pools(pools: &[CompactPool]) -> Vec<i32> {
+    pools
+        .iter()
+        .map(|&pool| compact_pool_message(pool) as i32)
+        .collect()
+}
+
+fn validate_address_batch(addresses: &[TransparentAddressScriptHash]) -> Result<(), IndexerError> {
+    if (1..=MAX_TRANSPARENT_ADDRESSES_PER_BATCH).contains(&addresses.len()) {
+        return Ok(());
+    }
+    Err(IndexerError::invalid_request(format!(
+        "addresses must contain between 1 and {MAX_TRANSPARENT_ADDRESSES_PER_BATCH} script hashes",
+    )))
+}
+
+fn address_lookup_message(address: TransparentAddressScriptHash) -> wallet::AddressLookup {
+    wallet::AddressLookup {
+        selector: Some(wallet::address_lookup::Selector::ScriptHash(
+            address.as_bytes().to_vec(),
+        )),
     }
 }
 
@@ -1150,6 +1345,21 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .map_err(|status| self.map_status(status))?
             .into_inner();
         self.decode_server_info(response)
+    }
+
+    async fn standard_fee(&self) -> Result<StandardFee, IndexerError> {
+        self.require_capability(Capability::StandardFee).await?;
+        let response = self
+            .read_rpc(
+                wallet::StandardFeeRequest {},
+                async |mut client, request| client.standard_fee(request).await,
+            )
+            .await
+            .map_err(|status| self.map_status(status))?
+            .into_inner();
+        standard_fee_from_message(response).ok_or_else(|| {
+            IndexerError::malformed("standard_fee.fee_zat", "recommended fee is zero")
+        })
     }
 
     async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError> {
@@ -1931,23 +2141,23 @@ fn transparent_unspent_output_stream_item(
     expected_network: Network,
     expected_epoch_id: Option<ChainEpochId>,
     pinned_chain_epoch: &mut Option<ChainEpoch>,
-    header_seen: &std::sync::atomic::AtomicBool,
     message: wallet::TransparentUnspentOutputsChunk,
 ) -> Result<Option<TransparentUnspentOutputChunk>, IndexerError> {
     match message.body.ok_or_else(|| {
         IndexerError::malformed("transparent_unspent_outputs_chunk.body", "field is missing")
     })? {
         wallet::transparent_unspent_outputs_chunk::Body::Header(chain_view) => {
-            stream_header_chain_epoch(expected_network, pinned_chain_epoch, Some(chain_view))?;
+            let mut validated_epoch = *pinned_chain_epoch;
+            stream_header_chain_epoch(expected_network, &mut validated_epoch, Some(chain_view))?;
             if let Some(expected) = expected_epoch_id
-                && pinned_chain_epoch.as_ref().map(|epoch| epoch.id) != Some(expected)
+                && validated_epoch.as_ref().map(|epoch| epoch.id) != Some(expected)
             {
                 return Err(IndexerError::malformed(
                     "transparent_unspent_outputs.header.chain_epoch_id",
                     "response epoch does not match requested epoch pin",
                 ));
             }
-            header_seen.store(true, std::sync::atomic::Ordering::Release);
+            *pinned_chain_epoch = validated_epoch;
             Ok(None)
         }
         wallet::transparent_unspent_outputs_chunk::Body::Item(output_message) => {
@@ -2020,31 +2230,62 @@ impl CompactBlockRangeStreamState {
             IndexerError::malformed("compact_blocks_in_range_chunk.body", "field is missing")
         })? {
             wallet::compact_blocks_in_range_chunk::Body::Header(chain_view) => {
-                if self.chain_epoch.is_some() {
-                    return Err(IndexerError::malformed(
-                        "compact_blocks_in_range.header",
-                        "stream sent more than one chain-view header",
-                    ));
-                }
-                self.chain_epoch = Some(chain_epoch_from_chain_view_with_pin(
-                    self.expected_network,
-                    self.expected_epoch_id,
-                    Some(chain_view),
-                )?);
+                self.accept_header(chain_view)?;
                 Ok(None)
             }
             wallet::compact_blocks_in_range_chunk::Body::Item(compact_block) => {
-                let chain_epoch = self.chain_epoch.ok_or_else(|| {
-                    IndexerError::malformed(
-                        "compact_blocks_in_range.item",
-                        "stream sent a compact block before its chain-view header",
-                    )
-                })?;
+                let chain_epoch = self.require_header()?;
                 let artifact = compact_block_from_message(compact_block)?;
                 self.accept_block_height(chain_epoch, artifact.height())?;
                 Ok(Some(artifact))
             }
         }
+    }
+
+    fn accept_nullifiers(
+        &mut self,
+        chunk: wallet::CompactNullifiersInRangeChunk,
+    ) -> Result<Option<CompactBlockNullifiers>, IndexerError> {
+        use wallet::compact_nullifiers_in_range_chunk::Body;
+        match chunk.body.ok_or_else(|| {
+            IndexerError::malformed("compact_nullifiers_in_range_chunk.body", "field is missing")
+        })? {
+            Body::Header(chain_view) => {
+                self.accept_header(chain_view)?;
+                Ok(None)
+            }
+            Body::Block(block) => {
+                let chain_epoch = self.require_header()?;
+                let block = compact_block_nullifiers_from_message(block)
+                    .map_err(wallet_decode_error_to_indexer_error)?;
+                self.accept_block_height(chain_epoch, block.height)?;
+                Ok(Some(block))
+            }
+        }
+    }
+
+    fn accept_header(&mut self, chain_view: wallet::ChainView) -> Result<(), IndexerError> {
+        if self.chain_epoch.is_some() {
+            return Err(IndexerError::malformed(
+                "stream.header",
+                "stream sent more than one chain-view header",
+            ));
+        }
+        self.chain_epoch = Some(chain_epoch_from_chain_view_with_pin(
+            self.expected_network,
+            self.expected_epoch_id,
+            Some(chain_view),
+        )?);
+        Ok(())
+    }
+
+    fn require_header(&self) -> Result<ChainEpoch, IndexerError> {
+        self.chain_epoch.ok_or_else(|| {
+            IndexerError::malformed(
+                "compact_blocks_in_range.item",
+                "stream sent a compact block before its chain-view header",
+            )
+        })
     }
 
     fn accept_block_height(
@@ -2074,10 +2315,10 @@ impl CompactBlockRangeStreamState {
                 ),
             ));
         }
-        self.next_height = if expected < self.block_range.end {
-            expected.value().checked_add(1).map(BlockHeight::new)
-        } else {
-            None
+        self.next_height = match expected.cmp(&self.block_range.end) {
+            std::cmp::Ordering::Less => expected.next(),
+            std::cmp::Ordering::Greater => expected.value().checked_sub(1).map(BlockHeight::new),
+            std::cmp::Ordering::Equal => None,
         };
         Ok(())
     }
@@ -2111,16 +2352,28 @@ fn compact_block_range_stream(
     wire_stream: IndexStream<wallet::CompactBlocksInRangeChunk>,
     state: CompactBlockRangeStreamState,
 ) -> IndexStream<CompactBlockArtifact> {
+    compact_range_stream(wire_stream, state, CompactBlockRangeStreamState::accept)
+}
+
+fn compact_range_stream<Chunk, Block>(
+    wire_stream: IndexStream<Chunk>,
+    state: CompactBlockRangeStreamState,
+    accept: fn(&mut CompactBlockRangeStreamState, Chunk) -> Result<Option<Block>, IndexerError>,
+) -> IndexStream<Block>
+where
+    Chunk: Send + 'static,
+    Block: Send + 'static,
+{
     Box::pin(futures_util::stream::unfold(
         Some((wire_stream, state)),
-        |stream_state| async move {
+        move |stream_state| async move {
             let (mut wire_stream, mut state) = stream_state?;
             loop {
                 let Some(chunk_result) = futures_util::StreamExt::next(&mut wire_stream).await
                 else {
                     return state.end_of_stream_error().map(|error| (Err(error), None));
                 };
-                match chunk_result.and_then(|chunk| state.accept(chunk)) {
+                match chunk_result.and_then(|chunk| accept(&mut state, chunk)) {
                     Ok(None) => {}
                     Ok(Some(artifact)) => return Some((Ok(artifact), Some((wire_stream, state)))),
                     Err(error) => return Some((Err(error), None)),
@@ -4054,12 +4307,10 @@ mod tests {
     #[test]
     fn transparent_unspent_header_rejects_a_response_from_another_epoch() {
         let mut pinned_epoch = None;
-        let header_seen = std::sync::atomic::AtomicBool::new(false);
         let outcome = transparent_unspent_output_stream_item(
             EXPECTED_NETWORK,
             Some(ChainEpochId::new(8)),
             &mut pinned_epoch,
-            &header_seen,
             wallet::TransparentUnspentOutputsChunk {
                 body: Some(wallet::transparent_unspent_outputs_chunk::Body::Header(
                     synthetic_chain_view(EXPECTED_NETWORK),
@@ -4071,7 +4322,7 @@ mod tests {
             outcome,
             Err(IndexerError::MalformedResponse { .. })
         ));
-        assert!(!header_seen.load(std::sync::atomic::Ordering::Acquire));
+        assert!(pinned_epoch.is_none());
     }
 
     #[test]
@@ -4179,12 +4430,10 @@ mod tests {
         assert!(missing_transparent_unspent_header_error(false).is_some());
 
         let mut pinned_epoch = None;
-        let header_seen = std::sync::atomic::AtomicBool::new(false);
         let outcome = transparent_unspent_output_stream_item(
             EXPECTED_NETWORK,
             Some(ChainEpochId::new(7)),
             &mut pinned_epoch,
-            &header_seen,
             wallet::TransparentUnspentOutputsChunk {
                 body: Some(wallet::transparent_unspent_outputs_chunk::Body::Header(
                     synthetic_chain_view(EXPECTED_NETWORK),
@@ -4193,7 +4442,7 @@ mod tests {
         );
 
         assert!(matches!(outcome, Ok(None)));
-        assert!(header_seen.load(std::sync::atomic::Ordering::Acquire));
+        assert!(pinned_epoch.is_some());
         assert!(missing_transparent_unspent_header_error(true).is_none());
     }
 
@@ -4251,7 +4500,7 @@ mod tests {
             .collect()
     }
 
-    fn is_malformed(decoded: &Result<BlockHeight, IndexerError>, expected_field: &str) -> bool {
+    fn is_malformed<T>(decoded: &Result<T, IndexerError>, expected_field: &str) -> bool {
         matches!(
             decoded,
             Err(IndexerError::MalformedResponse { field, .. }) if *field == expected_field
@@ -4308,7 +4557,26 @@ mod tests {
 
         assert_eq!(decoded.len(), 2, "the stream ends at its first error");
         assert!(matches!(decoded[0], Ok(height) if height == BlockHeight::new(40)));
-        assert!(is_malformed(&decoded[1], "compact_blocks_in_range.header"));
+        assert!(is_malformed(&decoded[1], "stream.header"));
+    }
+
+    #[test]
+    fn compact_nullifier_range_rejects_a_second_header() {
+        use wallet::compact_nullifiers_in_range_chunk::Body;
+
+        let mut state = CompactBlockRangeStreamState::new(
+            EXPECTED_NETWORK,
+            None,
+            BlockHeightRange::inclusive(BlockHeight::new(40), BlockHeight::new(41)),
+        );
+        let header = wallet::CompactNullifiersInRangeChunk {
+            body: Some(Body::Header(synthetic_chain_view(EXPECTED_NETWORK))),
+        };
+        assert!(matches!(state.accept_nullifiers(header.clone()), Ok(None)));
+        assert!(is_malformed(
+            &state.accept_nullifiers(header),
+            "stream.header"
+        ));
     }
 
     #[tokio::test]
