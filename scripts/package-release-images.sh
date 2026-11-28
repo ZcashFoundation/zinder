@@ -277,16 +277,18 @@ while IFS= read -r image_name; do
       }
       for profile_env in "${profile_envs[@]}"; do
         docker run --rm --platform "$platform" --user 10001:10001 \
-          --env-file "$profile_env" \
-          --entrypoint "$binary_name" "$smoke_image" config validate
+          --env-file "$profile_env" --entrypoint "$binary_name" "$smoke_image" config validate
       done
-      if docker run --rm --platform "$platform" --user 10001:10001 \
+      unknown_key_status=0
+      docker run --rm --platform "$platform" --user 10001:10001 \
         --env-file "${repository_root}/deploy/profiles/mainnet/zinder.env" \
         --env ZINDER_UNKNOWN__SMOKE_KEY=1 \
-        --entrypoint "$binary_name" "$smoke_image" config validate >/dev/null 2>&1; then
-        echo >&2 "${image_name} ${binary_name} accepted unknown ZINDER_UNKNOWN__SMOKE_KEY"
+        --entrypoint "$binary_name" "$smoke_image" config validate \
+        >/dev/null 2>&1 || unknown_key_status=$?
+      [[ "$unknown_key_status" -eq 1 ]] || {
+        echo >&2 "${image_name} ${binary_name} config validate with ZINDER_UNKNOWN__SMOKE_KEY exited ${unknown_key_status}, expected 1"
         exit 1
-      fi
+      }
     fi
   done
   rm -f -- "$smoke_filesystem"

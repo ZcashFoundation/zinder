@@ -188,10 +188,13 @@ jobs:
               for profile_env in "${profile_envs[@]}"; do
                 docker run --rm --env-file "$profile_env" "${image_name}:${PR_TAG}" config validate
               done
-              if docker run --rm --env-file deploy/profiles/mainnet/zinder.env \
+              unknown_key_status=0
+              docker run --rm --env-file deploy/profiles/mainnet/zinder.env \
                 --env ZINDER_UNKNOWN__SMOKE_KEY=1 \
-                "${image_name}:${PR_TAG}" config validate >/dev/null 2>&1; then
-                echo "::error::${image_name} accepted unknown ZINDER_UNKNOWN__SMOKE_KEY"
+                "${image_name}:${PR_TAG}" config validate \
+                >/dev/null 2>&1 || unknown_key_status=$?
+              if [[ "$unknown_key_status" -ne 1 ]]; then
+                echo "::error::${image_name} config validate with ZINDER_UNKNOWN__SMOKE_KEY exited ${unknown_key_status}, expected 1"
                 exit 1
               fi
             fi

@@ -308,10 +308,14 @@ if [[ -n "$build_images_workflow" ]]; then
       "$build_images_workflow" \
     || ! grep -Fq 'docker run --rm "${image_name}:${PR_TAG}" config validate --help >/dev/null' \
       "$build_images_workflow" \
-    || ! grep -Fq 'dev darkside --help >/dev/null' "$build_images_workflow" \
-    || ! grep -Fq 'find deploy/profiles ' "$build_images_workflow" \
-    || ! grep -Fq 'config validate' "$build_images_workflow" \
+    || ! grep -Fq 'docker run --rm "${image_name}:${PR_TAG}" dev darkside --help >/dev/null' \
+      "$build_images_workflow" \
+    || ! grep -Fq 'find deploy/profiles -mindepth 2 -maxdepth 2 -name zinder.env -type f | LC_ALL=C sort' \
+      "$build_images_workflow" \
+    || ! grep -Eq '^[[:space:]]*docker run --rm --env-file "\$profile_env" "\$\{image_name\}:\$\{PR_TAG\}" config validate$' \
+      "$build_images_workflow" \
     || ! grep -Fq 'ZINDER_UNKNOWN__SMOKE_KEY=1' "$build_images_workflow" \
+    || ! grep -Fq '[[ "$unknown_key_status" -ne 1 ]]' "$build_images_workflow" \
     || ! grep -Fq 'docker run --rm "${image_name}:${PR_TAG}" healthcheck --addr 127.0.0.1:1' \
       "$build_images_workflow" \
     || ! grep -Fq '10001:10001' "$build_images_workflow" \
@@ -1124,8 +1128,9 @@ EOF
     || ! grep -Fq '[[ "$healthcheck_status" -eq 1 ]]' "$image_packager" \
     || ! grep -Fq -- '--entrypoint "$binary_name" "$smoke_image" dev darkside --help >/dev/null' "$image_packager" \
     || ! grep -Fq 'find "${repository_root}/deploy/profiles"' "$image_packager" \
-    || ! grep -Fq -- '--entrypoint "$binary_name" "$smoke_image" config validate' "$image_packager" \
+    || ! grep -Eq '^[[:space:]]*--env-file "\$profile_env" --entrypoint "\$binary_name" "\$smoke_image" config validate$' "$image_packager" \
     || ! grep -Fq 'ZINDER_UNKNOWN__SMOKE_KEY=1' "$image_packager" \
+    || ! grep -Fq '[[ "$unknown_key_status" -eq 1 ]]' "$image_packager" \
     || ! grep -Fq "jq -r '.[]' <<< \"\$images_json\"" "$image_packager" \
     || ! grep -Fq -- '--build-context "zinder-archived-binaries=${binary_context}"' "$image_packager" \
     || ! grep -Fq -- '--build-arg "ZINDER_BINARIES_SOURCE=zinder-archived-binaries"' "$image_packager" \

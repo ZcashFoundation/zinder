@@ -886,8 +886,9 @@ expect_rejected_because \
   --image-packager "$no_darkside_packager"
 
 no_profile_validate_packager="$temporary_directory/no-profile-validate-packager.sh"
+# shellcheck disable=SC2016
 mutate_image_packager "$no_profile_validate_packager" \
-  sed 's/config validate/help/g'
+  sed '/--env-file "\$profile_env"/s/config validate$/config validate --help/'
 expect_rejected_because \
   "an image packager without deployment-profile config validate smoke" \
   'release admission rejected: the release image packager must' \
@@ -902,6 +903,16 @@ expect_rejected_because \
   'release admission rejected: the release image packager must' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --image-packager "$no_unknown_key_packager"
+
+unchecked_unknown_key_status_packager="$temporary_directory/unchecked-unknown-key-status-packager.sh"
+# shellcheck disable=SC2016
+mutate_image_packager "$unchecked_unknown_key_status_packager" \
+  sed '/\[\[ "\$unknown_key_status" -eq 1 \]\]/d'
+expect_rejected_because \
+  "an image packager that does not require exit code 1 for unknown config keys" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$unchecked_unknown_key_status_packager"
 
 wall_clock_created_packager="$temporary_directory/wall-clock-created-packager.sh"
 # shellcheck disable=SC2016
@@ -1511,7 +1522,8 @@ expect_rejected \
   --build-images-workflow "$no_darkside_build_workflow"
 
 no_profile_validate_build_workflow="$temporary_directory/no-profile-validate-build-images.yml"
-sed 's/config validate/help/g' \
+# shellcheck disable=SC2016
+sed '/--env-file "\$profile_env"/s/config validate$/config validate --help/' \
   "$repository_root/.github/workflows/build-images.yml" \
   > "$no_profile_validate_build_workflow"
 expect_rejected \
@@ -1525,6 +1537,15 @@ sed 's/ZINDER_UNKNOWN__SMOKE_KEY=1/ZINDER_NOOP=1/g' \
 expect_rejected \
   "a pull-request image workflow without unknown-key fail-closed smoke" \
   --build-images-workflow "$no_unknown_key_build_workflow"
+
+unchecked_unknown_key_status_build_workflow="$temporary_directory/unchecked-unknown-key-status-build-images.yml"
+# shellcheck disable=SC2016
+sed '/\[\[ "\$unknown_key_status" -ne 1 \]\]/d' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$unchecked_unknown_key_status_build_workflow"
+expect_rejected \
+  "a pull-request image workflow that does not require exit code 1 for unknown config keys" \
+  --build-images-workflow "$unchecked_unknown_key_status_build_workflow"
 
 arm64less_build_workflow="$temporary_directory/arm64less-build-images.yml"
 sed '/^[[:space:]]*-[[:space:]]*name: arm64$/,/^[[:space:]]*runner: ubuntu-24.04-arm$/d' \
