@@ -222,28 +222,31 @@ or differs in height, block hash, index, or digest.
 
 The wallet store holds transparent address data. Shielded data, such as
 compact blocks and tree states, stays in the canonical store. The wallet store
-is versioned by `WALLET_ROCKSDB_SCHEMA_VERSION` for its layout and
-`WALLET_PROJECTION_VALUE_ENCODING_VERSION` for its row values. Its control
+is versioned by `WALLET_ROCKSDB_SCHEMA_VERSION` (`WALLET_PROJECTION_SCHEMA_VERSION = 2`) for its layout and
+`WALLET_PROJECTION_VALUE_ENCODING_VERSION` (`2`) for its row values; older schemas fail closed on open and require a fresh wallet rebuild. Its control
 record binds it to one canonical source identity and records the chain event it
-has reached and a digest of its rows. Wallet data column families use LZ4
-at every level and for bulk SSTs.
+has reached and a digest of its rows.
 
-| Column family | Key | Filter |
-| --- | --- | --- |
-| `transparent_unspent_output` | `txid ‖ output_index_be` (36 bytes) | Partitioned hybrid Ribbon |
-| `transparent_spent_output` | `txid ‖ output_index_be` (36 bytes) | Partitioned hybrid Ribbon |
-| `transparent_unspent_output_by_address` | `address_script_hash ‖ height_be ‖ txid ‖ output_index_be` (72 bytes) | Partitioned hybrid Ribbon |
-| `transparent_address_transaction` | `address_script_hash ‖ height_be ‖ tx_index_be` (40 bytes) | Partitioned hybrid Ribbon |
-| `transparent_address_balance` | `address_script_hash` (32 bytes) | None |
-| `reorg_undo` | `height_be` (4 bytes) | None |
+| Column family | Key | Block size | Upper levels / bottommost & bulk SSTs | Filter |
+| --- | --- | --- | --- | --- |
+| `transparent_unspent_output` | `txid ‖ output_index_be` (36 bytes) | 8 KiB | LZ4 / Zstandard level 3 | Partitioned hybrid Ribbon (`10` bits/key) + two-level index (top-level blocks pinned) |
+| `transparent_spent_output` | `txid ‖ output_index_be` (36 bytes) | 8 KiB | LZ4 / Zstandard level 3 | Partitioned hybrid Ribbon (`10` bits/key) + two-level index (top-level blocks pinned) |
+| `transparent_unspent_output_by_address` | `address_script_hash ‖ height_be ‖ txid ‖ output_index_be` (72 bytes) | 16 KiB | LZ4 / Zstandard level 3 | Partitioned hybrid Ribbon (`10` bits/key) + two-level index (top-level blocks pinned) |
+| `transparent_address_transaction` | `address_script_hash ‖ height_be ‖ tx_index_be` (40 bytes) | 16 KiB | LZ4 / Zstandard level 3 | Partitioned hybrid Ribbon (`10` bits/key) + two-level index (top-level blocks pinned) |
+| `transparent_address_balance` | `address_script_hash` (32 bytes) | 4 KiB | LZ4 / Zstandard level 3 | None |
+| `reorg_undo` | `height_be` (4 bytes) | 4 KiB | LZ4 / Zstandard level 3 | None |
+| `block_hash_by_height` | `height_be` (4 bytes) | 4 KiB | None / None | None |
+
+Schema v2 normalizes canonical block hashes out of per-output and per-address-transaction rows into `block_hash_by_height` (`4`-byte big-endian height to `32`-byte block hash). `transparent_address_transaction` stores only the `32`-byte `txid` (`WalletAddressTransaction`), while `transparent_unspent_output` (`StoredWalletUnspentOutput`) and `transparent_spent_output` (`StoredWalletSpentOutput`) store a `1`-byte flag header (script kind plus an explicit-address-hash bit), omit derived `address_script_hash` unless overridden, encode `value_zat`, heights, `tx_index_in_block`, and `input_index` as canonical LEB128 varints, and collapse standard P2PKH and P2SH scripts to `20`-byte `hash160` tags. Compressible wallet column families use LZ4 in upper levels and Zstandard level 3 (`window_bits = -14`) for bottommost compaction and bulk-loaded SSTs, while `block_hash_by_height` stays uncompressed (`None`). `RocksDbWalletStore` pairs `block_hash_by_height` with a bounded FIFO `BlockHashChunkCache` of `128`-block chunks protected by `parking_lot::RwLock` (budgeted at `clamp(block_cache_capacity / 4, 1 MiB, 128 MiB)`): warm page reads resolve block hashes under one shared read lock and batch any misses via `MultiGet`, while transitions and secondary catch-up call `invalidate_from` at the previous settled tip height.
 
 The filters let the projector prove quickly that a new output, spend, or
 history row does not exist yet. They use about 10 bits per key, for roughly a
 1% false-positive rate. Flushed and level-0 files use Bloom filters, and deeper
-files use Ribbon filters, which are about 30% smaller. Filters share the
-store's block cache. Materialized-view stores and canonical families other than
-`block_hash_index`, `transaction_location`, `chain_epoch`, and `chain_event`
-use no filters.
+files use Ribbon filters, which are about 30% smaller. Point-lookup families
+enable `TwoLevelIndexSearch`, partitioned filters, and pinned top-level index
+and filter blocks; filters share the store's block cache. Materialized-view
+stores and canonical families other than `block_hash_index`,
+`transaction_location`, `chain_epoch`, and `chain_event` use no filters.
 
 **Construction.** The projector builds a new wallet store in an inactive path
 from a pinned canonical event. Before it publishes the store, it reopens it
@@ -252,11 +255,13 @@ match what construction produced, and the balances must sum to the unspent
 total. Otherwise the build is refused.
 
 **Row digest.** The row accumulator is a 2,048-byte `LtHash16` accumulator
-over every row of the six families: 1,024 little-endian 16-bit lanes, summed
+over every row of the seven families (`WalletProjectionRowFamily` tags `1..=7`,
+including `BlockHashByHeight = 7`): 1,024 little-endian 16-bit lanes, summed
 modulo 2^16. The row digest is the 32-byte BLAKE2b-256 hash of it. Each row
 contributes 2,048 bytes derived from its preimage. The preimage is the
 domain `zinder:wallet-projection:row:v1\0`, the accumulator version
-`WALLET_PROJECTION_ACCUMULATOR_VERSION` (1), the value encoding version, the
+`WALLET_PROJECTION_ACCUMULATOR_VERSION` (1), the value encoding version
+`WALLET_PROJECTION_VALUE_ENCODING_VERSION` (2), the
 family tag, and the key and value, each prefixed with its 32-bit big-endian
 length. An unkeyed 44-byte BLAKE2b hash of the preimage with the
 personalization `ZinderWProjRoot1` supplies a ChaCha12 key (32 bytes) and
