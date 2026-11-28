@@ -15,11 +15,54 @@ use tonic::{
     body::Body,
     codec::{Codec, EnabledCompressionEncodings, EncodeBuf, Encoder},
     codegen::{BoxStream, StdError, http, tokio_stream},
-    server::{Grpc, ServerStreamingService},
+    server::{Grpc, ServerStreamingService, UnaryService},
 };
 use tonic_prost::ProstDecoder;
 
-use crate::compat::lightwalletd::{BlockRange, CompactBlock};
+use crate::compat::lightwalletd::{BlockId, BlockRange, CompactBlock};
+
+/// Serves unary lightwalletd block calls from canonical encoded protobuf messages.
+///
+/// Opt in through [`CompactTxStreamer::encoded_unary_blocks`]. Implementations
+/// must return the same protobuf payload and statuses as their typed methods.
+///
+/// [`CompactTxStreamer::encoded_unary_blocks`]: crate::compat::lightwalletd::compact_tx_streamer_server::CompactTxStreamer::encoded_unary_blocks
+#[tonic::async_trait]
+pub trait EncodedUnaryBlocks: Send + Sync {
+    /// Returns the requested block with all pools.
+    async fn get_encoded_block(
+        &self,
+        request: Request<BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status>;
+
+    /// Returns the requested block with shielded nullifiers only.
+    async fn get_encoded_block_nullifiers(
+        &self,
+        request: Request<BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status>;
+}
+
+pub(crate) enum UnaryBlockMethod {
+    Full,
+    Nullifiers,
+}
+
+pub(crate) struct EncodedUnaryBlock<'a>(
+    pub(crate) &'a dyn EncodedUnaryBlocks,
+    pub(crate) UnaryBlockMethod,
+);
+
+impl<'a> UnaryService<BlockId> for EncodedUnaryBlock<'a> {
+    type Response = EncodedBlock;
+    type Future = Pin<Box<dyn Future<Output = Result<Response<EncodedBlock>, Status>> + Send + 'a>>;
+
+    fn call(&mut self, request: Request<BlockId>) -> Self::Future {
+        match self.1 {
+            UnaryBlockMethod::Full => self.0.get_encoded_block(request),
+            UnaryBlockMethod::Nullifiers => self.0.get_encoded_block_nullifiers(request),
+        }
+    }
+}
 
 /// A stream of complete lightwalletd `CompactBlock` messages, each already
 /// framed for gRPC.
@@ -304,6 +347,23 @@ impl Codec for EncodedBlockCodec {
 
     fn encoder(&mut self) -> Self::Encoder {
         Self
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        ProstDecoder::default()
+    }
+}
+
+pub(crate) struct EncodedUnaryBlockCodec;
+
+impl Codec for EncodedUnaryBlockCodec {
+    type Encode = EncodedBlock;
+    type Decode = BlockId;
+    type Encoder = EncodedBlockCodec;
+    type Decoder = ProstDecoder<BlockId>;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        EncodedBlockCodec
     }
 
     fn decoder(&mut self) -> Self::Decoder {

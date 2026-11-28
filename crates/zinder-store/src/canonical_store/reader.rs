@@ -37,10 +37,11 @@ use super::{
     },
     served_tree_state::ServedTreeState,
     settled_segments::store_access::{
-        self, SegmentStoreContext, find_sealed_segment_in_slice, open_replay_segment_readers,
-        populate_raw_transaction_blobs_batch, read_compact_block_split, read_raw_block_split,
-        read_raw_blocks_in_range_split, read_raw_transaction_split,
-        reconstruct_segment_compact_range, resolve_settled_segment_for_height,
+        self, SegmentStoreContext, find_sealed_segment_in_slice, map_shielded_read_error,
+        open_replay_segment_readers, populate_raw_transaction_blobs_batch,
+        read_compact_block_split, read_raw_block_split, read_raw_blocks_in_range_split,
+        read_raw_transaction_split, reconstruct_segment_compact_range,
+        resolve_settled_segment_for_height,
     },
     subtree_load::{decode_subtree_root, encode_subtree_root_position},
     tree_state_replay::{
@@ -886,8 +887,15 @@ where
                 blocks.reverse();
             }
             for compact_block in blocks {
-                let row_len =
-                    crate::proto_codec::encoded_compact_block_artifact_len(&compact_block);
+                let row_len = if readers.supplement.is_some() {
+                    readers
+                        .shielded
+                        .native_bytes_at(compact_block.height())
+                        .map_err(map_shielded_read_error)? as usize
+                } else {
+                    // A shielded-only segment can omit fields counted at write time.
+                    crate::proto_codec::encoded_compact_block_artifact_len(&compact_block)
+                };
                 if !state.try_push(compact_block, row_len) {
                     return Ok(false);
                 }
@@ -943,7 +951,7 @@ where
         }
         let slice = row?.ok_or_else(|| missing_compact_block_row(height))?;
         let raw_exceeds_budget = state.exceeds_budget(slice.len());
-        let (compact_block, compact_len) =
+        let (compact_block, shielded_len) =
             match LiveTailBlockRecord::decode_compact_block_v1(&slice, height) {
                 Ok(decoded) => decoded,
                 Err(_) if raw_exceeds_budget => return Ok(false),
@@ -954,6 +962,8 @@ where
                 "compact block row has the wrong height",
             ));
         }
+        let compact_len = crate::proto_codec::encoded_compact_block_artifact_len(&compact_block)
+            .max(shielded_len);
         if !state.try_push(compact_block, compact_len) {
             return Ok(false);
         }
@@ -996,8 +1006,8 @@ fn visit_compact_block_batches(
         if batch.is_empty() {
             return Ok(());
         }
-        let rows = fetch_compact_blocks_with_lengths(store.serving_context(), &batch)?;
-        for (compact_block, _) in rows {
+        let rows = fetch_compact_blocks(store.serving_context(), &batch)?;
+        for compact_block in rows {
             visit(compact_block)?;
         }
     }
@@ -1065,10 +1075,10 @@ fn first_unretained_height(
     }
 }
 
-fn fetch_compact_blocks_with_lengths(
+fn fetch_compact_blocks(
     ctx: SegmentStoreContext<'_>,
     heights: &[BlockHeight],
-) -> Result<Vec<(CompactBlockArtifact, usize)>, CanonicalStoreError> {
+) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
     if heights.is_empty() {
         return Ok(Vec::new());
     }
@@ -1091,11 +1101,7 @@ fn fetch_compact_blocks_with_lengths(
             }
             let readers = open_replay_segment_readers(ctx.db, ctx.segment_cache, &entry)?;
             let range = BlockHeightRange::inclusive(start, asc_heights[run_end - 1]);
-            for compact_block in reconstruct_segment_compact_range(&readers, range)? {
-                let row_len =
-                    crate::proto_codec::encoded_compact_block_artifact_len(&compact_block);
-                out.push((compact_block, row_len));
-            }
+            out.extend(reconstruct_segment_compact_range(&readers, range)?);
         } else {
             while run_end < asc_heights.len() {
                 let next_height = asc_heights[run_end];
@@ -1120,7 +1126,7 @@ fn fetch_compact_blocks_with_lengths(
 fn fetch_live_tail_compact_run(
     db: &DB,
     heights: &[BlockHeight],
-    out: &mut Vec<(CompactBlockArtifact, usize)>,
+    out: &mut Vec<CompactBlockArtifact>,
 ) -> Result<(), CanonicalStoreError> {
     let rows = store_access::fetch_live_tail_batch_pinned(
         db,
@@ -1129,15 +1135,14 @@ fn fetch_live_tail_compact_run(
     )?;
     for (height, row) in heights.iter().copied().zip(rows) {
         let slice = row?.ok_or_else(|| missing_compact_block_row(height))?;
-        let (compact_block, compact_len) =
-            LiveTailBlockRecord::decode_compact_block_v1(&slice, height)
-                .map_err(store_access::map_settled_segments_read_error)?;
+        let (compact_block, _) = LiveTailBlockRecord::decode_compact_block_v1(&slice, height)
+            .map_err(store_access::map_settled_segments_read_error)?;
         if compact_block.height() != height {
             return Err(CanonicalStoreError::publication(
                 "compact block row has the wrong height",
             ));
         }
-        out.push((compact_block, compact_len));
+        out.push(compact_block);
     }
     Ok(())
 }

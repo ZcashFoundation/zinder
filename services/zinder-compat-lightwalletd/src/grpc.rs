@@ -52,9 +52,8 @@ use zinder_store::{
 };
 
 use crate::block_methods::{
-    self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
-    CompactBlockReads, EncodedChunkReadOutcome, RequestedBlock, TipCapture, requested_block,
-    view_reaches,
+    BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView, CompactBlockReads,
+    EncodedChunkReadOutcome, RequestedBlock, TipCapture, requested_block, view_reaches,
 };
 use crate::compact_block_messages::CompactBlockShape;
 use crate::mempool::{
@@ -1102,10 +1101,52 @@ where
 }
 
 #[tonic::async_trait]
+impl<QueryApi> lightwalletd::EncodedUnaryBlocks for LightwalletdGrpcAdapter<QueryApi>
+where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    async fn get_encoded_block(
+        &self,
+        request: Request<lightwalletd::BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status> {
+        self.block_methods
+            .unary_block(
+                &self.query_api,
+                "get_block",
+                request.get_ref(),
+                CompactBlockShape::FULL_BLOCK,
+            )
+            .await?
+            .into_encoded()
+            .map(Response::new)
+    }
+
+    async fn get_encoded_block_nullifiers(
+        &self,
+        request: Request<lightwalletd::BlockId>,
+    ) -> Result<Response<EncodedBlock>, Status> {
+        self.block_methods
+            .unary_block(
+                &self.query_api,
+                "get_block_nullifiers",
+                request.get_ref(),
+                CompactBlockShape::BLOCK_NULLIFIERS,
+            )
+            .await?
+            .into_encoded()
+            .map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
 impl<QueryApi> compact_tx_streamer_server::CompactTxStreamer for LightwalletdGrpcAdapter<QueryApi>
 where
     QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
+    fn encoded_unary_blocks(&self) -> Option<&dyn lightwalletd::EncodedUnaryBlocks> {
+        Some(self)
+    }
+
     fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
         Some(self)
     }
@@ -1130,12 +1171,15 @@ where
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        let block_id = request.into_inner();
         self.block_methods
-            .await_block_tip(&self.query_api, "get_block", &block_id)
-            .await?;
-        block_methods::compact_block(&self.query_api, &block_id, CompactBlockShape::FULL_BLOCK)
-            .await
+            .unary_block(
+                &self.query_api,
+                "get_block",
+                request.get_ref(),
+                CompactBlockShape::FULL_BLOCK,
+            )
+            .await?
+            .into_message()
             .map(Response::new)
     }
 
@@ -1143,17 +1187,16 @@ where
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        let block_id = request.into_inner();
         self.block_methods
-            .await_block_tip(&self.query_api, "get_block_nullifiers", &block_id)
-            .await?;
-        block_methods::compact_block(
-            &self.query_api,
-            &block_id,
-            CompactBlockShape::BLOCK_NULLIFIERS,
-        )
-        .await
-        .map(Response::new)
+            .unary_block(
+                &self.query_api,
+                "get_block_nullifiers",
+                request.get_ref(),
+                CompactBlockShape::BLOCK_NULLIFIERS,
+            )
+            .await?
+            .into_message()
+            .map(Response::new)
     }
 
     type GetBlockRangeStream = GrpcStream<lightwalletd::CompactBlock>;
