@@ -146,10 +146,8 @@ presplit deterministically):
   `zip317_logical_actions`, `paid_fee`, and `burn_zat`), with `O(index)`
   `index_sha256` reader opening and sans-I/O `ByteRange` planning. Together with
   `ZSHRNG02` `Slab 0`, `splice_compact_block_wire` yields byte-identical
-  transparent-inclusive `CompactBlock` frames and
-  `reconstruct_compact_block_artifact` / `reconstruct_canonical_block_facts`
-  recover full canonical records for native query, wallet projection, and
-  Explorer views.
+  transparent-inclusive `CompactBlock` frames. The supplement also provides
+  the transaction facts for canonical replay.
 - **`ZSBLKB01` (`segments/raw_block/<start:010>-<end:010>.zsblkb01`, when `raw_blob_policy = "all"`):**
   single-copy full consensus block vault storing each block once (`Zstd` level 3
   or uncompressed), a flat `40`-byte per-transaction slice table `(tx_offset,
@@ -208,9 +206,13 @@ unsealed heights `> sealed_tip`):
   admitted rows without another MultiGet. A changed READY generation starts
   with an empty cache. Before row sizes are known, encoded range reads
   request up to 16 rows in their first batch.
-- Full `CompactBlockArtifact` and `CanonicalBlockFacts` reads splice `ZSHRNG02`
-  plus `ZSTSUP01` for settled heights and decode `ZSLVTL01` rows in `MultiGet`
-  batches for unsealed tail heights:
+- Settled `CompactBlockArtifact` reads combine `ZSHRNG02` and `ZSTSUP01`.
+- Settled canonical replay reconstructs `CanonicalBlockFacts` from
+  `block_header` and `ZSTSUP01`. Range replay scans consecutive headers
+  in batches of up to 256 blocks and checks each header's height, hash,
+  parent hash, and timestamp against the authenticated supplement envelope.
+- Unsealed compact-block and canonical-facts reads decode `ZSLVTL01` rows
+  in `MultiGet` batches:
   - An unbounded range read fetches up to `1,024` unsealed tail heights per batch.
   - Tree-state replay fetches up to `16` heights per batch and checks for
     cancellation after each block. Wallet queries at the same height and chain
@@ -300,7 +302,7 @@ be rebuilt.
 
 The row digest and the UTXO set commitment are sums of per-row hashes, so they
 do not depend on the order rows are hashed in. Construction also scans the
-settled canonical prefix (`ZSHRNG02` + `ZSTSUP01` segments) in `4,096`-block
+settled canonical replay prefix in `4,096`-block
 height chunks across
 `projector.build.accumulator_hashing_workers` threads into sharded outpoint
 sorters that split `projector.build.max_outpoint_sort_memory_bytes` evenly
