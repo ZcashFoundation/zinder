@@ -867,6 +867,13 @@ pub fn decode_projected_block_nullifiers(
             field: "projected_block_nullifiers",
         }
     })?;
+    if block
+        .vtx
+        .windows(2)
+        .any(|pair| pair[0].index >= pair[1].index)
+    {
+        return Err(WalletWireDecodeError::InvalidCompactTransactionOrder);
+    }
     let mut transactions = Vec::with_capacity(block.vtx.len());
     for tx in block.vtx {
         if tx.spends.is_empty() && tx.actions.is_empty() && tx.ironwood_actions.is_empty() {

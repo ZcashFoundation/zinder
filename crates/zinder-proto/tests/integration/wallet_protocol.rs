@@ -229,6 +229,32 @@ fn mixed_pool_projection_keeps_consensus_indexes_and_full_tree_sizes() -> eyre::
 }
 
 #[test]
+fn projected_nullifier_decoder_rejects_non_increasing_transaction_indexes() {
+    use zinder_proto::compat::lightwalletd::{CompactBlock, CompactSaplingSpend, CompactTx};
+
+    for indexes in [[4, 4], [4, 3]] {
+        let block = CompactBlock {
+            hash: vec![1; 32],
+            prev_hash: vec![2; 32],
+            vtx: indexes
+                .into_iter()
+                .map(|index| CompactTx {
+                    index,
+                    txid: vec![3; 32],
+                    spends: vec![CompactSaplingSpend { nf: vec![4; 32] }],
+                    ..CompactTx::default()
+                })
+                .collect(),
+            ..CompactBlock::default()
+        };
+        assert_eq!(
+            zinder_proto::wire::decode_projected_block_nullifiers(&block.encode_to_vec()),
+            Err(WalletWireDecodeError::InvalidCompactTransactionOrder)
+        );
+    }
+}
+
+#[test]
 fn compact_block_decoder_rejects_non_increasing_transaction_indexes() {
     let data = wallet::CompactTransactionData::default();
     let block = wallet::CompactBlock {
