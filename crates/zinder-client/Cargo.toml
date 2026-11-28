@@ -55,7 +55,7 @@ tonic = { workspace = true, features = ["transport", "tls-ring", "tls-native-roo
 tonic-types = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
-zinder-core = { version = "0.27.0", path = "../zinder-core", default-features = false }
+zinder-core = { version = "0.28.0", path = "../zinder-core", default-features = false }
 zinder-proto = { workspace = true, optional = true }
 
 [dev-dependencies]

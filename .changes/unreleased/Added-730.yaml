@@ -1,6 +1,0 @@
-kind: added
-body: Accept PROXY protocol v1 and v2 on wallet gRPC listeners so trusted TCP load balancers can preserve client addresses.
-time: 2026-11-27T23:16:01.257288818Z
-custom:
-    Bump: minor
-    PR: "730"
