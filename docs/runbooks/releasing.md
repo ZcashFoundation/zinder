@@ -60,14 +60,47 @@ because an OCI image tag cannot carry it.
    ```
 
    The script fails unless the requested version matches the fragments'
-   SemVer impact and every first-party package. For a prerelease, it keeps
-   the fragments, so the next candidate contains the whole release, and it
-   replaces an earlier candidate's section. For a stable version, it removes
-   the prerelease sections and consumes the fragments. Rerunning it for the
-   same version changes nothing.
+   SemVer impact and every first-party package. It also validates every pending
+   fragment's `Upgrade` class, computes the release's highest-precedence class,
+   and writes one `**Upgrade class:**` line with its rollback statement
+   immediately under the version heading in `.changes/v<version>.md` and
+   `CHANGELOG.md`. For a prerelease, it keeps the fragments, so the next
+   candidate contains the whole release, and it replaces an earlier candidate's
+   section. For a stable version, it removes the prerelease sections and
+   consumes the fragments. Rerunning it for the same version changes nothing.
 
 4. Open a pull request with this change and check `No release note required`
    in its template. Merge it to `main` once the required checks pass.
+
+### Upgrade class and rollback contract
+
+Starting at `v0.28.0`, every release section carries one `**Upgrade class:**`
+line derived from its fragments in strict precedence order
+(`compatible < additive-schema < projection-layout < canonical-layout`). This
+declaration replaces ad-hoc per-release store layout notices, and
+`scripts/extract-release-notes.sh` copies it unchanged into the GitHub Release
+notes:
+
+| Class | Rollback statement |
+| --- | --- |
+| `compatible` | Reversible by redeploying the previous release against the same store and schema. |
+| `additive-schema` | Reversible by redeploying the previous release against the same store and schema. |
+| `projection-layout` | Requires a fresh rebuild of the affected projection; release entries below name the affected projection (`wallet`, `explorer`, or `materialized-view`) and rollback steps. |
+| `canonical-layout` | Requires a fresh rebuild of the canonical store and dependent projections; release entries below state the layout changes and rollback steps. |
+
+Single-volume `rocksdb` deployments still restart every runtime on each release,
+regardless of class. Keeping old and new store paths side by side during a
+layout change on `rocksdb` is optional (~2x disk until the old path is removed);
+otherwise, rollback requires restoring a matching backup or snapshot or
+rebuilding from empty in a clean path. Any 7-day superseded-schema retention
+policy applies strictly to future hosted `postgres` (planned M3, not yet
+implemented).
+
+Pull requests that use the exact `- [x] No release note required` waiver count
+as `compatible` and must not alter any persisted store or projection layout. See
+[`.changes/README.md`](../../.changes/README.md) for fragment authoring rules
+and [Deploying on a VM](deploying-on-a-vm.md#upgrade-restart-and-roll-back) for
+operator upgrade and rollback steps.
 
 ## Confirm both node runtimes
 
@@ -120,8 +153,12 @@ approve the release only after all four jobs pass on the tag's commit.
 
    - `validate release identity` checks that the tag matches Cargo metadata
      and is reachable from `main`, that `CHANGELOG.md` has a non-empty section
-     for it, and that no published GitHub Release has the tag. A stable tag
-     must have no pending fragments. A prerelease tag must keep them.
+     for it, and that no published GitHub Release has the tag. Starting at
+     `v0.28.0`, `scripts/validate-changelog.sh release` also requires exactly
+     one valid `**Upgrade class:**` line immediately under the version heading.
+     A stable tag must have no pending fragments. A prerelease tag must keep
+     them and match their derived upgrade class in both `CHANGELOG.md` and
+     `.changes/v<version>.md`.
    - `build API release artifacts` and `verify public SDK packages`, which
      also dry-runs the crate publication plan. Missing crate versions are
      expected in that dry run.
@@ -255,5 +292,8 @@ Never move a release tag or rebuild it from another commit. A published
 GitHub Release is immutable, and the workflow refuses to change it.
 
 To roll a deployment back, follow
-[Deploying on a VM](deploying-on-a-vm.md). Start an older binary only against
-a store whose layout it supports.
+[Deploying on a VM](deploying-on-a-vm.md#upgrade-restart-and-roll-back) and
+check the release's declared `**Upgrade class:**` line. Only `compatible` and
+`additive-schema` releases support redeploying an older binary against the same
+store; layout changes require an optionally retained separate store, a matching
+backup or snapshot restore, or a fresh rebuild in a clean path.
