@@ -5377,6 +5377,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "wallet-scan-experiment"
+version = "0.29.0"
+dependencies = [
+ "clap",
+ "eyre",
+ "pasta_curves",
+ "prost",
+ "rust-rocksdb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "zinder-core",
+ "zinder-proto",
+ "zinder-store",
+ "zinder-testkit",
+]
+
+[[package]]
 name = "want"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
