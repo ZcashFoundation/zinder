@@ -9,7 +9,7 @@
 use eyre::{Result, eyre};
 use serde::Deserialize;
 use zinder_core::Network;
-use zinder_runtime::{ConfigError, ConfigLoader};
+use zinder_runtime::{ConfigError, ConfigLoader, ObservabilityConfig};
 use zinder_source::{NodeAuth, NodeFallbackSections, NodeSection, NodeTarget};
 
 #[derive(Debug, Default, Deserialize)]
@@ -355,5 +355,91 @@ fn node_type_errors_and_fallback_merges_preserve_provenance_and_precedence() -> 
     let rendered = toml::to_string(&zinder_runtime::NodeToml::from_node_target(&fallbacks[0]))?;
     assert!(rendered.contains("password = \"[REDACTED]\""), "{rendered}");
     assert!(!rendered.contains("0123456"), "{rendered}");
+    Ok(())
+}
+
+#[test]
+fn section_validation_attributes_failing_leaf_without_blaming_siblings() -> Result<()> {
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct ObservabilityProbe {
+        ops: OpsSection,
+        observability: ObservabilityConfig,
+    }
+
+    let invalid_rate = ConfigLoader::new()
+        .with_zinder_env_from_map([
+            (
+                "ZINDER_OBSERVABILITY__OTLP_ENDPOINT".to_owned(),
+                "http://127.0.0.1:4317".to_owned(),
+            ),
+            (
+                "ZINDER_OBSERVABILITY__SAMPLING_RATE".to_owned(),
+                "2".to_owned(),
+            ),
+            (
+                "ZINDER_OPS__LISTEN_ADDR".to_owned(),
+                "127.0.0.1:9105".to_owned(),
+            ),
+        ])?
+        .load::<ObservabilityProbe>();
+    assert!(
+        matches!(
+            invalid_rate,
+            Err(ConfigError::InvalidEnvValue {
+                ref original_name,
+                ref key,
+                ..
+            }) if original_name == "ZINDER_OBSERVABILITY__SAMPLING_RATE"
+                && key == "observability.sampling_rate"
+        ),
+        "unexpected outcome for env sampling rate: {invalid_rate:?}"
+    );
+
+    let dir = tempfile::tempdir()?;
+    let toml_path = dir.path().join("obs.toml");
+    std::fs::write(&toml_path, "[observability]\nsampling_rate = 2.0\n")?;
+    let toml_rate = ConfigLoader::new()
+        .with_file(Some(toml_path))
+        .with_zinder_env_from_map([(
+            "ZINDER_OBSERVABILITY__OTLP_ENDPOINT".to_owned(),
+            "http://127.0.0.1:4317".to_owned(),
+        )])?
+        .load::<ObservabilityProbe>();
+    assert!(
+        matches!(
+            toml_rate,
+            Err(ConfigError::Deserialize {
+                path: Some(ref failing_path),
+                ..
+            }) if failing_path == "observability.sampling_rate"
+        ),
+        "TOML validation failure must not blame sibling env var: {toml_rate:?}"
+    );
+
+    let invalid_endpoint = ConfigLoader::new()
+        .with_zinder_env_from_map([
+            (
+                "ZINDER_OBSERVABILITY__OTLP_ENDPOINT".to_owned(),
+                "not-a-uri".to_owned(),
+            ),
+            (
+                "ZINDER_OBSERVABILITY__SAMPLING_RATE".to_owned(),
+                "0.5".to_owned(),
+            ),
+        ])?
+        .load::<ObservabilityProbe>();
+    assert!(
+        matches!(
+            invalid_endpoint,
+            Err(ConfigError::InvalidEnvValue {
+                ref original_name,
+                ref key,
+                ..
+            }) if original_name == "ZINDER_OBSERVABILITY__OTLP_ENDPOINT"
+                && key == "observability.otlp_endpoint"
+        ),
+        "unexpected outcome for env otlp endpoint: {invalid_endpoint:?}"
+    );
     Ok(())
 }

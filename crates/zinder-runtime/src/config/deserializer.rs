@@ -100,6 +100,32 @@ impl DeserError {
         }
     }
 
+    fn enrich_node_value(&mut self, field_path: &str, entry_node: &ConfigNode) {
+        if let DeserErrorKind::Message {
+            path,
+            env_origin,
+            message,
+        } = &mut self.kind
+            && path.is_none()
+        {
+            if let Some(origin) = direct_env_origin(entry_node) {
+                *path = Some(field_path.to_owned());
+                if env_origin.is_none() {
+                    *env_origin = Some(origin.clone());
+                }
+            } else if let Some((leaf_path, leaf_origin)) =
+                entry_node.find_mentioned_leaf(field_path, message)
+            {
+                *path = Some(leaf_path);
+                if env_origin.is_none() {
+                    *env_origin = leaf_origin.cloned();
+                }
+            } else {
+                *path = Some(field_path.to_owned());
+            }
+        }
+    }
+
     fn into_config_error(self) -> ConfigError {
         match self.kind {
             DeserErrorKind::UnknownField {
@@ -956,7 +982,7 @@ impl<'de> MapAccess<'de> for ConfigTableAccess<'de> {
             path: visited_path.clone(),
         });
         if let Err(ref mut error) = outcome {
-            error.enrich_value(&visited_path, direct_env_origin(entry_node));
+            error.enrich_node_value(&visited_path, entry_node);
         }
         outcome
     }

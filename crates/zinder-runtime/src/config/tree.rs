@@ -192,6 +192,23 @@ impl ConfigNode {
             Self::Default(_) | Self::Toml(_) | Self::Override(_) => None,
         }
     }
+
+    pub(crate) fn find_mentioned_leaf(
+        &self,
+        current_path: &str,
+        message: &str,
+    ) -> Option<(String, Option<&EnvOrigin>)> {
+        let Self::Table(entries) = self else {
+            return None;
+        };
+        let mut candidate = MentionedLeafMatch::default();
+        collect_mentioned_leaves(entries, current_path, message, &mut candidate);
+        if candidate.ambiguous {
+            None
+        } else {
+            candidate.matched
+        }
+    }
 }
 
 /// Merged configuration tree ready for type-directed Serde deserialization.
@@ -427,4 +444,88 @@ fn env_origin_suffix(origin: Option<&EnvOrigin>) -> String {
     origin.map_or_else(String::new, |env_origin| {
         format!(" (environment variable `{}`)", env_origin.var_name)
     })
+}
+
+#[derive(Default)]
+struct MentionedLeafMatch<'a> {
+    matched: Option<(String, Option<&'a EnvOrigin>)>,
+    ambiguous: bool,
+}
+
+impl<'a> MentionedLeafMatch<'a> {
+    fn record(&mut self, leaf_path: String, origin: Option<&'a EnvOrigin>) {
+        if self.matched.is_some() {
+            self.ambiguous = true;
+        } else {
+            self.matched = Some((leaf_path, origin));
+        }
+    }
+}
+
+fn collect_mentioned_leaves<'a>(
+    entries: &'a BTreeMap<String, ConfigNode>,
+    parent_path: &str,
+    message: &str,
+    candidate: &mut MentionedLeafMatch<'a>,
+) {
+    if candidate.ambiguous {
+        return;
+    }
+    for (entry_key, entry_node) in entries {
+        let child_path = if parent_path.is_empty() {
+            entry_key.clone()
+        } else {
+            format!("{parent_path}.{entry_key}")
+        };
+        match entry_node {
+            ConfigNode::Table(nested) => {
+                collect_mentioned_leaves(nested, &child_path, message, candidate);
+            }
+            ConfigNode::Env { origin, .. } => {
+                if contains_dotted_path(message, &child_path) {
+                    candidate.record(child_path, Some(origin));
+                }
+            }
+            ConfigNode::Default(_) | ConfigNode::Toml(_) | ConfigNode::Override(_) => {
+                if contains_dotted_path(message, &child_path) {
+                    candidate.record(child_path, None);
+                }
+            }
+        }
+        if candidate.ambiguous {
+            return;
+        }
+    }
+}
+
+fn contains_dotted_path(message: &str, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let mut search_from = 0;
+    while let Some(offset) = message.get(search_from..).and_then(|tail| tail.find(path)) {
+        let start = search_from + offset;
+        let end = start + path.len();
+        let before_ok = start
+            .checked_sub(1)
+            .and_then(|idx| message.as_bytes().get(idx))
+            .is_none_or(|byte| !is_path_byte(*byte));
+        let after_ok = message
+            .as_bytes()
+            .get(end)
+            .is_none_or(|byte| !is_path_byte(*byte));
+        if before_ok && after_ok {
+            return true;
+        }
+        let advance = message
+            .get(start..)
+            .and_then(|tail| tail.chars().next())
+            .map_or(1, char::len_utf8);
+        search_from = start + advance;
+    }
+    false
+}
+
+const fn is_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.'
 }
