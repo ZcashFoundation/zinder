@@ -1004,9 +1004,9 @@ write_lifecycle_evidence() {
         canonical_store_identity: "canonical",
         canonical_store_schema_version: 2,
         wallet_store_identity: "wallet",
-        wallet_store_schema_version: 1,
-        wallet_projection_schema_version: 1,
-        wallet_value_encoding_version: 1
+        wallet_store_schema_version: 2,
+        wallet_projection_schema_version: 2,
+        wallet_value_encoding_version: 2
       },
       resource_limits: (
         {
@@ -1099,7 +1099,8 @@ write_lifecycle_evidence() {
           transparent_spent_output_count: 0,
           transparent_address_transaction_count: 0,
           transparent_address_balance_count: 0,
-          reorg_undo_count: 100
+          reorg_undo_count: 100,
+          block_hash_by_height_count: 205
         },
         utxo_summary: {
           utxo_count: 0,
@@ -1318,9 +1319,12 @@ expect_lifecycle_rejected() {
   fi
 }
 expect_lifecycle_rejected wrong-canonical-store-schema '.contracts.canonical_store_schema_version = 1'
-expect_lifecycle_rejected wrong-store-schema '.contracts.wallet_store_schema_version = 2'
+expect_lifecycle_rejected wrong-store-schema '.contracts.wallet_store_schema_version = 1'
 expect_lifecycle_rejected wrong-commitment-scheme '.wallet_storage_ready.utxo_summary.commitment_scheme = "lthash16"'
-expect_lifecycle_rejected wrong-projection-schema '.contracts.wallet_projection_schema_version = 2'
+expect_lifecycle_rejected wrong-projection-schema '.contracts.wallet_projection_schema_version = 1'
+expect_lifecycle_rejected wrong-value-encoding '.contracts.wallet_value_encoding_version = 1'
+expect_lifecycle_rejected missing-block-hash-row-count 'del(.wallet_storage_ready.row_counts.block_hash_by_height_count)'
+expect_lifecycle_rejected wrong-block-hash-row-count '.wallet_storage_ready.row_counts.block_hash_by_height_count = 204'
 expect_lifecycle_rejected legacy-diagnostic-projection-engine '.storage_candidate.diagnostic_projection_engine = null'
 expect_lifecycle_rejected missing-build-stages 'del(.wallet_storage_ready.build_stages)'
 expect_lifecycle_rejected reordered-build-stages '.wallet_storage_ready.build_stages |= (.[0:1] + [.[2], .[1]] + .[3:])'

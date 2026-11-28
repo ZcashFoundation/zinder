@@ -30,8 +30,10 @@ use zinder_core::{
     BlockHeight, Network, TransparentOutPoint, TransparentUtxoSetCommitment,
     wire::UtxoSetCommitmentElement,
 };
+#[cfg(test)]
+use zinder_wallet_projection::WalletUnspentOutput;
 use zinder_wallet_projection::{
-    WalletProjectionDigestBuilder, WalletProjectionRowFamily, WalletUnspentOutput,
+    StoredWalletUnspentOutput, WalletProjectionDigestBuilder, WalletProjectionRowFamily,
 };
 
 use crate::RocksDbWalletError;
@@ -105,13 +107,35 @@ impl ConstructionAccumulators {
     }
 
     /// Adds one unspent output to the UTXO set commitment.
+    #[cfg(test)]
     pub(crate) fn insert_unspent_output(
         &mut self,
         output: &WalletUnspentOutput,
     ) -> Result<(), RocksDbWalletError> {
+        self.insert_commitment_element(UtxoSetCommitmentElement {
+            network_id: self.network.id(),
+            outpoint: output.outpoint,
+            value_zat: output.value_zat,
+            script_pub_key: &output.script_pub_key,
+            block_height: output.created_at.block.height,
+        })
+    }
+
+    /// Adds one compact stored unspent output to the UTXO set commitment.
+    pub(crate) fn insert_stored_unspent_output(
+        &mut self,
+        output: &StoredWalletUnspentOutput,
+    ) -> Result<(), RocksDbWalletError> {
+        self.insert_commitment_element(output.commitment_element(self.network))
+    }
+
+    fn insert_commitment_element(
+        &mut self,
+        element: UtxoSetCommitmentElement<'_>,
+    ) -> Result<(), RocksDbWalletError> {
         let fits_a_batch = match self.workers.as_mut() {
             Some(workers) => workers.make_room(
-                output.script_pub_key.len(),
+                element.script_pub_key.len(),
                 BatchEntry::UnspentOutput,
                 &mut self.digest,
                 &mut self.commitment,
@@ -119,10 +143,9 @@ impl ConstructionAccumulators {
             None => false,
         };
         if fits_a_batch && let Some(workers) = self.workers.as_mut() {
-            workers.filling.push_unspent_output(output);
+            workers.filling.push_commitment_element(element);
         } else {
-            self.commitment
-                .insert(&utxo_element(self.network, output, &output.script_pub_key));
+            self.commitment.insert(&element);
         }
         Ok(())
     }
@@ -333,6 +356,7 @@ pub(crate) struct FinishedBranchAccumulators {
     commitment: TransparentUtxoSetCommitment,
 }
 
+#[cfg(test)]
 fn utxo_element<'script>(
     network: Network,
     output: &WalletUnspentOutput,
@@ -622,15 +646,15 @@ impl RowBatch {
         });
     }
 
-    fn push_unspent_output(&mut self, output: &WalletUnspentOutput) {
+    fn push_commitment_element(&mut self, element: UtxoSetCommitmentElement<'_>) {
         let script_start = self.bytes.len();
-        self.bytes.extend_from_slice(&output.script_pub_key);
+        self.bytes.extend_from_slice(element.script_pub_key);
         self.unspent_outputs.push(BatchedUnspentOutput {
-            outpoint: output.outpoint,
-            value_zat: output.value_zat,
-            block_height: output.created_at.block.height,
+            outpoint: element.outpoint,
+            value_zat: element.value_zat,
+            block_height: element.block_height,
             script_start,
-            script_len: output.script_pub_key.len(),
+            script_len: element.script_pub_key.len(),
         });
     }
 

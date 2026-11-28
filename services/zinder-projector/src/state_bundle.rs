@@ -1612,6 +1612,8 @@ struct WalletRowCountsManifest {
     transparent_address_transaction: u64,
     transparent_address_balance: u64,
     reorg_undo: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    block_hash_by_height: Option<u64>,
 }
 
 impl WalletRowCountsManifest {
@@ -1624,10 +1626,15 @@ impl WalletRowCountsManifest {
             transparent_address_transaction: counts.transparent_address_transaction_count,
             transparent_address_balance: counts.transparent_address_balance_count,
             reorg_undo: counts.reorg_undo_count,
+            block_hash_by_height: Some(counts.block_hash_by_height_count),
         }
     }
 
     fn validate(&self) -> Result<(), StateBundleError> {
+        require_manifest_value(
+            self.block_hash_by_height.is_some(),
+            "wallet checkpoint row_counts must include block_hash_by_height for schema version 2",
+        )?;
         require_manifest_value(
             self.transparent_unspent_output == self.transparent_unspent_output_by_address,
             "wallet unspent primary and address-index row counts differ",
@@ -2279,20 +2286,27 @@ pub(crate) mod tests {
             &sample_wallet_admission(7)?,
         )?;
         let valid = serde_json::to_value(manifest)?;
-        for (pointer, observed) in [
+        for (pointer, unsupported, observed) in [
             (
                 "/wallet_checkpoint/schema_version",
-                "wallet schema version 2",
+                1_u16,
+                "wallet schema version 1",
+            ),
+            (
+                "/wallet_checkpoint/schema_version",
+                3_u16,
+                "wallet schema version 3",
             ),
             (
                 "/wallet_checkpoint/utxo_commitment_scheme",
+                2_u16,
                 "UTXO commitment scheme 2",
             ),
         ] {
             let mut stale = valid.clone();
             *stale
                 .pointer_mut(pointer)
-                .ok_or("test mutation pointer must resolve")? = Value::from(2);
+                .ok_or("test mutation pointer must resolve")? = Value::from(unsupported);
             let decoded = serde_json::from_value::<StateBundleManifest>(stale)?;
             let message = decoded
                 .validate(Network::ZcashRegtest)
@@ -2307,27 +2321,104 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn genuine_v1_manifest_without_block_hash_row_count_reports_schema_mismatch_and_v2_requires_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = StateBundleManifest::from_admitted(
+            "bundle-a",
+            &sample_canonical_admission(7),
+            &sample_wallet_admission(7)?,
+        )?;
+        let valid = serde_json::to_value(manifest)?;
+
+        let temporary = TempDir::new()?;
+        let paths = prepare_state_bundle_capture(temporary.path(), "bundle-a")?;
+        fs::create_dir(paths.canonical_checkpoint())?;
+        fs::create_dir(paths.wallet_checkpoint())?;
+        let mut v1_manifest = valid.clone();
+        *v1_manifest
+            .pointer_mut("/wallet_checkpoint/schema_version")
+            .ok_or("wallet schema_version pointer must resolve")? = Value::from(1_u16);
+        v1_manifest
+            .pointer_mut("/wallet_checkpoint/row_counts")
+            .and_then(Value::as_object_mut)
+            .ok_or("wallet row_counts pointer must resolve")?
+            .remove("block_hash_by_height");
+        fs::write(paths.manifest(), serde_json::to_vec_pretty(&v1_manifest)?)?;
+
+        let v1_error = StateBundleManifest::read(paths.root(), Network::ZcashRegtest)
+            .err()
+            .ok_or("genuine v1 manifest without block_hash_by_height was admitted")?;
+        assert!(
+            matches!(v1_error, StateBundleError::ManifestContract { .. }),
+            "{v1_error}"
+        );
+        let v1_message = v1_error.to_string();
+        assert!(
+            v1_message.contains("wallet schema version 1"),
+            "{v1_message}"
+        );
+        assert!(
+            v1_message.contains("this release reads only"),
+            "{v1_message}"
+        );
+        assert!(
+            v1_message.contains("rebuild the wallet store"),
+            "{v1_message}"
+        );
+
+        let mut v2_missing = valid.clone();
+        v2_missing
+            .pointer_mut("/wallet_checkpoint/row_counts")
+            .and_then(Value::as_object_mut)
+            .ok_or("wallet row_counts pointer must resolve")?
+            .remove("block_hash_by_height");
+        let mut v2_null = valid;
+        *v2_null
+            .pointer_mut("/wallet_checkpoint/row_counts/block_hash_by_height")
+            .ok_or("wallet block_hash_by_height pointer must resolve")? = Value::Null;
+        for invalid_v2 in [v2_missing, v2_null] {
+            let decoded = serde_json::from_value::<StateBundleManifest>(invalid_v2)?;
+            let error = decoded
+                .validate(Network::ZcashRegtest)
+                .err()
+                .ok_or("v2 manifest without block_hash_by_height was admitted")?;
+            assert!(
+                matches!(error, StateBundleError::ManifestContract { .. }),
+                "{error}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("block_hash_by_height"), "{message}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn checkpoint_evidence_names_the_unsupported_wallet_schema_and_the_rebuild()
     -> Result<(), Box<dyn std::error::Error>> {
         let admitted = sample_wallet_admission(7)?;
-        let message = WalletAdmission::from_ready(
-            Network::ZcashRegtest,
-            &admitted.ready,
-            WALLET_PROJECTION_STORE_IDENTITY,
-            2,
-            None,
-        )
-        .err()
-        .ok_or("a incompatible wallet checkpoint was admitted")?
-        .to_string();
-        assert!(message.contains("wallet schema version 2"), "{message}");
-        assert!(
-            message.contains(&format!(
-                "this release reads only version {WALLET_ROCKSDB_SCHEMA_VERSION}"
-            )),
-            "{message}"
-        );
-        assert!(message.contains("rebuild the wallet store"), "{message}");
+        for unsupported_schema in [1_u16, 3_u16] {
+            let message = WalletAdmission::from_ready(
+                Network::ZcashRegtest,
+                &admitted.ready,
+                WALLET_PROJECTION_STORE_IDENTITY,
+                unsupported_schema,
+                None,
+            )
+            .err()
+            .ok_or("a incompatible wallet checkpoint was admitted")?
+            .to_string();
+            assert!(
+                message.contains(&format!("wallet schema version {unsupported_schema}")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!(
+                    "this release reads only version {WALLET_ROCKSDB_SCHEMA_VERSION}"
+                )),
+                "{message}"
+            );
+            assert!(message.contains("rebuild the wallet store"), "{message}");
+        }
         Ok(())
     }
 
@@ -2347,7 +2438,7 @@ pub(crate) mod tests {
             CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
                 .checked_add(1)
                 .ok_or("construction manifest test version overflow")?;
-        let mutations: [(&str, Value); 23] = [
+        let mutations: [(&str, Value); 24] = [
             ("/identity", Value::String("state_bundle".to_owned())),
             ("/format_version", Value::from(0)),
             ("/format_version", Value::from(1)),
@@ -2388,7 +2479,8 @@ pub(crate) mod tests {
                 "/canonical_checkpoint/build_plan/history_predecessor/block_id/hash",
                 Value::String(hex::encode([0x99; 32])),
             ),
-            ("/wallet_checkpoint/schema_version", Value::from(2)),
+            ("/wallet_checkpoint/schema_version", Value::from(1)),
+            ("/wallet_checkpoint/schema_version", Value::from(3)),
             ("/wallet_checkpoint/utxo_commitment_scheme", Value::from(2)),
             (
                 "/wallet_checkpoint/database_identity_sha256",
@@ -2896,7 +2988,10 @@ pub(crate) mod tests {
             settled_tip: source.settled_tip(),
             projection_digest: WalletProjectionDigest::from_bytes([0x55; 32]),
             projection_accumulator: WalletProjectionAccumulator::empty(),
-            row_counts: WalletProjectionFamilyRowCounts::default(),
+            row_counts: WalletProjectionFamilyRowCounts {
+                block_hash_by_height_count: sequence,
+                ..WalletProjectionFamilyRowCounts::default()
+            },
             utxo_summary: WalletUtxoSetSummary {
                 utxo_count: 0,
                 total_value_zat: 0,

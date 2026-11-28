@@ -2622,6 +2622,7 @@ fn wallet_row_count(counts: zinder_wallet_projection::WalletProjectionFamilyRowC
         .saturating_add(counts.transparent_address_transaction_count)
         .saturating_add(counts.transparent_address_balance_count)
         .saturating_add(counts.reorg_undo_count)
+        .saturating_add(counts.block_hash_by_height_count)
 }
 
 #[allow(

@@ -139,6 +139,7 @@ pub(super) struct WalletRecord {
     pub(super) transparent_address_transaction_count: u64,
     pub(super) transparent_address_balance_count: u64,
     pub(super) reorg_undo_count: u64,
+    pub(super) block_hash_by_height_count: u64,
     pub(super) utxo_count: u64,
     pub(super) utxo_total_value_zat: u64,
 }
@@ -159,6 +160,7 @@ impl From<&WalletProjectionReadyEvidence> for WalletRecord {
             transparent_address_transaction_count: rows.transparent_address_transaction_count,
             transparent_address_balance_count: rows.transparent_address_balance_count,
             reorg_undo_count: rows.reorg_undo_count,
+            block_hash_by_height_count: rows.block_hash_by_height_count,
             utxo_count: evidence.utxo_summary.utxo_count,
             utxo_total_value_zat: evidence.utxo_summary.total_value_zat,
         }

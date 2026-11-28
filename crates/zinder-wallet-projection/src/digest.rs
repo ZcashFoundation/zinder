@@ -43,6 +43,8 @@ pub enum WalletProjectionRowFamily {
     TransparentAddressBalance = 5,
     /// Bounded inverse deltas used for canonical reorgs.
     ReorgUndo = 6,
+    /// Canonical block hashes keyed by height.
+    BlockHashByHeight = 7,
 }
 
 impl WalletProjectionRowFamily {
@@ -226,13 +228,17 @@ impl WalletProjectionDigestBuilder {
                 self.row_counts.reorg_undo_count,
                 other.row_counts.reorg_undo_count,
             )?,
+            block_hash_by_height_count: combine_count(
+                self.row_counts.block_hash_by_height_count,
+                other.row_counts.block_hash_by_height_count,
+            )?,
         };
         self.accumulator.add_accumulator(&other.accumulator);
         self.row_counts = combined_counts;
         Ok(())
     }
 
-    /// Returns the row counts observed by all six family accumulators.
+    /// Returns the row counts observed by all seven family accumulators.
     #[must_use]
     pub const fn row_counts(&self) -> WalletProjectionFamilyRowCounts {
         self.row_counts
@@ -275,6 +281,9 @@ impl WalletProjectionDigestBuilder {
                 &mut self.row_counts.transparent_address_balance_count
             }
             WalletProjectionRowFamily::ReorgUndo => &mut self.row_counts.reorg_undo_count,
+            WalletProjectionRowFamily::BlockHashByHeight => {
+                &mut self.row_counts.block_hash_by_height_count
+            }
         }
     }
 
@@ -296,6 +305,9 @@ impl WalletProjectionDigestBuilder {
                 self.row_counts.transparent_address_balance_count
             }
             WalletProjectionRowFamily::ReorgUndo => self.row_counts.reorg_undo_count,
+            WalletProjectionRowFamily::BlockHashByHeight => {
+                self.row_counts.block_hash_by_height_count
+            }
         }
     }
 }
@@ -379,6 +391,7 @@ mod tests {
                 transparent_address_transaction_count: 0,
                 transparent_address_balance_count: 1,
                 reorg_undo_count: 0,
+                block_hash_by_height_count: 0,
             }
         );
     }
@@ -423,7 +436,7 @@ mod tests {
 
     #[test]
     fn combined_partial_builders_equal_one_sequential_builder() {
-        let rows: [(WalletProjectionRowFamily, &[u8], &[u8]); 4] = [
+        let rows: [(WalletProjectionRowFamily, &[u8], &[u8]); 5] = [
             (
                 WalletProjectionRowFamily::TransparentUnspentOutput,
                 b"a",
@@ -440,6 +453,7 @@ mod tests {
                 b"three",
             ),
             (WalletProjectionRowFamily::ReorgUndo, b"d", b"four"),
+            (WalletProjectionRowFamily::BlockHashByHeight, b"e", b"five"),
         ];
         let mut sequential = WalletProjectionDigestBuilder::new();
         let mut first = WalletProjectionDigestBuilder::new();
@@ -470,7 +484,7 @@ mod tests {
     fn combined_partial_builders_equal_the_serial_builder_for_every_split()
     -> Result<(), WalletProjectionContractError> {
         use WalletProjectionRowFamily::{
-            ReorgUndo, TransparentAddressBalance, TransparentAddressTransaction,
+            BlockHashByHeight, ReorgUndo, TransparentAddressBalance, TransparentAddressTransaction,
             TransparentSpentOutput, TransparentUnspentOutput, TransparentUnspentOutputByAddress,
         };
         const PARTS: usize = 3;
@@ -493,7 +507,7 @@ mod tests {
             (
                 TransparentAddressTransaction,
                 patterned_bytes(40, 0x36),
-                patterned_bytes(64, 0x37),
+                patterned_bytes(32, 0x37),
             ),
             (
                 TransparentAddressBalance,
@@ -504,6 +518,11 @@ mod tests {
                 ReorgUndo,
                 42u32.to_be_bytes().to_vec(),
                 patterned_bytes(196, 0x39),
+            ),
+            (
+                BlockHashByHeight,
+                42u32.to_be_bytes().to_vec(),
+                patterned_bytes(32, 0x3a),
             ),
         ];
         let mut serial = WalletProjectionDigestBuilder::new();
@@ -684,13 +703,13 @@ mod tests {
         hex::encode(Params::new().hash_length(32).hash(expansion).as_bytes())
     }
 
-    /// Row sequence over all six families that mixes inserts with exact
+    /// Row sequence over all seven families that mixes inserts with exact
     /// removals. Every family keeps at least one row at the end, so the final
     /// accumulator depends on each family tag and on both lane folds.
     fn multi_family_builder() -> Result<WalletProjectionDigestBuilder, WalletProjectionContractError>
     {
         use WalletProjectionRowFamily::{
-            ReorgUndo, TransparentAddressBalance, TransparentAddressTransaction,
+            BlockHashByHeight, ReorgUndo, TransparentAddressBalance, TransparentAddressTransaction,
             TransparentSpentOutput, TransparentUnspentOutput, TransparentUnspentOutputByAddress,
         };
 
@@ -730,7 +749,7 @@ mod tests {
         builder.append_row(
             TransparentAddressTransaction,
             &patterned_bytes(40, 0x15),
-            &patterned_bytes(64, 0x16),
+            &patterned_bytes(32, 0x16),
         )?;
         builder.append_row(ReorgUndo, &pruned_undo_key, &patterned_bytes(236, 0x17))?;
         builder.remove_row(ReorgUndo, &pruned_undo_key, &patterned_bytes(236, 0x17))?;
@@ -742,14 +761,15 @@ mod tests {
         )?;
         builder.append_row(TransparentUnspentOutputByAddress, &live_by_address, &[])?;
         builder.append_row(ReorgUndo, &live_undo_key, &patterned_bytes(196, 0x27))?;
+        builder.append_row(
+            BlockHashByHeight,
+            &live_undo_key,
+            &patterned_bytes(32, 0x28),
+        )?;
         Ok(builder)
     }
 
     /// Checks lanes and a digest from an independent implementation.
-    ///
-    /// `reference_expansion.py` in the accumulator scheme evidence builds the
-    /// row preimages and the expansion with Python's standard `hashlib.blake2b` and
-    /// its own `ChaCha12`.
     #[test]
     fn multi_family_sequence_keeps_its_pinned_accumulator()
     -> Result<(), WalletProjectionContractError> {
@@ -763,24 +783,23 @@ mod tests {
                 transparent_address_transaction_count: 1,
                 transparent_address_balance_count: 1,
                 reorg_undo_count: 1,
+                block_hash_by_height_count: 1,
             }
         );
         let lanes = builder.accumulator().as_bytes();
         assert_eq!(
-            hex::encode(&lanes[..16]),
-            "fa0b300c332ad3ce5ed6ecf39bf0f3fd"
-        );
-        assert_eq!(
-            hex::encode(&lanes[1024..1040]),
-            "7db295ab4b3d6343a79b3577ef4b4b26"
-        );
-        assert_eq!(
-            hex::encode(&lanes[2032..]),
-            "921f4a296028aa33ea7bc7f32bb09452"
-        );
-        assert_eq!(
-            hex::encode(builder.finish().as_bytes()),
-            "be0058a447ee9896fc6fa76f5970f8180770095f33bfea10b2d8612cb829bbe8"
+            (
+                hex::encode(&lanes[..16]),
+                hex::encode(&lanes[1024..1040]),
+                hex::encode(&lanes[2032..]),
+                hex::encode(builder.finish().as_bytes()),
+            ),
+            (
+                "f3762fa7a33e5d8859a6cc7518af3509".to_owned(),
+                "02ae3cd786d9204e1dd8ce7118e43a10".to_owned(),
+                "d7e62c1f579f93caa0d34f0c1af6b320".to_owned(),
+                "f1451ee10d215c92a121ff7d352faed8e1bfd7c4936c352a2773d4d80886ee0a".to_owned(),
+            )
         );
         Ok(())
     }

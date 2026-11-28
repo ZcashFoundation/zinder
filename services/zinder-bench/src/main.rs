@@ -42,6 +42,7 @@ mod rocksdb_store_properties;
 mod rocksdb_subtree_roots;
 mod rocksdb_tip_replay;
 mod rocksdb_tree_state_replay;
+mod rocksdb_wallet_footprint;
 mod rocksdb_wallet_rebuild;
 mod wallet_load;
 
@@ -111,6 +112,9 @@ enum Command {
     /// Rebuild and cold-admit a wallet store from an existing READY canonical store.
     #[command(name = "rocksdb-wallet-rebuild")]
     RocksDbWalletRebuild(RocksDbWalletRebuildArgs),
+    /// Measure per-CF wallet `RocksDB` footprint, cold readback, and warm transparent query latency.
+    #[command(name = "rocksdb-wallet-footprint")]
+    RocksDbWalletFootprint(rocksdb_wallet_footprint::RocksDbWalletFootprintArgs),
     /// Measure unbounded ranges and byte-bounded serving chunks on a READY store.
     #[command(name = "rocksdb-compact-block-range")]
     RocksDbCompactBlockRange(ReadStoreArgs),
@@ -378,6 +382,10 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             let encoded = serde_json::to_vec_pretty(&output)?;
             write_report_to_stdout(&encoded);
             Ok(())
+        }
+        Command::RocksDbWalletFootprint(args) => {
+            let output = rocksdb_wallet_footprint::run(&args)?;
+            emit_report(&output, args.output_json.as_deref())
         }
         Command::RocksDbCompactBlockRange(args) => {
             let report = run_rocksdb_compact_block_range(&args).await?;

@@ -26,18 +26,20 @@ pub use digest::{
     WalletProjectionAccumulator, WalletProjectionDigestBuilder, WalletProjectionRowFamily,
 };
 pub use rows::{
-    WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionHistoryPage,
-    WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletAddressUnspentOutputsPage,
-    WalletOutpointKey, WalletReorgUndo, WalletSpentOutput, WalletTransactionPosition,
-    WalletUnspentOutput,
+    StoredWalletSpentOutput, StoredWalletUnspentOutput, WalletAddressBalance,
+    WalletAddressTransaction, WalletAddressTransactionHistoryPage, WalletAddressTransactionKey,
+    WalletAddressUnspentOutputKey, WalletAddressUnspentOutputsPage, WalletBlockHash,
+    WalletOutpointKey, WalletReorgUndo, WalletSpentOutput, WalletStoredTransactionPosition,
+    WalletTransactionPosition, WalletUnspentOutput,
 };
 pub use serial_oracle::WalletProjectionSerialOracle;
 
 /// Physical wallet schema version under the clean `wallet` identity.
-pub const WALLET_PROJECTION_SCHEMA_VERSION: u16 = 1;
+pub const WALLET_PROJECTION_SCHEMA_VERSION: u16 = 2;
 
-/// Wallet projection row-value encoding version with source-bound reorg undo.
-pub const WALLET_PROJECTION_VALUE_ENCODING_VERSION: u16 = 1;
+/// Wallet projection row-value encoding version with source-bound reorg undo and
+/// compact height-deduplicated rows.
+pub const WALLET_PROJECTION_VALUE_ENCODING_VERSION: u16 = 2;
 
 /// Version of the durable projection-build lease embedded in store control.
 pub const WALLET_PROJECTION_BUILD_LEASE_VERSION: u16 = 1;

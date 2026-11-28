@@ -190,6 +190,7 @@ jq -e \
     );
   def row_counts:
     exact_keys([
+      "block_hash_by_height_count",
       "reorg_undo_count",
       "transparent_address_balance_count",
       "transparent_address_transaction_count",
@@ -391,9 +392,9 @@ jq -e \
       and .canonical_store_identity == "canonical"
       and .canonical_store_schema_version == 2
       and .wallet_store_identity == "wallet"
-      and .wallet_store_schema_version == 1
-      and .wallet_projection_schema_version == 1
-      and .wallet_value_encoding_version == 1)
+      and .wallet_store_schema_version == 2
+      and .wallet_projection_schema_version == 2
+      and .wallet_value_encoding_version == 2)
     and ((.resource_limits
       | exact_keys(
           [
@@ -589,6 +590,7 @@ jq -e \
           + (2 * .row_counts.transparent_spent_output_count))
       and .row_counts.reorg_undo_count
         == ([.scanned_block_count, $report.resource_limits.supported_reorg_depth] | min)
+      and .row_counts.block_hash_by_height_count == .scanned_block_count
       and (.utxo_summary
         | exact_keys([
             "commitment_accumulator_hex",

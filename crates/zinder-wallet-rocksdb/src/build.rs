@@ -400,7 +400,7 @@ pub struct WalletColdReopenPhaseDurations {
 pub struct WalletBuildPhaseDurations {
     /// Fresh path creation and durable BUILDING publication.
     pub store_initialization: Duration,
-    /// Authenticated canonical replay scan and event staging.
+    /// Authenticated canonical replay scan, event staging, and block-hash SST flush.
     pub canonical_scan: Duration,
     /// External run finalization and merge for outpoint events.
     pub outpoint_sort: Duration,

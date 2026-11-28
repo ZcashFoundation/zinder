@@ -119,11 +119,13 @@ impl RocksDbWalletSecondary {
         let control = decode_only_control(&bounded_open)?;
         let ready_evidence =
             ready_evidence_from_control(&control, &primary_path, expected_network)?;
+        let block_hash_cache = super::store::BlockHashChunkCache::for_bounded_open(&bounded_open);
         Ok(Self {
             store: RocksDbWalletStore {
                 bounded_open,
                 control,
                 ready_evidence,
+                block_hash_cache,
                 verified_undo_suffix_generation: None,
                 last_transition_footprint: None,
             },
@@ -170,6 +172,11 @@ impl RocksDbWalletSecondary {
         }
         self.store.control = control;
         self.store.ready_evidence = ready_evidence;
+        if after != before {
+            self.store
+                .block_hash_cache
+                .invalidate_from(before.settled_tip().height);
+        }
         Ok(WalletSecondaryCatchupOutcome { before, after })
     }
 

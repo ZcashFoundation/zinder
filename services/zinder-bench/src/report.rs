@@ -1221,6 +1221,8 @@ pub struct WalletStorageRowCounts {
     pub transparent_address_balance_count: u64,
     /// Retained reorg undo rows.
     pub reorg_undo_count: u64,
+    /// Block hash by height lookup rows.
+    pub block_hash_by_height_count: u64,
 }
 
 /// Current transparent UTXO aggregate admitted with wallet READY.
@@ -4565,6 +4567,7 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
                     transparent_address_transaction_count: 0,
                     transparent_address_balance_count: 0,
                     reorg_undo_count: 100,
+                    block_hash_by_height_count: 205,
                 },
                 utxo_summary: super::WalletStorageUtxoSummary {
                     utxo_count: 0,
